@@ -204,6 +204,16 @@ macOS Desktop 曾可用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 与 CLI 共用 man
 - 对外 Unix socket：`~/.codex-bridge/control.sock`
 - CLI：`codexctl`
 
+当前实现阶段已经落地读写分离：读取扫描 `~/.codex/sessions` 和 `session_index.jsonl`；
+显式 thread ID 可确定性读取，在 CDP 提供焦点窗口信息之前，`current` 只能用最近修改的
+未归档 rollout 作为非权威推断。写入必须使用显式 `--thread` 或 daemon 内存中的 `select`
+结果，禁止把 mtime 推断用于写命令。
+
+写后端使用当前 Codex CLI：普通消息走 `codex queue`，steer 在缺少 queue-steer 参数时走
+`codex exec resume` follow-up fallback，interrupt 从 rollout 取得活动 turn ID 后，通过
+`codex app-server proxy` 发送结构化 `turn/interrupt`。最后一条路径依赖共享 app-server；
+Desktop private stdio server 不可达时必须返回错误，不能伪装成功。
+
 命令集：
 
 ```
@@ -223,7 +233,7 @@ codexctl decline <id>
 codexctl interrupt
 ```
 
-内部优先级：
+目标架构的后续优先级：
 
 - 读取：app-server/thread persisted state → CDP DOM → AX → screen capture + vision/OCR
 - 写入：same app-server turn/start / turn/steer → CDP Input → CGEvent
@@ -232,7 +242,7 @@ codexctl interrupt
 
 - 读取历史 → thread/read
 - 判断运行状态 → app-server state/session files
-- 发送文字 → Codex UI CDP
+- 发送普通消息 → 当前实现使用 `codex queue`；未来可按能力增加 same app-server/CDP
 - 审批 → UI CDP
 - 滚动 → UI CDP
 

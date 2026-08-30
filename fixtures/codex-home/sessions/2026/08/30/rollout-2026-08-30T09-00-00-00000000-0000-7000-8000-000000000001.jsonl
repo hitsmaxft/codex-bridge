@@ -1,0 +1,6 @@
+{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000001","timestamp":"2026-08-30T01:00:00Z","cwd":"/tmp","source":"fixture"}}
+{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"fixture-developer","role":"developer","content":[{"type":"input_text","text":"this internal record must not be shown"}]}}
+{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","id":"fixture-user","role":"user","content":[{"type":"input_text","text":"fixture user message"}]}}
+{"timestamp":"2026-08-30T01:00:03Z","type":"response_item","payload":{"type":"message","id":"fixture-commentary","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"fixture commentary"}]}}
+{"timestamp":"2026-08-30T01:00:04Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"this duplicate event must not be shown"}]}}}
+{"timestamp":"2026-08-30T01:00:05Z","type":"response_item","payload":{"type":"message","id":"fixture-final","role":"assistant","phase":"final","content":[{"type":"output_text","text":"fixture final answer"}]}}

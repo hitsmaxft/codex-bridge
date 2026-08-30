@@ -4,23 +4,42 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+mod sessions;
+mod write_backend;
+
+pub use sessions::{
+    default_codex_home, SessionStore, ThreadMessage, ThreadSnapshot, ThreadSummary, CODEX_HOME_ENV,
+};
+pub use write_backend::{
+    BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
+};
+
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
-    Ls,
+    Ls {
+        limit: u32,
+        include_archived: bool,
+    },
+    Select {
+        thread_id: String,
+    },
     Current,
     Status,
     Show {
-        json: bool,
+        thread_id: Option<String>,
+        last: Option<u32>,
     },
     Tail,
     Send {
+        thread_id: Option<String>,
         text: String,
     },
     Steer {
+        thread_id: Option<String>,
         text: String,
     },
     Scroll {
@@ -36,13 +55,16 @@ pub enum Request {
     Decline {
         id: u64,
     },
-    Interrupt,
+    Interrupt {
+        thread_id: Option<String>,
+    },
 }
 
 impl Request {
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Ls => "ls",
+            Self::Ls { .. } => "ls",
+            Self::Select { .. } => "select",
             Self::Current => "current",
             Self::Status => "status",
             Self::Show { .. } => "show",
@@ -53,7 +75,7 @@ impl Request {
             Self::Pending => "pending",
             Self::Approve { .. } => "approve",
             Self::Decline { .. } => "decline",
-            Self::Interrupt => "interrupt",
+            Self::Interrupt { .. } => "interrupt",
         }
     }
 }
@@ -138,5 +160,31 @@ mod tests {
         assert_eq!(json["ok"], false);
         assert!(json.get("result").is_none());
         assert_eq!(json["error"]["code"], "not_implemented");
+    }
+
+    #[test]
+    fn list_request_carries_a_bounded_query() {
+        let request = Request::Ls {
+            limit: 25,
+            include_archived: true,
+        };
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["command"], "ls");
+        assert_eq!(json["limit"], 25);
+        assert_eq!(json["include_archived"], true);
+    }
+
+    #[test]
+    fn write_requests_carry_optional_thread_targets() {
+        let request = Request::Send {
+            thread_id: Some("thread-1".into()),
+            text: "continue".into(),
+        };
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["command"], "send");
+        assert_eq!(json["thread_id"], "thread-1");
+        assert_eq!(json["text"], "continue");
     }
 }

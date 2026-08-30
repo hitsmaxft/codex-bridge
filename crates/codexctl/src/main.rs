@@ -18,6 +18,10 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
 
+    /// Target thread for show/send/steer/interrupt, overriding the daemon selection.
+    #[arg(long, global = true, value_name = "THREAD_ID")]
+    thread: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -25,28 +29,74 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// List known Codex threads.
-    Ls,
-    /// Show the thread associated with the active Codex window.
-    Current,
-    /// Show bridge and active-thread status.
-    Status,
-    /// Show the current thread's messages.
+    Ls {
+        /// Maximum number of threads to return.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+
+        /// Include archived rollouts in addition to unarchived ones.
+        #[arg(long)]
+        include_archived: bool,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select the default thread used by subsequent commands.
+    Select {
+        /// Thread UUID returned by `codexctl ls`.
+        #[arg(value_name = "THREAD_ID")]
+        thread_id: String,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the selected thread or most recently modified unarchived rollout.
+    Current {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show bridge and rollout-store status.
+    Status {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show messages from --thread, the selected thread, or the latest rollout.
     Show {
+        /// Legacy positional form of --thread.
+        #[arg(value_name = "THREAD_ID")]
+        thread_id: Option<String>,
+
+        /// Return only the last N user/assistant messages.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=10000))]
+        last: Option<u32>,
+
         /// Emit structured JSON.
         #[arg(long)]
         json: bool,
     },
     /// Stream new items from the current thread.
     Tail,
-    /// Send a new message through the best available write path.
+    /// Queue a new turn through `codex queue` without taking writer ownership.
     Send {
         #[arg(required = true, value_name = "TEXT")]
         text: Vec<String>,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
     },
-    /// Steer the active turn without starting a separate request.
+    /// Send a follow-up through the `codex exec resume` fallback.
     Steer {
         #[arg(required = true, value_name = "TEXT")]
         text: Vec<String>,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Scroll the Codex conversation UI.
     Scroll(ScrollArgs),
@@ -56,8 +106,12 @@ enum Command {
     Approve { id: u64 },
     /// Decline a pending request.
     Decline { id: u64 },
-    /// Interrupt the active turn.
-    Interrupt,
+    /// Interrupt the active turn through the shared app-server.
+    Interrupt {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -90,6 +144,16 @@ enum DirectionArg {
     Down,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OutputKind {
+    Generic,
+    Threads,
+    Selection,
+    Current,
+    Messages,
+    Write,
+}
+
 impl From<DirectionArg> for ScrollDirection {
     fn from(value: DirectionArg) -> Self {
         match value {
@@ -100,40 +164,119 @@ impl From<DirectionArg> for ScrollDirection {
 }
 
 impl Command {
-    fn into_request(self) -> (Request, bool) {
+    fn into_request(self, target_thread: Option<String>) -> Result<(Request, bool, OutputKind)> {
         match self {
-            Self::Ls => (Request::Ls, false),
-            Self::Current => (Request::Current, false),
-            Self::Status => (Request::Status, false),
-            Self::Show { json } => (Request::Show { json }, json),
-            Self::Tail => (Request::Tail, false),
-            Self::Send { text } => (
+            Self::Ls {
+                limit,
+                include_archived,
+                json,
+            } => {
+                reject_target(&target_thread, "ls")?;
+                Ok((
+                    Request::Ls {
+                        limit,
+                        include_archived,
+                    },
+                    json,
+                    OutputKind::Threads,
+                ))
+            }
+            Self::Select { thread_id, json } => {
+                reject_target(&target_thread, "select")?;
+                Ok((Request::Select { thread_id }, json, OutputKind::Selection))
+            }
+            Self::Current { json } => {
+                reject_target(&target_thread, "current")?;
+                Ok((Request::Current, json, OutputKind::Current))
+            }
+            Self::Status { json } => {
+                reject_target(&target_thread, "status")?;
+                Ok((Request::Status, json, OutputKind::Generic))
+            }
+            Self::Show {
+                thread_id,
+                last,
+                json,
+            } => Ok((
+                Request::Show {
+                    thread_id: merge_target(target_thread, thread_id)?,
+                    last,
+                },
+                json,
+                OutputKind::Messages,
+            )),
+            Self::Tail => {
+                reject_target(&target_thread, "tail")?;
+                Ok((Request::Tail, false, OutputKind::Generic))
+            }
+            Self::Send { text, json } => Ok((
                 Request::Send {
+                    thread_id: target_thread,
                     text: text.join(" "),
                 },
-                false,
-            ),
-            Self::Steer { text } => (
+                json,
+                OutputKind::Write,
+            )),
+            Self::Steer { text, json } => Ok((
                 Request::Steer {
+                    thread_id: target_thread,
                     text: text.join(" "),
                 },
-                false,
-            ),
-            Self::Scroll(args) => (
-                Request::Scroll {
-                    direction: args.direction.map(Into::into),
-                    pixels: args.pixels,
-                    target: args.target,
-                    message_id: args.message_id,
+                json,
+                OutputKind::Write,
+            )),
+            Self::Scroll(args) => {
+                reject_target(&target_thread, "scroll")?;
+                Ok((
+                    Request::Scroll {
+                        direction: args.direction.map(Into::into),
+                        pixels: args.pixels,
+                        target: args.target,
+                        message_id: args.message_id,
+                    },
+                    false,
+                    OutputKind::Generic,
+                ))
+            }
+            Self::Pending => {
+                reject_target(&target_thread, "pending")?;
+                Ok((Request::Pending, false, OutputKind::Generic))
+            }
+            Self::Approve { id } => {
+                reject_target(&target_thread, "approve")?;
+                Ok((Request::Approve { id }, false, OutputKind::Generic))
+            }
+            Self::Decline { id } => {
+                reject_target(&target_thread, "decline")?;
+                Ok((Request::Decline { id }, false, OutputKind::Generic))
+            }
+            Self::Interrupt { json } => Ok((
+                Request::Interrupt {
+                    thread_id: target_thread,
                 },
-                false,
-            ),
-            Self::Pending => (Request::Pending, false),
-            Self::Approve { id } => (Request::Approve { id }, false),
-            Self::Decline { id } => (Request::Decline { id }, false),
-            Self::Interrupt => (Request::Interrupt, false),
+                json,
+                OutputKind::Write,
+            )),
         }
     }
+}
+
+fn merge_target(
+    target_thread: Option<String>,
+    positional_thread: Option<String>,
+) -> Result<Option<String>> {
+    match (target_thread, positional_thread) {
+        (Some(_), Some(_)) => bail!("pass either --thread or positional THREAD_ID, not both"),
+        (Some(thread), None) | (None, Some(thread)) => Ok(Some(thread)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn reject_target(target_thread: &Option<String>, command: &str) -> Result<()> {
+    if target_thread.is_some() {
+        bail!("--thread is not supported by {command}");
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -143,7 +286,7 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => default_socket_path()?,
     };
-    let (request, json_output) = cli.command.into_request();
+    let (request, json_output, output_kind) = cli.command.into_request(cli.thread)?;
     let response = send_request(&socket_path, &request).await?;
 
     if !response.ok {
@@ -157,7 +300,7 @@ async fn main() -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        print_human(&result)?;
+        print_human(&result, output_kind)?;
     }
     Ok(())
 }
@@ -192,7 +335,16 @@ async fn send_request(socket_path: &Path, request: &Request) -> Result<Response>
     serde_json::from_str(&line).context("codex-bridge returned invalid JSON")
 }
 
-fn print_human(value: &serde_json::Value) -> Result<()> {
+fn print_human(value: &serde_json::Value, output_kind: OutputKind) -> Result<()> {
+    match output_kind {
+        OutputKind::Threads => return print_threads(value),
+        OutputKind::Selection => return print_selection(value),
+        OutputKind::Current => return print_current(value),
+        OutputKind::Messages => return print_messages(value),
+        OutputKind::Write => return print_write_result(value),
+        OutputKind::Generic => {}
+    }
+
     match value {
         serde_json::Value::Null => {}
         serde_json::Value::String(text) => println!("{text}"),
@@ -209,18 +361,145 @@ fn print_human(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn print_threads(value: &serde_json::Value) -> Result<()> {
+    let threads = value
+        .get("threads")
+        .and_then(serde_json::Value::as_array)
+        .context("bridge response has no threads array")?;
+    for thread in threads {
+        let id = string_value(thread, "id").unwrap_or("<unknown>");
+        let title = string_value(thread, "title").unwrap_or("<untitled>");
+        let cwd = string_value(thread, "cwd").unwrap_or("<unknown>");
+        let archived = thread
+            .get("archived")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let marker = if archived { "archived" } else { "unarchived" };
+        println!("{id}\t{marker}\t{title}\t{cwd}");
+    }
+
+    let returned = value.get("returned").and_then(serde_json::Value::as_u64);
+    let available = value.get("available").and_then(serde_json::Value::as_u64);
+    if let (Some(returned), Some(available)) = (returned, available) {
+        if returned < available {
+            eprintln!("showing {returned} of {available} threads; increase --limit to see more");
+        }
+    }
+    Ok(())
+}
+
+fn print_current(value: &serde_json::Value) -> Result<()> {
+    let thread = value
+        .get("thread")
+        .context("bridge response has no thread")?;
+    println!("id: {}", string_value(thread, "id").unwrap_or("<unknown>"));
+    println!(
+        "title: {}",
+        string_value(thread, "title").unwrap_or("<untitled>")
+    );
+    println!(
+        "cwd: {}",
+        string_value(thread, "cwd").unwrap_or("<unknown>")
+    );
+    let selection = value
+        .get("selection")
+        .and_then(|selection| selection.get("method"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    println!("selection: {selection}");
+    Ok(())
+}
+
+fn print_selection(value: &serde_json::Value) -> Result<()> {
+    let thread = value
+        .get("thread")
+        .context("bridge response has no selected thread")?;
+    println!(
+        "selected: {} ({})",
+        string_value(thread, "title").unwrap_or("<untitled>"),
+        string_value(thread, "id").unwrap_or("<unknown>")
+    );
+    Ok(())
+}
+
+fn print_write_result(value: &serde_json::Value) -> Result<()> {
+    let action = string_value(value, "action").unwrap_or("write");
+    let status = string_value(value, "status").unwrap_or("completed");
+    let thread_id = string_value(value, "thread_id").unwrap_or("<unknown>");
+    let backend = value
+        .get("backend")
+        .and_then(|backend| backend.get("backend"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    println!("{action}: {status}");
+    println!("thread: {thread_id}");
+    println!("backend: {backend}");
+    if let Some(stdout) = value
+        .get("backend")
+        .and_then(|backend| backend.get("stdout"))
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("{stdout}");
+    }
+    Ok(())
+}
+
+fn print_messages(value: &serde_json::Value) -> Result<()> {
+    let thread = value
+        .get("thread")
+        .context("bridge response has no thread")?;
+    println!(
+        "thread: {} ({})",
+        string_value(thread, "title").unwrap_or("<untitled>"),
+        string_value(thread, "id").unwrap_or("<unknown>")
+    );
+
+    let messages = value
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .context("bridge response has no messages array")?;
+    for message in messages {
+        let role = string_value(message, "role").unwrap_or("unknown");
+        let phase = string_value(message, "phase")
+            .map(|phase| format!("/{phase}"))
+            .unwrap_or_default();
+        println!("\n[{role}{phase}]");
+        let content = message
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .context("message has no content array")?;
+        for item in content {
+            if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                println!("{text}");
+            } else {
+                println!("{}", serde_json::to_string(item)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn string_value<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    value.get(name).and_then(serde_json::Value::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn send_joins_unquoted_message_words() {
-        let cli = Cli::try_parse_from(["codexctl", "send", "keep", "going"]).unwrap();
-        let (request, _) = cli.command.into_request();
+        let cli = Cli::try_parse_from([
+            "codexctl", "--thread", "thread-1", "send", "keep", "going", "--json",
+        ])
+        .unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
 
+        assert!(json);
         assert_eq!(
             request,
             Request::Send {
+                thread_id: Some("thread-1".into()),
                 text: "keep going".into()
             }
         );
@@ -231,5 +510,52 @@ mod tests {
         assert!(Cli::try_parse_from(["codexctl", "scroll"]).is_err());
         assert!(Cli::try_parse_from(["codexctl", "scroll", "down", "--to", "bottom"]).is_err());
         assert!(Cli::try_parse_from(["codexctl", "scroll", "--to", "bottom"]).is_ok());
+    }
+
+    #[test]
+    fn show_accepts_an_explicit_thread_id() {
+        let cli =
+            Cli::try_parse_from(["codexctl", "show", "thread-1", "--last", "5", "--json"]).unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
+
+        assert!(json);
+        assert_eq!(
+            request,
+            Request::Show {
+                thread_id: Some("thread-1".into()),
+                last: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn select_and_interrupt_use_explicit_targeting() {
+        let cli = Cli::try_parse_from(["codexctl", "select", "thread-1", "--json"]).unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
+        assert!(json);
+        assert_eq!(
+            request,
+            Request::Select {
+                thread_id: "thread-1".into()
+            }
+        );
+
+        let cli = Cli::try_parse_from(["codexctl", "interrupt", "--thread", "thread-2", "--json"])
+            .unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
+        assert!(json);
+        assert_eq!(
+            request,
+            Request::Interrupt {
+                thread_id: Some("thread-2".into())
+            }
+        );
+    }
+
+    #[test]
+    fn show_rejects_two_thread_targets() {
+        let cli =
+            Cli::try_parse_from(["codexctl", "--thread", "thread-1", "show", "thread-2"]).unwrap();
+        assert!(cli.command.into_request(cli.thread).is_err());
     }
 }
