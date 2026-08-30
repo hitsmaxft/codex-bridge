@@ -44,11 +44,16 @@ codexctl send "继续检查" --json
 codexctl --thread <THREAD_ID> send "直接指定目标"
 codexctl steer "补充约束"
 codexctl interrupt --json
+codexctl host-exec -- wlink --help
+codexctl --thread <THREAD_ID> host-exec --timeout 600 -- \
+  cases/run-ch585-smoke.sh
 ```
 
-- `ls` 按 rollout 文件修改时间列出线程，并支持包含归档线程。
+- `ls` 按 rollout 文件修改时间列出线程，并支持包含归档线程。每条 session 都返回 rollout
+  创建时记录的 `cwd`，并在该目录运行 `git branch --show-current` 填充可空的 `git_branch`；
+  目录已删除、非 Git 仓库或 detached HEAD 时返回 `null`/显示 `<unknown>`。
 - `show <THREAD_ID>` 是确定性的；解析结果只保留 user/assistant message，跳过内部记录，
-  也允许读取仍在追加的 JSONL 文件。
+  也允许读取仍在追加的 JSONL 文件，并显示相同的 `cwd` 与 `git_branch`。
 - 无参数的 `current` 与 `show` 暂时选择最近修改的未归档 rollout。返回的 `selection`
   会明确标记 `authoritative=false`，因为这不能证明哪个 Codex Desktop 窗口当前获得焦点。
 - `select` 在 daemon 内存中保存默认 thread；`--thread` 可为 `show`、`send`、`steer`、
@@ -61,6 +66,10 @@ codexctl interrupt --json
 - `interrupt` 从 rollout 解析活动 turn ID，再通过 `codex app-server proxy` 向共享 daemon
   发送 `turn/interrupt`。Desktop 使用 private stdio app-server 时会返回明确错误，不能把失败
   报告成已中断。
+- `host-exec` 在所选 thread 的 `cwd` 中由宿主机 bridge 执行命令，用于 USB 刷机和硬件测试。
+  请求传递 argv 数组且不经过 shell；默认只允许 `wlink`、`cases/run-ch585-*.sh` 和受限的
+  Git 子命令。stdout/stderr 各最多保留 32 KiB，默认超时 300 秒，整个子进程组最长允许
+  3600 秒。命令非零退出或超时后，结果仍包含输出和 exit code，同时 `codexctl` 返回非零。
 
 `tail`、`scroll`、`pending` 和审批仍只有 CLI/协议骨架；在
 app-server/CDP backend 接入前会明确返回 `not_implemented`，不会伪装成已执行。
@@ -68,6 +77,9 @@ app-server/CDP backend 接入前会明确返回 `not_implemented`，不会伪装
 daemon 可通过 `--codex-home PATH` 指向另一份只读状态目录，便于离线使用和隔离测试。
 写路径可通过 `--codex-bin PATH`/`CODEX_BRIDGE_CODEX_BIN` 指定 Codex CLI，通过
 `--app-server-socket PATH`/`CODEX_BRIDGE_APP_SERVER_SOCKET` 指定 interrupt 使用的共享 socket。
+host-exec 默认策略可由 `--host-exec-policy PATH` 或 `CODEX_BRIDGE_HOST_EXEC_POLICY` 指向的
+JSON 完全替换；格式见 [host-exec-policy.example.json](host-exec-policy.example.json)。允许
+workspace 脚本意味着信任该脚本的当前内容，公开或不可信仓库应收紧/移除这类规则。
 第三方 Agent 的完整隔离启动、协议检查、故障定位和修复流程见
 [DEBUGGING.md](DEBUGGING.md)。
 

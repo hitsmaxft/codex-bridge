@@ -8,9 +8,9 @@ use std::sync::{Arc, RwLock};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use codex_bridge::{
-    default_codex_home, default_socket_path, BackendFailure, CodexCliBackend, Request, Response,
-    SessionStore, ThreadSummary, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV, PROTOCOL_VERSION,
-    SOCKET_ENV,
+    default_codex_home, default_socket_path, BackendFailure, CodexCliBackend, HostExecFailure,
+    HostExecutor, Request, Response, SessionStore, ThreadSummary, APP_SERVER_SOCKET_ENV,
+    CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -36,6 +36,10 @@ struct Args {
     /// Shared app-server socket used for turn interruption.
     #[arg(long, value_name = "PATH")]
     app_server_socket: Option<PathBuf>,
+
+    /// JSON policy replacing the built-in host-exec allowlist.
+    #[arg(long, value_name = "PATH")]
+    host_exec_policy: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -69,6 +73,15 @@ async fn main() -> Result<()> {
         });
     let session_store = Arc::new(SessionStore::new(codex_home));
     let write_backend = Arc::new(CodexCliBackend::new(codex_program, app_server_socket));
+    let host_exec_policy = args.host_exec_policy.or_else(|| {
+        env::var_os(HOST_EXEC_POLICY_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let host_executor = Arc::new(
+        HostExecutor::load(host_exec_policy.as_deref())
+            .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?,
+    );
     let selected_thread = Arc::new(RwLock::new(None));
     let secure_existing_parent = args.socket.is_none()
         && env::var_os(SOCKET_ENV)
@@ -103,6 +116,7 @@ async fn main() -> Result<()> {
                 let socket_path = Arc::clone(&socket_path);
                 let session_store = Arc::clone(&session_store);
                 let write_backend = Arc::clone(&write_backend);
+                let host_executor = Arc::clone(&host_executor);
                 let selected_thread = Arc::clone(&selected_thread);
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(
@@ -110,6 +124,7 @@ async fn main() -> Result<()> {
                         &socket_path,
                         session_store,
                         write_backend,
+                        host_executor,
                         selected_thread,
                     ).await {
                         eprintln!("control connection failed: {error:#}");
@@ -170,6 +185,7 @@ async fn handle_connection(
     socket_path: &Path,
     session_store: Arc<SessionStore>,
     write_backend: Arc<CodexCliBackend>,
+    host_executor: Arc<HostExecutor>,
     selected_thread: Arc<RwLock<Option<String>>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -194,6 +210,7 @@ async fn handle_connection(
                         &socket_path,
                         &session_store,
                         &write_backend,
+                        &host_executor,
                         &selected_thread,
                     )
                 })
@@ -218,6 +235,7 @@ fn dispatch(
     socket_path: &Path,
     session_store: &SessionStore,
     write_backend: &CodexCliBackend,
+    host_executor: &HostExecutor,
     selected_thread: &RwLock<Option<String>>,
 ) -> Response {
     match request {
@@ -238,6 +256,7 @@ fn dispatch(
                 "app_server_available": fs::metadata(write_backend.app_server_socket())
                     .is_ok_and(|metadata| metadata.file_type().is_socket()),
             },
+            "host_executor": host_executor.summary(),
         })),
         Request::Ls {
             limit,
@@ -246,10 +265,8 @@ fn dispatch(
             if !(1..=1_000).contains(&limit) {
                 return Response::error("invalid_request", "ls limit must be between 1 and 1000");
             }
-            match session_store.list_threads(include_archived) {
-                Ok(mut threads) => {
-                    let available = threads.len();
-                    threads.truncate(limit as usize);
+            match session_store.list_threads_limited(include_archived, limit as usize) {
+                Ok((threads, available)) => {
                     let returned = threads.len();
                     Response::success(json!({
                         "source": "rollout_jsonl",
@@ -402,6 +419,26 @@ fn dispatch(
                 Err(error) => write_backend_error(error),
             }
         }
+        Request::HostExec {
+            thread_id,
+            argv,
+            timeout_seconds,
+        } => {
+            let resolved = match resolve_write_target(thread_id, session_store, selected_thread) {
+                Ok(resolved) => resolved,
+                Err(response) => return response,
+            };
+            match host_executor.execute(&resolved.thread.cwd, &argv, timeout_seconds) {
+                Ok(execution) => Response::success(json!({
+                    "action": "host_exec",
+                    "status": if execution.timed_out { "timed_out" } else { "exited" },
+                    "thread_id": resolved.thread.id,
+                    "target": resolved.method,
+                    "execution": execution,
+                })),
+                Err(error) => host_exec_error(error),
+            }
+        }
         request => Response::error(
             "not_implemented",
             format!(
@@ -518,6 +555,10 @@ fn backend_error(error: anyhow::Error) -> Response {
 }
 
 fn write_backend_error(error: BackendFailure) -> Response {
+    Response::error(error.code, error.message)
+}
+
+fn host_exec_error(error: HostExecFailure) -> Response {
     Response::error(error.code, error.message)
 }
 

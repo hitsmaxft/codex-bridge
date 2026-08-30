@@ -3,6 +3,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
@@ -22,6 +23,7 @@ pub struct ThreadSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub cwd: PathBuf,
+    pub git_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     pub updated_at_ms: u64,
@@ -79,6 +81,39 @@ impl SessionStore {
     }
 
     pub fn list_threads(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
+        let mut threads = self.scan_threads(include_archived)?;
+        populate_git_branches(&mut threads);
+        Ok(threads)
+    }
+
+    pub fn list_threads_limited(
+        &self,
+        include_archived: bool,
+        limit: usize,
+    ) -> Result<(Vec<ThreadSummary>, usize)> {
+        let mut threads = self.scan_threads(include_archived)?;
+        let available = threads.len();
+        threads.truncate(limit);
+        populate_git_branches(&mut threads);
+        Ok((threads, available))
+    }
+
+    pub fn current_thread(&self) -> Result<Option<ThreadSummary>> {
+        Ok(self.list_threads_limited(false, 1)?.0.into_iter().next())
+    }
+
+    pub fn find_thread(&self, thread_id: &str) -> Result<Option<ThreadSummary>> {
+        let mut thread = self
+            .scan_threads(true)?
+            .into_iter()
+            .find(|thread| thread.id == thread_id);
+        if let Some(thread) = &mut thread {
+            thread.git_branch = git_branch_for_cwd(&thread.cwd);
+        }
+        Ok(thread)
+    }
+
+    fn scan_threads(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
         let titles = self.read_title_index()?;
         let mut files = Vec::new();
         collect_rollout_files(&self.codex_home.join("sessions"), false, &mut files)?;
@@ -108,17 +143,6 @@ impl SessionStore {
                 .then_with(|| right.id.cmp(&left.id))
         });
         Ok(threads)
-    }
-
-    pub fn current_thread(&self) -> Result<Option<ThreadSummary>> {
-        Ok(self.list_threads(false)?.into_iter().next())
-    }
-
-    pub fn find_thread(&self, thread_id: &str) -> Result<Option<ThreadSummary>> {
-        Ok(self
-            .list_threads(true)?
-            .into_iter()
-            .find(|thread| thread.id == thread_id))
     }
 
     pub fn read_thread(&self, thread_id: &str) -> Result<Option<ThreadSnapshot>> {
@@ -272,12 +296,42 @@ fn read_rollout_summary(
         title: titles.get(&id).cloned().or(fallback_title),
         id,
         cwd,
+        git_branch: None,
         created_at,
         updated_at_ms,
         source,
         archived,
         rollout_path: path.to_path_buf(),
     }))
+}
+
+fn populate_git_branches(threads: &mut [ThreadSummary]) {
+    let mut by_cwd = HashMap::<PathBuf, Option<String>>::new();
+    for thread in threads {
+        thread.git_branch = by_cwd
+            .entry(thread.cwd.clone())
+            .or_insert_with(|| git_branch_for_cwd(&thread.cwd))
+            .clone();
+    }
+}
+
+fn git_branch_for_cwd(cwd: &Path) -> Option<String> {
+    if !cwd.is_dir() {
+        return None;
+    }
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > 4 * 1024 {
+        return None;
+    }
+    let branch = std::str::from_utf8(&output.stdout).ok()?.trim();
+    (!branch.is_empty()).then(|| branch.to_owned())
 }
 
 fn read_rollout_messages(path: &Path) -> Result<Vec<ThreadMessage>> {
@@ -437,6 +491,21 @@ mod tests {
         }
     }
 
+    fn init_git_repo(path: &Path, branch: &str) {
+        fs::create_dir_all(path).unwrap();
+        let status = Command::new("git")
+            .args(["init", "--quiet", "--initial-branch", branch])
+            .current_dir(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     fn reads_titles_and_user_assistant_messages_without_internal_records() {
         let fixture = Fixture::new();
@@ -465,11 +534,55 @@ mod tests {
         let threads = store.list_threads(false).unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].title.as_deref(), Some("Latest title"));
+        assert_eq!(threads[0].cwd, Path::new("/tmp/project"));
+        assert_eq!(threads[0].git_branch, None);
+        let thread_json = serde_json::to_value(&threads[0]).unwrap();
+        assert_eq!(thread_json["cwd"], "/tmp/project");
+        assert!(thread_json["git_branch"].is_null());
 
         let snapshot = store.read_thread("thread-1").unwrap().unwrap();
         assert_eq!(snapshot.messages.len(), 2);
         assert_eq!(snapshot.messages[0].role, "user");
         assert_eq!(snapshot.messages[1].role, "assistant");
+        assert_eq!(snapshot.thread.cwd, Path::new("/tmp/project"));
+        assert_eq!(snapshot.thread.git_branch, None);
+    }
+
+    #[test]
+    fn session_list_and_detail_include_the_branch_from_the_rollout_cwd() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("workspace");
+        init_git_repo(&workspace, "fixture-branch");
+        let cwd = serde_json::to_string(&workspace).unwrap();
+        let session_meta = format!(
+            r#"{{"timestamp":"2026-08-31T01:00:00Z","type":"session_meta","payload":{{"id":"thread-git","timestamp":"2026-08-31T01:00:00Z","cwd":{cwd},"source":"fixture"}}}}"#
+        );
+        fixture.write_rollout("rollout-git.jsonl", &[&session_meta]);
+
+        let store = SessionStore::new(fixture.path.clone());
+        let (threads, available) = store.list_threads_limited(false, 1).unwrap();
+        assert_eq!(available, 1);
+        assert_eq!(threads[0].cwd, workspace);
+        assert_eq!(threads[0].git_branch.as_deref(), Some("fixture-branch"));
+        let thread_json = serde_json::to_value(&threads[0]).unwrap();
+        assert_eq!(thread_json["git_branch"], "fixture-branch");
+
+        let snapshot = store.read_thread("thread-git").unwrap().unwrap();
+        assert_eq!(snapshot.thread.cwd, threads[0].cwd);
+        assert_eq!(
+            snapshot.thread.git_branch.as_deref(),
+            Some("fixture-branch")
+        );
+    }
+
+    #[test]
+    fn git_branch_is_null_for_non_git_or_deleted_workspaces() {
+        let fixture = Fixture::new();
+        let non_git = fixture.path.join("non-git");
+        fs::create_dir_all(&non_git).unwrap();
+
+        assert_eq!(git_branch_for_cwd(&non_git), None);
+        assert_eq!(git_branch_for_cwd(&fixture.path.join("deleted")), None);
     }
 
     #[test]

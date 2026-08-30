@@ -12,18 +12,19 @@
 - `codexctl` 是一次性 CLI，通过 Unix socket 向 daemon 发送一行 JSON 请求并读取一行 JSON
   响应。
 
-当前协议版本是 `3`。已经实现的命令：
+当前协议版本是 `4`。已经实现的命令：
 
 | 命令 | 当前行为 |
 | --- | --- |
 | `status` | 返回 bridge、协议版本和 rollout store 状态 |
-| `ls` | 列出 rollout，可限制数量或包含归档 |
+| `ls` | 列出 rollout、cwd 与 git branch，可限制数量或包含归档 |
 | `select` | 在 daemon 内存中保存默认目标 thread |
 | `current` | 返回最近修改的未归档 rollout |
-| `show [THREAD_ID]` | 读取指定 thread 或最近 rollout 的 user/assistant 消息 |
+| `show [THREAD_ID]` | 读取指定 thread 的 cwd、git branch 与 user/assistant 消息 |
 | `send` | 通过 `codex queue` 给目标 thread 排队一条消息 |
 | `steer` | 通过 `codex exec resume` fallback 发送 follow-up |
 | `interrupt` | 通过 CLI app-server proxy 调用 `turn/interrupt` |
+| `host-exec` | 在所选 thread cwd 中执行 allowlist 允许的宿主机 argv |
 
 尚未实现的 `tail`、`scroll`、`pending`、`approve` 和 `decline` 必须返回
 `not_implemented`。不要为了让演示“成功”而伪造执行结果。
@@ -58,6 +59,8 @@
   message 与活动 turn ID 解析。
 - [`crates/codex-bridge/src/write_backend.rs`](crates/codex-bridge/src/write_backend.rs)：安全的
   Codex CLI 参数调用和 app-server interrupt JSON-RPC。
+- [`crates/codex-bridge/src/host_executor.rs`](crates/codex-bridge/src/host_executor.rs)：host-exec
+  策略校验、限长输出、超时和进程组终止。
 - [`crates/codex-bridge/src/main.rs`](crates/codex-bridge/src/main.rs)：socket 生命周期、请求大小限制和
   daemon dispatch。
 - [`crates/codexctl/src/main.rs`](crates/codexctl/src/main.rs)：CLI 参数、协议客户端、human/JSON 输出。
@@ -71,6 +74,7 @@
 - `ls --limit` 范围是 `1..=1000`。
 - `show --last` 范围是 `1..=10000`。
 - backend stdout/stderr 最多各返回 `64 KiB`。
+- host-exec stdout/stderr 各最多保留 `32 KiB`，默认超时 `300 秒`，策略上限 `3600 秒`。
 - app-server initialize 与 interrupt 响应各等待最多 `10 秒`。
 - daemon 创建的默认 socket 权限为 `0600`，默认 socket 目录权限为 `0700`。
 - 自定义 socket 路径的既有父目录不会被擅自改权限。
@@ -99,12 +103,15 @@ CARGO_TARGET_DIR=/path/to/main/codexapp-cli/target \
 - tagged JSON 协议结构；
 - CLI 参数映射；
 - 新旧标题中选择较新的 `session_index.jsonl` 记录；
+- 从 rollout `session_meta.payload.cwd` 返回工作路径，并在该目录解析 git branch；
+- 非 Git 仓库或已删除 cwd 时稳定返回 `git_branch: null`；
 - 只保留 user/assistant message；
 - 忽略 developer/internal record；
 - 缺失状态目录时返回空只读结果。
 - write 命令不会回退到非权威 mtime thread；
 - queue/resume 参数不经过 shell；
 - fake Codex 子进程与 interrupt JSON-RPC 完整往返。
+- host-exec shell/路径越界拒绝、策略替换、输出截断、非零退出和进程组超时。
 
 ## 5. 使用隔离 fixture 启动
 
@@ -158,12 +165,13 @@ bridge_socket='/private/var/.../control.sock'
 
 关键验收点：
 
-- `status.protocol_version` 是 `3`。
+- `status.protocol_version` 是 `4`。
 - `status.rollout_store.available` 是 `true`，且 `read_only` 是 `true`。
-- `ls` 只列出 fixture thread，状态显示为 `unarchived`。
+- `ls` 只列出 fixture thread，状态显示为 `unarchived`，cwd 是 `/tmp`；fixture cwd 不是有效
+  Git workspace 时 branch 显示为 `<unknown>`，JSON 中为 `null`。
 - `current` 明确打印 `not authoritative for focused window`。
-- `show` 只显示一条 user message 和两条 assistant message，不显示 fixture 中的 developer
-  message。
+- `show` 显示 cwd 与 git branch，并只显示一条 user message 和两条 assistant message，不显示
+  fixture 中的 developer message。
 - `show --last 1 --json` 的 `messages_returned` 是 `1`，`messages_total` 是 `3`，最后一条
   内容是 `fixture final answer`。
 - 显式 thread ID 的 `selection.authoritative` 是 `true`。
@@ -324,9 +332,23 @@ rollout 只保存另一种结构，应先制作最小脱敏 fixture 和回归测
 codexctl --thread <THREAD_ID> send 'message'
 codexctl --thread <THREAD_ID> steer 'follow-up'
 codexctl --thread <THREAD_ID> interrupt
+codexctl --thread <THREAD_ID> host-exec -- git status
 ```
 
 `select` 只保存在当前 bridge daemon 内存里，重启 daemon 后需要重新选择。
+
+### `host_exec_not_allowed`、`host_exec_unavailable` 或超时
+
+- `host_exec_not_allowed` 表示 argv 没有匹配 daemon 策略；不要通过包一层 `sh -c` 绕过。
+- `host_exec_unavailable` 表示规则允许，但 PATH 中没有可执行文件，或 workspace 脚本不存在、
+  无执行位、解析到 workspace 外。
+- CLI 默认超时 300 秒；超时后 bridge 杀死该调用的整个进程组，响应保留 `timed_out=true`、
+  `exit_code=-1` 和已截断的输出。
+- stdout/stderr 每路最多 32 KiB；`*_truncated=true` 代表后续内容已丢弃。
+
+策略可由 daemon 的 `--host-exec-policy PATH` 或 `CODEX_BRIDGE_HOST_EXEC_POLICY` 指定；自定义
+JSON 完全替换内置规则，先对照 `host-exec-policy.example.json` 检查。host-exec 总是在已选择
+thread 的 rollout cwd 中执行，不接受任意 `--cwd`。
 
 ### `codex_cli_unavailable` 或 `codex_cli_failed`
 
@@ -358,13 +380,14 @@ Codex Desktop 使用 private stdio app-server 时，共享 socket 无法中断�
 
 ### `invalid_request`
 
-先运行 `status --json` 检查 daemon 协议版本。协议 v3 的典型请求是：
+先运行 `status --json` 检查 daemon 协议版本。协议 v4 的典型请求是：
 
 ```json
 {"command":"ls","limit":20,"include_archived":false}
 {"command":"show","thread_id":null,"last":null}
 {"command":"send","thread_id":"THREAD_ID","text":"message"}
 {"command":"interrupt","thread_id":"THREAD_ID"}
+{"command":"host_exec","thread_id":"THREAD_ID","argv":["git","status"],"timeout_seconds":30}
 ```
 
 旧 daemon 与新 CLI 混用时应重新构建并重启 fixture daemon，不要连接正在运行的未知 bridge。
@@ -386,13 +409,14 @@ Codex Desktop 使用 private stdio app-server 时，共享 socket 无法中断�
    - JSON schema 或协议兼容性：`lib.rs`；
    - rollout 发现与解析：`sessions.rs`；
    - Codex 子进程与 interrupt RPC：`write_backend.rs`；
+   - host 命令授权、限流和超时：`host_executor.rs`；
    - daemon 错误码、限制和 dispatch：bridge `main.rs`；
    - CLI 参数与显示：codexctl `main.rs`。
 5. 协议字段有不兼容变化时递增 `PROTOCOL_VERSION`，同时更新 README、本文件和协议测试。
 6. 保持错误语义稳定：用户输入错误用 `invalid_request`，找不到 thread 用
    `thread_not_found`，存储读取失败用 `rollout_store_error`，未实现能力用
    `not_implemented`；Codex CLI 与 app-server 错误使用各自的 `codex_cli_*`/
-   `app_server_*` code。
+   `app_server_*` code；host-exec 使用 `host_exec_*` code。
 7. 运行格式检查、针对性测试和全 workspace 测试。
 8. 审查 `git diff --check` 与 `git status --short`，确认没有真实 Codex 状态、socket、日志或
    target 产物进入变更。
@@ -404,6 +428,7 @@ Codex Desktop 使用 private stdio app-server 时，共享 socket 无法中断�
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo test -p codex-bridge sessions::tests
 CARGO_INCREMENTAL=0 cargo test -p codex-bridge write_backend::tests
+CARGO_INCREMENTAL=0 cargo test -p codex-bridge host_executor::tests
 CARGO_INCREMENTAL=0 cargo test --workspace
 git diff --check
 git status --short

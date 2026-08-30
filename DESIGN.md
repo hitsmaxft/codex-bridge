@@ -209,10 +209,20 @@ macOS Desktop 曾可用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 与 CLI 共用 man
 未归档 rollout 作为非权威推断。写入必须使用显式 `--thread` 或 daemon 内存中的 `select`
 结果，禁止把 mtime 推断用于写命令。
 
+每个 session 的工作路径取自 rollout 创建时的 `session_meta.payload.cwd`。列表、current 和
+show 在该路径执行只读的 `git branch --show-current` 来补充 `git_branch`；目录不存在、不是
+Git 仓库或处于 detached HEAD 时该字段为 `null`，不影响 session 读取。
+
 写后端使用当前 Codex CLI：普通消息走 `codex queue`，steer 在缺少 queue-steer 参数时走
 `codex exec resume` follow-up fallback，interrupt 从 rollout 取得活动 turn ID 后，通过
 `codex app-server proxy` 发送结构化 `turn/interrupt`。最后一条路径依赖共享 app-server；
 Desktop private stdio server 不可达时必须返回错误，不能伪装成功。
+
+需要 USB 等宿主机资源的命令走独立 host-executor：bridge 在明确选择的 thread cwd 中直接
+spawn argv，不使用 shell。内置策略只允许 `wlink`、CH585 case runner 和受限 Git 子命令；
+策略可由 daemon 管理员用 JSON 替换。执行环境会移除非必要变量，stdout/stderr 分别限长
+32 KiB，默认 300 秒并在超时时终止整个进程组。它是显式的受控写路径，不属于只读 rollout
+解析，也不能作为任意宿主机 shell。
 
 命令集：
 

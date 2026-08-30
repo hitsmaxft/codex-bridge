@@ -1,0 +1,15 @@
+{
+  "executables": ["wlink"],
+  "workspace_paths": ["cases/run-ch585-*.sh"],
+  "git_subcommands": [
+    "describe",
+    "diff",
+    "log",
+    "ls-files",
+    "rev-parse",
+    "show",
+    "status"
+  ],
+  "default_timeout_seconds": 300,
+  "max_timeout_seconds": 3600
+}

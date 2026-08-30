@@ -18,7 +18,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
 
-    /// Target thread for show/send/steer/interrupt, overriding the daemon selection.
+    /// Target thread for show/send/steer/interrupt/host-exec, overriding daemon selection.
     #[arg(long, global = true, value_name = "THREAD_ID")]
     thread: Option<String>,
 
@@ -112,6 +112,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run an allowlisted command on the host in the target thread workspace.
+    HostExec {
+        /// Kill the command after this many seconds (daemon default: 300).
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: Option<u64>,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Command and arguments. Use `--` before values that start with `-`.
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        argv: Vec<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -152,6 +171,7 @@ enum OutputKind {
     Current,
     Messages,
     Write,
+    HostExec,
 }
 
 impl From<DirectionArg> for ScrollDirection {
@@ -257,6 +277,19 @@ impl Command {
                 json,
                 OutputKind::Write,
             )),
+            Self::HostExec {
+                timeout,
+                json,
+                argv,
+            } => Ok((
+                Request::HostExec {
+                    thread_id: target_thread,
+                    argv,
+                    timeout_seconds: timeout,
+                },
+                json,
+                OutputKind::HostExec,
+            )),
         }
     }
 }
@@ -302,6 +335,9 @@ async fn main() -> Result<()> {
     } else {
         print_human(&result, output_kind)?;
     }
+    if let Some(message) = host_exec_failure(&result, output_kind) {
+        bail!(message);
+    }
     Ok(())
 }
 
@@ -342,6 +378,7 @@ fn print_human(value: &serde_json::Value, output_kind: OutputKind) -> Result<()>
         OutputKind::Current => return print_current(value),
         OutputKind::Messages => return print_messages(value),
         OutputKind::Write => return print_write_result(value),
+        OutputKind::HostExec => return print_host_exec_result(value),
         OutputKind::Generic => {}
     }
 
@@ -369,13 +406,13 @@ fn print_threads(value: &serde_json::Value) -> Result<()> {
     for thread in threads {
         let id = string_value(thread, "id").unwrap_or("<unknown>");
         let title = string_value(thread, "title").unwrap_or("<untitled>");
-        let cwd = string_value(thread, "cwd").unwrap_or("<unknown>");
+        let (cwd, git_branch) = thread_location(thread);
         let archived = thread
             .get("archived")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let marker = if archived { "archived" } else { "unarchived" };
-        println!("{id}\t{marker}\t{title}\t{cwd}");
+        println!("{id}\t{marker}\t{title}\t{cwd}\t{git_branch}");
     }
 
     let returned = value.get("returned").and_then(serde_json::Value::as_u64);
@@ -397,10 +434,7 @@ fn print_current(value: &serde_json::Value) -> Result<()> {
         "title: {}",
         string_value(thread, "title").unwrap_or("<untitled>")
     );
-    println!(
-        "cwd: {}",
-        string_value(thread, "cwd").unwrap_or("<unknown>")
-    );
+    print_thread_location(thread);
     let selection = value
         .get("selection")
         .and_then(|selection| selection.get("method"))
@@ -419,6 +453,7 @@ fn print_selection(value: &serde_json::Value) -> Result<()> {
         string_value(thread, "title").unwrap_or("<untitled>"),
         string_value(thread, "id").unwrap_or("<unknown>")
     );
+    print_thread_location(thread);
     Ok(())
 }
 
@@ -444,6 +479,73 @@ fn print_write_result(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn print_host_exec_result(value: &serde_json::Value) -> Result<()> {
+    let execution = value
+        .get("execution")
+        .context("bridge response has no host execution result")?;
+    let status = string_value(value, "status").unwrap_or("unknown");
+    let exit_code = execution
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
+    let duration_ms = execution
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    println!("host-exec: {status} (exit {exit_code}, {duration_ms} ms)");
+    println!(
+        "cwd: {}",
+        string_value(execution, "cwd").unwrap_or("<unknown>")
+    );
+    println!(
+        "policy: {}",
+        string_value(execution, "policy_rule").unwrap_or("<unknown>")
+    );
+    if let Some(stdout) = string_value(execution, "stdout") {
+        print!("{stdout}");
+        if !stdout.ends_with('\n') {
+            println!();
+        }
+    }
+    if execution
+        .get("stdout_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!("[stdout truncated]");
+    }
+    if let Some(stderr) = string_value(execution, "stderr") {
+        eprint!("{stderr}");
+        if !stderr.ends_with('\n') {
+            eprintln!();
+        }
+    }
+    if execution
+        .get("stderr_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        eprintln!("[stderr truncated]");
+    }
+    Ok(())
+}
+
+fn host_exec_failure(value: &serde_json::Value, output_kind: OutputKind) -> Option<String> {
+    if !matches!(output_kind, OutputKind::HostExec) {
+        return None;
+    }
+    let execution = value.get("execution")?;
+    if execution
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some("host command timed out".to_owned());
+    }
+    let exit_code = execution.get("exit_code")?.as_i64()?;
+    (exit_code != 0).then(|| format!("host command exited with status {exit_code}"))
+}
+
 fn print_messages(value: &serde_json::Value) -> Result<()> {
     let thread = value
         .get("thread")
@@ -453,6 +555,7 @@ fn print_messages(value: &serde_json::Value) -> Result<()> {
         string_value(thread, "title").unwrap_or("<untitled>"),
         string_value(thread, "id").unwrap_or("<unknown>")
     );
+    print_thread_location(thread);
 
     let messages = value
         .get("messages")
@@ -481,6 +584,19 @@ fn print_messages(value: &serde_json::Value) -> Result<()> {
 
 fn string_value<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a str> {
     value.get(name).and_then(serde_json::Value::as_str)
+}
+
+fn thread_location(thread: &serde_json::Value) -> (&str, &str) {
+    (
+        string_value(thread, "cwd").unwrap_or("<unknown>"),
+        string_value(thread, "git_branch").unwrap_or("<unknown>"),
+    )
+}
+
+fn print_thread_location(thread: &serde_json::Value) {
+    let (cwd, git_branch) = thread_location(thread);
+    println!("cwd: {cwd}");
+    println!("git branch: {git_branch}");
 }
 
 #[cfg(test)]
@@ -557,5 +673,63 @@ mod tests {
         let cli =
             Cli::try_parse_from(["codexctl", "--thread", "thread-1", "show", "thread-2"]).unwrap();
         assert!(cli.command.into_request(cli.thread).is_err());
+    }
+
+    #[test]
+    fn session_location_formats_branch_and_null_as_unknown() {
+        let thread = serde_json::json!({"cwd": "/tmp/project", "git_branch": "main"});
+        assert_eq!(thread_location(&thread), ("/tmp/project", "main"));
+
+        let thread = serde_json::json!({"cwd": "/tmp/deleted", "git_branch": null});
+        assert_eq!(thread_location(&thread), ("/tmp/deleted", "<unknown>"));
+    }
+
+    #[test]
+    fn host_exec_preserves_argv_and_accepts_hyphenated_arguments() {
+        let cli = Cli::try_parse_from([
+            "codexctl",
+            "--thread",
+            "thread-1",
+            "host-exec",
+            "--timeout",
+            "45",
+            "--json",
+            "--",
+            "wlink",
+            "--probe",
+            "1",
+        ])
+        .unwrap();
+        let (request, json, output) = cli.command.into_request(cli.thread).unwrap();
+
+        assert!(json);
+        assert!(matches!(output, OutputKind::HostExec));
+        assert_eq!(
+            request,
+            Request::HostExec {
+                thread_id: Some("thread-1".into()),
+                argv: vec!["wlink".into(), "--probe".into(), "1".into()],
+                timeout_seconds: Some(45),
+            }
+        );
+    }
+
+    #[test]
+    fn host_exec_failure_detects_timeout_and_nonzero_exit() {
+        let timed_out = serde_json::json!({
+            "execution": {"timed_out": true, "exit_code": -1}
+        });
+        assert_eq!(
+            host_exec_failure(&timed_out, OutputKind::HostExec).as_deref(),
+            Some("host command timed out")
+        );
+
+        let failed = serde_json::json!({
+            "execution": {"timed_out": false, "exit_code": 7}
+        });
+        assert_eq!(
+            host_exec_failure(&failed, OutputKind::HostExec).as_deref(),
+            Some("host command exited with status 7")
+        );
     }
 }

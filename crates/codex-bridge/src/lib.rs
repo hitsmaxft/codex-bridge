@@ -4,9 +4,15 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+mod host_executor;
 mod sessions;
 mod write_backend;
 
+pub use host_executor::{
+    HostExecFailure, HostExecPolicyConfig, HostExecPolicySummary, HostExecResult, HostExecutor,
+    DEFAULT_HOST_EXEC_TIMEOUT_SECONDS, HOST_EXEC_OUTPUT_LIMIT_BYTES, HOST_EXEC_POLICY_ENV,
+    MAX_HOST_EXEC_TIMEOUT_SECONDS,
+};
 pub use sessions::{
     default_codex_home, SessionStore, ThreadMessage, ThreadSnapshot, ThreadSummary, CODEX_HOME_ENV,
 };
@@ -14,7 +20,7 @@ pub use write_backend::{
     BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +64,11 @@ pub enum Request {
     Interrupt {
         thread_id: Option<String>,
     },
+    HostExec {
+        thread_id: Option<String>,
+        argv: Vec<String>,
+        timeout_seconds: Option<u64>,
+    },
 }
 
 impl Request {
@@ -76,6 +87,7 @@ impl Request {
             Self::Approve { .. } => "approve",
             Self::Decline { .. } => "decline",
             Self::Interrupt { .. } => "interrupt",
+            Self::HostExec { .. } => "host_exec",
         }
     }
 }
@@ -186,5 +198,19 @@ mod tests {
         assert_eq!(json["command"], "send");
         assert_eq!(json["thread_id"], "thread-1");
         assert_eq!(json["text"], "continue");
+    }
+
+    #[test]
+    fn host_exec_request_uses_an_argv_array_without_a_shell_string() {
+        let request = Request::HostExec {
+            thread_id: Some("thread-1".into()),
+            argv: vec!["wlink".into(), "flash".into(), "firmware.bin".into()],
+            timeout_seconds: Some(120),
+        };
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["command"], "host_exec");
+        assert_eq!(json["argv"][0], "wlink");
+        assert_eq!(json["timeout_seconds"], 120);
     }
 }
