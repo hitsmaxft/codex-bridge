@@ -376,14 +376,26 @@ fn dispatch(
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
-            match write_backend.steer_with_resume(&resolved.thread.id, &resolved.thread.cwd, &text)
-            {
+            let turn_id = match session_store.active_turn_id(&resolved.thread.id) {
+                Ok(Some(turn_id)) => turn_id,
+                Ok(None) => {
+                    return Response::error(
+                        "no_active_turn",
+                        format!(
+                            "thread {} has no active turn; use send to queue a message instead",
+                            resolved.thread.id
+                        ),
+                    );
+                }
+                Err(error) => return backend_error(error),
+            };
+            match write_backend.steer_via_app_server(&resolved.thread.id, &turn_id, &text) {
                 Ok(backend) => Response::success(json!({
                     "action": "steer",
-                    "status": "completed",
+                    "status": "steered",
                     "thread_id": resolved.thread.id,
                     "target": resolved.method,
-                    "semantics": "exec_resume_follow_up",
+                    "semantics": "app_server_steer",
                     "backend": backend,
                 })),
                 Err(error) => write_backend_error(error),

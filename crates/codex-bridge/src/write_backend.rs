@@ -69,13 +69,22 @@ impl CodexCliBackend {
         self.run(queue_invocation(thread_id, text))
     }
 
-    pub fn steer_with_resume(
+    pub fn steer_via_app_server(
         &self,
         thread_id: &str,
-        cwd: &Path,
+        turn_id: &str,
         text: &str,
     ) -> Result<BackendSuccess, BackendFailure> {
-        self.run(steer_invocation(thread_id, cwd, text))
+        let params = json!({
+            "threadId": thread_id,
+            "input": [{
+                "type": "text",
+                "text": text,
+                "text_elements": []
+            }],
+            "expectedTurnId": turn_id
+        });
+        self.run_app_server_rpc("turn/steer", params, "codex_app_server_steer")
     }
 
     pub fn interrupt_turn(
@@ -83,25 +92,8 @@ impl CodexCliBackend {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<BackendSuccess, BackendFailure> {
-        let metadata =
-            std::fs::metadata(&self.app_server_socket).map_err(|error| BackendFailure {
-                code: "app_server_unavailable",
-                message: format!(
-                    "cannot inspect app-server socket {}: {error}",
-                    self.app_server_socket.display()
-                ),
-            })?;
-        if !metadata.file_type().is_socket() {
-            return Err(BackendFailure {
-                code: "app_server_unavailable",
-                message: format!(
-                    "app-server endpoint is not a Unix socket: {}",
-                    self.app_server_socket.display()
-                ),
-            });
-        }
-
-        self.run_interrupt_proxy(thread_id, turn_id)
+        let params = json!({"threadId": thread_id, "turnId": turn_id});
+        self.run_app_server_rpc("turn/interrupt", params, "codex_app_server_interrupt")
     }
 
     fn run(&self, invocation: Invocation) -> Result<BackendSuccess, BackendFailure> {
@@ -137,11 +129,30 @@ impl CodexCliBackend {
         })
     }
 
-    fn run_interrupt_proxy(
+    fn run_app_server_rpc(
         &self,
-        thread_id: &str,
-        turn_id: &str,
+        method: &str,
+        params: Value,
+        backend_name: &'static str,
     ) -> Result<BackendSuccess, BackendFailure> {
+        let metadata =
+            std::fs::metadata(&self.app_server_socket).map_err(|error| BackendFailure {
+                code: "app_server_unavailable",
+                message: format!(
+                    "cannot inspect app-server socket {}: {error}",
+                    self.app_server_socket.display()
+                ),
+            })?;
+        if !metadata.file_type().is_socket() {
+            return Err(BackendFailure {
+                code: "app_server_unavailable",
+                message: format!(
+                    "app-server endpoint is not a Unix socket: {}",
+                    self.app_server_socket.display()
+                ),
+            });
+        }
+
         let mut child = Command::new(&self.program)
             .args([
                 OsString::from("app-server"),
@@ -203,8 +214,8 @@ impl CodexCliBackend {
                 &mut stdin,
                 &json!({
                     "id": 1,
-                    "method": "turn/interrupt",
-                    "params": {"threadId": thread_id, "turnId": turn_id}
+                    "method": method,
+                    "params": params
                 }),
             )?;
             ensure_rpc_success(wait_for_response(&line_receiver, 1, RPC_TIMEOUT)?)
@@ -226,7 +237,7 @@ impl CodexCliBackend {
         })?;
 
         Ok(BackendSuccess {
-            backend: "codex_app_server_interrupt".to_owned(),
+            backend: backend_name.to_owned(),
             exit_code: status.and_then(|status| status.code()).unwrap_or(0),
             stdout: None,
             stderr,
@@ -245,19 +256,6 @@ fn queue_invocation(thread_id: &str, text: &str) -> Invocation {
             text.into(),
         ],
         cwd: None,
-    }
-}
-
-fn steer_invocation(thread_id: &str, cwd: &Path, text: &str) -> Invocation {
-    Invocation {
-        backend: "codex_exec_resume",
-        args: vec![
-            "exec".into(),
-            "resume".into(),
-            thread_id.into(),
-            text.into(),
-        ],
-        cwd: Some(cwd.to_path_buf()),
     }
 }
 
@@ -401,16 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn steer_uses_exec_resume_in_the_thread_workspace() {
-        let invocation = steer_invocation("thread-1", Path::new("/tmp/project"), "guide it");
-        assert_eq!(
-            args(&invocation),
-            ["exec", "resume", "thread-1", "guide it"]
-        );
-        assert_eq!(invocation.cwd.as_deref(), Some(Path::new("/tmp/project")));
-    }
-
-    #[test]
     fn interrupt_rpc_requires_both_thread_and_turn_ids() {
         let mut bytes = Vec::new();
         write_rpc_line(
@@ -440,24 +428,30 @@ mod tests {
     }
 
     #[test]
-    fn fake_codex_exercises_queue_resume_and_interrupt_processes() {
+    fn fake_codex_exercises_queue_steer_and_interrupt_processes() {
         let fake_codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/fake-codex");
-        let backend = CodexCliBackend::new(fake_codex, PathBuf::from("/unused/fake.sock"));
+        let backend = CodexCliBackend::new(fake_codex.clone(), PathBuf::from("/unused/fake.sock"));
 
         let queue = backend.queue_message("thread-1", "hello").unwrap();
         assert_eq!(queue.backend, "codex_queue");
         assert!(queue.stdout.unwrap().contains("<--message> <hello>"));
 
-        let steer = backend
-            .steer_with_resume("thread-1", Path::new("/tmp"), "guide")
-            .unwrap();
-        assert_eq!(steer.backend, "codex_exec_resume");
-        assert!(steer
-            .stdout
-            .unwrap()
-            .contains("<resume> <thread-1> <guide>"));
+        // app-server proxy path requires a live unix socket for the socket check
+        let sock_dir = std::env::temp_dir().join(format!(
+            "codexctl-bridge-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let backend = CodexCliBackend::new(fake_codex, sock_path);
 
-        let interrupt = backend.run_interrupt_proxy("thread-1", "turn-1").unwrap();
+        let steer = backend
+            .steer_via_app_server("thread-1", "turn-1", "guide")
+            .unwrap();
+        assert_eq!(steer.backend, "codex_app_server_steer");
+
+        let interrupt = backend.interrupt_turn("thread-1", "turn-1").unwrap();
         assert_eq!(interrupt.backend, "codex_app_server_interrupt");
     }
 }
