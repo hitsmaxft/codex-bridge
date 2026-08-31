@@ -1,20 +1,5 @@
 #!/bin/sh
 
-if [ "$1" = "app-server" ] && [ "$2" = "proxy" ]; then
-    while IFS= read -r rpc_line; do
-        case "$rpc_line" in
-            *'"id":0'*)
-                printf '%s\n' '{"id":0,"result":{}}'
-                ;;
-            *'"id":1'*)
-                printf '%s\n' '{"id":1,"result":{}}'
-                exit 0
-                ;;
-        esac
-    done
-    exit 0
-fi
-
 printf '%s' 'fake codex'
 for fake_arg in "$@"; do
     printf ' <%s>' "$fake_arg"

@@ -89,7 +89,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Send a follow-up through the `codex exec resume` fallback.
+    /// Inject guidance into the active turn through the shared app-server.
     Steer {
         #[arg(required = true, value_name = "TEXT")]
         text: Vec<String>,

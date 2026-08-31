@@ -33,7 +33,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     codex_bin: Option<PathBuf>,
 
-    /// Shared app-server socket used for turn interruption.
+    /// Shared app-server WebSocket-over-UDS endpoint used for steer and interrupt.
     #[arg(long, value_name = "PATH")]
     app_server_socket: Option<PathBuf>,
 

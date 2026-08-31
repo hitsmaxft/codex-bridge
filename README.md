@@ -60,12 +60,14 @@ codexctl --thread <THREAD_ID> host-exec --timeout 600 -- \
   `interrupt` 单次覆盖选择。写命令没有 mtime fallback，未选择目标时返回
   `thread_not_selected`。
 - `send` 调用 `codex queue --thread ID --message TEXT`，不通过 resume 抢占 active writer。
-- `steer` 在当前 Codex CLI 没有 queue-steer 参数时调用 `codex exec resume ID PROMPT`。
-  这是“续写 follow-up”fallback，不承诺能注入一个已运行的 turn；遇到 active-writer 冲突会
-  原样返回 `codex_cli_failed`。
-- `interrupt` 从 rollout 解析活动 turn ID，再通过 `codex app-server proxy` 向共享 daemon
-  发送 `turn/interrupt`。Desktop 使用 private stdio app-server 时会返回明确错误，不能把失败
-  报告成已中断。
+- `steer` 从 rollout 解析活动 turn ID，再通过共享 app-server 的
+  WebSocket-over-Unix-socket 控制端点发送 `turn/steer`。这是真正的 same-turn 注入，不会另起
+  `codex exec resume` writer。
+- `interrupt` 使用相同端点发送 `turn/interrupt`。目标 thread 必须由该 app-server 实例持有，
+  且 rollout 中的活动 turn ID 必须仍然匹配；否则返回明确错误，不能伪装成功。
+- Codex Desktop 26.820.60940 仍自行启动 private stdio app-server，它没有公开 control socket。
+  因此上述 steer/interrupt 当前可操作 standalone/shared daemon 会话，不能跨实例操作 GUI
+  private 会话。
 - `host-exec` 在所选 thread 的 `cwd` 中由宿主机 bridge 执行命令，用于 USB 刷机和硬件测试。
   请求传递 argv 数组且不经过 shell；默认只允许 `wlink`、`cases/run-ch585-*.sh` 和受限的
   Git 子命令。stdout/stderr 各最多保留 32 KiB，默认超时 300 秒，整个子进程组最长允许
@@ -76,7 +78,9 @@ app-server/CDP backend 接入前会明确返回 `not_implemented`，不会伪装
 
 daemon 可通过 `--codex-home PATH` 指向另一份只读状态目录，便于离线使用和隔离测试。
 写路径可通过 `--codex-bin PATH`/`CODEX_BRIDGE_CODEX_BIN` 指定 Codex CLI，通过
-`--app-server-socket PATH`/`CODEX_BRIDGE_APP_SERVER_SOCKET` 指定 interrupt 使用的共享 socket。
+`--app-server-socket PATH`/`CODEX_BRIDGE_APP_SERVER_SOCKET` 指定 steer/interrupt 使用的共享
+WebSocket-over-UDS socket。不要把该端点当作 JSONL socket；`codex app-server proxy` 只做原始
+字节转发，无法完成 WebSocket Upgrade。
 host-exec 默认策略可由 `--host-exec-policy PATH` 或 `CODEX_BRIDGE_HOST_EXEC_POLICY` 指向的
 JSON 完全替换；格式见 [host-exec-policy.example.json](host-exec-policy.example.json)。允许
 workspace 脚本意味着信任该脚本的当前内容，公开或不可信仓库应收紧/移除这类规则。

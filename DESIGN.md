@@ -192,7 +192,10 @@ thread ... already has an active writer
 且 App 存在不及时释放 writer 的问题。
 
 理想架构：same app-server 供 App 和 codexctl 共用。Codex 支持 Unix socket app-server：
-`~/.codex/app-server-control/app-server-control.sock`，CLI 也有 remote app-server 连接能力。
+`~/.codex/app-server-control/app-server-control.sock`。该 Unix socket 上承载的是 WebSocket，
+客户端必须先执行 HTTP Upgrade，再以 WebSocket text frame 发送 JSON-RPC；它不是 JSONL/raw
+Unix stream。Codex 0.151.0 的 `app-server proxy` 只做 stdio 与 socket 的逐字节复制，不能作为
+这个控制 socket 的协议适配器。
 macOS Desktop 曾可用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 与 CLI 共用 managed daemon。
 
 ⚠️ **2026-08-29 最新状态**：Desktop 26.820.60940 已出现 regression，又忽略 local-daemon 配置，
@@ -213,10 +216,11 @@ macOS Desktop 曾可用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 与 CLI 共用 man
 show 在该路径执行只读的 `git branch --show-current` 来补充 `git_branch`；目录不存在、不是
 Git 仓库或处于 detached HEAD 时该字段为 `null`，不影响 session 读取。
 
-写后端使用当前 Codex CLI：普通消息走 `codex queue`，steer 在缺少 queue-steer 参数时走
-`codex exec resume` follow-up fallback，interrupt 从 rollout 取得活动 turn ID 后，通过
-`codex app-server proxy` 发送结构化 `turn/interrupt`。最后一条路径依赖共享 app-server；
-Desktop private stdio server 不可达时必须返回错误，不能伪装成功。
+写后端使用当前 Codex CLI 和共享 app-server：普通消息走 `codex queue`；steer/interrupt 从
+rollout 取得活动 turn ID 后，由 bridge 直接建立 WebSocket-over-UDS 连接，完成
+`initialize`/`initialized` 后分别发送结构化 `turn/steer` 或 `turn/interrupt`。这两条路径只能
+操作持有目标 thread 的同一个 app-server 实例；Desktop private stdio server 不可达时必须
+返回错误，不能退回 `exec resume` 或伪装成功。
 
 需要 USB 等宿主机资源的命令走独立 host-executor：bridge 在明确选择的 thread cwd 中直接
 spawn argv，不使用 shell。内置策略只允许 `wlink`、CH585 case runner 和受限 Git 子命令；
