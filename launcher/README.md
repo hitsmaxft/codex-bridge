@@ -1,9 +1,9 @@
 # macOS launcher
 
-这里预留 CodexBridge launcher 的实现。后续 launcher 将负责：
+This directory is reserved for the CodexBridge launcher. A future implementation will:
 
-1. 以私有 Chromium DevTools Protocol endpoint 启动 Codex.app；
-2. 发现 Codex Electron renderer target；
-3. 把 endpoint 信息交给 `codex-bridge`，并维持应用生命周期。
+1. Launch Codex.app with a private Chromium DevTools Protocol endpoint.
+2. Discover the Codex Electron renderer target.
+3. Pass the endpoint details to `codex-bridge` and manage the application lifecycle.
 
-第一版不修改 `app.asar`，也不对 Codex.app 重新签名。
+The first version will neither modify `app.asar` nor re-sign Codex.app.

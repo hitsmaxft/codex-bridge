@@ -1,22 +1,15 @@
 # codex-gui-bridge
 
-这个 crate 目前包含两层不同成熟度的实现：
+This crate currently contains two layers of implementation at different levels of maturity:
 
-- `ws-unix-bridge` 是 `Cargo.toml` 中唯一注册的 binary。它已有 fake WebSocket/Unix-socket
-  往返测试，可作为实验性的透明传输适配器。
-- `src/main.rs`、`src/lib.rs`、`broker.rs`、`cli_api.rs`、`protocol.rs`、`supervisor.rs` 和
-  `src/bin/codex-gui.rs` 是工作区中的 broker/supervisor 草案。当前 crate 设置了
-  `autolib = false`、`autobins = false`，尚未注册这些 target，也缺少相应依赖配置；普通
-  `cargo build --workspace` 不会编译或验证它们。
+- `ws-unix-bridge` is the only binary registered in `Cargo.toml`. It already has fake WebSocket/Unix-socket round-trip tests and can serve as an experimental transparent transport adapter.
+- `src/main.rs`, `src/lib.rs`, `broker.rs`, `cli_api.rs`, `protocol.rs`, `supervisor.rs`, and `src/bin/codex-gui.rs` are broker/supervisor drafts in the workspace. The crate currently sets `autolib = false` and `autobins = false`, so these targets aren't registered yet and lack the corresponding dependency configuration; a plain `cargo build --workspace` won't compile or verify them.
 
-因此，下面“透明桥”部分描述当前可构建路径；“共享连接 broker 草案”只记录设计和待办，不能
-作为功能已完成的证据。
+So the "transparent bridge" section below describes the currently buildable path, while the "shared-connection broker draft" only records design and TODOs and can't be taken as evidence that the feature is complete.
 
-## 当前可构建路径：ws-unix-bridge
+## Currently Buildable Path: ws-unix-bridge
 
-`ws-unix-bridge` 的目标是让 Codex Desktop 和官方 remote-control daemon 使用同一个
-app-server 实例。它终止 Desktop 的 TCP WebSocket 连接，建立到 daemon Unix socket 的另一个
-WebSocket 连接，并在两侧之间原样转发 frame，不解析或改写 JSON-RPC。
+`ws-unix-bridge` aims to let Codex Desktop and the official remote-control daemon share a single app-server instance. It terminates the Desktop's TCP WebSocket connection, opens another WebSocket connection to the daemon's Unix socket, and forwards frames between the two sides verbatim, without parsing or rewriting JSON-RPC.
 
 ```text
 Codex Desktop
@@ -32,23 +25,19 @@ Codex Desktop
   ~/.codex/app-server-control/app-server-control.sock
 ```
 
-bridge 会转发 text、binary、ping、pong 和 close frame。它不会自行发送 `initialize`：Desktop
-自己的 handshake 及后续 app-server 流量原样通过。每个 Desktop 连接对应一个上游 Unix-socket
-连接；任一侧断开都会结束这一对连接。
+The bridge forwards text, binary, ping, pong, and close frames. It doesn't send `initialize` itself: the Desktop's own handshake and subsequent app-server traffic pass through unchanged. Each Desktop connection maps to one upstream Unix-socket connection, and a disconnect on either side ends that pair.
 
-这条路径只有在 Desktop 实际读取 `CODEX_APP_SERVER_WS_URL` 并连接到 bridge 时才可能让 GUI
-与 `codexctl` 共用 daemon。目前自动测试只证明 frame 透明转发，不证明任何 Desktop 版本接受
-该环境变量，也不证明 GUI thread 已能被 steer/interrupt。
+This path only lets the GUI share the daemon with `codexctl` if the Desktop actually reads `CODEX_APP_SERVER_WS_URL` and connects to the bridge. The automated tests currently prove only transparent frame forwarding — not that any Desktop version honors this environment variable, and not that GUI threads can already be steered or interrupted.
 
-### 启动
+### Launching
 
-先确认官方 remote-control daemon 是否已持有默认 socket；已有实例时不要启动第二份：
+First, confirm whether the official remote-control daemon already holds the default socket; don't start a second instance if one is already running:
 
 ```sh
 codex app-server --remote-control --listen unix://
 ```
 
-然后从仓库启动 bridge：
+Then launch the bridge from the repository:
 
 ```sh
 CARGO_INCREMENTAL=0 cargo run -p codex-gui-bridge --bin ws-unix-bridge -- \
@@ -56,35 +45,30 @@ CARGO_INCREMENTAL=0 cargo run -p codex-gui-bridge --bin ws-unix-bridge -- \
   --upstream-socket "$HOME/.codex/app-server-control/app-server-control.sock"
 ```
 
-`--listen` defaults to `127.0.0.1:18790`. `--upstream-socket` defaults to the
-path shown above.
+`--listen` defaults to `127.0.0.1:18790`. `--upstream-socket` defaults to the path shown above.
 
-只有用户明确允许关闭并重启 Codex Desktop、且已确认不会影响现有工作时，才能让 Desktop 继承
-实验性 transport 环境变量：
+Only let the Desktop inherit the experimental transport environment variable when the user has explicitly agreed to close and restart Codex Desktop and has confirmed this won't disrupt existing work:
 
 ```sh
 CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc \
   /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 ```
 
-如果 app bundle 位于其他路径，只替换 executable 路径。不要在普通 fixture 调试中执行这一步，
-也不要用现有 585、kof96 或其他真实项目会话做首个写入测试。
+If the app bundle lives elsewhere, only replace the executable path. Don't run this during ordinary fixture debugging, and don't use existing sessions in project 585, kof96, or any other real project as the first write test.
 
-bridge 默认只绑定 loopback。它不增加认证或授权，绝不能监听非 loopback 地址或暴露到不可信
-网络。
+The bridge binds only to loopback by default. It adds no authentication or authorization, so it must never listen on a non-loopback address or be exposed to an untrusted network.
 
-### 测试
+### Tests
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 ```
 
-测试使用临时 Unix socket、fake WebSocket app-server 和 fake Desktop loopback 连接，只验证
-双向 frame 原样到达；不会启动真实 app-server、daemon 或 Desktop。
+The tests use a temporary Unix socket, a fake WebSocket app-server, and a fake Desktop loopback connection, and only verify that frames arrive verbatim in both directions; they don't start a real app-server, daemon, or Desktop.
 
-## 尚未接入构建：共享连接 broker 草案
+## Not Yet Wired Into the Build: Shared-Connection Broker Draft
 
-未跟踪源码中的目标架构是：
+The draft source describes this target architecture:
 
 ```text
 Desktop ──WS 127.0.0.1:18790/rpc──> broker
@@ -96,23 +80,16 @@ Desktop ──WS 127.0.0.1:18790/rpc──> broker
 codex-gui ──Unix socket /tmp/codex-gui.sock──┘
 ```
 
-设计意图是让 GUI 流量和 `send`、`steer`、`interrupt` 共用同一条 app-server upstream；只读的
-`threads`、`read`、`turns` 使用临时连接。草案 CLI 还定义了 `status`、`current` 和 `tail`。
+The design intent is for GUI traffic and `send`, `steer`, and `interrupt` to share the same app-server upstream, while the read-only `threads`, `read`, and `turns` use ephemeral connections. The draft CLI also defines `status`, `current`, and `tail`.
 
-在把它写成可运行功能前，至少需要完成：
+Before this can become a working feature, at least the following must be completed:
 
-1. 在 Cargo 中显式注册 library、daemon 和 `codex-gui` binary，并补齐 serde、Tokio process/
-   time/sync 等依赖后通过 build、Clippy 和测试。
-2. 将 CLI socket 放进用户私有目录，设置 `0600` 权限，并用 inode/ownership 检查处理 stale
-   socket；不能无条件删除固定 `/tmp/codex-gui.sock`。
-3. 为 loopback broker 增加本地授权边界，或明确证明只有受信任 Desktop 能连接；当前任一本地
-   进程都可能尝试注入 RPC。
-4. 正确终止 supervisor 启动的 app-server child，限制 crash-loop，并验证 Desktop 断线、重连
-   和多连接时 upstream 不会串线。
-5. 从 app-server response/notification 可靠追踪 GUI 当前 thread；仅观察带 `threadId` 的
-   Desktop request 不足以覆盖新建 thread。
-6. 增加 fake Desktop ↔ broker ↔ fake app-server ↔ CLI 的端到端测试，再在用户授权的全新临时
-   thread 上做真实 GUI 验收。
-7. 明确它与现有 `codexctl`/`codex-bridge` 的合并方案，避免长期维护第二套 CLI 协议和输出格式。
+1. Explicitly register the library, daemon, and `codex-gui` binary in Cargo, add the serde and Tokio process/time/sync dependencies, and pass build, Clippy, and tests.
+2. Put the CLI socket in a user-private directory with `0600` permissions, and use inode/ownership checks to handle stale sockets; don't unconditionally delete the fixed `/tmp/codex-gui.sock`.
+3. Add a local authorization boundary for the loopback broker, or explicitly prove that only a trusted Desktop can connect; as it stands, any local process could try to inject RPC.
+4. Properly terminate the app-server child started by the supervisor, limit crash-loops, and verify that upstream connections don't cross when the Desktop disconnects, reconnects, or opens multiple connections.
+5. Reliably track the GUI's current thread from app-server responses/notifications; watching only Desktop requests that carry `threadId` isn't enough to cover newly created threads.
+6. Add end-to-end tests covering fake Desktop ↔ broker ↔ fake app-server ↔ CLI, then do real GUI acceptance on a fresh temporary thread authorized by the user.
+7. Clarify how it merges with the existing `codexctl`/`codex-bridge`, to avoid maintaining a second CLI protocol and output format long-term.
 
-完成这些门槛前，不要运行或发布草案 daemon，也不要把源码存在描述成 GUI 控制已完成。
+Until these gates are met, don't run or ship the draft daemon, and don't describe the existence of the source as proof that GUI control is complete.

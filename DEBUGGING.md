@@ -1,88 +1,74 @@
-# codexapp-cli 初步调试与修复手册
+# codexapp-cli Initial Debugging & Fix Guide
 
-本文面向接手本仓库的第三方 Agent。目标是在不影响正在运行的 Codex Desktop 的前提下，
-启动 `codex-bridge` 与 `codexctl`，使用隔离 fixture 验证读路径和写后端，定位协议、rollout
-解析或 Codex CLI 调用问题，并完成可回归的修复。
+This guide is for a third-party agent taking over this repository. The goal is to start `codex-bridge` and `codexctl` without disturbing a running Codex Desktop, validate the read path and write backends against isolated fixtures, track down protocol, rollout parsing, or Codex CLI invocation issues, and land regression-safe fixes.
 
-## 1. 先理解当前边界
+## 1. Understand the current boundaries first
 
-项目由两个进程组成：
+The project consists of two processes:
 
-- `codex-bridge` 是本地 daemon，监听 Unix socket，读取 Codex rollout 状态。
-- `codexctl` 是一次性 CLI，通过 Unix socket 向 daemon 发送一行 JSON 请求并读取一行 JSON
-  响应。
+- `codex-bridge` is a local daemon that listens on a Unix socket and reads Codex rollout state.
+- `codexctl` is a one-shot CLI that sends a single line of JSON over the Unix socket to the daemon and reads a single line of JSON back.
 
-当前协议版本是 `4`。已经实现的命令：
+The current protocol version is `4`. Implemented commands:
 
-| 命令 | 当前行为 |
+| Command | Current behavior |
 | --- | --- |
-| `status` | 返回 bridge、协议版本和 rollout store 状态 |
-| `ls` | 列出 rollout、cwd 与 git branch，可限制数量或包含归档 |
-| `select` | 在 daemon 内存中保存默认目标 thread |
-| `current` | 返回最近修改的未归档 rollout |
-| `show [THREAD_ID]` | 读取指定 thread 的 cwd、git branch 与 user/assistant 消息 |
-| `send` | 通过 `codex queue` 给目标 thread 排队一条消息 |
-| `steer` | 通过共享 app-server 的 WebSocket-over-UDS 调用 `turn/steer` |
-| `interrupt` | 通过同一控制端点调用 `turn/interrupt` |
-| `host-exec` | 在所选 thread cwd 中执行 allowlist 允许的宿主机 argv |
+| `status` | Returns bridge, protocol version, and rollout store status |
+| `ls` | Lists rollouts, cwd, and git branch; can be limited or include archives |
+| `select` | Saves the default target thread in the daemon's memory |
+| `current` | Returns the most recently modified unarchived rollout |
+| `show [THREAD_ID]` | Reads a given thread's cwd, git branch, and user/assistant messages |
+| `send` | Queues a message to the target thread via `codex queue` |
+| `steer` | Calls `turn/steer` via WebSocket-over-UDS on the shared app-server |
+| `interrupt` | Calls `turn/interrupt` on the same control endpoint |
+| `host-exec` | Runs allowlist-permitted host argv in the selected thread's cwd |
 
-尚未实现的 `tail`、`scroll`、`pending`、`approve` 和 `decline` 必须返回
-`not_implemented`。不要为了让演示“成功”而伪造执行结果。
+The not-yet-implemented `tail`, `scroll`, `pending`, `approve`, and `decline` must return `not_implemented`. Do not fake execution results to make a demo "succeed".
 
-`current` 也有明确限制：它只按 rollout 文件修改时间推断，不能证明哪个 Codex App 窗口
-当前获得焦点。JSON 响应中的 `selection.authoritative` 必须保持为 `false`；需要确定性读取时，
-使用 `show <THREAD_ID>`。
+`current` also has an explicit limitation: it only infers from rollout file modification times and cannot prove which Codex App window currently has focus. `selection.authoritative` in the JSON response must stay `false`; when you need a deterministic read, use `show <THREAD_ID>`.
 
-写命令的目标规则更严格：必须先运行 `select <THREAD_ID>`，或为单次命令传
-`--thread <THREAD_ID>`。写路径绝不使用最近 mtime 猜测，未选择时必须返回
-`thread_not_selected`。
+The target rules for write commands are stricter: you must first run `select <THREAD_ID>`, or pass `--thread <THREAD_ID>` for a single command. The write path never guesses from the most recent mtime and must return `thread_not_selected` when nothing is selected.
 
-## 2. 安全规则
+## 2. Safety rules
 
-初步调试必须遵守以下规则：
+Initial debugging must follow these rules:
 
-1. 使用仓库内的 `fixtures/codex-home`，不要直接使用 `~/.codex`。
-2. 使用 `mktemp -d` 创建调试目录，并通过 `--socket` 指定其中的 socket。
-3. 不启动 Codex App、不重启 Codex App、不连接它的 app-server、CDP 或 remote-debugging
-   endpoint。
-4. 不运行 launcher，不修改 `app.asar`，不发送按键、鼠标或 approval。
-5. 不删除默认的 `~/.codex-bridge/control.sock`。如果默认 socket 已有服务，保持不动。
-6. 不修改任何真实 rollout、`session_index.jsonl` 或 `state_5.sqlite`。
-7. 未获得用户明确许可时，不运行以真实 `~/.codex` 为 `--codex-home` 的 smoke test。
+1. Use the repository's `fixtures/codex-home`, not `~/.codex` directly.
+2. Create debugging directories with `mktemp -d` and specify a socket inside them via `--socket`.
+3. Do not launch Codex App, restart Codex App, or connect to its app-server, CDP, or remote-debugging endpoint.
+4. Do not run the launcher, modify `app.asar`, or send keystrokes, mouse input, or approvals.
+5. Do not delete the default `~/.codex-bridge/control.sock`. If something is already serving on the default socket, leave it alone.
+6. Do not modify any real rollout, `session_index.jsonl`, or `state_5.sqlite`.
+7. Do not run a smoke test with the real `~/.codex` as `--codex-home` without the user's explicit permission.
 
-只读 fixture 流程与正在运行的 Codex App 完全隔离。
+The read-only fixture flow is fully isolated from a running Codex App.
 
-## 3. 代码地图
+## 3. Code map
 
-- [`crates/codex-bridge/src/lib.rs`](crates/codex-bridge/src/lib.rs)：请求/响应结构与协议版本。
-- [`crates/codex-bridge/src/sessions.rs`](crates/codex-bridge/src/sessions.rs)：rollout 扫描、标题索引、
-  message 与活动 turn ID 解析。
-- [`crates/codex-bridge/src/write_backend.rs`](crates/codex-bridge/src/write_backend.rs)：安全的
-  Codex CLI 参数调用和 app-server WebSocket-over-UDS JSON-RPC。
-- [`crates/codex-bridge/src/host_executor.rs`](crates/codex-bridge/src/host_executor.rs)：host-exec
-  策略校验、限长输出、超时和进程组终止。
-- [`crates/codex-bridge/src/main.rs`](crates/codex-bridge/src/main.rs)：socket 生命周期、请求大小限制和
-  daemon dispatch。
-- [`crates/codexctl/src/main.rs`](crates/codexctl/src/main.rs)：CLI 参数、协议客户端、human/JSON 输出。
-- [`fixtures/codex-home`](fixtures/codex-home)：用于隔离调试的最小 Codex 状态目录。
-- [`fixtures/fake-codex`](fixtures/fake-codex)：不会连接真实服务的可执行 write-backend fixture。
+- [`crates/codex-bridge/src/lib.rs`](crates/codex-bridge/src/lib.rs): request/response structs and protocol version.
+- [`crates/codex-bridge/src/sessions.rs`](crates/codex-bridge/src/sessions.rs): rollout scanning, title indexing, message and active turn ID parsing.
+- [`crates/codex-bridge/src/write_backend.rs`](crates/codex-bridge/src/write_backend.rs): safe Codex CLI argument invocation and app-server WebSocket-over-UDS JSON-RPC.
+- [`crates/codex-bridge/src/host_executor.rs`](crates/codex-bridge/src/host_executor.rs): host-exec policy validation, output length limits, timeouts, and process-group termination.
+- [`crates/codex-bridge/src/main.rs`](crates/codex-bridge/src/main.rs): socket lifecycle, request size limits, and daemon dispatch.
+- [`crates/codexctl/src/main.rs`](crates/codexctl/src/main.rs): CLI arguments, protocol client, human/JSON output.
+- [`fixtures/codex-home`](fixtures/codex-home): a minimal Codex state directory for isolated debugging.
+- [`fixtures/fake-codex`](fixtures/fake-codex): an executable write-backend fixture that does not connect to real services.
 
-关键限制：
+Key limits:
 
-- 请求最大 `1 MiB`。
-- 响应最大 `16 MiB`。
-- `ls --limit` 范围是 `1..=1000`。
-- `show --last` 范围是 `1..=10000`。
-- backend stdout/stderr 最多各返回 `64 KiB`。
-- host-exec stdout/stderr 各最多保留 `32 KiB`，默认超时 `300 秒`，策略上限 `3600 秒`。
-- app-server WebSocket handshake、initialize 与 steer/interrupt 响应各等待最多 `10 秒`。
-- daemon 创建的默认 socket 权限为 `0600`，默认 socket 目录权限为 `0700`。
-- 自定义 socket 路径的既有父目录不会被擅自改权限。
+- Requests are capped at `1 MiB`.
+- Responses are capped at `16 MiB`.
+- `ls --limit` range is `1..=1000`.
+- `show --last` range is `1..=10000`.
+- Backend stdout/stderr each return at most `64 KiB`.
+- host-exec stdout/stderr each keep at most `32 KiB`, with a default timeout of `300 seconds` and a policy cap of `3600 seconds`.
+- The app-server WebSocket handshake, initialize, and steer/interrupt responses each wait at most `10 seconds`.
+- The daemon-created default socket is `0600`; the default socket directory is `0700`.
+- Pre-existing parent directories of custom socket paths are not silently re-permissioned.
 
-## 4. 构建与单元测试
+## 4. Build and unit tests
 
-下列命令中的 `/path/to/codexapp-cli` 代表本机仓库根目录，请替换为实际绝对路径。从仓库
-根目录执行：
+In the commands below, `/path/to/codexapp-cli` stands for this repository's root on your machine; replace it with the real absolute path. Run from the repository root:
 
 ```sh
 cd /path/to/codexapp-cli
@@ -90,39 +76,38 @@ cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo test --workspace
 ```
 
-本项目的 Rust 产物统一复用仓库根目录的 `target`，不要为普通调试创建新的长期 target。
-如果在链接 worktree 中工作，应显式复用主项目 target：
+The project's Rust artifacts all share the repository root's `target`. Don't create a new long-lived target for routine debugging. If you work in a linked worktree, explicitly reuse the main project's target:
 
 ```sh
 CARGO_TARGET_DIR=/path/to/main/codexapp-cli/target \
   CARGO_INCREMENTAL=0 cargo test --workspace
 ```
 
-测试必须只使用临时目录或仓库 fixture，不能依赖当前用户的真实 `~/.codex`。当前测试会验证：
+Tests must use only temporary directories or repository fixtures; they must not depend on the current user's real `~/.codex`. Current tests verify:
 
-- tagged JSON 协议结构；
-- CLI 参数映射；
-- 新旧标题中选择较新的 `session_index.jsonl` 记录；
-- 从 rollout `session_meta.payload.cwd` 返回工作路径，并在该目录解析 git branch；
-- 非 Git 仓库或已删除 cwd 时稳定返回 `git_branch: null`；
-- 只保留 user/assistant message；
-- 忽略 developer/internal record；
-- 缺失状态目录时返回空只读结果。
-- write 命令不会回退到非权威 mtime thread；
-- queue 参数不经过 shell；
-- WebSocket-over-UDS handshake、initialize、steer 和 interrupt JSON-RPC 完整往返。
-- host-exec shell/路径越界拒绝、策略替换、输出截断、非零退出和进程组超时。
+- the tagged JSON protocol structure;
+- CLI argument mapping;
+- selecting the newer `session_index.jsonl` record between new and old titles;
+- returning the working path from the rollout's `session_meta.payload.cwd` and resolving the git branch in that directory;
+- stably returning `git_branch: null` for non-Git repositories or deleted cwds;
+- keeping only user/assistant messages;
+- ignoring developer/internal records;
+- returning empty read-only results when the state directory is missing;
+- write commands not falling back to a non-authoritative mtime thread;
+- queue arguments not passing through a shell;
+- full WebSocket-over-UDS handshake, initialize, steer, and interrupt JSON-RPC round trips;
+- host-exec shell/path escape rejection, policy substitution, output truncation, non-zero exit, and process-group timeout.
 
-## 5. 使用隔离 fixture 启动
+## 5. Launching with isolated fixtures
 
-先构建二进制：
+First build the binaries:
 
 ```sh
 cd /path/to/codexapp-cli
 CARGO_INCREMENTAL=0 cargo build --workspace
 ```
 
-在终端 A 创建临时 socket 目录并启动 daemon：
+In terminal A, create a temporary socket directory and start the daemon:
 
 ```sh
 cd /path/to/codexapp-cli
@@ -135,20 +120,20 @@ printf 'bridge socket: %s\n' "$bridge_socket"
   --codex-bin "$PWD/fixtures/fake-codex"
 ```
 
-预期 daemon 保持前台运行，并只输出类似：
+Expect the daemon to stay in the foreground and print only something like:
 
 ```text
 codex-bridge listening on /private/var/.../control.sock
 ```
 
-将终端 A 打印的绝对 socket 路径复制到终端 B：
+Copy the absolute socket path printed in terminal A into terminal B:
 
 ```sh
 cd /path/to/codexapp-cli
 bridge_socket='/private/var/.../control.sock'
 ```
 
-然后按顺序验证：
+Then verify in order:
 
 ```sh
 ./target/debug/codexctl --socket "$bridge_socket" status --json
@@ -162,41 +147,36 @@ bridge_socket='/private/var/.../control.sock'
 ./target/debug/codexctl --socket "$bridge_socket" send 'fixture message'
 ```
 
-关键验收点：
+Key acceptance points:
 
-- `status.protocol_version` 是 `4`。
-- `status.rollout_store.available` 是 `true`，且 `read_only` 是 `true`。
-- `ls` 只列出 fixture thread，状态显示为 `unarchived`，cwd 是 `/tmp`；fixture cwd 不是有效
-  Git workspace 时 branch 显示为 `<unknown>`，JSON 中为 `null`。
-- `current` 明确打印 `not authoritative for focused window`。
-- `show` 显示 cwd 与 git branch，并只显示一条 user message 和两条 assistant message，不显示
-  fixture 中的 developer message。
-- `show --last 1 --json` 的 `messages_returned` 是 `1`，`messages_total` 是 `3`，最后一条
-  内容是 `fixture final answer`。
-- 显式 thread ID 的 `selection.authoritative` 是 `true`。
-- `select` 后 `current` 使用 `selected_thread`，不再使用 mtime 推断。
-- `send` 返回 `status=queued`、`backend.backend=codex_queue`，输出来自 fake Codex。
+- `status.protocol_version` is `4`.
+- `status.rollout_store.available` is `true`, and `read_only` is `true`.
+- `ls` lists only the fixture thread with status `unarchived` and cwd `/tmp`; when the fixture cwd is not a valid Git workspace, the branch shows as `<unknown>` and as `null` in JSON.
+- `current` explicitly prints `not authoritative for focused window`.
+- `show` displays the cwd and git branch, shows only one user message and two assistant messages, and does not show the fixture's developer message.
+- `show --last 1 --json` has `messages_returned` equal to `1`, `messages_total` equal to `3`, and the last message's content is `fixture final answer`.
+- `selection.authoritative` is `true` with an explicit thread ID.
+- After `select`, `current` uses `selected_thread` and no longer uses mtime inference.
+- `send` returns `status=queued`, `backend.backend=codex_queue`, and output comes from the fake Codex.
 
-fixture 没有活动 turn，`steer` 和 `interrupt` 都应在连接 app-server 前安全失败：
+The fixture has no active turn, so both `steer` and `interrupt` should fail safely before connecting to the app-server:
 
 ```sh
 ./target/debug/codexctl --socket "$bridge_socket" steer 'fixture follow-up'
 ./target/debug/codexctl --socket "$bridge_socket" interrupt
 ```
 
-预期 CLI 非零退出，并报告：
+Expect a non-zero CLI exit reporting:
 
 ```text
 no_active_turn: thread 00000000-0000-7000-8000-000000000001 has no active turn in its rollout
 ```
 
-fixture daemon 的 `--codex-bin` 指向仓库 fake 程序，因此 `send` 不会接触真实 Codex CLI；无
-活动 turn 的 `steer`/`interrupt` 也不会连接真实 app-server 或 Codex App。
+The fixture daemon's `--codex-bin` points at the repository's fake program, so `send` never touches the real Codex CLI, and the no-active-turn `steer`/`interrupt` never connect to the real app-server or Codex App.
 
-## 6. 直接检查 JSON 行协议
+## 6. Inspecting the JSON-lines protocol directly
 
-只有在怀疑 CLI 参数映射或输出渲染有问题时，才绕过 `codexctl` 检查 wire protocol。
-macOS 自带的 `nc` 可连接 Unix socket：
+Only bypass `codexctl` to check the wire protocol if you suspect a CLI argument-mapping or output-rendering problem. macOS's built-in `nc` can connect to a Unix socket:
 
 ```sh
 printf '%s\n' '{"command":"status"}' | nc -U "$bridge_socket"
@@ -212,88 +192,83 @@ printf '%s\n' \
   | nc -U "$bridge_socket"
 ```
 
-每个连接只发送一个以换行结束的 JSON request，daemon 也只返回一个以换行结束的 JSON
-response。成功响应结构为：
+Send exactly one newline-terminated JSON request per connection; the daemon returns exactly one newline-terminated JSON response. A successful response looks like:
 
 ```json
 {"ok":true,"result":{}}
 ```
 
-失败响应结构为：
+A failed response looks like:
 
 ```json
 {"ok":false,"error":{"code":"...","message":"..."}}
 ```
 
-如果直接协议成功而 `codexctl` 失败，问题通常在 CLI 参数映射、16 MiB 响应限制或 human
-renderer；如果两者都失败，优先检查 daemon dispatch 和 session parser。
+If the raw protocol succeeds but `codexctl` fails, the problem is usually in the CLI argument mapping, the 16 MiB response limit, or the human renderer; if both fail, check the daemon dispatch and session parser first.
 
-## 7. 停止与清理
+## 7. Stopping and cleaning up
 
-1. 在终端 A 按 `Ctrl-C`，等待 daemon 正常退出。
-2. daemon 的 `SocketGuard` 应删除它自己创建且 inode 未变化的 socket。
-3. 确认 socket 已消失，再删除已解析的精确临时目录：
+1. Press `Ctrl-C` in terminal A and wait for the daemon to exit cleanly.
+2. The daemon's `SocketGuard` should remove the socket it created, provided the inode is unchanged.
+3. Confirm the socket is gone, then remove the exact resolved temporary directory:
 
 ```sh
 test ! -S "$bridge_socket"
 rmdir "$debug_root"
 ```
 
-如果第一条检查失败，停止清理并先确认 daemon 状态，不要递归删除目录。
+If the first check fails, stop the cleanup and verify the daemon's state first; do not recursively delete the directory.
 
-4. 不要清理整个仓库 target；只清理本项目包产物：
+4. Don't clean the whole repository target; only clean this project's package artifacts:
 
 ```sh
 cd /path/to/codexapp-cli
-cargo clean -p codexctl -p codex-bridge
+cargo clean -p codexctl
+cargo clean -p codex-bridge
 ```
 
-如果另一个 Cargo 进程正在使用共享 target，先停止清理并报告，不要与并发构建争用或删除其
-产物。禁止使用 `rm -rf target`。
+If another Cargo process is using the shared target, stop the cleanup and report it instead of racing the concurrent build or deleting its artifacts. `rm -rf target` is forbidden.
 
-## 8. 常见故障
+## 8. Common failures
 
 ### `cannot connect to codex-bridge`
 
-检查：
+Check:
 
-- daemon 是否仍在终端 A 前台运行；
-- 两个终端使用的 socket 绝对路径是否完全一致；
-- 是否误用了默认 socket；
-- 临时目录是否被提前删除。
+- whether the daemon is still running in the foreground in terminal A;
+- whether both terminals use exactly the same absolute socket path;
+- whether you accidentally used the default socket;
+- whether the temporary directory was deleted too early.
 
-不要通过删除 `~/.codex-bridge/control.sock` 来“修复”自定义 socket 问题。
+Don't "fix" a custom-socket problem by deleting `~/.codex-bridge/control.sock`.
 
 ### `codex-bridge is already listening`
 
-目标 socket 已有可连接的 daemon。为本次调试新建另一个 `mktemp -d` 目录，不要抢占或终止
-未知服务。
+The target socket already has a reachable daemon. Create another `mktemp -d` directory for this debugging session; don't seize or kill the unknown service.
 
 ### `refusing to replace non-socket path`
 
-`--socket` 指向了普通文件或符号链接。换用新的临时路径；不要删除未知文件。
+`--socket` points to a regular file or symlink. Use a fresh temporary path; don't delete unknown files.
 
 ### `thread_not_found`
 
-依次确认：
+Confirm in order:
 
-1. 文件位于 `sessions/**/*.jsonl` 或 `archived_sessions/*.jsonl`；
-2. 存在 `type=session_meta` 记录；
-3. `session_meta.payload.id` 或 `session_id` 与查询 ID 一致；
-4. `session_meta.payload.cwd` 是字符串；
-5. 查询归档 thread 时使用显式 `show <THREAD_ID>`。
+1. The file is at `sessions/**/*.jsonl` or `archived_sessions/*.jsonl`;
+2. A `type=session_meta` record exists;
+3. `session_meta.payload.id` or `session_id` matches the queried ID;
+4. `session_meta.payload.cwd` is a string;
+5. Use an explicit `show <THREAD_ID>` when querying archived threads.
 
-`current` 只考虑未归档 rollout；显式 `show` 会同时搜索归档与未归档 rollout。
+`current` only considers unarchived rollouts; explicit `show` searches both archived and unarchived rollouts.
 
-### thread 存在但标题为 `<untitled>`
+### Thread exists but titled `<untitled>`
 
-标题优先来自 `session_index.jsonl` 中该 ID 最新的 `updated_at` 记录；没有索引时，parser
-使用第一条 user `response_item` 的文本并截断为 120 个字符。检查字段名是否为
-`thread_name`，时间是否是可按字典序比较的 ISO-8601 字符串。
+Titles prefer the `session_index.jsonl` record for that ID with the latest `updated_at`; with no index, the parser uses the text of the first user `response_item` truncated to 120 characters. Check that the field name is `thread_name` and that the time is an ISO-8601 string that compares lexicographically.
 
-### `show` 没有消息
+### `show` has no messages
 
-当前 parser 只接收以下结构：
+The current parser only accepts structures like:
 
 ```json
 {
@@ -306,25 +281,19 @@ cargo clean -p codexctl -p codex-bridge
 }
 ```
 
-`event_msg`、developer message、reasoning、command execution 和 tool output 会被跳过。如果新版
-rollout 只保存另一种结构，应先制作最小脱敏 fixture 和回归测试，再扩展 parser；不要直接把
-所有 payload 原样暴露给 CLI。
+`event_msg`, developer messages, reasoning, command execution, and tool output are skipped. If a newer rollout stores only a different structure, first build a minimal redacted fixture and a regression test, then extend the parser; don't expose all payloads verbatim to the CLI.
 
-### `current` 选中了错误 thread
+### `current` selects the wrong thread
 
-这不一定是 parser bug。当前算法就是“最近修改的未归档 rollout”。先使用
-`show <THREAD_ID>` 完成确定性读取。真正的焦点窗口识别属于后续 CDP/UI backend，不能通过
-继续增加文件时间猜测来伪装解决。
+This isn't necessarily a parser bug. The current algorithm is literally "most recently modified unarchived rollout." Use `show <THREAD_ID>` for deterministic reads first. True focused-window identification belongs to a future CDP/UI backend and can't be faked by piling on more file-time heuristics.
 
 ### `codex-bridge response exceeds 16 MiB`
 
-先使用 `show --last N` 缩小响应。若仍需读取完整大 thread，正确修复方向是设计分页或流式
-协议，并同步升级协议版本，而不是简单取消上限。
+First shrink the response with `show --last N`. If you still need to read a full large thread, the correct fix is to design a paginated or streaming protocol and bump the protocol version accordingly, rather than simply removing the cap.
 
 ### `thread_not_selected`
 
-写命令不会使用 `current` 的 mtime 推断。先运行 `codexctl select <THREAD_ID>`，或对单次命令
-使用全局 `--thread <THREAD_ID>`：
+Write commands don't use `current`'s mtime inference. Run `codexctl select <THREAD_ID>` first, or use the global `--thread <THREAD_ID>` for a single command:
 
 ```sh
 codexctl --thread <THREAD_ID> send 'message'
@@ -333,60 +302,44 @@ codexctl --thread <THREAD_ID> interrupt
 codexctl --thread <THREAD_ID> host-exec -- git status
 ```
 
-`select` 只保存在当前 bridge daemon 内存里，重启 daemon 后需要重新选择。
+`select` is only stored in the current bridge daemon's memory; you must re-select after restarting the daemon.
 
-### `host_exec_not_allowed`、`host_exec_unavailable` 或超时
+### `host_exec_not_allowed`, `host_exec_unavailable`, or timeouts
 
-- `host_exec_not_allowed` 表示 argv 没有匹配 daemon 策略；不要通过包一层 `sh -c` 绕过。
-- `host_exec_unavailable` 表示规则允许，但 PATH 中没有可执行文件，或 workspace 脚本不存在、
-  无执行位、解析到 workspace 外。
-- CLI 默认超时 300 秒；超时后 bridge 杀死该调用的整个进程组，响应保留 `timed_out=true`、
-  `exit_code=-1` 和已截断的输出。
-- stdout/stderr 每路最多 32 KiB；`*_truncated=true` 代表后续内容已丢弃。
+- `host_exec_not_allowed` means the argv didn't match the daemon policy; don't try to bypass it by wrapping in `sh -c`.
+- `host_exec_unavailable` means the rule permits it, but there's no executable on PATH, or the workspace script doesn't exist, has no execute bit, or resolves outside the workspace.
+- The CLI default timeout is 300 seconds; on timeout, the bridge kills the entire process group of the invocation, and the response keeps `timed_out=true`, `exit_code=-1`, and the truncated output.
+- stdout/stderr are capped at 32 KiB each; `*_truncated=true` means later content was discarded.
 
-策略可由 daemon 的 `--host-exec-policy PATH` 或 `CODEX_BRIDGE_HOST_EXEC_POLICY` 指定；自定义
-JSON 完全替换内置规则，先对照 `host-exec-policy.example.json` 检查。host-exec 总是在已选择
-thread 的 rollout cwd 中执行，不接受任意 `--cwd`。
+Policy can be supplied via the daemon's `--host-exec-policy PATH` or `CODEX_BRIDGE_HOST_EXEC_POLICY`; a custom JSON fully replaces the built-in rules, so check it against `host-exec-policy.example.json` first. host-exec always runs in the selected thread's rollout cwd and does not accept an arbitrary `--cwd`.
 
-### `codex_cli_unavailable` 或 `codex_cli_failed`
+### `codex_cli_unavailable` or `codex_cli_failed`
 
-- `codex_cli_unavailable` 表示无法启动 `--codex-bin` 指定的程序；检查绝对路径和执行权限。
-- `codex_cli_failed` 表示 Codex CLI 已启动但非零退出；保留 stderr，检查 CLI 版本、登录状态、
-  thread 是否存在，以及 active-writer 冲突。
-- `send` 要求本机 Codex CLI 提供 `codex queue --thread --message`。
-- `steer` 不使用 Codex 子进程，因此 steer 失败应查看下面的 `app_server_*` 错误，而不是
-  `codex_cli_*`。
+- `codex_cli_unavailable` means the program specified by `--codex-bin` couldn't be started; check the absolute path and execute permissions.
+- `codex_cli_failed` means the Codex CLI started but exited non-zero; keep the stderr and check the CLI version, login state, whether the thread exists, and active-writer conflicts.
+- `send` requires the local Codex CLI to provide `codex queue --thread --message`.
+- `steer` doesn't use a Codex subprocess, so steer failures should be diagnosed with the `app_server_*` errors below, not `codex_cli_*`.
 
 ### `no_active_turn`
 
-`steer` 和 `interrupt` 从 rollout 的 `task_started`、`task_complete` 和 `turn_aborted` 事件推导
-活动 turn。没有未完成的 `task_started` 时不会调用 app-server。若新版 rollout 更改事件格式，
-先增加脱敏 fixture 和 parser 测试。
+`steer` and `interrupt` derive the active turn from the rollout's `task_started`, `task_complete`, and `turn_aborted` events. The app-server isn't called when there's no outstanding `task_started`. If a newer rollout changes the event format, add a redacted fixture and parser test first.
 
-### `app_server_unavailable`、`app_server_timeout` 或 `app_server_rejected`
+### `app_server_unavailable`, `app_server_timeout`, or `app_server_rejected`
 
-steer/interrupt 直接连接默认的
-`$CODEX_HOME/app-server-control/app-server-control.sock`。该 Unix socket 上承载 WebSocket：
-先 HTTP Upgrade，再用 text frame 传输 JSON-RPC。可通过 daemon 的 `--app-server-socket PATH`
-或 `CODEX_BRIDGE_APP_SERVER_SOCKET` 覆盖。
+steer/interrupt connect directly to the default `$CODEX_HOME/app-server-control/app-server-control.sock`. A WebSocket runs on this Unix socket: an HTTP Upgrade first, then JSON-RPC over text frames. It can be overridden via the daemon's `--app-server-socket PATH` or `CODEX_BRIDGE_APP_SERVER_SOCKET`.
 
-- socket 不存在或不是 Unix socket：`app_server_unavailable`；
-- WebSocket handshake、initialize 或方法响应超时：`app_server_timeout`；
-- Upgrade 失败、连接提前关闭或响应不是 JSON：`app_server_protocol_error`；
-- `turnId` 过期、thread 不属于该 server 或 server 拒绝请求：`app_server_rejected`。
+- Socket missing or not a Unix socket: `app_server_unavailable`;
+- WebSocket handshake, initialize, or method response timeout: `app_server_timeout`;
+- Upgrade failure, premature close, or a response that isn't JSON: `app_server_protocol_error`;
+- `turnId` expired, thread not owned by that server, or the server rejected the request: `app_server_rejected`.
 
-不要在这里重新引入 `codex app-server proxy`：Codex 0.151.0 的 proxy 只是把 stdio 原始字节
-复制到 socket，没有执行 WebSocket Upgrade，因此服务端会在读取 JSON-RPC 前关闭连接。
-`remoteControlEnabled=true` 描述 daemon 的远程控制能力，不会把本地控制 socket 改成 JSONL。
+Don't reintroduce `codex app-server proxy` here: the proxy in Codex 0.151.0 only copies raw stdio bytes to the socket and never performs the WebSocket Upgrade, so the server closes the connection before reading the JSON-RPC. `remoteControlEnabled=true` describes the daemon's remote-control capability and does not turn the local control socket into JSONL.
 
-Codex Desktop 使用 private stdio app-server 时，共享 socket 无法 steer/interrupt 它的 turn，
-这是 app-server 实例边界。Desktop 内置 `codex_app` MCP 暴露 `send_message_to_thread` 等工具，
-但入口由 GUI 私有 pipe、代码签名 peer 校验和 approval 路由保护，不是可供外部 CLI 复用的
-稳定 API。不要绕过签名校验、修改 `app.asar`，也不要 queue `/stop` 伪装成功。
+When Codex Desktop uses a private stdio app-server, the shared socket can't steer/interrupt its turns — that's an app-server instance boundary. Desktop's built-in `codex_app` MCP exposes tools like `send_message_to_thread`, but the entry point is guarded by the GUI's private pipe, code-signed peer verification, and approval routing; it's not a stable API for external CLIs to reuse. Don't bypass signature checks, modify `app.asar`, or queue `/stop` to fake success.
 
 ### `invalid_request`
 
-先运行 `status --json` 检查 daemon 协议版本。协议 v4 的典型请求是：
+Run `status --json` first to check the daemon's protocol version. Typical protocol v4 requests are:
 
 ```json
 {"command":"ls","limit":20,"include_archived":false}
@@ -396,39 +349,33 @@ Codex Desktop 使用 private stdio app-server 时，共享 socket 无法 steer/i
 {"command":"host_exec","thread_id":"THREAD_ID","argv":["git","status"],"timeout_seconds":30}
 ```
 
-旧 daemon 与新 CLI 混用时应重新构建并重启 fixture daemon，不要连接正在运行的未知 bridge。
+If mixing an old daemon with a new CLI, rebuild and restart the fixture daemon; don't connect to a running unknown bridge.
 
 ### `rollout_store_error`
 
-保留完整错误链，检查路径、权限和发生错误的具体文件。活动 rollout 最后一行暂时无效或包含
-不完整 UTF-8 时，已完成记录仍应可读；其他 I/O 错误不应被静默吞掉。
+Keep the full error chain and check the path, permissions, and the specific file where the error occurred. If an active rollout's last line is temporarily invalid or contains incomplete UTF-8, completed records should still be readable; other I/O errors shouldn't be silently swallowed.
 
-## 9. 标准修复流程
+## 9. Standard fix workflow
 
-修复任何问题时遵守以下顺序：
+Follow this order for any fix:
 
-1. 记录失败命令、精确 socket、协议版本、错误 code 和 message。
-2. 在 `fixtures/codex-home` 的副本或 Rust 临时 fixture 中最小化问题。不要提交真实用户对话、
-   token、路径或完整 rollout。
-3. 先添加能复现问题的测试，并确认失败发生在预期层。
-4. 只修改负责该行为的层：
-   - JSON schema 或协议兼容性：`lib.rs`；
-   - rollout 发现与解析：`sessions.rs`；
-   - Codex 子进程与 app-server WebSocket RPC：`write_backend.rs`；
-   - host 命令授权、限流和超时：`host_executor.rs`；
-   - daemon 错误码、限制和 dispatch：bridge `main.rs`；
-   - CLI 参数与显示：codexctl `main.rs`。
-5. 协议字段有不兼容变化时递增 `PROTOCOL_VERSION`，同时更新 README、本文件和协议测试。
-6. 保持错误语义稳定：用户输入错误用 `invalid_request`，找不到 thread 用
-   `thread_not_found`，存储读取失败用 `rollout_store_error`，未实现能力用
-   `not_implemented`；Codex CLI 与 app-server 错误使用各自的 `codex_cli_*`/
-   `app_server_*` code；host-exec 使用 `host_exec_*` code。
-7. 运行格式检查、针对性测试和全 workspace 测试。
-8. 审查 `git diff --check` 与 `git status --short`，确认没有真实 Codex 状态、socket、日志或
-   target 产物进入变更。
-9. 停止 fixture daemon，再执行包级缓存清理。
+1. Record the failing command, exact socket, protocol version, error code, and message.
+2. Minimize the problem in a copy of `fixtures/codex-home` or a Rust temporary fixture. Don't commit real user conversations, tokens, paths, or full rollouts.
+3. Add a test that reproduces the problem first, and confirm the failure occurs in the expected layer.
+4. Modify only the layer responsible for the behavior:
+   - JSON schema or protocol compatibility: `lib.rs`;
+   - rollout discovery and parsing: `sessions.rs`;
+   - Codex subprocess and app-server WebSocket RPC: `write_backend.rs`;
+   - host command authorization, rate limiting, and timeouts: `host_executor.rs`;
+   - daemon error codes, limits, and dispatch: bridge `main.rs`;
+   - CLI arguments and display: codexctl `main.rs`.
+5. Increment `PROTOCOL_VERSION` on any incompatible protocol-field change, and update the README, this file, and the protocol tests at the same time.
+6. Keep error semantics stable: `invalid_request` for bad user input, `thread_not_found` for a missing thread, `rollout_store_error` for storage read failures, `not_implemented` for unimplemented capabilities; Codex CLI and app-server errors use their own `codex_cli_*`/`app_server_*` codes; host-exec uses `host_exec_*` codes.
+7. Run formatting checks, targeted tests, and the full workspace tests.
+8. Review `git diff --check` and `git status --short` to confirm no real Codex state, sockets, logs, or target artifacts enter the changes.
+9. Stop the fixture daemon, then run package-level cache cleanup.
 
-推荐验证命令：
+Recommended verification commands:
 
 ```sh
 cargo fmt --all -- --check
@@ -440,13 +387,11 @@ git diff --check
 git status --short
 ```
 
-这里的“修复完成”至少意味着：最小回归测试通过、全 workspace 测试通过、fixture CLI 路径
-通过、错误码符合约定，并且没有把静态/fixture 验证描述成真实 Codex App 行为验证。
+Here, "fix complete" means at minimum: the minimal regression test passes, the full workspace test suite passes, the fixture CLI paths pass, error codes follow the conventions, and static/fixture validation is never described as verification of real Codex App behavior.
 
-## 10. 真实状态的可选 smoke test
+## 10. Optional smoke test on real state
 
-只有用户明确允许后，才可让 daemon 指向真实 Codex 状态目录。即便获得许可，也必须继续使用
-独立临时 socket，且只调用 `status`、`ls`、`current`、`show --last N`：
+Only after the user explicitly permits it may the daemon point at the real Codex state directory. Even with permission, keep using a separate temporary socket and only call `status`, `ls`, `current`, and `show --last N`:
 
 ```sh
 codex_state_dir="${CODEX_HOME:-${HOME}/.codex}"
@@ -457,18 +402,17 @@ bridge_socket="$debug_root/control.sock"
   --codex-home "$codex_state_dir"
 ```
 
-真实只读 smoke test 仍不能证明：
+A real read-only smoke test still cannot prove:
 
-- 当前 UI 焦点窗口；
-- active-writer 所有权；
-- app-server 请求可用性；
-- CDP 输入、滚动或按钮操作；
-- approval、interrupt 或消息发送成功。
+- the current UI focused window;
+- active-writer ownership;
+- app-server request availability;
+- CDP input, scrolling, or button actions;
+- approval, interrupt, or message-send success.
 
-这些属于后续 backend 的独立验收门，必须在用户允许影响当前 App 的专门调试窗口中完成。
+Those are separate acceptance gates for later backends and must be completed in a dedicated debugging window where the user permits affecting the current App.
 
-若只需确认 standalone control socket 的实际传输层，可运行 opt-in 的只读测试。它只完成
-WebSocket Upgrade、initialize 和 `thread/loaded/list`，不会启动或修改 turn：
+If you only need to confirm the actual transport layer of the standalone control socket, you can run the opt-in read-only test. It only performs the WebSocket Upgrade, initialize, and `thread/loaded/list`; it won't start or modify a turn:
 
 ```sh
 CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$codex_state_dir/app-server-control/app-server-control.sock" \
@@ -476,29 +420,23 @@ CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$codex_state_dir/app-server-control/app-ser
   live_app_server_websocket_probe -- --ignored --nocapture
 ```
 
-如果用户进一步明确允许真实写入，先从单条可识别、无副作用的 queue 消息开始：
+If the user further explicitly permits real writes, start with a single identifiable, side-effect-free queue message:
 
 ```sh
 ./target/debug/codexctl --socket "$bridge_socket" select <THREAD_ID>
 ./target/debug/codexctl --socket "$bridge_socket" send 'codexapp-cli write smoke test'
 ```
 
-只有确认 queue 到达正确 thread，并确认目标 thread 由指定共享 app-server 实例持有后，才分别
-申请 steer 和 interrupt 验收。三者必须分开记录：
+Only after confirming the queue message reaches the right thread, and that the target thread is held by the designated shared app-server instance, should you separately request steer and interrupt acceptance. The three must be logged separately:
 
-- send 通过只证明 `codex queue` 接受并排队；
-- steer 通过证明共享 app-server 接受了对匹配活动 turn 的 `turn/steer`；
-- interrupt 通过只证明目标 thread 位于指定共享 app-server 且活动 `turnId` 匹配；
-- 任何一项都不证明 CDP/UI 控制可用。
+- send passing only proves `codex queue` accepted and queued the message;
+- steer passing proves the shared app-server accepted `turn/steer` for a matching active turn;
+- interrupt passing only proves the target thread is on the designated shared app-server and the active `turnId` matches;
+- none of them proves CDP/UI control availability.
 
-不要用当前正在工作的会话做 steer smoke test。应启动独立 app-server socket、在临时 cwd 创建
-新 thread，并只对这个新 thread 调用 `turn/start` 和 `turn/steer`；开始前把目标 thread ID 与
-cwd 记入日志，确认不属于任何真实项目。测试结束后停止临时 daemon，但保留 rollout 作为审计
-证据，除非用户明确要求删除。
+Don't run the steer smoke test on a session you're currently using. Start a separate app-server socket, create a new thread in a temporary cwd, and call `turn/start` and `turn/steer` only on this new thread; log the target thread ID and cwd before starting, confirming they don't belong to any real project. After the test, stop the temporary daemon but keep the rollout as audit evidence unless the user explicitly asks to delete it.
 
-仓库提供了显式 opt-in 的 live 测试，它会创建新临时 cwd 和新 thread，真实调用
-`turn/start`、`turn/steer`，然后尝试 interrupt 清理；绝不能把 socket 指向 Desktop private
-stdio server，也不要复用已有 thread：
+The repository provides an explicit opt-in live test that creates a new temporary cwd and a new thread, actually calls `turn/start` and `turn/steer`, then tries an interrupt cleanup; never point the socket at the Desktop's private stdio server, and don't reuse an existing thread:
 
 ```sh
 CODEX_BRIDGE_TEST_ALLOW_WRITE=1 \
@@ -507,40 +445,37 @@ CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$codex_state_dir/app-server-control/app-ser
   live_app_server_steers_new_isolated_thread -- --ignored --nocapture
 ```
 
-## 11. GUI transport 实验的检查顺序
+## 11. Check order for GUI transport experiments
 
-先区分 `crates/codex-gui-bridge` 中的两套代码：
+First distinguish the two code bases under `crates/codex-gui-bridge`:
 
-- `ws-unix-bridge` 已在 Cargo 中注册；可以执行 fake transport 测试。
-- broker/supervisor/`codex-gui` 源码目前未注册，workspace build 不会覆盖它们。检查本地改动时
-  必须把这些未跟踪文件单独列出，不能因为 `cargo test --workspace` 通过就声称草案通过。
+- `ws-unix-bridge` is registered in Cargo; it can run fake transport tests.
+- The broker/supervisor/`codex-gui` sources are tracked but their targets are not registered, so the
+  workspace build does not compile them. Review these excluded targets separately; passing
+  `cargo test --workspace` does not mean the draft passes.
 
-透明 bridge 的安全测试只有一条：
+The transparent bridge has only one safety test:
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 ```
 
-它使用 fake Desktop 和 fake app-server，验收内容仅为：TCP WebSocket ↔ Unix-socket
-WebSocket 的 text frame 可以双向原样转发。它不验证环境变量、GUI 启动、thread ownership、
-steer、interrupt 或 approval。
+It uses a fake Desktop and fake app-server, and its only acceptance criterion is that text frames forward verbatim, bidirectionally, between a TCP WebSocket and a Unix-socket WebSocket. It doesn't validate environment variables, GUI startup, thread ownership, steer, interrupt, or approval.
 
-不要在初步调试中执行下列动作：
+Don't do the following during initial debugging:
 
-- 关闭或重启当前 Codex Desktop；
-- 为当前 GUI 注入 `CODEX_APP_SERVER_WS_URL`；
-- 启动第二份默认 remote-control daemon；
-- 用已有项目 thread 做 send/steer/interrupt；
-- 运行尚未接入构建的 broker/supervisor 草案。
+- quit or restart the current Codex Desktop;
+- inject `CODEX_APP_SERVER_WS_URL` into the current GUI;
+- launch a second default remote-control daemon;
+- send/steer/interrupt on an existing project thread;
+- run the broker/supervisor draft that isn't wired into the build.
 
-若用户专门授权 GUI 验收，仍要先记录现有 Desktop/daemon PID 和 socket owner，使用全新的临时
-thread，并依次保留以下独立证据：
+If the user specifically authorizes GUI acceptance, still first record the existing Desktop/daemon PIDs and socket owner, use a brand-new temporary thread, and preserve the following independent evidence in order:
 
-1. Desktop 确实连接到 loopback bridge；
-2. bridge 确实连接到预期 daemon/app-server；
-3. GUI 创建的 thread 能被同一 server 的只读 API 看到；
-4. 新临时 thread 的 `turn/steer` 被同一个 turn 接受；
-5. Desktop 仍收到完整 notification、approval 和最终消息。
+1. Desktop does connect to the loopback bridge;
+2. the bridge does connect to the intended daemon/app-server;
+3. the thread created by the GUI is visible to the same server's read-only API;
+4. `turn/steer` on the new temporary thread is accepted by the same turn;
+5. Desktop still receives the full notification, approval, and final message.
 
-broker 草案只有在 Cargo target/依赖接入、私有 `0600` CLI socket、本地客户端授权、child 退出
-清理、重连路由和端到端 fake 测试全部完成后，才进入上述真实 GUI 验收阶段。
+The broker draft only enters the real GUI acceptance phase above once the Cargo target/dependencies are wired in, the private `0600` CLI socket, local client authorization, child exit cleanup, reconnect routing, and end-to-end fake tests are all complete.

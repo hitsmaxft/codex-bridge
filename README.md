@@ -1,45 +1,52 @@
 # codexapp-cli
 
-`codexapp-cli` 把正在运行的 Codex Desktop 包装成本地 CLI/RPC 服务。它按
-[DESIGN.md](DESIGN.md) 采用读写分离的混合架构：rollout/app-server 状态用于读取会话，
-写消息由 Codex CLI 执行；尚未实现的 UI 操作才预留 Chromium CDP 通道。
+`codexapp-cli` wraps a running Codex Desktop as a local CLI/RPC service. Following
+[DESIGN.md](DESIGN.md), it uses a hybrid architecture with separate read and write paths:
+rollout/app-server state is used to read sessions, while writes are performed by the Codex CLI.
+A Chromium CDP channel is reserved for UI operations that have not yet been implemented.
 
-## 目录
+## Layout
 
-- `crates/codexctl`：面向用户的 CLI，把命令编码为 JSON 请求。
-- `crates/codex-bridge`：本地 daemon 与共享协议，监听 Unix socket。
-- `crates/codex-gui-bridge`：实验性的 Desktop/app-server transport。当前 Cargo 只注册并测试
-  透明转发 binary `ws-unix-bridge`；工作区中新增的 broker/supervisor/`codex-gui` 源码尚未接入
-  构建，不能视为可用功能。
-- `launcher`：预留的 macOS launcher，后续负责带私有 CDP endpoint 启动 Codex.app。
+- `crates/codexctl`: the user-facing CLI, which encodes commands as JSON requests.
+- `crates/codex-bridge`: the local daemon and shared protocol, listening on a Unix socket.
+- `crates/codex-gui-bridge`: an experimental Desktop/app-server transport. Cargo currently
+  registers and tests only the transparent `ws-unix-bridge` binary. The broker, supervisor, and
+  `codex-gui` sources are not yet wired into the build and must not be treated as usable features.
+- `launcher`: a reserved macOS launcher that may later start Codex.app with a private CDP endpoint.
 
-CLI 和 daemon 默认使用 `~/.codex-bridge/control.sock`。可通过双方的 `--socket PATH`
-参数或 `CODEX_BRIDGE_SOCKET` 环境变量覆盖。daemon 将默认 socket 目录权限设为 `0700`、
-socket 权限设为 `0600`；对于自定义路径，只会收紧由 daemon 新建的目录，不修改既有父目录。
-启动时只会清理由上次异常退出遗留且已无法连接的 socket。
+The CLI and daemon use `~/.codex-bridge/control.sock` by default. Override it on either side with
+`--socket PATH` or the `CODEX_BRIDGE_SOCKET` environment variable. The daemon sets the default
+socket directory to mode `0700` and the socket to `0600`. For custom paths, it only tightens
+permissions on directories it creates and leaves existing parent directories unchanged. At
+startup, it removes only stale sockets left by an abnormal exit that can no longer be connected to.
 
-## GUI transport 实验状态
+## GUI transport experiment
 
-默认的 Codex Desktop 仍使用 private stdio app-server，现有 `codexctl steer/interrupt` 只能操作
-目标 thread 所属的 standalone/shared daemon。仓库提供的 `ws-unix-bridge` 尝试把 Desktop 的
-TCP WebSocket 原样转发到官方 daemon 的 WebSocket-over-UDS socket，从而让两端落在同一个
-app-server 实例：
+Codex Desktop still uses a private stdio app-server by default. As a result, the current
+`codexctl steer` and `codexctl interrupt` commands can only operate on threads owned by the target
+standalone/shared daemon.
+
+The repository's `ws-unix-bridge` attempts to forward Desktop's TCP WebSocket unchanged to the
+official daemon's WebSocket-over-UDS endpoint so both sides use the same app-server instance:
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 ```
 
-该测试完全使用 fake endpoint，只证明 frame 双向透明转发。它不证明当前 Desktop 接受
-`CODEX_APP_SERVER_WS_URL`，也不证明 GUI 会话已经能被外部 steer。真实验证需要用户明确允许
-重启 Desktop，并且必须创建全新的临时 thread；不得使用任何正在工作的项目会话。
+This test uses fake endpoints and proves only bidirectional frame forwarding. It does not prove
+that the current Desktop honors `CODEX_APP_SERVER_WS_URL`, or that GUI sessions can already be
+steered externally. Real validation requires explicit permission to restart Desktop and must use a
+brand-new temporary thread. Never use an active project session for the first test.
 
-`crates/codex-gui-bridge/src/main.rs` 等未跟踪文件描述了更进一步的共享连接 broker，但当前
-`Cargo.toml` 设置 `autolib=false/autobins=false`，这些源码不会参与 workspace build。其安全
-缺口、接入条件和验证门见 [crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md)。
+Files such as `crates/codex-gui-bridge/src/main.rs` describe a more advanced shared-connection
+broker. However, `Cargo.toml` currently sets `autolib=false` and `autobins=false`, so those sources
+do not participate in the workspace build. See
+[crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for their security gaps,
+integration requirements, and validation gates.
 
-## 当前可运行范围
+## Currently runnable features
 
-构建并分别启动 daemon、CLI：
+Build the project, then start the daemon and CLI separately:
 
 ```sh
 cargo build
@@ -50,9 +57,10 @@ cargo run -p codex-bridge
 cargo run -p codexctl -- status
 ```
 
-`status` 已贯通 CLI、JSON 行协议和 daemon，可返回服务状态、协议版本和只读 rollout
-存储状态。第一阶段的状态后端不连接正在运行的 Codex App，而是读取
-`$CODEX_HOME/sessions`（默认 `~/.codex/sessions`）与 `session_index.jsonl`：
+`status` is wired end to end through the CLI, JSON-lines protocol, and daemon. It returns service
+status, protocol version, and read-only rollout-store state. This first-stage backend does not
+connect to a running Codex App. It reads `$CODEX_HOME/sessions` (default: `~/.codex/sessions`) and
+`session_index.jsonl` instead:
 
 ```sh
 codexctl ls --limit 20
@@ -62,54 +70,66 @@ codexctl show
 codexctl show --last 20
 codexctl show <THREAD_ID> --json
 codexctl select <THREAD_ID> --json
-codexctl send "继续检查" --json
-codexctl --thread <THREAD_ID> send "直接指定目标"
-codexctl steer "补充约束"
+codexctl send "Continue checking" --json
+codexctl --thread <THREAD_ID> send "Target this thread explicitly"
+codexctl steer "Apply this additional constraint"
 codexctl interrupt --json
 codexctl host-exec -- wlink --help
 codexctl --thread <THREAD_ID> host-exec --timeout 600 -- \
   cases/run-ch585-smoke.sh
 ```
 
-- `ls` 按 rollout 文件修改时间列出线程，并支持包含归档线程。每条 session 都返回 rollout
-  创建时记录的 `cwd`，并在该目录运行 `git branch --show-current` 填充可空的 `git_branch`；
-  目录已删除、非 Git 仓库或 detached HEAD 时返回 `null`/显示 `<unknown>`。
-- `show <THREAD_ID>` 是确定性的；解析结果只保留 user/assistant message，跳过内部记录，
-  也允许读取仍在追加的 JSONL 文件，并显示相同的 `cwd` 与 `git_branch`。
-- 无参数的 `current` 与 `show` 暂时选择最近修改的未归档 rollout。返回的 `selection`
-  会明确标记 `authoritative=false`，因为这不能证明哪个 Codex Desktop 窗口当前获得焦点。
-- `select` 在 daemon 内存中保存默认 thread；`--thread` 可为 `show`、`send`、`steer`、
-  `interrupt` 单次覆盖选择。写命令没有 mtime fallback，未选择目标时返回
-  `thread_not_selected`。
-- `send` 调用 `codex queue --thread ID --message TEXT`，不通过 resume 抢占 active writer。
-- `steer` 从 rollout 解析活动 turn ID，再通过共享 app-server 的
-  WebSocket-over-Unix-socket 控制端点发送 `turn/steer`。这是真正的 same-turn 注入，不会另起
-  `codex exec resume` writer。
-- `interrupt` 使用相同端点发送 `turn/interrupt`。目标 thread 必须由该 app-server 实例持有，
-  且 rollout 中的活动 turn ID 必须仍然匹配；否则返回明确错误，不能伪装成功。
-- Codex Desktop 26.820.60940 仍自行启动 private stdio app-server，它没有公开 control socket。
-  因此上述 steer/interrupt 当前可操作 standalone/shared daemon 会话，不能跨实例操作 GUI
-  private 会话。
-- `host-exec` 在所选 thread 的 `cwd` 中由宿主机 bridge 执行命令，用于 USB 刷机和硬件测试。
-  请求传递 argv 数组且不经过 shell；默认只允许 `wlink`、`cases/run-ch585-*.sh` 和受限的
-  Git 子命令。stdout/stderr 各最多保留 32 KiB，默认超时 300 秒，整个子进程组最长允许
-  3600 秒。命令非零退出或超时后，结果仍包含输出和 exit code，同时 `codexctl` 返回非零。
+- `ls` lists threads by rollout file modification time and can include archived threads. Each
+  session returns the `cwd` recorded when the rollout was created and runs
+  `git branch --show-current` there to populate the nullable `git_branch`. If the directory has
+  been deleted, is not a Git repository, or is in detached HEAD state, JSON returns `null` and the
+  human-readable output shows `<unknown>`.
+- `show <THREAD_ID>` is deterministic. It keeps only user and assistant messages, skips internal
+  records, can read a JSONL file while it is still being appended, and displays the same `cwd` and
+  `git_branch` fields.
+- `current` and `show` without an argument select the most recently modified unarchived rollout.
+  Their `selection` is explicitly marked `authoritative=false`, because this does not prove which
+  Codex Desktop window has focus.
+- `select` stores a default thread in daemon memory. `--thread` overrides that selection for one
+  `show`, `send`, `steer`, or `interrupt` command. Write commands never fall back to mtime and
+  return `thread_not_selected` when no target has been selected.
+- `send` invokes `codex queue --thread ID --message TEXT`; it does not use resume or take ownership
+  from the active writer.
+- `steer` reads the active turn ID from the rollout and sends `turn/steer` through the shared
+  app-server's WebSocket-over-UDS control endpoint. This is genuine same-turn injection and does
+  not spawn a separate `codex exec resume` writer.
+- `interrupt` sends `turn/interrupt` through the same endpoint. The target thread must belong to
+  that app-server instance, and the rollout's active turn ID must still match. Otherwise the
+  command returns an explicit error rather than pretending to succeed.
+- Codex Desktop 26.820.60940 still launches its own private stdio app-server, which exposes no
+  control socket. Therefore, steer and interrupt currently work for standalone/shared-daemon
+  sessions but cannot cross app-server instances to control private GUI sessions.
+- `host-exec` runs an allowlisted host command in the selected thread's `cwd`, primarily for USB
+  flashing and hardware tests. Requests carry an argv array and never pass through a shell. The
+  built-in policy allows only `wlink`, `cases/run-ch585-*.sh`, and restricted Git subcommands.
+  stdout and stderr are each capped at 32 KiB, the default timeout is 300 seconds, and the maximum
+  process-group lifetime is 3600 seconds. A non-zero exit or timeout still returns captured output
+  and the exit code, while `codexctl` exits non-zero.
 
-`tail`、`scroll`、`pending` 和审批仍只有 CLI/协议骨架；在
-app-server/CDP backend 接入前会明确返回 `not_implemented`，不会伪装成已执行。
+`tail`, `scroll`, `pending`, and approval commands are still CLI/protocol skeletons. Until an
+app-server or CDP backend is connected, they return `not_implemented` instead of pretending that
+an action occurred.
 
-daemon 可通过 `--codex-home PATH` 指向另一份只读状态目录，便于离线使用和隔离测试。
-写路径可通过 `--codex-bin PATH`/`CODEX_BRIDGE_CODEX_BIN` 指定 Codex CLI，通过
-`--app-server-socket PATH`/`CODEX_BRIDGE_APP_SERVER_SOCKET` 指定 steer/interrupt 使用的共享
-WebSocket-over-UDS socket。不要把该端点当作 JSONL socket；`codex app-server proxy` 只做原始
-字节转发，无法完成 WebSocket Upgrade。
-host-exec 默认策略可由 `--host-exec-policy PATH` 或 `CODEX_BRIDGE_HOST_EXEC_POLICY` 指向的
-JSON 完全替换；格式见 [host-exec-policy.example.json](host-exec-policy.example.json)。允许
-workspace 脚本意味着信任该脚本的当前内容，公开或不可信仓库应收紧/移除这类规则。
-第三方 Agent 的完整隔离启动、协议检查、故障定位和修复流程见
-[DEBUGGING.md](DEBUGGING.md)。
+Use `--codex-home PATH` to point the daemon at another read-only state directory for offline or
+isolated testing. On the write path, select the Codex executable with
+`--codex-bin PATH`/`CODEX_BRIDGE_CODEX_BIN`, and select the shared WebSocket-over-UDS endpoint for
+steer and interrupt with `--app-server-socket PATH`/`CODEX_BRIDGE_APP_SERVER_SOCKET`. Do not treat
+that endpoint as JSONL: `codex app-server proxy` forwards raw bytes and cannot perform the
+WebSocket Upgrade.
 
-查看完整命令：
+Replace the built-in host-exec policy with a JSON file via `--host-exec-policy PATH` or
+`CODEX_BRIDGE_HOST_EXEC_POLICY`; see
+[host-exec-policy.example.json](host-exec-policy.example.json). Allowing a workspace script means
+trusting its current contents, so public or untrusted repositories should tighten or remove those
+rules. See [DEBUGGING.md](DEBUGGING.md) for the complete isolated startup, protocol inspection,
+troubleshooting, and repair workflow for third-party agents.
+
+View the complete command help:
 
 ```sh
 cargo run -p codexctl -- --help

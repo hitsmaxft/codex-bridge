@@ -1,19 +1,16 @@
-# codexapp-cli — Codex App CLI 化方案
+# codexapp-cli — Turning the Codex App into a CLI
 
-## 目标
+## Goal
 
-把正在运行的 Codex App（macOS ChatGPT.app / Codex Desktop）包装成稳定的 CLI/RPC 服务。
-采用「状态层 + UI 控制层」混合方案，**不是**单纯模拟键鼠。
+Wrap the running Codex App (macOS ChatGPT.app / Codex Desktop) into a stable CLI/RPC service. It uses a hybrid **state layer + UI control layer** approach — **not** pure keyboard/mouse simulation.
 
-## 现实条件
+## Current Reality
 
-1. Codex Desktop 是 Electron 应用，前端在 app.asar，底层依赖 Codex app-server。
-2. 当前 macOS 版 Codex 的 Accessibility 暴露有问题——实测 AXWindows=nil、attribute 为空，
-   不能把 AXUIElement 当主接口。
-3. Codex app-server 本身已提供完整的结构化接口：thread/read、thread/turns/list、
-   turn/start、流式 item events、approval 等。
+1. Codex Desktop is an Electron app; the frontend lives in app.asar and it depends on the Codex app-server underneath.
+2. The current macOS Codex Accessibility exposure is broken — in testing, `AXWindows=nil` and attributes are empty, so `AXUIElement` can't be the primary interface.
+3. The Codex app-server already provides a complete structured interface: `thread/read`, `thread/turns/list`, `turn/start`, streaming item events, approval, and more.
 
-## 架构
+## Architecture
 
 ```
                  ┌─────────────────────┐
@@ -29,9 +26,9 @@ CLI: codexctl ──▶│ Local Bridge Daemon │
        thread / turn / item        Codex Electron UI
 ```
 
-## 1. 读取内容：不读屏幕，直接读 thread
+## 1. Reading content: read the thread, not the screen
 
-命令示例：
+Example commands:
 
 ```
 codexctl current
@@ -41,13 +38,13 @@ codexctl status
 codexctl tail
 ```
 
-内部优先从 app-server 获取：
+Internally, prefer fetching from the app-server:
 
-- `thread/read` — 不 resume thread 就读取持久化会话（对 single-writer 限制非常重要，无需抢 writer）
+- `thread/read` — reads the persisted session without resuming the thread (important given the single-writer restriction; no need to grab the writer)
 - `thread/turns/list`
 - `thread/items/list`
 
-返回结构：
+Return structure:
 
 ```json
 {
@@ -63,13 +60,11 @@ codexctl tail
 }
 ```
 
-比从窗口解析 Markdown/code block 稳定得多。即使 Codex 窗口滚出历史、虚拟列表卸载 DOM，
-仍能获得完整历史。
+This is far more stable than parsing Markdown/code blocks out of the window. Even when the Codex window has scrolled past history and the virtual list unloads DOM nodes, you still get the full history.
 
-## 2. 操作 UI：推荐 CDP，而不是 AX
+## 2. Driving the UI: prefer CDP over AX
 
-控制 Codex App 启动方式，让 Electron renderer 开启 Chromium DevTools Protocol。
-daemon 可调用：
+Control how the Codex App launches so the Electron renderer enables the Chromium DevTools Protocol. The daemon can then call:
 
 - Browser.getVersion
 - Target.getTargets
@@ -80,39 +75,35 @@ daemon 可调用：
 - Input.dispatchKeyEvent
 - Input.dispatchMouseEvent
 
-命令：
+Commands:
 
 ```
 codexctl ui dump
 codexctl ui find --role textbox
-codexctl send "检查这个 PR"
+codexctl send "Review this PR"
 codexctl scroll +800
 codexctl click "Allow"
 ```
 
-读取 DOM（conversation → user-message / assistant-message → markdown / code-block / tool-call / composer），
-而不是 pixel → OCR → 猜。
+Read the DOM (conversation → user-message / assistant-message → markdown / code-block / tool-call / composer) instead of pixel → OCR → guess.
 
-**关键**：Codex 已正常启动且启动时未开 CDP 时，通常不能事后无侵入地加 remote-debugging endpoint。
-所以做一个 launcher：
+**Key point**: Once Codex is already running normally without CDP enabled at launch, you generally can't non-intrusively attach a remote-debugging endpoint afterward. So we build a launcher:
 
 ```
 CodexBridge.app
     ↓
-启动 Codex.app + private CDP endpoint
+launch Codex.app + private CDP endpoint
     ↓
-发现 renderer target
+discover renderer target
     ↓
-保持 CDP WebSocket
+keep CDP WebSocket open
 ```
 
-更激进的 app.asar patch（在 Electron main process 植入 Unix-domain socket bridge）稳定性更高，
-但每次 Codex 更新都要重新 patch/重新签名，**第一版不做**。
+A more aggressive app.asar patch (embedding a Unix-domain socket bridge in the Electron main process) would be more stable, but every Codex update would require re-patching and re-signing — **not for the first version**.
 
-## 3. 输入：模拟真实 Chromium input event
+## 3. Input: simulate real Chromium input events
 
-不要主要依赖 `textarea.value = "hello"`（React controlled input 易不同步）。
-通过 CDP：
+Don't rely primarily on `textarea.value = "hello"` (React controlled inputs easily get out of sync). Via CDP:
 
 ```
 focus composer
@@ -120,7 +111,7 @@ focus composer
 → Input.dispatchKeyEvent Enter
 ```
 
-点击按钮同样：
+Clicking buttons works the same way:
 
 ```
 DOM.querySelector
@@ -128,15 +119,15 @@ DOM.querySelector
 → Input.dispatchMouseEvent
 ```
 
-`codexctl send "继续修复"` 实际执行：
+`codexctl send "keep fixing"` actually executes:
 
 ```
 locate composer → focus → insert text → keyDown Enter → keyUp Enter → wait conversation state changes
 ```
 
-## 4. 滚动
+## 4. Scrolling
 
-物理 UI：
+Physical UI:
 
 ```
 codexctl scroll up
@@ -145,28 +136,27 @@ codexctl scroll --pixels 1200
 codexctl scroll --to bottom
 ```
 
-用 CDP wheel event。
+Uses CDP wheel events.
 
-语义滚动：
+Semantic scrolling:
 
 ```
 codexctl scroll --to-message <id>
 codexctl scroll --to "command failed"
 ```
 
-先从结构化 history 找 message，再从 DOM 找对应节点 → scrollIntoView()。
+First find the message in the structured history, then locate the corresponding node in the DOM → `scrollIntoView()`.
 
-## 5. approval / request-user-input 结构化
+## 5. Structured approval / request-user-input
 
-App-server 的 approval 是 JSON-RPC server request（文件修改、命令执行、permission request），
-客户端返回结构化 decision：
+App-server approvals are JSON-RPC server requests (file modification, command execution, permission requests); the client returns a structured decision:
 
 - accept
 - acceptForSession
 - decline
 - cancel
 
-命令：
+Commands:
 
 ```
 $ codexctl pending
@@ -178,75 +168,45 @@ reason     Need to verify tests
 $ codexctl approve 81
 ```
 
-不做「找 Allow 按钮 → 算坐标 → mouse click」。
+We do **not** do "find the Allow button → compute coordinates → mouse click".
 
-## 6. active-writer 问题（已知限制）
+## 6. The active-writer problem (known limitation)
 
-0.147 以后，thread 有 active-writer ownership。Desktop 已打开某 thread 后，独立 CLI 执行
-`codex resume <thread>` 可能报：
+Since 0.147, threads have active-writer ownership. After Desktop has opened a thread, an independent CLI running `codex resume <thread>` may report:
 
 ```
 thread ... already has an active writer
 ```
 
-且 App 存在不及时释放 writer 的问题。
+Also, the App has a problem of not releasing the writer in a timely manner.
 
-理想架构：same app-server 供 App 和 codexctl 共用。Codex 支持 Unix socket app-server：
-`~/.codex/app-server-control/app-server-control.sock`。该 Unix socket 上承载的是 WebSocket，
-客户端必须先执行 HTTP Upgrade，再以 WebSocket text frame 发送 JSON-RPC；它不是 JSONL/raw
-Unix stream。Codex 0.151.0 的 `app-server proxy` 只做 stdio 与 socket 的逐字节复制，不能作为
-这个控制 socket 的协议适配器。
-macOS Desktop 曾可用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 与 CLI 共用 managed daemon。
+The ideal architecture is a single app-server shared by both the App and codexctl. Codex supports a Unix-socket app-server: `~/.codex/app-server-control/app-server-control.sock`. This Unix socket carries WebSocket: the client must first perform an HTTP Upgrade, then send JSON-RPC as WebSocket text frames; it is **not** a JSONL/raw Unix stream. Codex 0.151.0's `app-server proxy` only byte-copies between stdio and the socket, so it can't act as a protocol adapter for this control socket. macOS Desktop used to be able to share the managed daemon with the CLI via `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`.
 
-⚠️ **2026-08-29 最新状态**：Desktop 26.820.60940 已出现 regression，又忽略 local-daemon 配置，
-自行启动 private stdio app-server。**不要把「共享 App Server」作为唯一实现基础。**
+⚠️ **Latest status (2026-08-29)**: Desktop 26.820.60940 has a regression — it again ignores the local-daemon configuration and starts its own private stdio app-server. **Do not make "shared App Server" the sole implementation foundation.**
 
-### GUI transport 实验
+### GUI transport experiments
 
-当前已注册的 `ws-unix-bridge` 是最小透明适配层：Desktop 连接 loopback TCP WebSocket，bridge
-再对官方 daemon 的 Unix socket 完成 WebSocket handshake，之后不解析或改写 JSON-RPC。若
-Desktop 确实接受 `CODEX_APP_SERVER_WS_URL`，它有机会让 GUI 与 `codexctl` 落到同一 app-server
-实例；现阶段只有 fake endpoint 双向 frame 测试，尚无 Desktop 实机验收，因此仍属于非默认
-实验路径。
+The currently registered `ws-unix-bridge` is a minimal transparent adapter layer: Desktop connects to a loopback TCP WebSocket, and the bridge completes the WebSocket handshake against the official daemon's Unix socket, then neither parses nor rewrites JSON-RPC. If Desktop actually honors `CODEX_APP_SERVER_WS_URL`, this could land the GUI and `codexctl` on the same app-server instance. Right now there are only bidirectional frame tests against a fake endpoint, with no live Desktop acceptance yet, so it remains a non-default experimental path.
 
-工作区另有一套未接入 Cargo 的 broker/supervisor 草案。它计划自行启动 TCP WebSocket
-app-server，并让 GUI 流量与 CLI 写请求共享同一条 upstream connection；读请求可用临时连接。
-相较透明 bridge，这能精确控制 injected response 的路由，但也引入新的本地授权、socket 权限、
-child 生命周期、重连/多连接和 current-thread 追踪责任。在这些安全与端到端测试门完成前，不能
-替代现有 `codex-bridge`，也不能宣称已解决 Desktop GUI 控制。
+The workspace also has a broker/supervisor draft that isn't wired into Cargo yet. It plans to start its own TCP WebSocket app-server and share a single upstream connection between GUI traffic and CLI write requests; read requests may use temporary connections. Compared with the transparent bridge, this gives precise control over routing injected responses, but it also introduces new responsibilities: local authorization, socket permissions, child lifecycle, reconnection/multi-connection handling, and current-thread tracking. Until these security and end-to-end test gates pass, it can't replace the existing `codex-bridge`, nor can it claim to have solved Desktop GUI control.
 
-两种实验都遵守相同验收边界：fake WebSocket 只证明 transport；standalone thread 只证明共享
-daemon；只有用户明确授权的全新临时 GUI thread 才能证明 Desktop 集成。不得用正在工作的真实
-项目会话做首个验证。
+Both experiments share the same acceptance boundary: a fake WebSocket only proves the transport; a standalone thread only proves the shared daemon; only a brand-new temporary GUI thread explicitly authorized by the user can prove Desktop integration. You must not use a real, actively working project session as the first validation.
 
-## 第一版方案
+## First-version plan
 
-- **codex-bridge**：Rust daemon + 很薄的 macOS launcher
-- 对外 Unix socket：`~/.codex-bridge/control.sock`
-- CLI：`codexctl`
+- **codex-bridge**: a Rust daemon plus a very thin macOS launcher
+- Client-facing Unix socket: `~/.codex-bridge/control.sock`
+- CLI: `codexctl`
 
-当前实现阶段已经落地读写分离：读取扫描 `~/.codex/sessions` 和 `session_index.jsonl`；
-显式 thread ID 可确定性读取，在 CDP 提供焦点窗口信息之前，`current` 只能用最近修改的
-未归档 rollout 作为非权威推断。写入必须使用显式 `--thread` 或 daemon 内存中的 `select`
-结果，禁止把 mtime 推断用于写命令。
+The current implementation stage already separates reads from writes: reads scan `~/.codex/sessions` and `session_index.jsonl`; an explicit thread ID can be read deterministically, and until CDP provides focused-window information, `current` can only use the most recently modified unarchived rollout as a non-authoritative guess. Writes must use an explicit `--thread` or an in-memory `select` result in the daemon; mtime-based inference is forbidden for write commands.
 
-每个 session 的工作路径取自 rollout 创建时的 `session_meta.payload.cwd`。列表、current 和
-show 在该路径执行只读的 `git branch --show-current` 来补充 `git_branch`；目录不存在、不是
-Git 仓库或处于 detached HEAD 时该字段为 `null`，不影响 session 读取。
+Each session's working path is taken from `session_meta.payload.cwd` recorded when the rollout was created. `ls`, `current`, and `show` run a read-only `git branch --show-current` in that path to populate `git_branch`; if the directory doesn't exist, isn't a Git repository, or is in detached HEAD state, the field is `null` and doesn't affect session reads.
 
-写后端使用当前 Codex CLI 和共享 app-server：普通消息走 `codex queue`；steer/interrupt 从
-rollout 取得活动 turn ID 后，由 bridge 直接建立 WebSocket-over-UDS 连接，完成
-`initialize`/`initialized` 后分别发送结构化 `turn/steer` 或 `turn/interrupt`。这两条路径只能
-操作持有目标 thread 的同一个 app-server 实例；Desktop private stdio server 不可达时必须
-返回错误，不能退回 `exec resume` 或伪装成功。
+The write backend uses the current Codex CLI and the shared app-server: normal messages go through `codex queue`; for steer/interrupt, the bridge reads the active turn ID from the rollout, opens a WebSocket-over-UDS connection directly, and after completing `initialize`/`initialized`, sends a structured `turn/steer` or `turn/interrupt` respectively. Both paths can only operate on the same app-server instance that owns the target thread; if the Desktop private stdio server is unreachable, it must return an error — it must not fall back to `exec resume` or fake success.
 
-需要 USB 等宿主机资源的命令走独立 host-executor：bridge 在明确选择的 thread cwd 中直接
-spawn argv，不使用 shell。内置策略只允许 `wlink`、CH585 case runner 和受限 Git 子命令；
-策略可由 daemon 管理员用 JSON 替换。执行环境会移除非必要变量，stdout/stderr 分别限长
-32 KiB，默认 300 秒并在超时时终止整个进程组。它是显式的受控写路径，不属于只读 rollout
-解析，也不能作为任意宿主机 shell。
+Commands that need host resources such as USB go through a dedicated host-executor: the bridge spawns argv directly in the explicitly selected thread cwd, without using a shell. The built-in policy only allows `wlink`, the CH585 case runner, and a restricted set of Git subcommands; the daemon administrator can replace the policy with JSON. The execution environment strips non-essential variables, caps stdout/stderr at 32 KiB each, defaults to a 300-second timeout, and kills the entire process group on expiry. It is an explicit, controlled write path — not read-only rollout parsing, and not an arbitrary host shell.
 
-命令集：
+Command set:
 
 ```
 codexctl ls
@@ -255,8 +215,8 @@ codexctl status
 codexctl show
 codexctl show --json
 codexctl tail
-codexctl send "继续"
-codexctl steer "先不要改代码，分析原因"
+codexctl send "continue"
+codexctl steer "Don't change the code yet; analyze the cause"
 codexctl scroll down
 codexctl scroll --to bottom
 codexctl pending
@@ -265,37 +225,35 @@ codexctl decline <id>
 codexctl interrupt
 ```
 
-目标架构的后续优先级：
+Future priorities for the target architecture:
 
-- 读取：app-server/thread persisted state → CDP DOM → AX → screen capture + vision/OCR
-- 写入：same app-server turn/start / turn/steer → CDP Input → CGEvent
+- Read: app-server/thread persisted state → CDP DOM → AX → screen capture + vision/OCR
+- Write: same app-server turn/start / turn/steer → CDP Input → CGEvent
 
-**「读」与「写」不强制走同一条路径**。例如 App 正占用 writer：
+**Reads and writes are not forced down the same path.** For example, while the App holds the writer:
 
-- 读取历史 → thread/read
-- 判断运行状态 → app-server state/session files
-- 发送普通消息 → 当前实现使用 `codex queue`；未来可按能力增加 same app-server/CDP
-- 审批 → UI CDP
-- 滚动 → UI CDP
+- Read history → `thread/read`
+- Determine running state → app-server state/session files
+- Send normal messages → the current implementation uses `codex queue`; same app-server/CDP may be added later by capability
+- Approvals → UI CDP
+- Scrolling → UI CDP
 
-## 结论
+## Conclusion
 
-- AXUIElement + OCR 做完整 Codex parser 不值得投入（AX 暴露不可靠）
-- 最实用：**Codex protocol 负责语义，Electron CDP 负责操作当前 App UI**
-- 最终目标：让另一个 Agent 程序化操纵 Codex App → 在 codexctl 上直接加 MCP server，
-  提供 `codex_read_thread` / `codex_send` / `codex_scroll` / `codex_approve` / `codex_interrupt`
-  一组工具，Agent 不需要自己理解 UI。
+- Building a full Codex parser on AXUIElement + OCR isn't worth the effort (AX exposure is unreliable)
+- Most practical: **the Codex protocol handles semantics; Electron CDP manipulates the current App UI**
+- End goal: let another agent manipulate the Codex App programmatically → add an MCP server directly on top of codexctl, exposing a toolset of `codex_read_thread` / `codex_send` / `codex_scroll` / `codex_approve` / `codex_interrupt`, so the agent doesn't need to understand the UI itself.
 
-## 项目结构（建议）
+## Project structure (suggested)
 
 ```
 codexapp-cli/
-├── DESIGN.md          # 本方案
+├── DESIGN.md          # this design document
 ├── Cargo.toml         # workspace
 ├── crates/
-│   ├── codexctl/      # CLI 入口（clap）
-│   ├── codex-bridge/  # 当前 daemon（Rust）
-│   └── codex-gui-bridge/ # 实验 transport；仅 ws-unix-bridge 已注册
-├── launcher/          # macOS launcher（启动 Codex.app + CDP）
+│   ├── codexctl/      # CLI entry point (clap)
+│   ├── codex-bridge/  # current daemon (Rust)
+│   └── codex-gui-bridge/ # experimental transport; only ws-unix-bridge registered
+├── launcher/          # macOS launcher (launches Codex.app + CDP)
 └── docs/
 ```
