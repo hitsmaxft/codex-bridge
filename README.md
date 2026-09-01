@@ -8,14 +8,34 @@
 
 - `crates/codexctl`：面向用户的 CLI，把命令编码为 JSON 请求。
 - `crates/codex-bridge`：本地 daemon 与共享协议，监听 Unix socket。
-- `crates/codex-gui-bridge`：把 Desktop 的 TCP WebSocket 透明桥接到官方
-  app-server remote-control daemon 的 WebSocket-over-Unix-socket 端点。
+- `crates/codex-gui-bridge`：实验性的 Desktop/app-server transport。当前 Cargo 只注册并测试
+  透明转发 binary `ws-unix-bridge`；工作区中新增的 broker/supervisor/`codex-gui` 源码尚未接入
+  构建，不能视为可用功能。
 - `launcher`：预留的 macOS launcher，后续负责带私有 CDP endpoint 启动 Codex.app。
 
 CLI 和 daemon 默认使用 `~/.codex-bridge/control.sock`。可通过双方的 `--socket PATH`
 参数或 `CODEX_BRIDGE_SOCKET` 环境变量覆盖。daemon 将默认 socket 目录权限设为 `0700`、
 socket 权限设为 `0600`；对于自定义路径，只会收紧由 daemon 新建的目录，不修改既有父目录。
 启动时只会清理由上次异常退出遗留且已无法连接的 socket。
+
+## GUI transport 实验状态
+
+默认的 Codex Desktop 仍使用 private stdio app-server，现有 `codexctl steer/interrupt` 只能操作
+目标 thread 所属的 standalone/shared daemon。仓库提供的 `ws-unix-bridge` 尝试把 Desktop 的
+TCP WebSocket 原样转发到官方 daemon 的 WebSocket-over-UDS socket，从而让两端落在同一个
+app-server 实例：
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
+```
+
+该测试完全使用 fake endpoint，只证明 frame 双向透明转发。它不证明当前 Desktop 接受
+`CODEX_APP_SERVER_WS_URL`，也不证明 GUI 会话已经能被外部 steer。真实验证需要用户明确允许
+重启 Desktop，并且必须创建全新的临时 thread；不得使用任何正在工作的项目会话。
+
+`crates/codex-gui-bridge/src/main.rs` 等未跟踪文件描述了更进一步的共享连接 broker，但当前
+`Cargo.toml` 设置 `autolib=false/autobins=false`，这些源码不会参与 workspace build。其安全
+缺口、接入条件和验证门见 [crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md)。
 
 ## 当前可运行范围
 

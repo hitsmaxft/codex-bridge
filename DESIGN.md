@@ -201,6 +201,24 @@ macOS Desktop 曾可用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 与 CLI 共用 man
 ⚠️ **2026-08-29 最新状态**：Desktop 26.820.60940 已出现 regression，又忽略 local-daemon 配置，
 自行启动 private stdio app-server。**不要把「共享 App Server」作为唯一实现基础。**
 
+### GUI transport 实验
+
+当前已注册的 `ws-unix-bridge` 是最小透明适配层：Desktop 连接 loopback TCP WebSocket，bridge
+再对官方 daemon 的 Unix socket 完成 WebSocket handshake，之后不解析或改写 JSON-RPC。若
+Desktop 确实接受 `CODEX_APP_SERVER_WS_URL`，它有机会让 GUI 与 `codexctl` 落到同一 app-server
+实例；现阶段只有 fake endpoint 双向 frame 测试，尚无 Desktop 实机验收，因此仍属于非默认
+实验路径。
+
+工作区另有一套未接入 Cargo 的 broker/supervisor 草案。它计划自行启动 TCP WebSocket
+app-server，并让 GUI 流量与 CLI 写请求共享同一条 upstream connection；读请求可用临时连接。
+相较透明 bridge，这能精确控制 injected response 的路由，但也引入新的本地授权、socket 权限、
+child 生命周期、重连/多连接和 current-thread 追踪责任。在这些安全与端到端测试门完成前，不能
+替代现有 `codex-bridge`，也不能宣称已解决 Desktop GUI 控制。
+
+两种实验都遵守相同验收边界：fake WebSocket 只证明 transport；standalone thread 只证明共享
+daemon；只有用户明确授权的全新临时 GUI thread 才能证明 Desktop 集成。不得用正在工作的真实
+项目会话做首个验证。
+
 ## 第一版方案
 
 - **codex-bridge**：Rust daemon + 很薄的 macOS launcher
@@ -276,7 +294,8 @@ codexapp-cli/
 ├── Cargo.toml         # workspace
 ├── crates/
 │   ├── codexctl/      # CLI 入口（clap）
-│   └── codex-bridge/  # daemon（Rust）
+│   ├── codex-bridge/  # 当前 daemon（Rust）
+│   └── codex-gui-bridge/ # 实验 transport；仅 ws-unix-bridge 已注册
 ├── launcher/          # macOS launcher（启动 Codex.app + CDP）
 └── docs/
 ```

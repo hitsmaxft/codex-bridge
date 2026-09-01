@@ -506,3 +506,41 @@ CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$codex_state_dir/app-server-control/app-ser
   CARGO_INCREMENTAL=0 cargo test -p codex-bridge \
   live_app_server_steers_new_isolated_thread -- --ignored --nocapture
 ```
+
+## 11. GUI transport 实验的检查顺序
+
+先区分 `crates/codex-gui-bridge` 中的两套代码：
+
+- `ws-unix-bridge` 已在 Cargo 中注册；可以执行 fake transport 测试。
+- broker/supervisor/`codex-gui` 源码目前未注册，workspace build 不会覆盖它们。检查本地改动时
+  必须把这些未跟踪文件单独列出，不能因为 `cargo test --workspace` 通过就声称草案通过。
+
+透明 bridge 的安全测试只有一条：
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
+```
+
+它使用 fake Desktop 和 fake app-server，验收内容仅为：TCP WebSocket ↔ Unix-socket
+WebSocket 的 text frame 可以双向原样转发。它不验证环境变量、GUI 启动、thread ownership、
+steer、interrupt 或 approval。
+
+不要在初步调试中执行下列动作：
+
+- 关闭或重启当前 Codex Desktop；
+- 为当前 GUI 注入 `CODEX_APP_SERVER_WS_URL`；
+- 启动第二份默认 remote-control daemon；
+- 用已有项目 thread 做 send/steer/interrupt；
+- 运行尚未接入构建的 broker/supervisor 草案。
+
+若用户专门授权 GUI 验收，仍要先记录现有 Desktop/daemon PID 和 socket owner，使用全新的临时
+thread，并依次保留以下独立证据：
+
+1. Desktop 确实连接到 loopback bridge；
+2. bridge 确实连接到预期 daemon/app-server；
+3. GUI 创建的 thread 能被同一 server 的只读 API 看到；
+4. 新临时 thread 的 `turn/steer` 被同一个 turn 接受；
+5. Desktop 仍收到完整 notification、approval 和最终消息。
+
+broker 草案只有在 Cargo target/依赖接入、私有 `0600` CLI socket、本地客户端授权、child 退出
+清理、重连路由和端到端 fake 测试全部完成后，才进入上述真实 GUI 验收阶段。
