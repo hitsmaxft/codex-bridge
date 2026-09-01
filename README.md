@@ -8,6 +8,8 @@
 
 - `crates/codexctl`：面向用户的 CLI，把命令编码为 JSON 请求。
 - `crates/codex-bridge`：本地 daemon 与共享协议，监听 Unix socket。
+- `crates/codex-gui-bridge`：把 Desktop 的 TCP WebSocket 透明桥接到官方
+  app-server remote-control daemon 的 WebSocket-over-Unix-socket 端点。
 - `launcher`：预留的 macOS launcher，后续负责带私有 CDP endpoint 启动 Codex.app。
 
 CLI 和 daemon 默认使用 `~/.codex-bridge/control.sock`。可通过双方的 `--socket PATH`

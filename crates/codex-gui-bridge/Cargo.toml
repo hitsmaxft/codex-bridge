@@ -1,0 +1,21 @@
+[package]
+name = "codex-gui-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+autobins = false
+autolib = false
+
+[[bin]]
+name = "ws-unix-bridge"
+path = "src/bin/ws-unix-bridge.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time"] }
