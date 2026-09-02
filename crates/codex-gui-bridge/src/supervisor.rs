@@ -105,7 +105,10 @@ impl Supervisor {
             .args(["app-server", "--listen", &self.listen_url])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Preserve startup/schema diagnostics in the broker's log. A
+            // rejected --listen URL otherwise looks like an unexplained
+            // restart loop with status 2.
+            .stderr(Stdio::inherit())
             .kill_on_drop(true);
         let mut child: Child = command
             .spawn()
@@ -159,11 +162,11 @@ mod tests {
     fn handle_starts_stopped() {
         let supervisor = Supervisor::new(
             PathBuf::from("/bin/true"),
-            "ws://127.0.0.1:18791/rpc".to_owned(),
+            "ws://127.0.0.1:18791".to_owned(),
         );
         let handle = supervisor.handle();
         assert!(!*handle.running.borrow());
-        assert_eq!(handle.listen_url, "ws://127.0.0.1:18791/rpc");
+        assert_eq!(handle.listen_url, "ws://127.0.0.1:18791");
     }
 
     #[tokio::test]
@@ -178,7 +181,7 @@ mod tests {
         std::fs::write(&executable, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let supervisor = Supervisor::new(executable.clone(), "ws://127.0.0.1:18791/rpc".to_owned());
+        let supervisor = Supervisor::new(executable.clone(), "ws://127.0.0.1:18791".to_owned());
         let mut handle = supervisor.handle();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(supervisor.run(shutdown_rx));

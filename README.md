@@ -45,8 +45,12 @@ connection, token rejection, disconnect/reconnect, single-Desktop enforcement, p
 code-level evidence only: it
 does not prove that a current Desktop honors `CODEX_APP_SERVER_WS_URL`, preserves approvals and
 notifications through the broker, or can be controlled end to end. See
-[crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for the remaining acceptance
-gates.
+[crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for installation, the
+step-by-step Desktop transport interposition procedure, rollback, and the remaining acceptance
+gates. The procedure affects only a newly launched Desktop process; it does not patch the app,
+bypass its signature, or change the global launch environment. The recommended broker path
+directly supervises the app-server executable bundled with Desktop; it does not install or depend
+on the separately managed standalone daemon.
 
 ## Currently runnable features
 

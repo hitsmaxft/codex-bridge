@@ -21,7 +21,7 @@ struct Args {
     #[arg(long, default_value = DEFAULT_LISTEN_ADDR)]
     listen: SocketAddr,
 
-    /// Unix socket exposed by `codex app-server --remote-control --listen unix://`.
+    /// Unix socket exposed after `codex app-server daemon enable-remote-control`.
     #[arg(long, value_name = "PATH")]
     upstream_socket: Option<PathBuf>,
 }

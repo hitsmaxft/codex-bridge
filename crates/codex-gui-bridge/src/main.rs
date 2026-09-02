@@ -82,13 +82,13 @@ async fn main() -> Result<()> {
         None => default_desktop_codex()?,
     };
 
-    let app_server_url = format!("ws://{}/rpc", args.app_server_addr);
+    let (app_server_listen_url, app_server_url) = app_server_urls(args.app_server_addr);
     let broker_listen_url = format!("ws://{}/rpc?token={desktop_token}", args.broker_addr);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Supervisor: owns the app-server process.
-    let supervisor = Supervisor::new(codex_bin, app_server_url.clone());
+    let supervisor = Supervisor::new(codex_bin, app_server_listen_url);
     let supervisor_shutdown = shutdown_rx.clone();
     let supervisor_failure = shutdown_tx.clone();
     let supervisor_task = tokio::spawn(async move {
@@ -182,6 +182,14 @@ fn generate_desktop_token() -> Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// `codex app-server --listen` accepts only `ws://IP:PORT`, while WebSocket
+/// clients connect to its `/rpc` resource.
+fn app_server_urls(address: SocketAddr) -> (String, String) {
+    let listen_url = format!("ws://{address}");
+    let rpc_url = format!("{listen_url}/rpc");
+    (listen_url, rpc_url)
+}
+
 /// Locate the `codex` binary bundled inside Codex Desktop, falling back to the
 /// PATH `codex` if the app bundle is not found.
 fn default_desktop_codex() -> Result<PathBuf> {
@@ -190,4 +198,17 @@ fn default_desktop_codex() -> Result<PathBuf> {
         return Ok(bundled);
     }
     Ok(PathBuf::from("codex"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_server_listen_url_has_no_rpc_path() {
+        let address: SocketAddr = "127.0.0.1:18791".parse().unwrap();
+        let (listen_url, rpc_url) = app_server_urls(address);
+        assert_eq!(listen_url, "ws://127.0.0.1:18791");
+        assert_eq!(rpc_url, "ws://127.0.0.1:18791/rpc");
+    }
 }
