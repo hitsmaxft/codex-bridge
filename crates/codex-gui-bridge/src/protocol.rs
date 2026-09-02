@@ -22,6 +22,16 @@ pub fn has_id(message: &Value) -> bool {
     message.get("id").is_some()
 }
 
+/// Stable map key for either a numeric or string JSON-RPC request id.
+pub fn request_id_key(message: &Value) -> Option<String> {
+    let id = message.get("id")?;
+    match id {
+        Value::String(id) => Some(format!("s:{id}")),
+        Value::Number(id) => Some(format!("n:{id}")),
+        _ => None,
+    }
+}
+
 /// True when the message is a notification (no id field).
 pub fn is_notification(message: &Value) -> bool {
     !has_id(message)
@@ -39,6 +49,29 @@ pub fn thread_id_of(message: &Value) -> Option<String> {
         .and_then(|params| params.get("threadId"))
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// Extract a thread id from either a client request or the app-server shapes
+/// that identify the thread created/resumed by the GUI. Current v2 schemas use
+/// `result.thread.id` for thread/start and thread/resume responses, and
+/// `params.thread.id` for the thread/started notification.
+pub fn observed_thread_id(message: &Value) -> Option<String> {
+    thread_id_of(message).or_else(|| {
+        [
+            &["result", "thread", "id"][..],
+            &["params", "thread", "id"][..],
+        ]
+        .into_iter()
+        .find_map(|path| {
+            value_at_path(message, path)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    })
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |current, key| current.get(key))
 }
 
 /// Build a JSON-RPC style request with an injected (string) id.
@@ -121,11 +154,7 @@ pub fn turn_interrupt_request(id: u64, thread_id: &str, turn_id: &str) -> Value 
 
 /// Build a `thread/read` request.
 pub fn thread_read_request(id: u64, thread_id: &str) -> Value {
-    injected_request(
-        id,
-        "thread/read",
-        json!({ "threadId": thread_id }),
-    )
+    injected_request(id, "thread/read", json!({ "threadId": thread_id }))
 }
 
 /// Build a `thread/turns/list` request.
@@ -142,20 +171,13 @@ pub fn thread_turns_list_request(id: u64, thread_id: &str, limit: u64) -> Value 
 
 /// Build a `thread/list` request.
 pub fn thread_list_request(id: u64, limit: u64) -> Value {
-    injected_request(
-        id,
-        "thread/list",
-        json!({ "limit": limit }),
-    )
+    injected_request(id, "thread/list", json!({ "limit": limit }))
 }
 
 /// Extract a human-readable error string from an app-server error object.
 pub fn error_message(message: &Value) -> String {
     if let Some(error) = message.get("error") {
-        let code = error
-            .get("code")
-            .map(Value::to_string)
-            .unwrap_or_default();
+        let code = error.get("code").map(Value::to_string).unwrap_or_default();
         let msg = error
             .get("message")
             .and_then(Value::as_str)
@@ -171,16 +193,32 @@ mod tests {
 
     #[test]
     fn injected_id_detection() {
-        assert!(is_injected_response(&json!({"id": "__bridge_000042", "result": {}})));
+        assert!(is_injected_response(
+            &json!({"id": "__bridge_000042", "result": {}})
+        ));
         assert!(!is_injected_response(&json!({"id": 42, "result": {}})));
         assert!(!is_injected_response(&json!({"id": "42", "result": {}})));
-        assert!(!is_injected_response(&json!({"method": "turn/started", "params": {}})));
+        assert!(!is_injected_response(
+            &json!({"method": "turn/started", "params": {}})
+        ));
     }
 
     #[test]
     fn notification_detection() {
-        assert!(is_notification(&json!({"method": "turn/started", "params": {}})));
-        assert!(!is_notification(&json!({"id": 1, "method": "turn/start", "params": {}})));
+        assert!(is_notification(
+            &json!({"method": "turn/started", "params": {}})
+        ));
+        assert!(!is_notification(
+            &json!({"id": 1, "method": "turn/start", "params": {}})
+        ));
+        assert_eq!(
+            request_id_key(&json!({"id": 1, "method": "turn/start"})).as_deref(),
+            Some("n:1")
+        );
+        assert_eq!(
+            request_id_key(&json!({"id": "1", "method": "turn/start"})).as_deref(),
+            Some("s:1")
+        );
     }
 
     #[test]
@@ -192,6 +230,23 @@ mod tests {
         });
         assert_eq!(thread_id_of(&request).as_deref(), Some("abc-123"));
         assert_eq!(thread_id_of(&json!({"method": "x"})), None);
+
+        assert_eq!(
+            observed_thread_id(&json!({
+                "id": 7,
+                "result": {"thread": {"id": "created-thread"}}
+            }))
+            .as_deref(),
+            Some("created-thread")
+        );
+        assert_eq!(
+            observed_thread_id(&json!({
+                "method": "thread/started",
+                "params": {"thread": {"id": "notified-thread"}}
+            }))
+            .as_deref(),
+            Some("notified-thread")
+        );
     }
 
     #[test]

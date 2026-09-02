@@ -1,13 +1,17 @@
 # codex-gui-bridge
 
-This crate currently contains two layers of implementation at different levels of maturity:
+This crate contains two registered experimental transports:
 
-- `ws-unix-bridge` is the only binary registered in `Cargo.toml`. It already has fake WebSocket/Unix-socket round-trip tests and can serve as an experimental transparent transport adapter.
-- `src/main.rs`, `src/lib.rs`, `broker.rs`, `cli_api.rs`, `protocol.rs`, `supervisor.rs`, and `src/bin/codex-gui.rs` are broker/supervisor drafts in the workspace. The crate currently sets `autolib = false` and `autobins = false`, so these targets aren't registered yet and lack the corresponding dependency configuration; a plain `cargo build --workspace` won't compile or verify them.
+- `ws-unix-bridge` is a transparent TCP-WebSocket ↔ Unix-WebSocket adapter.
+- `codex-gui-bridge` is a shared-connection broker and app-server supervisor;
+  `codex-gui` is its Unix-socket client.
 
-So the "transparent bridge" section below describes the currently buildable path, while the "shared-connection broker draft" only records design and TODOs and can't be taken as evidence that the feature is complete.
+Both paths compile and have fake-endpoint tests. Neither has completed live
+Desktop acceptance, so build/test success must not be described as proof that a
+current Desktop honors `CODEX_APP_SERVER_WS_URL` or that real GUI sessions can
+already be controlled.
 
-## Currently Buildable Path: ws-unix-bridge
+## Transparent Path: ws-unix-bridge
 
 `ws-unix-bridge` aims to let Codex Desktop and the official remote-control daemon share a single app-server instance. It terminates the Desktop's TCP WebSocket connection, opens another WebSocket connection to the daemon's Unix socket, and forwards frames between the two sides verbatim, without parsing or rewriting JSON-RPC.
 
@@ -66,30 +70,81 @@ CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 
 The tests use a temporary Unix socket, a fake WebSocket app-server, and a fake Desktop loopback connection, and only verify that frames arrive verbatim in both directions; they don't start a real app-server, daemon, or Desktop.
 
-## Not Yet Wired Into the Build: Shared-Connection Broker Draft
+## Fixture-Tested Shared-Connection Broker
 
-The draft source describes this target architecture:
+The registered broker uses this architecture:
 
 ```text
-Desktop ──WS 127.0.0.1:18790/rpc──> broker
-                                        │ shared upstream connection
-                                        v
-                         supervised app-server 127.0.0.1:18791/rpc
-                                        ^
-                                        │ injected JSON-RPC
-codex-gui ──Unix socket /tmp/codex-gui.sock──┘
+Desktop ──WS 127.0.0.1:18790/rpc?token=...──> broker
+                                                  │ shared upstream
+                                                  v
+                                   app-server 127.0.0.1:18791/rpc
+                                                  ^
+                                                  │ injected JSON-RPC
+codex-gui ──private same-UID Unix socket───────────┘
 ```
 
-The design intent is for GUI traffic and `send`, `steer`, and `interrupt` to share the same app-server upstream, while the read-only `threads`, `read`, and `turns` use ephemeral connections. The draft CLI also defines `status`, `current`, and `tail`.
+Desktop traffic and `send`, `steer`, and `interrupt` share one upstream
+connection. Read-only `threads`, `read`, and `turns` use initialized
+ephemeral connections. Injected string request IDs are consumed by the broker
+and returned only to the CLI; ordinary responses, notifications, and
+server-to-client approval requests continue to Desktop.
 
-Before this can become a working feature, at least the following must be completed:
+The daemon enforces the following local boundaries:
 
-1. Explicitly register the library, daemon, and `codex-gui` binary in Cargo, add the serde and Tokio process/time/sync dependencies, and pass build, Clippy, and tests.
-2. Put the CLI socket in a user-private directory with `0600` permissions, and use inode/ownership checks to handle stale sockets; don't unconditionally delete the fixed `/tmp/codex-gui.sock`.
-3. Add a local authorization boundary for the loopback broker, or explicitly prove that only a trusted Desktop can connect; as it stands, any local process could try to inject RPC.
-4. Properly terminate the app-server child started by the supervisor, limit crash-loops, and verify that upstream connections don't cross when the Desktop disconnects, reconnects, or opens multiple connections.
-5. Reliably track the GUI's current thread from app-server responses/notifications; watching only Desktop requests that carry `threadId` isn't enough to cover newly created threads.
-6. Add end-to-end tests covering fake Desktop ↔ broker ↔ fake app-server ↔ CLI, then do real GUI acceptance on a fresh temporary thread authorized by the user.
-7. Clarify how it merges with the existing `codexctl`/`codex-bridge`, to avoid maintaining a second CLI protocol and output format long-term.
+- both TCP listeners must be loopback;
+- each daemon run generates a 256-bit token that must appear in the Desktop
+  WebSocket URL;
+- CLI writes remain disabled until the app-server accepts Desktop's
+  `initialize` request;
+- only one Desktop connection is accepted at a time, and disconnect cleanup
+  completes before reconnect;
+- the CLI socket lives under a per-user `0700` directory, has mode `0600`,
+  verifies the peer UID, and replaces only an owned, proven-stale socket inode;
+- shutdown kills and reaps the supervised app-server, while unexpected exits
+  use bounded exponential backoff.
 
-Until these gates are met, don't run or ship the draft daemon, and don't describe the existence of the source as proof that GUI control is complete.
+Current-thread tracking correlates Desktop request IDs with
+`thread/start`/`thread/resume` responses, and also observes explicit
+`turn/start` thread IDs. It does not treat every `thread/started`
+notification as active because such notifications can describe subagents.
+
+### Fixture tests
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --all-targets
+```
+
+The suite covers a fake Desktop ↔ broker ↔ fake app-server ↔ CLI write,
+injected-response isolation, initialized read-only RPC, token rejection,
+simultaneous-connection rejection, disconnect/reconnect, private socket
+permissions and cleanup, non-socket preservation, and supervised-child
+termination. It starts neither Desktop nor a real app-server.
+
+### Experimental launch
+
+Running this command starts a real supervised app-server, so do it only when
+that experiment is explicitly authorized:
+
+```sh
+CARGO_INCREMENTAL=0 cargo run -p codex-gui-bridge --bin codex-gui-bridge
+```
+
+The daemon prints the capability-bearing `CODEX_APP_SERVER_WS_URL` and the
+private CLI socket path. `codex-gui` computes the same default socket path:
+
+```sh
+CARGO_INCREMENTAL=0 cargo run -p codex-gui-bridge --bin codex-gui -- status
+CARGO_INCREMENTAL=0 cargo run -p codex-gui-bridge --bin codex-gui -- current
+```
+
+Do not restart Desktop or give it the printed URL without separate permission.
+The first live write must use a brand-new temporary GUI thread, not an active
+project thread.
+
+Remaining acceptance gates are real-Desktop-only: prove the current app honors
+the environment variable, prove the GUI-created thread belongs to the
+supervised server, and preserve notifications, approvals, final output, and
+disconnect behavior through `send`/`steer`/`interrupt`. The broker also
+needs a merge plan with `codexctl`/`codex-bridge` before it can be shipped
+as a second public control surface.

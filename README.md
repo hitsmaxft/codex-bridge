@@ -9,9 +9,9 @@ A Chromium CDP channel is reserved for UI operations that have not yet been impl
 
 - `crates/codexctl`: the user-facing CLI, which encodes commands as JSON requests.
 - `crates/codex-bridge`: the local daemon and shared protocol, listening on a Unix socket.
-- `crates/codex-gui-bridge`: an experimental Desktop/app-server transport. Cargo currently
-  registers and tests only the transparent `ws-unix-bridge` binary. The broker, supervisor, and
-  `codex-gui` sources are not yet wired into the build and must not be treated as usable features.
+- `crates/codex-gui-bridge`: experimental Desktop/app-server transports. Cargo registers the
+  transparent `ws-unix-bridge` plus the shared-connection broker, supervisor, and `codex-gui`
+  client. All of them have fake-endpoint tests; none has completed live Desktop acceptance.
 - `launcher`: a reserved macOS launcher that may later start Codex.app with a private CDP endpoint.
 
 The CLI and daemon use `~/.codex-bridge/control.sock` by default. Override it on either side with
@@ -38,11 +38,15 @@ that the current Desktop honors `CODEX_APP_SERVER_WS_URL`, or that GUI sessions 
 steered externally. Real validation requires explicit permission to restart Desktop and must use a
 brand-new temporary thread. Never use an active project session for the first test.
 
-Files such as `crates/codex-gui-bridge/src/main.rs` describe a more advanced shared-connection
-broker. However, `Cargo.toml` currently sets `autolib=false` and `autobins=false`, so those sources
-do not participate in the workspace build. See
-[crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for their security gaps,
-integration requirements, and validation gates.
+The shared-connection broker is now part of the workspace build. Its fixture tests cover a fake
+Desktop and app-server sharing one upstream, CLI response isolation, an initialized read-only
+connection, token rejection, disconnect/reconnect, single-Desktop enforcement, private
+`0600` Unix-socket IPC, Desktop-initialize gating, and supervisor child termination. This is
+code-level evidence only: it
+does not prove that a current Desktop honors `CODEX_APP_SERVER_WS_URL`, preserves approvals and
+notifications through the broker, or can be controlled end to end. See
+[crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for the remaining acceptance
+gates.
 
 ## Currently runnable features
 

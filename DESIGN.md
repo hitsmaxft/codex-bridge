@@ -182,13 +182,25 @@ Also, the App has a problem of not releasing the writer in a timely manner.
 
 The ideal architecture is a single app-server shared by both the App and codexctl. Codex supports a Unix-socket app-server: `~/.codex/app-server-control/app-server-control.sock`. This Unix socket carries WebSocket: the client must first perform an HTTP Upgrade, then send JSON-RPC as WebSocket text frames; it is **not** a JSONL/raw Unix stream. Codex 0.151.0's `app-server proxy` only byte-copies between stdio and the socket, so it can't act as a protocol adapter for this control socket. macOS Desktop used to be able to share the managed daemon with the CLI via `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`.
 
-⚠️ **Latest status (2026-08-29)**: Desktop 26.820.60940 has a regression — it again ignores the local-daemon configuration and starts its own private stdio app-server. **Do not make "shared App Server" the sole implementation foundation.**
+⚠️ **Last live observation (2026-08-29)**: Desktop 26.820.60940 ignored the
+local-daemon configuration and started its own private stdio app-server. This
+observation has not been refreshed in the current broker work. **Do not make
+"shared App Server" the sole implementation foundation.**
 
 ### GUI transport experiments
 
 The currently registered `ws-unix-bridge` is a minimal transparent adapter layer: Desktop connects to a loopback TCP WebSocket, and the bridge completes the WebSocket handshake against the official daemon's Unix socket, then neither parses nor rewrites JSON-RPC. If Desktop actually honors `CODEX_APP_SERVER_WS_URL`, this could land the GUI and `codexctl` on the same app-server instance. Right now there are only bidirectional frame tests against a fake endpoint, with no live Desktop acceptance yet, so it remains a non-default experimental path.
 
-The workspace also has a broker/supervisor draft that isn't wired into Cargo yet. It plans to start its own TCP WebSocket app-server and share a single upstream connection between GUI traffic and CLI write requests; read requests may use temporary connections. Compared with the transparent bridge, this gives precise control over routing injected responses, but it also introduces new responsibilities: local authorization, socket permissions, child lifecycle, reconnection/multi-connection handling, and current-thread tracking. Until these security and end-to-end test gates pass, it can't replace the existing `codex-bridge`, nor can it claim to have solved Desktop GUI control.
+The workspace now builds a broker/supervisor experiment that starts its own TCP
+WebSocket app-server and shares one upstream connection between GUI traffic and
+CLI write requests; read requests use initialized temporary connections. Fake
+end-to-end tests now cover injected-response routing, a per-run Desktop
+capability token, private same-UID Unix-socket IPC, supervised child shutdown,
+disconnect/reconnect, rejection of simultaneous Desktop connections, and
+thread tracking from request/response correlation. This still can't replace
+the existing `codex-bridge` or claim to have solved Desktop GUI control until
+an explicitly authorized temporary GUI thread proves the real environment
+variable, notification/approval flow, and UI behavior.
 
 Both experiments share the same acceptance boundary: a fake WebSocket only proves the transport; a standalone thread only proves the shared daemon; only a brand-new temporary GUI thread explicitly authorized by the user can prove Desktop integration. You must not use a real, actively working project session as the first validation.
 
@@ -253,7 +265,7 @@ codexapp-cli/
 ├── crates/
 │   ├── codexctl/      # CLI entry point (clap)
 │   ├── codex-bridge/  # current daemon (Rust)
-│   └── codex-gui-bridge/ # experimental transport; only ws-unix-bridge registered
+│   └── codex-gui-bridge/ # registered experimental transports; fake-tested only
 ├── launcher/          # macOS launcher (launches Codex.app + CDP)
 └── docs/
 ```

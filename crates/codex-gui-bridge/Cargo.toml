@@ -3,8 +3,17 @@ name = "codex-gui-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-autobins = false
-autolib = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "codex-gui-bridge"
+path = "src/main.rs"
+
+[[bin]]
+name = "codex-gui"
+path = "src/bin/codex-gui.rs"
 
 [[bin]]
 name = "ws-unix-bridge"
@@ -14,6 +23,9 @@ path = "src/bin/ws-unix-bridge.rs"
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 

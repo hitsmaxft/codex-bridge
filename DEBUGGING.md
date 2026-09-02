@@ -449,10 +449,9 @@ CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$codex_state_dir/app-server-control/app-ser
 
 First distinguish the two code bases under `crates/codex-gui-bridge`:
 
-- `ws-unix-bridge` is registered in Cargo; it can run fake transport tests.
-- The broker/supervisor/`codex-gui` sources are tracked but their targets are not registered, so the
-  workspace build does not compile them. Review these excluded targets separately; passing
-  `cargo test --workspace` does not mean the draft passes.
+- `ws-unix-bridge` is a transparent TCP-WebSocket to Unix-WebSocket adapter.
+- `codex-gui-bridge`, its library, and `codex-gui` are registered experimental broker targets.
+  They compile in the workspace and have fake end-to-end tests, but no live Desktop acceptance.
 
 The transparent bridge has only one safety test:
 
@@ -462,13 +461,25 @@ CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 
 It uses a fake Desktop and fake app-server, and its only acceptance criterion is that text frames forward verbatim, bidirectionally, between a TCP WebSocket and a Unix-socket WebSocket. It doesn't validate environment variables, GUI startup, thread ownership, steer, interrupt, or approval.
 
+Run the complete broker fixture suite separately:
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --all-targets
+```
+
+This verifies fake Desktop ↔ broker ↔ fake app-server ↔ CLI routing, read-only
+initialization, token rejection, single-Desktop enforcement,
+disconnect/reconnect cleanup, current-thread request/response correlation,
+same-UID private socket IPC, stale-path protection, and supervised-child
+termination. It still does not start Desktop or a real app-server.
+
 Don't do the following during initial debugging:
 
 - quit or restart the current Codex Desktop;
 - inject `CODEX_APP_SERVER_WS_URL` into the current GUI;
 - launch a second default remote-control daemon;
 - send/steer/interrupt on an existing project thread;
-- run the broker/supervisor draft that isn't wired into the build.
+- run the broker/supervisor against the real Desktop or a real app-server.
 
 If the user specifically authorizes GUI acceptance, still first record the existing Desktop/daemon PIDs and socket owner, use a brand-new temporary thread, and preserve the following independent evidence in order:
 
@@ -478,4 +489,7 @@ If the user specifically authorizes GUI acceptance, still first record the exist
 4. `turn/steer` on the new temporary thread is accepted by the same turn;
 5. Desktop still receives the full notification, approval, and final message.
 
-The broker draft only enters the real GUI acceptance phase above once the Cargo target/dependencies are wired in, the private `0600` CLI socket, local client authorization, child exit cleanup, reconnect routing, and end-to-end fake tests are all complete.
+Those code-side prerequisites are now covered by the fixture suite. Real GUI
+acceptance still requires explicit authorization, the capability-bearing
+`CODEX_APP_SERVER_WS_URL` printed by the daemon, and a new temporary thread.
+Do not interpret successful fixture tests as Desktop acceptance.

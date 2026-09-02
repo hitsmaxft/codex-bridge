@@ -2,21 +2,22 @@
 //!
 //! Talks to the daemon's Unix socket and renders the JSON response.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use codex_gui_bridge::cli_api::default_socket_path;
 use serde_json::{json, Value};
 
-const DEFAULT_CLI_SOCKET: &str = "/tmp/codex-gui.sock";
-
 #[derive(Debug, Parser)]
-#[command(version, about = "Control Codex Desktop sessions through the codex-gui-bridge broker")]
+#[command(
+    version,
+    about = "Control Codex Desktop sessions through the codex-gui-bridge broker"
+)]
 struct Args {
     /// Unix socket path of the codex-gui-bridge daemon.
-    #[arg(long, global = true, default_value = DEFAULT_CLI_SOCKET)]
-    socket: PathBuf,
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -81,6 +82,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let socket = args.socket.clone().unwrap_or_else(default_socket_path);
     let request = match &args.command {
         Command::Status => json!({"cmd": "status"}),
         Command::Threads { limit } => json!({"cmd": "threads", "limit": limit}),
@@ -103,7 +105,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let response = request_daemon(&args.socket, &request).await?;
+    let response = request_daemon(&socket, &request).await?;
     render(&args.command, response)?;
     Ok(())
 }
@@ -122,7 +124,10 @@ async fn request_daemon(socket: &PathBuf, request: &Value) -> Result<Value> {
     stream.shutdown().await?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await.context("read daemon response")?;
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .context("read daemon response")?;
     if n == 0 {
         anyhow::bail!("daemon returned an empty response (is codex-gui-bridge running?)");
     }
@@ -154,6 +159,10 @@ fn render(command: &Command, response: Value) -> Result<()> {
 }
 
 fn render_status(result: &Value) {
+    let connected = result["desktopConnected"].as_bool().unwrap_or(false);
+    println!("desktop connected: {connected}");
+    let ready = result["desktopReady"].as_bool().unwrap_or(false);
+    println!("desktop initialized: {ready}");
     let active = result["activeThread"].as_str().unwrap_or("(none)");
     println!("active thread: {active}");
     if let Some(activity) = result["recentActivity"].as_array() {
@@ -246,7 +255,10 @@ fn render_send(result: &Value) {
     // Ack: print a short status rather than dumping the whole response.
     if let Some(error) = result.get("error") {
         println!("rejected: {}", error);
-    } else if let Some(turn) = result.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str)
+    } else if let Some(turn) = result
+        .get("turn")
+        .and_then(|t| t.get("id"))
+        .and_then(Value::as_str)
     {
         println!("turn started: {turn}");
     } else {
