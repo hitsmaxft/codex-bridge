@@ -1,21 +1,51 @@
 # codex-gui-bridge
 
-This crate contains two registered experimental transports:
+This crate contains two registered Desktop transports:
 
 - `ws-unix-bridge` is a transparent TCP-WebSocket ↔ Unix-WebSocket adapter.
 - `codex-gui-bridge` is a shared-connection broker and app-server supervisor;
   `codex-gui` is its Unix-socket client.
 
-Both paths compile and have fake-endpoint tests. Neither has completed live
-Desktop acceptance, so build/test success must not be described as proof that a
-current Desktop honors `CODEX_APP_SERVER_WS_URL` or that real GUI sessions can
-already be controlled.
+The project adopted `ws-unix-bridge` plus the managed standalone daemon as
+**Solution B**. That path completed live Desktop acceptance on 2026-09-04. The
+broker remains fixture-tested source code, but it was not adopted and has not
+completed its own live acceptance.
+
+## Adopted Architecture: Solution B
+
+```text
+Desktop
+  CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc
+          |
+          | WebSocket over TCP
+          v
+  ws-unix-bridge (127.0.0.1:18790)
+          |
+          | WebSocket over Unix socket
+          v
+  managed standalone app-server
+  ~/.codex/app-server-control/app-server-control.sock
+          |
+          +-- local GUI and CLI control
+          +-- remote control and mobile history
+```
+
+The bridge terminates the two WebSocket transports but forwards text, binary,
+ping, pong, and close frames without parsing or rewriting JSON-RPC. Each
+Desktop connection maps to one upstream Unix-socket connection. The Desktop
+still sends `initialize` and every later request itself.
+
+The standalone daemon is a core dependency in this deployment. It provides the
+durable app-server process, remote-control endpoint, and shared thread/writer
+state used by Desktop, CLI control, and the mobile client. This single-instance
+property is the reason Solution B was selected over directly supervising a
+second bundled app-server.
 
 ## Install
 
-The tools require the Rust toolchain and, for the recommended live path, an
-installed ChatGPT Desktop bundle. A separately installed/managed standalone
-Codex daemon is **not** required. Install all three repository binaries from a
+The bridge tools require the Rust toolchain. The adopted path also requires an
+installed ChatGPT Desktop bundle and the managed standalone Codex package under
+`~/.codex/packages/standalone`. Install all three repository binaries from a
 checkout:
 
 ```sh
@@ -39,190 +69,204 @@ During repository development, the equivalent commands can be run without
 installation by replacing each binary name with, for example,
 `CARGO_INCREMENTAL=0 cargo run -p codex-gui-bridge --bin codex-gui-bridge --`.
 
-### Runtime choice, verified 2026-09-02
-
-Use the app-server executable shipped inside the installed Desktop bundle for
-the broker path:
+`cargo install` installs only this repository's bridge/client binaries. It does
+not install Desktop or the managed standalone package. On the accepted machine,
+the launchd job deliberately runs the repository's release binary directly so
+the deployed artifact is explicit:
 
 ```text
-new ChatGPT Desktop process
-  -> codex-gui-bridge
-  -> /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen ws://127.0.0.1:18791
+/Users/bhe/projects/ai/codexapp-cli/target/release/ws-unix-bridge
 ```
 
-This is a directly supervised child process, not `codex app-server daemon` and
-not the managed standalone package under `~/.codex/packages/standalone`.
-`cargo install` above installs only this repository's three bridge/client
-binaries; it does not install another app-server.
+If an installed `${CARGO_HOME:-$HOME/.cargo}/bin/ws-unix-bridge` is used
+instead, make the launchd `ProgramArguments` path match that choice.
 
-The choice is based on a real local protocol probe, not just `--help` output.
-After correcting the listener URL so `--listen` receives `ws://IP:PORT` while
-clients connect to `ws://IP:PORT/rpc`, the following two binaries both
-completed `initialize` followed by `thread/list`:
+## Manual Startup and Validation
 
-- Desktop bundle: `codex-cli 0.151.0-alpha.7.2`, SHA-256
-  `a6042937174f72112dbd2d554a4af36936422e0c5ac69e353dc68994458996e9`;
-- PATH CLI: `codex-cli 0.152.1`, SHA-256
-  `8194ea3181f330e63023b234b0b231855e5874e0331c5ef7cbc490591497a7bf`.
+Before the first manual test, save work and quit ChatGPT Desktop completely;
+closing a window is not sufficient. Interposition affects only a newly started
+Desktop process. It does not patch the app bundle, inject code, or bypass the
+application signature.
 
-That probe proves basic direct app-server startup and read-only RPC for these
-exact binaries. It does not prove full Desktop compatibility for the different
-PATH version. The bundled binary is therefore the default because it minimizes
-protocol-version skew with the installed GUI. Use `--codex-bin PATH` only for
-an explicit compatibility experiment.
+First inspect the managed daemon and enable remote control. Use the managed
+binary's explicit path when multiple `codex` versions are installed:
 
-The managed daemon reported version `0.152.1`, backend `pid`, and control
-socket `~/.codex/app-server-control/app-server-control.sock` on the same
-machine. Only its status, version, and socket presence were confirmed in this
-pass; it was not needed for the successful direct probes and has not passed the
-broker's live-Desktop acceptance gates. It remains an optional transparent-path
-experiment below, not the installation recommendation.
+```sh
+CODEX_STANDALONE="$HOME/.codex/packages/standalone/current/codex"
+"$CODEX_STANDALONE" app-server daemon start
+"$CODEX_STANDALONE" app-server daemon enable-remote-control
+"$CODEX_STANDALONE" app-server daemon version
+test -S "$HOME/.codex/app-server-control/app-server-control.sock"
+```
 
-## Interpose the Desktop Transport
+`daemon version` must report `status: running` and the expected socket path.
+The start command is idempotent; do not start an ad-hoc second app-server when
+the managed daemon already owns the socket.
 
-Here, “interpose” (or “hijack”) means launching a **new** Desktop process with
-`CODEX_APP_SERVER_WS_URL` pointed at a loopback bridge. It is process-local
-configuration: no app bundle is modified, no code is injected, and the app's
-signature is not bypassed.
-
-The shared-connection broker is the useful path when `codex-gui` must observe
-or control the same app-server connection as Desktop. Before the first live
-attempt, save any work and quit ChatGPT Desktop completely; closing a window is
-not sufficient. Check that neither required loopback port is already owned by
-another process:
+Check that the bridge port is free, then start the adapter:
 
 ```sh
 lsof -nP -iTCP:18790 -sTCP:LISTEN
-lsof -nP -iTCP:18791 -sTCP:LISTEN
-```
 
-Do not kill an unknown listener. Either stop the process that you knowingly
-started or select unused loopback ports with `--broker-addr` and
-`--app-server-addr`.
-
-Start the broker in its own terminal:
-
-```sh
-codex-gui-bridge \
-  --codex-bin /Applications/ChatGPT.app/Contents/Resources/codex
-```
-
-The explicit path makes the runtime choice visible and reproducible. Omitting
-`--codex-bin` currently selects the same bundled binary when it exists and
-falls back to `codex` on `PATH` otherwise. Keep this terminal open and copy the
-complete `broker=` URL from the startup line, including its random
-`?token=...` query. Treat that capability URL as a secret for the life of the
-broker and do not publish it in logs or issue reports.
-
-With Desktop still fully quit, launch the bundle executable directly from a
-second terminal, substituting the exact URL printed by the broker:
-
-```sh
-CODEX_APP_SERVER_WS_URL='ws://127.0.0.1:18790/rpc?token=REPLACE_WITH_PRINTED_TOKEN' \
-  /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
-```
-
-Do not use `open -a ChatGPT` for this check: macOS may reuse an existing
-process, in which case the process will not inherit the shell assignment. Do
-not set the variable globally with `launchctl setenv`; keeping it on this one
-command makes rollback deterministic.
-
-Once the GUI is visible, verify the transport before sending anything:
-
-```sh
-codex-gui status
-codex-gui current
-codex-gui threads --limit 10
-```
-
-`status` must report both `desktop connected: true` and
-`desktop initialized: true`. A false value means the interposition has not
-been proved; common causes are a reused Desktop process, an ignored environment
-variable, a wrong/expired token, or a protocol mismatch. Create a brand-new
-temporary GUI thread for the first read/write test. Do not use an active
-project thread.
-
-To roll back, quit that Desktop instance normally, press Ctrl-C in the broker
-terminal, and launch Desktop normally without `CODEX_APP_SERVER_WS_URL`. The
-broker stops and reaps its supervised app-server; it does not leave a patched
-Desktop installation behind.
-
-## Optional, Unaccepted Transparent Path: ws-unix-bridge
-
-`ws-unix-bridge` aims to let Codex Desktop and the official remote-control daemon share a single app-server instance. It terminates the Desktop's TCP WebSocket connection, opens another WebSocket connection to the daemon's Unix socket, and forwards frames between the two sides verbatim, without parsing or rewriting JSON-RPC.
-
-```text
-Codex Desktop
-  CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc
-          |
-          | WebSocket over TCP
-          v
-  ws-unix-bridge (127.0.0.1:18790)
-          |
-          | WebSocket over Unix socket
-          v
-  codex app-server daemon (remote control enabled)
-  ~/.codex/app-server-control/app-server-control.sock
-```
-
-The bridge forwards text, binary, ping, pong, and close frames. It doesn't send `initialize` itself: the Desktop's own handshake and subsequent app-server traffic pass through unchanged. Each Desktop connection maps to one upstream Unix-socket connection, and a disconnect on either side ends that pair.
-
-This path only lets the GUI share the daemon with `codexctl` if the Desktop actually reads `CODEX_APP_SERVER_WS_URL` and connects to the bridge. The automated tests currently prove only transparent frame forwarding — not that any Desktop version honors this environment variable, and not that GUI threads can already be steered or interrupted.
-
-### Launching
-
-This section is not part of the recommended installation. First inspect the
-managed daemon instead of installing or restarting it blindly:
-
-```sh
-codex app-server daemon version
-test -S "$HOME/.codex/app-server-control/app-server-control.sock"
-```
-
-Only when deliberately testing this transparent path and no managed daemon is
-running, start it and enable remote control. These commands replace the older,
-unsupported `codex app-server --remote-control --listen unix://` spelling:
-
-```sh
-codex app-server daemon start
-codex app-server daemon enable-remote-control
-test -S "$HOME/.codex/app-server-control/app-server-control.sock"
-```
-
-Then launch the installed bridge:
-
-```sh
 ws-unix-bridge \
   --listen 127.0.0.1:18790 \
   --upstream-socket "$HOME/.codex/app-server-control/app-server-control.sock"
 ```
 
-`--listen` defaults to `127.0.0.1:18790`. `--upstream-socket` defaults to the path shown above.
+Do not kill an unknown listener. Stop only a process that you knowingly
+started, or choose another loopback port. The bridge has no application-layer
+authentication and must never listen on a non-loopback address.
 
-Only let a fully quit Desktop inherit the experimental transport variable:
+With Desktop still fully quit, launch it directly with the two local-daemon
+variables used by the accepted deployment:
 
 ```sh
 CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc \
+CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 \
   /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 ```
 
-If the app bundle lives elsewhere, only replace the executable path. Don't run this during ordinary fixture debugging, and don't use existing sessions in project 585, kof96, or any other real project as the first write test.
+Do not use `open -a ChatGPT` for this one-process check: macOS may reuse an
+existing process that did not inherit the variables. Before a write test,
+verify the transport and read path:
 
-This transparent path has no capability token and exposes no `codex-gui` CLI
-socket. Keep it on loopback, verify it only with a temporary thread, and use
-the same quit/Ctrl-C/normal-launch rollback described above.
+```sh
+ps eww -p "$(pgrep -x ChatGPT | tail -1)" | tr ' ' '\n' | \
+  grep '^CODEX_APP_SERVER_'
+lsof -nP -iTCP:18790
+"$CODEX_STANDALONE" app-server daemon version
+```
 
-The bridge binds only to loopback by default. It adds no authentication or authorization, so it must never listen on a non-loopback address or be exposed to an untrusted network.
+Desktop logs should show `transport=websocket`, `initialized=true`, and a
+successful `thread/list`. Open a disposable thread and confirm that its history
+loads before testing `steer` or `interrupt` on a real session.
 
-### Tests
+## launchd Persistence
+
+The accepted machine uses three user LaunchAgents. launchd does not expand
+`$HOME` inside `ProgramArguments`, so every plist contains absolute paths.
+
+| Label | Role | Important settings |
+| --- | --- | --- |
+| `com.lunghaa.codex-app-server` | Starts the managed daemon at login | `RunAtLoad=true`; runs `~/.codex/packages/standalone/current/codex app-server daemon start`; the command exits after the daemon's own PID manager takes over |
+| `com.lunghaa.ws-unix-bridge` | Keeps the transparent adapter alive | `RunAtLoad=true`, `KeepAlive=true`; runs the release bridge with `--listen 127.0.0.1:18790` and the app-server control socket |
+| `com.lunghaa.codex-app-server-env` | Injects the Desktop transport into the user launchd domain | `RunAtLoad=true`; runs a short script containing the two `launchctl setenv` commands below |
+
+The accepted launchd user domain contained both variables. For reproducible
+login persistence, the environment script should set both explicitly:
+
+```sh
+#!/bin/sh
+launchctl setenv CODEX_APP_SERVER_WS_URL \
+  "ws://127.0.0.1:18790/rpc"
+launchctl setenv CODEX_APP_SERVER_USE_LOCAL_DAEMON "1"
+```
+
+The bridge LaunchAgent on the accepted machine has these effective arguments
+and log paths:
+
+```text
+ProgramArguments:
+  /Users/bhe/projects/ai/codexapp-cli/target/release/ws-unix-bridge
+  --listen
+  127.0.0.1:18790
+  --upstream-socket
+  /Users/bhe/.codex/app-server-control/app-server-control.sock
+StandardOutPath: /Users/bhe/.codex/ws-unix-bridge.log
+StandardErrorPath: /Users/bhe/.codex/ws-unix-bridge.log
+```
+
+After writing the plists under `~/Library/LaunchAgents`, load them once in
+dependency order:
+
+```sh
+launchctl bootstrap gui/"$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.lunghaa.codex-app-server.plist"
+launchctl bootstrap gui/"$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.lunghaa.ws-unix-bridge.plist"
+launchctl bootstrap gui/"$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.lunghaa.codex-app-server-env.plist"
+```
+
+`bootstrap` is an installation-time command and reports an error if the label
+is already loaded. For an existing deployment, inspect it instead of reloading
+it blindly:
+
+```sh
+launchctl print gui/"$(id -u)"/com.lunghaa.codex-app-server
+launchctl print gui/"$(id -u)"/com.lunghaa.ws-unix-bridge
+launchctl print gui/"$(id -u)"/com.lunghaa.codex-app-server-env
+launchctl getenv CODEX_APP_SERVER_WS_URL
+launchctl getenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
+```
+
+The environment applies only to processes launched after it is set. Fully quit
+and relaunch Desktop after login-agent changes.
+
+### Rollback
+
+To stop interposing Desktop while retaining mobile remote control, quit Desktop,
+unload only the bridge and environment jobs, remove the two variables from the
+launchd user domain, and then launch Desktop normally:
+
+```sh
+launchctl bootout gui/"$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.lunghaa.ws-unix-bridge.plist"
+launchctl bootout gui/"$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.lunghaa.codex-app-server-env.plist"
+launchctl unsetenv CODEX_APP_SERVER_WS_URL
+launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
+```
+
+Do not stop the standalone daemon if remote control or a mobile session still
+depends on it. Disabling remote control is a separate, explicit operation.
+
+## Live Acceptance Record: 2026-09-04
+
+The base live-Desktop acceptance gate passed for this exact deployment:
+
+- ChatGPT Desktop `26.831.21537` (`CFBundleVersion 7579`), with bundled
+  `codex-cli 0.152.1`;
+- managed standalone app-server `0.153.2`, SHA-256
+  `195ace4100a634a9df39147f493e730e666b5bd87795f3c9f3251d8542400424`;
+- `ws-unix-bridge` package version `0.1.0`, SHA-256
+  `688f884b8d773bf8077d7fe9152c3220269f16dbd72f3ae9bc0854d463c42f92`;
+- repository revision `59a5862b4b2e0a1588e4f114d681cd7034745ace`.
+
+Observed evidence, in order:
+
+1. Desktop PID 67425 inherited both deployment variables and connected from
+   `127.0.0.1:61510` to bridge PID 68521 at `127.0.0.1:18790`.
+2. The bridge held the matching TCP connection and a Unix connection to
+   standalone daemon PID 50310 at
+   `~/.codex/app-server-control/app-server-control.sock`.
+3. After the bridge was rebuilt and relaunched, Desktop reconnected and logged
+   `transport=websocket`, `initialized=true`, and successful `thread/list`.
+4. GUI session history opened: repeated `thread/turns/list` requests for the
+   selected thread completed with `errorCode=null`.
+5. `remoteControl/enable` completed, the local remote-connection state became
+   `connected`, and mobile full-history synchronization was operator-accepted.
+6. A later `turn/steer` completed with `errorCode=null` through the same
+   Desktop connection.
+
+This record proves transport selection, initialization, list/read/history
+loading, remote-control connection, mobile history for the observed account,
+and one same-turn steer. It does not yet prove login/reboot recovery,
+long-duration reconnect behavior, every approval/notification path, or future
+version compatibility. Merely receiving a `thread/resume` request is not by
+itself a success predicate; use the response and visible history state.
+
+### Forwarding Regression Test
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 ```
 
-The tests use a temporary Unix socket, a fake WebSocket app-server, and a fake Desktop loopback connection, and only verify that frames arrive verbatim in both directions; they don't start a real app-server, daemon, or Desktop.
+The test uses a temporary Unix socket, fake WebSocket app-server, and fake
+Desktop loopback connection. It proves frame forwarding only; the live record
+above is the separate Desktop/daemon acceptance gate.
 
-## Fixture-Tested Shared-Connection Broker
+## Alternative Not Adopted: Shared-Connection Broker
 
 The registered broker uses this architecture:
 
@@ -273,11 +317,10 @@ simultaneous-connection rejection, disconnect/reconnect, private socket
 permissions and cleanup, non-socket preservation, and supervised-child
 termination. It starts neither Desktop nor a real app-server.
 
-### Experimental launch
+### Alternative launch
 
 Running this command starts the Desktop-bundled app-server directly; it does
-not use the managed standalone daemon. The full safe launch and rollback
-sequence is in [Interpose the Desktop Transport](#interpose-the-desktop-transport):
+not use the managed standalone daemon and is not part of Solution B:
 
 ```sh
 codex-gui-bridge \

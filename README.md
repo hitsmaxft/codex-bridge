@@ -9,9 +9,10 @@ A Chromium CDP channel is reserved for UI operations that have not yet been impl
 
 - `crates/codexctl`: the user-facing CLI, which encodes commands as JSON requests.
 - `crates/codex-bridge`: the local daemon and shared protocol, listening on a Unix socket.
-- `crates/codex-gui-bridge`: experimental Desktop/app-server transports. Cargo registers the
-  transparent `ws-unix-bridge` plus the shared-connection broker, supervisor, and `codex-gui`
-  client. All of them have fake-endpoint tests; none has completed live Desktop acceptance.
+- `crates/codex-gui-bridge`: Desktop/app-server transports. The deployed path is the transparent
+  `ws-unix-bridge` in front of the managed standalone daemon. The crate also retains the
+  shared-connection broker, supervisor, and `codex-gui` client as a tested but unadopted
+  alternative.
 - `launcher`: a reserved macOS launcher that may later start Codex.app with a private CDP endpoint.
 
 The CLI and daemon use `~/.codex-bridge/control.sock` by default. Override it on either side with
@@ -20,37 +21,47 @@ socket directory to mode `0700` and the socket to `0600`. For custom paths, it o
 permissions on directories it creates and leaves existing parent directories unchanged. At
 startup, it removes only stale sockets left by an abnormal exit that can no longer be connected to.
 
-## GUI transport experiment
+## Deployed GUI transport: Solution B
 
-Codex Desktop still uses a private stdio app-server by default. As a result, the current
-`codexctl steer` and `codexctl interrupt` commands can only operate on threads owned by the target
-standalone/shared daemon.
+The adopted local architecture shares the managed standalone app-server between Desktop, CLI
+control, and remote control:
 
-The repository's `ws-unix-bridge` attempts to forward Desktop's TCP WebSocket unchanged to the
-official daemon's WebSocket-over-UDS endpoint so both sides use the same app-server instance:
+```text
+Codex Desktop (TCP 127.0.0.1:61510)
+  -> ws-unix-bridge (TCP 127.0.0.1:18790)
+  -> WebSocket over ~/.codex/app-server-control/app-server-control.sock
+  -> managed standalone app-server (PID 50310 during acceptance)
+  -> remote control / mobile client
+```
+
+`ws-unix-bridge` changes only the transport. It accepts Desktop's TCP WebSocket, opens a WebSocket
+over the daemon's Unix socket, and forwards frames without parsing or rewriting JSON-RPC. The
+standalone daemon is therefore a core dependency of this deployment, not an optional experiment.
+Keeping one app-server instance also keeps GUI, CLI, and mobile remote control on the same thread
+store and writer-ownership boundary.
+
+This path completed live Desktop acceptance on 2026-09-04 with Desktop `26.831.21537`, its bundled
+CLI `0.152.1`, and standalone app-server `0.153.2`. The running Desktop inherited
+`CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc`, established the expected TCP connection to the
+bridge, initialized with `transport=websocket`, and received successful `thread/list`,
+`thread/turns/list`, remote-control, and `turn/steer` responses. GUI history opened successfully;
+mobile full-history synchronization was also accepted during the deployment check.
+
+Those observations prove the current local Desktop-to-daemon path and session-history loading for
+the exact accepted versions. They are not a general compatibility guarantee for future Desktop or
+standalone releases, and they do not replace a login/reboot or long-duration recovery test. The
+fake-endpoint test remains useful as a narrower forwarding regression:
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 ```
 
-This test uses fake endpoints and proves only bidirectional frame forwarding. It does not prove
-that the current Desktop honors `CODEX_APP_SERVER_WS_URL`, or that GUI sessions can already be
-steered externally. Real validation requires explicit permission to restart Desktop and must use a
-brand-new temporary thread. Never use an active project session for the first test.
-
-The shared-connection broker is now part of the workspace build. Its fixture tests cover a fake
-Desktop and app-server sharing one upstream, CLI response isolation, an initialized read-only
-connection, token rejection, disconnect/reconnect, single-Desktop enforcement, private
-`0600` Unix-socket IPC, Desktop-initialize gating, and supervisor child termination. This is
-code-level evidence only: it
-does not prove that a current Desktop honors `CODEX_APP_SERVER_WS_URL`, preserves approvals and
-notifications through the broker, or can be controlled end to end. See
-[crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for installation, the
-step-by-step Desktop transport interposition procedure, rollback, and the remaining acceptance
-gates. The procedure affects only a newly launched Desktop process; it does not patch the app,
-bypass its signature, or change the global launch environment. The recommended broker path
-directly supervises the app-server executable bundled with Desktop; it does not install or depend
-on the separately managed standalone daemon.
+The shared-connection `codex-gui-bridge` broker remains in the workspace but was not selected for
+deployment. Its fixture tests cover protocol isolation, capability-token enforcement, private CLI
+IPC, reconnect handling, and supervised-child cleanup; no live acceptance claim is made for that
+alternative. See [crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for the
+Solution B topology, manual validation, launchd persistence, rollback, evidence record, and broker
+status.
 
 ## Currently runnable features
 
@@ -109,9 +120,10 @@ codexctl --thread <THREAD_ID> host-exec --timeout 600 -- \
 - `interrupt` sends `turn/interrupt` through the same endpoint. The target thread must belong to
   that app-server instance, and the rollout's active turn ID must still match. Otherwise the
   command returns an explicit error rather than pretending to succeed.
-- Codex Desktop 26.820.60940 still launches its own private stdio app-server, which exposes no
-  control socket. Therefore, steer and interrupt currently work for standalone/shared-daemon
-  sessions but cannot cross app-server instances to control private GUI sessions.
+- Without transport interposition, Desktop may own a separate private app-server and the commands
+  cannot cross that process boundary. In the deployed Solution B configuration, Desktop connects
+  through `ws-unix-bridge` to the same managed standalone daemon, so `steer` and `interrupt` can
+  target threads owned by that shared instance.
 - `host-exec` runs an allowlisted host command in the selected thread's `cwd`, primarily for USB
   flashing and hardware tests. Requests carry an argv array and never pass through a shell. The
   built-in policy allows only `wlink`, `cases/run-ch585-*.sh`, and restricted Git subcommands.
