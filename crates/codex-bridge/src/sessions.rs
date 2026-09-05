@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, ErrorKind};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -319,18 +319,47 @@ fn git_branch_for_cwd(cwd: &Path) -> Option<String> {
     if !cwd.is_dir() {
         return None;
     }
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .stdout(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+        .spawn()
         .ok()?;
-    if !output.status.success() || output.stdout.len() > 4 * 1024 {
+
+    // Git on a cloud-synced or offloaded repo (e.g. ~/Documents on iCloud Drive)
+    // can block for minutes waiting for file materialization. Bound the wait so a
+    // single pathological checkout cannot stall `ls`/`show`/`current` forever.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let branch = std::str::from_utf8(&output.stdout).ok()?.trim();
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()?
+        .read_to_string(&mut stdout)
+        .ok()?;
+    if stdout.len() > 4 * 1024 {
+        return None;
+    }
+    let branch = stdout.trim();
     (!branch.is_empty()).then(|| branch.to_owned())
 }
 
