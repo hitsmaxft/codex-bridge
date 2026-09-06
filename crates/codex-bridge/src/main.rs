@@ -724,6 +724,53 @@ fn weekly_usage(rate_limits: &Value) -> Option<Value> {
     }))
 }
 
+fn composer_model_options(response: &Value) -> Vec<Value> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.get("model").and_then(Value::as_str)?;
+            let efforts = model
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|effort| {
+                    Some(json!({
+                        "id": effort.get("reasoningEffort")?.as_str()?,
+                        "description": effort.get("description").and_then(Value::as_str),
+                    }))
+                })
+                .collect::<Vec<_>>();
+            (!efforts.is_empty()).then(|| {
+                json!({
+                    "id": id,
+                    "name": model.get("displayName").and_then(Value::as_str).unwrap_or(id),
+                    "description": model.get("description").and_then(Value::as_str),
+                    "default_effort": model.get("defaultReasoningEffort").and_then(Value::as_str),
+                    "efforts": efforts,
+                })
+            })
+        })
+        .collect()
+}
+
+fn model_supports(options: &[Value], model: &str, effort: &str) -> bool {
+    options.iter().any(|option| {
+        option.get("id").and_then(Value::as_str) == Some(model)
+            && option
+                .get("efforts")
+                .and_then(Value::as_array)
+                .is_some_and(|efforts| {
+                    efforts
+                        .iter()
+                        .any(|item| item.get("id").and_then(Value::as_str) == Some(effort))
+                })
+    })
+}
+
 fn dispatch(
     request: Request,
     socket_path: &Path,
@@ -965,6 +1012,52 @@ fn dispatch(
                     .and_then(Value::as_str),
                 "weekly_usage": rate_limits.as_ref().and_then(weekly_usage),
             }))
+        }
+        Request::ComposerOptions => {
+            match write_backend
+                .app_server_rpc("model/list", json!({"limit": 100, "includeHidden": false}))
+            {
+                Ok(result) => Response::success(json!({
+                    "models": composer_model_options(&result),
+                })),
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::ThreadSettingsUpdate {
+            thread_id,
+            model,
+            effort,
+        } => {
+            if model.is_empty() || model.len() > 128 || effort.is_empty() || effort.len() > 32 {
+                return Response::error(
+                    "invalid_request",
+                    "model and effort must be non-empty and reasonably sized",
+                );
+            }
+            let available = match write_backend
+                .app_server_rpc("model/list", json!({"limit": 100, "includeHidden": false}))
+            {
+                Ok(result) => composer_model_options(&result),
+                Err(error) => return write_backend_error(error),
+            };
+            if !model_supports(&available, &model, &effort) {
+                return Response::error(
+                    "invalid_thread_settings",
+                    "the selected model and reasoning effort are not currently available",
+                );
+            }
+            match write_backend.app_server_rpc(
+                "thread/settings/update",
+                json!({"threadId": thread_id, "model": model, "effort": effort}),
+            ) {
+                Ok(_) => Response::success(json!({
+                    "action": "thread_settings_update",
+                    "thread_id": thread_id,
+                    "model": model,
+                    "reasoning_effort": effort,
+                })),
+                Err(error) => write_backend_error(error),
+            }
         }
         Request::Select { thread_id } => {
             let thread = match thread_by_id(session_store, &thread_id) {
@@ -1914,6 +2007,30 @@ mod tests {
     }
 
     #[test]
+    fn composer_options_keep_only_supported_model_effort_pairs() {
+        let response = json!({"data":[
+            {
+                "model":"gpt-test",
+                "displayName":"GPT Test",
+                "description":"Test model",
+                "defaultReasoningEffort":"medium",
+                "supportedReasoningEfforts":[
+                    {"reasoningEffort":"low","description":"Fast"},
+                    {"reasoningEffort":"medium","description":"Balanced"}
+                ]
+            },
+            {"model":"gpt-empty","supportedReasoningEfforts":[]}
+        ]});
+        let options = composer_model_options(&response);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0]["id"], "gpt-test");
+        assert_eq!(options[0]["efforts"][1]["id"], "medium");
+        assert!(model_supports(&options, "gpt-test", "low"));
+        assert!(!model_supports(&options, "gpt-test", "high"));
+        assert!(!model_supports(&options, "gpt-missing", "low"));
+    }
+
+    #[test]
     fn embedded_web_ui_uses_split_data_feeds_and_keeps_raw_protocol_access() {
         let html = include_str!("web_ui.html");
         for command in [
@@ -1924,6 +2041,8 @@ mod tests {
             "tool_content",
             "thread_activity",
             "composer_status",
+            "composer_options",
+            "thread_settings_update",
             "select",
             "current",
             "status",
@@ -1955,7 +2074,7 @@ mod tests {
         assert!(html.contains("window.addEventListener('pagehide',persistDrafts)"));
         assert!(html.contains("正在压缩上下文…"));
         assert!(html.contains("周剩余 ${weekly.remaining_percent}%"));
-        assert!(html.contains("思考 ${r.reasoning_effort}"));
+        assert!(html.contains("思考 ${state.composerEffort}"));
         assert!(html.contains("-webkit-text-size-adjust:100%"));
         assert!(html.contains("document.activeElement?.blur()"));
         assert!(html.contains("m.role==='assistant'"));
@@ -1968,6 +2087,8 @@ mod tests {
         assert!(html.contains("animation:edge-flow var(--glow-speed) linear infinite"));
         assert!(html.contains("width:17px;height:17px"));
         assert!(html.contains("transform:rotate(225deg)"));
+        assert!(html.contains("id=\"modelPicker\""));
+        assert!(html.contains("thread_settings_update"));
         assert!(!html.contains("sessionStorage"));
     }
 

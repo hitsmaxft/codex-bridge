@@ -21,7 +21,7 @@ pub use write_backend::{
     BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +61,12 @@ pub enum Request {
     },
     ComposerStatus {
         thread_id: String,
+    },
+    ComposerOptions,
+    ThreadSettingsUpdate {
+        thread_id: String,
+        model: String,
+        effort: String,
     },
     Select {
         thread_id: String,
@@ -119,6 +125,8 @@ impl Request {
             Self::ToolContent { .. } => "tool_content",
             Self::ThreadActivity { .. } => "thread_activity",
             Self::ComposerStatus { .. } => "composer_status",
+            Self::ComposerOptions => "composer_options",
+            Self::ThreadSettingsUpdate { .. } => "thread_settings_update",
             Self::Select { .. } => "select",
             Self::Current => "current",
             Self::Status => "status",
@@ -294,6 +302,16 @@ mod tests {
         .unwrap();
         assert_eq!(composer["command"], "composer_status");
         assert_eq!(composer["thread_id"], "thread-1");
+
+        let settings = serde_json::to_value(Request::ThreadSettingsUpdate {
+            thread_id: "thread-1".into(),
+            model: "gpt-test".into(),
+            effort: "high".into(),
+        })
+        .unwrap();
+        assert_eq!(settings["command"], "thread_settings_update");
+        assert_eq!(settings["model"], "gpt-test");
+        assert_eq!(settings["effort"], "high");
     }
 
     #[test]
