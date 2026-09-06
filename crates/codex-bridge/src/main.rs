@@ -1891,6 +1891,9 @@ mod tests {
         assert!(html.contains(".tools select option{background:#fff;color:#151515}"));
         assert!(html.contains("id=\"outboxTray\""));
         assert!(html.contains("await refreshPending()"));
+        assert!(html.contains("bindSwipe(document.querySelector('main'),1"));
+        assert!(html.contains("bindSwipe($('sidebar'),-1"));
+        assert!(html.contains("touch-action:pan-y"));
         assert!(!html.contains("sessionStorage"));
     }
 
