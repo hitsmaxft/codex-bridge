@@ -1,6 +1,6 @@
 # codexapp-cli
 
-[Project site](https://hitsmaxft.github.io/codexapp-cli/) · Local CLI · Private Web UI · Codex Desktop
+[Project site](https://gh.bhee.online/codexapp-cli/) · Local CLI · Private Web UI · Codex Desktop
 
 `codexapp-cli` wraps a running Codex Desktop as a local CLI/RPC service. Following
 [DESIGN.md](DESIGN.md), it uses a hybrid architecture with separate read and write paths:
