@@ -707,6 +707,23 @@ fn basic_auth_required() -> HttpResponse {
     response
 }
 
+fn weekly_usage(rate_limits: &Value) -> Option<Value> {
+    let snapshot = rate_limits.get("rateLimits")?;
+    let window = [snapshot.get("primary"), snapshot.get("secondary")]
+        .into_iter()
+        .flatten()
+        .find(|window| {
+            window.get("windowDurationMins").and_then(Value::as_i64) == Some(7 * 24 * 60)
+        })?;
+    let used_percent = window.get("usedPercent")?.as_i64()?.clamp(0, 100);
+    Some(json!({
+        "remaining_percent": 100 - used_percent,
+        "used_percent": used_percent,
+        "resets_at": window.get("resetsAt").and_then(Value::as_i64),
+        "window_duration_mins": 7 * 24 * 60,
+    }))
+}
+
 fn dispatch(
     request: Request,
     socket_path: &Path,
@@ -929,6 +946,26 @@ fn dispatch(
             ),
             Err(error) => backend_error(error),
         },
+        Request::ComposerStatus { thread_id } => {
+            let thread = match write_backend.app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            ) {
+                Ok(result) => result,
+                Err(error) => return write_backend_error(error),
+            };
+            let rate_limits = write_backend
+                .app_server_rpc("account/rateLimits/read", json!({}))
+                .ok();
+            Response::success(json!({
+                "thread_id": thread_id,
+                "model": thread.pointer("/thread/model").and_then(Value::as_str),
+                "reasoning_effort": thread
+                    .pointer("/thread/reasoningEffort")
+                    .and_then(Value::as_str),
+                "weekly_usage": rate_limits.as_ref().and_then(weekly_usage),
+            }))
+        }
         Request::Select { thread_id } => {
             let thread = match thread_by_id(session_store, &thread_id) {
                 Ok(thread) => thread,
@@ -1859,6 +1896,21 @@ mod tests {
     }
 
     #[test]
+    fn weekly_usage_reports_remaining_percent_from_the_seven_day_window() {
+        let limits = json!({
+            "rateLimits": {
+                "primary": {"usedPercent": 34, "resetsAt": 1789147537, "windowDurationMins": 10080},
+                "secondary": null
+            }
+        });
+        let usage = weekly_usage(&limits).unwrap();
+        assert_eq!(usage["remaining_percent"], 66);
+        assert_eq!(usage["used_percent"], 34);
+        assert_eq!(usage["resets_at"], 1789147537);
+        assert!(weekly_usage(&json!({"rateLimits":{"primary":{"usedPercent":12,"windowDurationMins":300}}})).is_none());
+    }
+
+    #[test]
     fn embedded_web_ui_uses_split_data_feeds_and_keeps_raw_protocol_access() {
         let html = include_str!("web_ui.html");
         for command in [
@@ -1868,6 +1920,7 @@ mod tests {
             "message_content",
             "tool_content",
             "thread_activity",
+            "composer_status",
             "select",
             "current",
             "status",
@@ -1897,6 +1950,9 @@ mod tests {
         assert!(html.contains("codex-bridge.drafts.v1"));
         assert!(html.contains("saveDraft(state.current.id,$('messageText').value,true)"));
         assert!(html.contains("window.addEventListener('pagehide',persistDrafts)"));
+        assert!(html.contains("正在压缩上下文…"));
+        assert!(html.contains("周剩余 ${weekly.remaining_percent}%"));
+        assert!(html.contains("思考 ${r.reasoning_effort}"));
         assert!(!html.contains("sessionStorage"));
     }
 

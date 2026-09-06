@@ -21,7 +21,7 @@ pub use write_backend::{
     BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +57,9 @@ pub enum Request {
         tool_index: u32,
     },
     ThreadActivity {
+        thread_id: String,
+    },
+    ComposerStatus {
         thread_id: String,
     },
     Select {
@@ -115,6 +118,7 @@ impl Request {
             Self::MessageContent { .. } => "message_content",
             Self::ToolContent { .. } => "tool_content",
             Self::ThreadActivity { .. } => "thread_activity",
+            Self::ComposerStatus { .. } => "composer_status",
             Self::Select { .. } => "select",
             Self::Current => "current",
             Self::Status => "status",
@@ -283,6 +287,13 @@ mod tests {
         .unwrap();
         assert_eq!(activity["command"], "thread_activity");
         assert_eq!(activity["thread_id"], "thread-1");
+
+        let composer = serde_json::to_value(Request::ComposerStatus {
+            thread_id: "thread-1".into(),
+        })
+        .unwrap();
+        assert_eq!(composer["command"], "composer_status");
+        assert_eq!(composer["thread_id"], "thread-1");
     }
 
     #[test]
