@@ -1060,16 +1060,34 @@ fn dispatch(
                 Ok(result) => result,
                 Err(error) => return write_backend_error(error),
             };
-            let rate_limits = write_backend
-                .app_server_rpc("account/rateLimits/read", json!({}))
-                .ok();
+            let (weekly_usage, weekly_usage_error) =
+                match write_backend.app_server_rpc("account/rateLimits/read", json!({})) {
+                    Ok(rate_limits) => match weekly_usage(&rate_limits) {
+                        Some(usage) => (Some(usage), None),
+                        None => (
+                            None,
+                            Some(json!({
+                                "code": "weekly_usage_unavailable",
+                                "message": "app-server response did not include seven-day usage",
+                            })),
+                        ),
+                    },
+                    Err(error) => (
+                        None,
+                        Some(json!({
+                            "code": error.code,
+                            "message": error.message,
+                        })),
+                    ),
+                };
             Response::success(json!({
                 "thread_id": thread_id,
                 "model": thread.pointer("/thread/model").and_then(Value::as_str),
                 "reasoning_effort": thread
                     .pointer("/thread/reasoningEffort")
                     .and_then(Value::as_str),
-                "weekly_usage": rate_limits.as_ref().and_then(weekly_usage),
+                "weekly_usage": weekly_usage,
+                "weekly_usage_error": weekly_usage_error,
             }))
         }
         Request::ComposerOptions => {
@@ -2160,6 +2178,9 @@ mod tests {
         assert!(html.contains("window.addEventListener('pagehide',persistDrafts)"));
         assert!(html.contains("正在压缩上下文…"));
         assert!(html.contains("周剩余 ${weekly.remaining_percent}%"));
+        assert!(html.contains("id=\"usageHealth\""));
+        assert!(html.contains("服务异常 · 等待恢复"));
+        assert!(html.contains("setUsageUnavailable"));
         assert!(html.contains("思考 ${state.composerEffort}"));
         assert!(html.contains("-webkit-text-size-adjust:100%"));
         assert!(html.contains("document.activeElement?.blur()"));
