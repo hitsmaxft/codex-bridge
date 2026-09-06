@@ -1,8 +1,8 @@
-# codexapp-cli
+# codex-bridge
 
-[Project site](https://gh.bhee.online/codexapp-cli/) · Local CLI · Private Web UI · Codex Desktop
+[Project site](https://gh.bhee.online/codex-bridge/) · Local CLI · Private Web UI · Codex Desktop
 
-`codexapp-cli` wraps a running Codex Desktop as a local CLI/RPC service. Following
+`codex-bridge` wraps a running Codex Desktop as a local CLI/RPC service. Following
 [DESIGN.md](DESIGN.md), it uses a hybrid architecture with separate read and write paths:
 rollout/app-server state is used to read sessions, while writes are performed by the Codex CLI.
 A Chromium CDP channel is reserved for UI operations that have not yet been implemented.

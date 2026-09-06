@@ -1,4 +1,4 @@
-# codexapp-cli — Turning the Codex App into a CLI
+# codex-bridge — Turning the Codex App into a CLI
 
 ## Goal
 
@@ -259,7 +259,7 @@ Future priorities for the target architecture:
 ## Project structure (suggested)
 
 ```
-codexapp-cli/
+codex-bridge/
 ├── DESIGN.md          # this design document
 ├── Cargo.toml         # workspace
 ├── crates/

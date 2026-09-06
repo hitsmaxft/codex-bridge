@@ -1,4 +1,4 @@
-# codexapp-cli Initial Debugging & Fix Guide
+# codex-bridge Initial Debugging & Fix Guide
 
 This guide is for a third-party agent taking over this repository. The goal is to start `codex-bridge` and `codexctl` without disturbing a running Codex Desktop, validate the read path and write backends against isolated fixtures, track down protocol, rollout parsing, or Codex CLI invocation issues, and land regression-safe fixes.
 
@@ -68,10 +68,10 @@ Key limits:
 
 ## 4. Build and unit tests
 
-In the commands below, `/path/to/codexapp-cli` stands for this repository's root on your machine; replace it with the real absolute path. Run from the repository root:
+In the commands below, `/path/to/codex-bridge` stands for this repository's root on your machine; replace it with the real absolute path. Run from the repository root:
 
 ```sh
-cd /path/to/codexapp-cli
+cd /path/to/codex-bridge
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo test --workspace
 ```
@@ -79,7 +79,7 @@ CARGO_INCREMENTAL=0 cargo test --workspace
 The project's Rust artifacts all share the repository root's `target`. Don't create a new long-lived target for routine debugging. If you work in a linked worktree, explicitly reuse the main project's target:
 
 ```sh
-CARGO_TARGET_DIR=/path/to/main/codexapp-cli/target \
+CARGO_TARGET_DIR=/path/to/main/codex-bridge/target \
   CARGO_INCREMENTAL=0 cargo test --workspace
 ```
 
@@ -103,15 +103,15 @@ Tests must use only temporary directories or repository fixtures; they must not 
 First build the binaries:
 
 ```sh
-cd /path/to/codexapp-cli
+cd /path/to/codex-bridge
 CARGO_INCREMENTAL=0 cargo build --workspace
 ```
 
 In terminal A, create a temporary socket directory and start the daemon:
 
 ```sh
-cd /path/to/codexapp-cli
-debug_root="$(mktemp -d "${TMPDIR:-/tmp}/codexapp-cli.XXXXXX")"
+cd /path/to/codex-bridge
+debug_root="$(mktemp -d "${TMPDIR:-/tmp}/codex-bridge.XXXXXX")"
 bridge_socket="$debug_root/control.sock"
 printf 'bridge socket: %s\n' "$bridge_socket"
 ./target/debug/codex-bridge \
@@ -129,7 +129,7 @@ codex-bridge listening on /private/var/.../control.sock
 Copy the absolute socket path printed in terminal A into terminal B:
 
 ```sh
-cd /path/to/codexapp-cli
+cd /path/to/codex-bridge
 bridge_socket='/private/var/.../control.sock'
 ```
 
@@ -222,7 +222,7 @@ If the first check fails, stop the cleanup and verify the daemon's state first; 
 4. Don't clean the whole repository target; only clean this project's package artifacts:
 
 ```sh
-cd /path/to/codexapp-cli
+cd /path/to/codex-bridge
 cargo clean -p codexctl
 cargo clean -p codex-bridge
 ```
@@ -395,7 +395,7 @@ Only after the user explicitly permits it may the daemon point at the real Codex
 
 ```sh
 codex_state_dir="${CODEX_HOME:-${HOME}/.codex}"
-debug_root="$(mktemp -d "${TMPDIR:-/tmp}/codexapp-cli-live-read.XXXXXX")"
+debug_root="$(mktemp -d "${TMPDIR:-/tmp}/codex-bridge-live-read.XXXXXX")"
 bridge_socket="$debug_root/control.sock"
 ./target/debug/codex-bridge \
   --socket "$bridge_socket" \
@@ -424,7 +424,7 @@ If the user further explicitly permits real writes, start with a single identifi
 
 ```sh
 ./target/debug/codexctl --socket "$bridge_socket" select <THREAD_ID>
-./target/debug/codexctl --socket "$bridge_socket" send 'codexapp-cli write smoke test'
+./target/debug/codexctl --socket "$bridge_socket" send 'codex-bridge write smoke test'
 ```
 
 Only after confirming the queue message reaches the right thread, and that the target thread is held by the designated shared app-server instance, should you separately request steer and interrupt acceptance. The three must be logged separately:

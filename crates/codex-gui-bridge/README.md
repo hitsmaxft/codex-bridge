@@ -49,8 +49,8 @@ installed ChatGPT Desktop bundle and the managed standalone Codex package under
 checkout:
 
 ```sh
-git clone https://github.com/hitsmaxft/codexapp-cli.git
-cd codexapp-cli
+git clone https://github.com/hitsmaxft/codex-bridge.git
+cd codex-bridge
 CARGO_TARGET_DIR="$PWD/target" CARGO_INCREMENTAL=0 \
   cargo install --locked --path crates/codex-gui-bridge --bins
 ```

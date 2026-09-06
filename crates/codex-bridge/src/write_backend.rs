@@ -561,7 +561,7 @@ mod tests {
             .expect("set CODEX_BRIDGE_TEST_APP_SERVER_SOCKET to a standalone daemon socket");
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let cwd = std::env::temp_dir().join(format!(
-            "codexapp-cli-live-steer-{}-{sequence}",
+            "codex-bridge-live-steer-{}-{sequence}",
             std::process::id(),
         ));
         std::fs::create_dir_all(&cwd).unwrap();

@@ -2154,7 +2154,7 @@ mod tests {
             name: "exec".into(),
             status: "completed".into(),
             input: Value::String(
-                r#"const r = await tools.exec_command({cmd:"CARGO_INCREMENTAL=0 cargo build --release --locked && launchctl kickstart -k gui/501/com.lunghaa.codex-bridge",workdir:"/workspace/codexapp-cli",yield_time_ms:30000,max_output_tokens:20000}); text(JSON.stringify(r))"#.into(),
+                r#"const r = await tools.exec_command({cmd:"CARGO_INCREMENTAL=0 cargo build --release --locked && launchctl kickstart -k gui/501/com.lunghaa.codex-bridge",workdir:"/workspace/codex-bridge",yield_time_ms:30000,max_output_tokens:20000}); text(JSON.stringify(r))"#.into(),
             ),
             output: None,
         };
@@ -2166,7 +2166,7 @@ mod tests {
             parsed_tool_input(&tool).unwrap(),
             json!({
                 "cmd": "CARGO_INCREMENTAL=0 cargo build --release --locked && launchctl kickstart -k gui/501/com.lunghaa.codex-bridge",
-                "workdir": "/workspace/codexapp-cli",
+                "workdir": "/workspace/codex-bridge",
                 "yield_time_ms": 30000,
                 "max_output_tokens": 20000,
             })
