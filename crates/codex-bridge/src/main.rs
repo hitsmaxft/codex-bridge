@@ -2181,7 +2181,7 @@ mod tests {
         assert!(html.contains("id=\"usageHealth\""));
         assert!(html.contains("服务异常 · 等待恢复"));
         assert!(html.contains("setUsageUnavailable"));
-        assert!(html.contains("思考 ${state.composerEffort}"));
+        assert!(html.contains("[state.composerModel,state.composerEffort]"));
         assert!(html.contains("-webkit-text-size-adjust:100%"));
         assert!(html.contains("document.activeElement?.blur()"));
         assert!(html.contains("m.role==='assistant'"));
