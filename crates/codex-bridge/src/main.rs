@@ -1962,6 +1962,8 @@ mod tests {
         assert!(html.contains("toLocaleTimeString"));
         assert!(html.contains("contain:inline-size"));
         assert!(html.contains("settleHorizontalPosition()"));
+        assert!(html.contains("--glow-base:#0a84ff4d"));
+        assert!(html.contains("--glow-base:#20a94a47"));
         assert!(!html.contains("sessionStorage"));
     }
 
