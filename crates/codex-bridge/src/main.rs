@@ -23,6 +23,7 @@ use codex_bridge::{
     HostExecutor, Request, Response, SessionStore, ThreadMessage, ThreadSummary, ThreadToolCall,
     APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -96,11 +97,13 @@ struct WebAuth {
 
 #[derive(Debug, Clone, Serialize)]
 struct PendingMessage {
-    id: u64,
+    id: String,
     thread_id: String,
     text: String,
     action: String,
     status: String,
+    source: String,
+    #[serde(skip)]
     after_message_index: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -113,15 +116,19 @@ struct PendingMessages {
 }
 
 impl PendingMessages {
-    fn begin(&self, thread_id: &str, text: &str, action: &str, after_message_index: i64) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    fn begin(&self, thread_id: &str, text: &str, action: &str, after_message_index: i64) -> String {
+        let id = format!(
+            "bridge-{}",
+            self.next_id.fetch_add(1, Ordering::Relaxed) + 1
+        );
         if let Ok(mut entries) = self.entries.write() {
             entries.push(PendingMessage {
-                id,
+                id: id.clone(),
                 thread_id: thread_id.to_owned(),
                 text: text.to_owned(),
                 action: action.to_owned(),
                 status: format!("{action}ing"),
+                source: "bridge".to_owned(),
                 after_message_index,
                 error: None,
             });
@@ -129,7 +136,7 @@ impl PendingMessages {
         id
     }
 
-    fn finish(&self, id: u64, status: &str, error: Option<String>) {
+    fn finish(&self, id: &str, status: &str, error: Option<String>) {
         if let Ok(mut entries) = self.entries.write() {
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
                 entry.status = status.to_owned();
@@ -161,8 +168,69 @@ impl PendingMessages {
             let is_landed = pending_message_landed(entry, messages, &mut landed);
             !is_landed
         });
-        entries.clone()
+        let mut combined = entries.clone();
+        for queued in read_codex_queue(session_store.home()) {
+            let duplicate = combined.iter().any(|entry| {
+                entry.thread_id == queued.thread_id
+                    && entry.action == "queue"
+                    && entry.text == queued.text
+            });
+            if !duplicate {
+                combined.push(queued);
+            }
+        }
+        combined
     }
+}
+
+fn read_codex_queue(codex_home: &Path) -> Vec<PendingMessage> {
+    let path = codex_home.join("queue_1.sqlite");
+    let Ok(connection) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) = connection.prepare(
+        "SELECT id, thread_id, payload_json FROM queued_items ORDER BY thread_id, queue_order",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok())
+        .filter_map(|(id, thread_id, payload)| {
+            let text = queue_payload_text(&payload)?;
+            Some(PendingMessage {
+                id,
+                thread_id,
+                text,
+                action: "queue".to_owned(),
+                status: "queued".to_owned(),
+                source: "codex_queue".to_owned(),
+                after_message_index: -1,
+                error: None,
+            })
+        })
+        .collect()
+}
+
+fn queue_payload_text(payload: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    let content = payload.get("UserInput")?.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn pending_message_landed(
@@ -932,7 +1000,7 @@ fn dispatch(
             );
             match write_backend.queue_message(&resolved.thread.id, &text) {
                 Ok(backend) => {
-                    pending_messages.finish(pending_id, "queued", None);
+                    pending_messages.finish(&pending_id, "queued", None);
                     Response::success(json!({
                         "action": "send",
                         "status": "queued",
@@ -943,7 +1011,7 @@ fn dispatch(
                     }))
                 }
                 Err(error) => {
-                    pending_messages.finish(pending_id, "failed", Some(error.message.clone()));
+                    pending_messages.finish(&pending_id, "failed", Some(error.message.clone()));
                     write_backend_error(error)
                 }
             }
@@ -977,7 +1045,7 @@ fn dispatch(
             );
             match write_backend.steer_via_app_server(&resolved.thread.id, &turn_id, &text) {
                 Ok(backend) => {
-                    pending_messages.finish(pending_id, "steered", None);
+                    pending_messages.finish(&pending_id, "steered", None);
                     Response::success(json!({
                         "action": "steer",
                         "status": "steered",
@@ -989,7 +1057,7 @@ fn dispatch(
                     }))
                 }
                 Err(error) => {
-                    pending_messages.finish(pending_id, "failed", Some(error.message.clone()));
+                    pending_messages.finish(&pending_id, "failed", Some(error.message.clone()));
                     write_backend_error(error)
                 }
             }
@@ -1735,7 +1803,7 @@ mod tests {
     fn bridge_pending_state_tracks_status_and_new_message_position() {
         let pending = PendingMessages::default();
         let id = pending.begin("thread-1", "same text", "queue", 1);
-        pending.finish(id, "queued", None);
+        pending.finish(&id, "queued", None);
         let entry = pending.entries.read().unwrap()[0].clone();
         assert_eq!(entry.status, "queued");
 
@@ -1765,6 +1833,14 @@ mod tests {
             &messages,
             &mut HashSet::new()
         ));
+
+        assert_eq!(
+            queue_payload_text(
+                r#"{"UserInput":{"client_id":"client-1","content":[{"type":"text","text":"queued from Codex","text_elements":[]}]}}"#
+            )
+            .as_deref(),
+            Some("queued from Codex")
+        );
     }
 
     #[test]
