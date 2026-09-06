@@ -1964,6 +1964,10 @@ mod tests {
         assert!(html.contains("settleHorizontalPosition()"));
         assert!(html.contains("--glow-base:#0a84ff4d"));
         assert!(html.contains("--glow-base:#20a94a47"));
+        assert!(html.contains("--glow-core:#d9eeff"));
+        assert!(html.contains("animation:edge-flow var(--glow-speed) linear infinite"));
+        assert!(html.contains("width:17px;height:17px"));
+        assert!(html.contains("transform:rotate(225deg)"));
         assert!(!html.contains("sessionStorage"));
     }
 
