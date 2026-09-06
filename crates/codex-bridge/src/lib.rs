@@ -21,7 +21,7 @@ pub use write_backend::{
     BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +84,7 @@ pub enum Request {
         message_id: Option<String>,
     },
     Pending,
+    PendingMessages,
     Approve {
         id: u64,
     },
@@ -123,6 +124,7 @@ impl Request {
             Self::Steer { .. } => "steer",
             Self::Scroll { .. } => "scroll",
             Self::Pending => "pending",
+            Self::PendingMessages => "pending_messages",
             Self::Approve { .. } => "approve",
             Self::Decline { .. } => "decline",
             Self::Interrupt { .. } => "interrupt",

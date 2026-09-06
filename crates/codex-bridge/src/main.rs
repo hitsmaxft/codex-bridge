@@ -1,9 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Context, Result};
@@ -21,6 +23,7 @@ use codex_bridge::{
     HostExecutor, Request, Response, SessionStore, ThreadMessage, ThreadSummary, ThreadToolCall,
     APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -76,6 +79,7 @@ struct BridgeState {
     write_backend: Arc<CodexCliBackend>,
     host_executor: Arc<HostExecutor>,
     selected_thread: Arc<RwLock<Option<String>>>,
+    pending_messages: Arc<PendingMessages>,
 }
 
 #[derive(Clone)]
@@ -88,6 +92,101 @@ struct WebState {
 struct WebAuth {
     username: String,
     password: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PendingMessage {
+    id: u64,
+    thread_id: String,
+    text: String,
+    action: String,
+    status: String,
+    after_message_index: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PendingMessages {
+    next_id: AtomicU64,
+    entries: RwLock<Vec<PendingMessage>>,
+}
+
+impl PendingMessages {
+    fn begin(&self, thread_id: &str, text: &str, action: &str, after_message_index: i64) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut entries) = self.entries.write() {
+            entries.push(PendingMessage {
+                id,
+                thread_id: thread_id.to_owned(),
+                text: text.to_owned(),
+                action: action.to_owned(),
+                status: format!("{action}ing"),
+                after_message_index,
+                error: None,
+            });
+        }
+        id
+    }
+
+    fn finish(&self, id: u64, status: &str, error: Option<String>) {
+        if let Ok(mut entries) = self.entries.write() {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.status = status.to_owned();
+                entry.error = error;
+            }
+        }
+    }
+
+    fn reconcile(&self, session_store: &SessionStore) -> Vec<PendingMessage> {
+        let Ok(mut entries) = self.entries.write() else {
+            return Vec::new();
+        };
+        let mut messages_by_thread = HashMap::new();
+        let mut landed = HashSet::new();
+        entries.retain(|entry| {
+            if entry.status == "failed" {
+                return true;
+            }
+            let messages = messages_by_thread
+                .entry(entry.thread_id.clone())
+                .or_insert_with(|| {
+                    session_store
+                        .read_thread(&entry.thread_id)
+                        .ok()
+                        .flatten()
+                        .map(|snapshot| snapshot.messages)
+                        .unwrap_or_default()
+                });
+            let is_landed = pending_message_landed(entry, messages, &mut landed);
+            !is_landed
+        });
+        entries.clone()
+    }
+}
+
+fn pending_message_landed(
+    entry: &PendingMessage,
+    messages: &[ThreadMessage],
+    landed: &mut HashSet<(String, usize, String)>,
+) -> bool {
+    messages
+        .iter()
+        .enumerate()
+        .skip((entry.after_message_index + 1).max(0) as usize)
+        .filter(|(_, message)| message.role == "user")
+        .flat_map(|(message_index, message)| {
+            message.content.iter().filter_map(move |content| {
+                content
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| (message_index, text))
+            })
+        })
+        .any(|(message_index, text)| {
+            let key = (entry.thread_id.clone(), message_index, text.to_owned());
+            text == entry.text && landed.insert(key)
+        })
 }
 
 #[tokio::main]
@@ -131,6 +230,7 @@ async fn main() -> Result<()> {
             .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?,
     );
     let selected_thread = Arc::new(RwLock::new(None));
+    let pending_messages = Arc::new(PendingMessages::default());
     let secure_existing_parent = args.socket.is_none()
         && env::var_os(SOCKET_ENV)
             .filter(|value| !value.is_empty())
@@ -159,6 +259,7 @@ async fn main() -> Result<()> {
         write_backend,
         host_executor,
         selected_thread,
+        pending_messages,
     };
 
     println!("codex-bridge listening on {}", socket_path.display());
@@ -324,6 +425,7 @@ async fn handle_connection(stream: UnixStream, state: BridgeState) -> Result<()>
                     &state.write_backend,
                     &state.host_executor,
                     &state.selected_thread,
+                    &state.pending_messages,
                 )
             })
             .await
@@ -438,6 +540,7 @@ async fn web_command(
             &bridge.write_backend,
             &bridge.host_executor,
             &bridge.selected_thread,
+            &bridge.pending_messages,
         )
     })
     .await
@@ -543,6 +646,7 @@ fn dispatch(
     write_backend: &CodexCliBackend,
     host_executor: &HostExecutor,
     selected_thread: &RwLock<Option<String>>,
+    pending_messages: &PendingMessages,
 ) -> Response {
     match request {
         Request::Status => Response::success(json!({
@@ -563,6 +667,9 @@ fn dispatch(
                     .is_ok_and(|metadata| metadata.file_type().is_socket()),
             },
             "host_executor": host_executor.summary(),
+        })),
+        Request::PendingMessages => Response::success(json!({
+            "messages": pending_messages.reconcile(session_store),
         })),
         Request::Ls {
             limit,
@@ -817,15 +924,28 @@ fn dispatch(
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
+            let pending_id = pending_messages.begin(
+                &resolved.thread.id,
+                &text,
+                "queue",
+                latest_message_index(session_store, &resolved.thread.id),
+            );
             match write_backend.queue_message(&resolved.thread.id, &text) {
-                Ok(backend) => Response::success(json!({
-                    "action": "send",
-                    "status": "queued",
-                    "thread_id": resolved.thread.id,
-                    "target": resolved.method,
-                    "backend": backend,
-                })),
-                Err(error) => write_backend_error(error),
+                Ok(backend) => {
+                    pending_messages.finish(pending_id, "queued", None);
+                    Response::success(json!({
+                        "action": "send",
+                        "status": "queued",
+                        "pending_id": pending_id,
+                        "thread_id": resolved.thread.id,
+                        "target": resolved.method,
+                        "backend": backend,
+                    }))
+                }
+                Err(error) => {
+                    pending_messages.finish(pending_id, "failed", Some(error.message.clone()));
+                    write_backend_error(error)
+                }
             }
         }
         Request::Steer { thread_id, text } => {
@@ -849,16 +969,29 @@ fn dispatch(
                 }
                 Err(error) => return backend_error(error),
             };
+            let pending_id = pending_messages.begin(
+                &resolved.thread.id,
+                &text,
+                "steer",
+                latest_message_index(session_store, &resolved.thread.id),
+            );
             match write_backend.steer_via_app_server(&resolved.thread.id, &turn_id, &text) {
-                Ok(backend) => Response::success(json!({
-                    "action": "steer",
-                    "status": "steered",
-                    "thread_id": resolved.thread.id,
-                    "target": resolved.method,
-                    "semantics": "app_server_steer",
-                    "backend": backend,
-                })),
-                Err(error) => write_backend_error(error),
+                Ok(backend) => {
+                    pending_messages.finish(pending_id, "steered", None);
+                    Response::success(json!({
+                        "action": "steer",
+                        "status": "steered",
+                        "pending_id": pending_id,
+                        "thread_id": resolved.thread.id,
+                        "target": resolved.method,
+                        "semantics": "app_server_steer",
+                        "backend": backend,
+                    }))
+                }
+                Err(error) => {
+                    pending_messages.finish(pending_id, "failed", Some(error.message.clone()));
+                    write_backend_error(error)
+                }
             }
         }
         Request::Interrupt { thread_id } => {
@@ -948,6 +1081,15 @@ struct ResolvedThread {
     thread: ThreadSummary,
     method: &'static str,
     authoritative: bool,
+}
+
+fn latest_message_index(session_store: &SessionStore, thread_id: &str) -> i64 {
+    session_store
+        .read_thread(thread_id)
+        .ok()
+        .flatten()
+        .map(|snapshot| snapshot.messages.len() as i64 - 1)
+        .unwrap_or(-1)
 }
 
 fn resolve_read_target(
@@ -1590,6 +1732,42 @@ mod tests {
     }
 
     #[test]
+    fn bridge_pending_state_tracks_status_and_new_message_position() {
+        let pending = PendingMessages::default();
+        let id = pending.begin("thread-1", "same text", "queue", 1);
+        pending.finish(id, "queued", None);
+        let entry = pending.entries.read().unwrap()[0].clone();
+        assert_eq!(entry.status, "queued");
+
+        let message = |role: &str, text: &str| ThreadMessage {
+            timestamp: None,
+            id: None,
+            role: role.to_owned(),
+            phase: None,
+            content: vec![json!({"type":"input_text","text":text})],
+            tools: Vec::new(),
+        };
+        let messages = vec![
+            message("user", "same text"),
+            message("assistant", "working"),
+            message("user", "same text"),
+        ];
+        let mut landed = HashSet::new();
+        assert!(pending_message_landed(&entry, &messages, &mut landed));
+        assert!(!pending_message_landed(&entry, &messages, &mut landed));
+
+        let after_new_message = PendingMessage {
+            after_message_index: 2,
+            ..entry
+        };
+        assert!(!pending_message_landed(
+            &after_new_message,
+            &messages,
+            &mut HashSet::new()
+        ));
+    }
+
+    #[test]
     fn embedded_web_ui_uses_split_data_feeds_and_keeps_raw_protocol_access() {
         let html = include_str!("web_ui.html");
         for command in [
@@ -1607,6 +1785,7 @@ mod tests {
             "steer",
             "scroll",
             "pending",
+            "pending_messages",
             "approve",
             "decline",
             "interrupt",
@@ -1619,6 +1798,9 @@ mod tests {
         assert!(html.contains("Any codex-bridge Request JSON"));
         assert!(html.contains("appendToolValue(body,r.tool.output)"));
         assert!(html.contains(".tools select option{background:#fff;color:#151515}"));
+        assert!(html.contains("id=\"outboxTray\""));
+        assert!(html.contains("await refreshPending()"));
+        assert!(!html.contains("sessionStorage"));
     }
 
     #[test]

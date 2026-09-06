@@ -37,6 +37,7 @@ struct CachedMessages {
 struct CachedActivity {
     processed_len: u64,
     active_turn_id: Option<String>,
+    active_tools: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +134,10 @@ pub struct ThreadActivity {
     pub updated_at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_tool: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -884,13 +889,21 @@ fn read_thread_activity(
             file_len,
             updated_at_ms,
             active_turn_id: cached.active_turn_id.clone(),
+            phase: activity_phase(&cached.active_turn_id, &cached.active_tools),
+            active_tool: cached.active_tools.last().map(|(_, name)| name.clone()),
         });
     }
 
-    let (start, mut active_turn_id) = cached
+    let (start, mut active_turn_id, mut active_tools) = cached
         .filter(|cached| cached.processed_len <= file_len)
-        .map(|cached| (cached.processed_len, cached.active_turn_id))
-        .unwrap_or((0, None));
+        .map(|cached| {
+            (
+                cached.processed_len,
+                cached.active_turn_id,
+                cached.active_tools,
+            )
+        })
+        .unwrap_or((0, None, Vec::new()));
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     file.seek(SeekFrom::Start(start))
@@ -913,7 +926,7 @@ fn read_thread_activity(
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        update_active_turn(&record, &mut active_turn_id);
+        update_activity(&record, &mut active_turn_id, &mut active_tools);
     }
     if let Ok(mut cache) = cache.lock() {
         cache.insert(
@@ -921,17 +934,66 @@ fn read_thread_activity(
             CachedActivity {
                 processed_len,
                 active_turn_id: active_turn_id.clone(),
+                active_tools: active_tools.clone(),
             },
         );
     }
     Ok(ThreadActivity {
         file_len,
         updated_at_ms,
+        phase: activity_phase(&active_turn_id, &active_tools),
+        active_tool: active_tools.last().map(|(_, name)| name.clone()),
         active_turn_id,
     })
 }
 
-fn update_active_turn(record: &Value, active_turn_id: &mut Option<String>) {
+fn activity_phase(
+    active_turn_id: &Option<String>,
+    active_tools: &[(String, String)],
+) -> Option<String> {
+    active_turn_id.as_ref()?;
+    Some(if active_tools.is_empty() {
+        "model".to_owned()
+    } else {
+        "tool".to_owned()
+    })
+}
+
+fn update_activity(
+    record: &Value,
+    active_turn_id: &mut Option<String>,
+    active_tools: &mut Vec<(String, String)>,
+) {
+    if record.get("type").and_then(Value::as_str) == Some("response_item") {
+        let payload = &record["payload"];
+        let payload_type = payload.get("type").and_then(Value::as_str);
+        let call_id = payload
+            .get("call_id")
+            .or_else(|| payload.get("id"))
+            .and_then(Value::as_str);
+        match payload_type {
+            Some("custom_tool_call" | "function_call") => {
+                if let Some(call_id) = call_id {
+                    active_tools.retain(|(existing, _)| existing != call_id);
+                    active_tools.push((
+                        call_id.to_owned(),
+                        payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_owned(),
+                    ));
+                }
+            }
+            Some("custom_tool_call_output" | "function_call_output") => {
+                if let Some(call_id) = call_id {
+                    active_tools.retain(|(existing, _)| existing != call_id);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
     if record.get("type").and_then(Value::as_str) != Some("event_msg") {
         return;
     }
@@ -939,11 +1001,15 @@ fn update_active_turn(record: &Value, active_turn_id: &mut Option<String>) {
     let event_type = payload.get("type").and_then(Value::as_str);
     let turn_id = payload.get("turn_id").and_then(Value::as_str);
     match event_type {
-        Some("task_started") => *active_turn_id = turn_id.map(str::to_owned),
+        Some("task_started") => {
+            *active_turn_id = turn_id.map(str::to_owned);
+            active_tools.clear();
+        }
         Some("task_complete" | "turn_aborted")
             if turn_id.is_none() || turn_id == active_turn_id.as_deref() =>
         {
             *active_turn_id = None;
+            active_tools.clear();
         }
         _ => {}
     }
@@ -1343,13 +1409,39 @@ mod tests {
             store.active_turn_id("thread-active").unwrap().as_deref(),
             Some("turn-active")
         );
+        assert_eq!(
+            store
+                .thread_activity("thread-active")
+                .unwrap()
+                .unwrap()
+                .phase,
+            Some("model".to_owned())
+        );
 
         let path = fixture
             .path
             .join("sessions/2026/08/30/rollout-active.jsonl");
         let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
         file.write_all(
-            br#"{"timestamp":"2026-08-30T01:00:04Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-active"}}
+            br#"{"timestamp":"2026-08-30T01:00:04Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"exec","status":"completed","input":"{}"}}
+"#,
+        )
+        .unwrap();
+        let activity = store.thread_activity("thread-active").unwrap().unwrap();
+        assert_eq!(activity.phase, Some("tool".to_owned()));
+        assert_eq!(activity.active_tool, Some("exec".to_owned()));
+
+        file.write_all(
+            br#"{"timestamp":"2026-08-30T01:00:05Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":"done"}}
+"#,
+        )
+        .unwrap();
+        let activity = store.thread_activity("thread-active").unwrap().unwrap();
+        assert_eq!(activity.phase, Some("model".to_owned()));
+        assert_eq!(activity.active_tool, None);
+
+        file.write_all(
+            br#"{"timestamp":"2026-08-30T01:00:06Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-active"}}
 "#,
         )
         .unwrap();
