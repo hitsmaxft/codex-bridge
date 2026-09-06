@@ -1,20 +1,51 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, ErrorKind, Read};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
+const GIT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
+const GIT_BRANCH_PARALLELISM: usize = 16;
+const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(3);
+const MESSAGE_CACHE_ENTRIES: usize = 4;
+
+type GitBranchCache = Arc<Mutex<HashMap<PathBuf, (Instant, Option<String>)>>>;
+
+#[derive(Debug, Clone)]
+struct SummaryCache {
+    refreshed_at: Instant,
+    threads: Vec<ThreadSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedMessages {
+    modified: Option<SystemTime>,
+    file_len: u64,
+    used_at: Instant,
+    messages: Arc<Vec<ThreadMessage>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedActivity {
+    processed_len: u64,
+    active_turn_id: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     codex_home: PathBuf,
+    git_branch_cache: GitBranchCache,
+    summary_cache: Arc<Mutex<Option<SummaryCache>>>,
+    message_cache: Arc<Mutex<HashMap<PathBuf, CachedMessages>>>,
+    activity_cache: Arc<Mutex<HashMap<PathBuf, CachedActivity>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +80,59 @@ pub struct ThreadMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     pub content: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ThreadToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThreadToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub status: String,
+    pub input: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub path: PathBuf,
+    pub name: String,
+    pub thread_count: usize,
+    pub archived_count: usize,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectThreadSummary {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub cwd: PathBuf,
+    pub git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub updated_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessagePage {
+    pub messages: Vec<ThreadMessage>,
+    pub start: usize,
+    pub end: usize,
+    pub total: usize,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadActivity {
+    pub file_len: u64,
+    pub updated_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +153,13 @@ pub fn default_codex_home() -> Result<PathBuf> {
 
 impl SessionStore {
     pub fn new(codex_home: PathBuf) -> Self {
-        Self { codex_home }
+        Self {
+            codex_home,
+            git_branch_cache: Arc::new(Mutex::new(HashMap::new())),
+            summary_cache: Arc::new(Mutex::new(None)),
+            message_cache: Arc::new(Mutex::new(HashMap::new())),
+            activity_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn home(&self) -> &Path {
@@ -81,8 +171,8 @@ impl SessionStore {
     }
 
     pub fn list_threads(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
-        let mut threads = self.scan_threads(include_archived)?;
-        populate_git_branches(&mut threads);
+        let mut threads = self.cached_threads(include_archived)?;
+        populate_git_branches(&mut threads, &self.git_branch_cache);
         Ok(threads)
     }
 
@@ -91,10 +181,10 @@ impl SessionStore {
         include_archived: bool,
         limit: usize,
     ) -> Result<(Vec<ThreadSummary>, usize)> {
-        let mut threads = self.scan_threads(include_archived)?;
+        let mut threads = self.cached_threads(include_archived)?;
         let available = threads.len();
         threads.truncate(limit);
-        populate_git_branches(&mut threads);
+        populate_git_branches(&mut threads, &self.git_branch_cache);
         Ok((threads, available))
     }
 
@@ -104,33 +194,107 @@ impl SessionStore {
 
     pub fn find_thread(&self, thread_id: &str) -> Result<Option<ThreadSummary>> {
         let mut thread = self
-            .scan_threads(true)?
+            .cached_threads(true)?
             .into_iter()
             .find(|thread| thread.id == thread_id);
         if let Some(thread) = &mut thread {
-            thread.git_branch = git_branch_for_cwd(&thread.cwd);
+            populate_git_branches(std::slice::from_mut(thread), &self.git_branch_cache);
         }
         Ok(thread)
     }
 
-    fn scan_threads(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
+    pub fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectSummary>> {
+        let threads = self.cached_threads(include_archived)?;
+        let mut projects = HashMap::<PathBuf, ProjectSummary>::new();
+        for thread in threads {
+            let path = project_root_for_cwd(&thread.cwd);
+            let entry = projects
+                .entry(path.clone())
+                .or_insert_with(|| ProjectSummary {
+                    name: project_name(&path),
+                    path,
+                    thread_count: 0,
+                    archived_count: 0,
+                    updated_at_ms: 0,
+                });
+            entry.thread_count += 1;
+            entry.archived_count += usize::from(thread.archived);
+            entry.updated_at_ms = entry.updated_at_ms.max(thread.updated_at_ms);
+        }
+        let mut projects = projects.into_values().collect::<Vec<_>>();
+        projects.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Ok(projects)
+    }
+
+    pub fn list_project_threads(
+        &self,
+        project_path: &Path,
+        include_archived: bool,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<ProjectThreadSummary>, usize)> {
+        let mut threads = self
+            .cached_threads(include_archived)?
+            .into_iter()
+            .filter(|thread| project_root_for_cwd(&thread.cwd) == project_path)
+            .collect::<Vec<_>>();
+        let available = threads.len();
+        if offset >= available {
+            return Ok((Vec::new(), available));
+        }
+        let end = available.min(offset.saturating_add(limit));
+        threads = threads[offset..end].to_vec();
+        populate_git_branches(&mut threads, &self.git_branch_cache);
+        Ok((
+            threads
+                .into_iter()
+                .map(ProjectThreadSummary::from)
+                .collect(),
+            available,
+        ))
+    }
+
+    fn cached_threads(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
+        if let Ok(cache) = self.summary_cache.lock() {
+            if let Some(cache) = cache.as_ref() {
+                if cache.refreshed_at.elapsed() <= SUMMARY_CACHE_TTL {
+                    return Ok(filter_archived(cache.threads.clone(), include_archived));
+                }
+            }
+        }
+
+        let threads = self.scan_threads()?;
+        if let Ok(mut cache) = self.summary_cache.lock() {
+            *cache = Some(SummaryCache {
+                refreshed_at: Instant::now(),
+                threads: threads.clone(),
+            });
+        }
+        Ok(filter_archived(threads, include_archived))
+    }
+
+    fn scan_threads(&self) -> Result<Vec<ThreadSummary>> {
         let titles = self.read_title_index()?;
         let mut files = Vec::new();
         collect_rollout_files(&self.codex_home.join("sessions"), false, &mut files)?;
-        if include_archived {
-            collect_rollout_files(&self.codex_home.join("archived_sessions"), true, &mut files)?;
-        }
+        collect_rollout_files(&self.codex_home.join("archived_sessions"), true, &mut files)?;
 
-        let mut by_id = HashMap::<String, ThreadSummary>::new();
+        let mut by_id = HashMap::<(String, bool), ThreadSummary>::new();
         for (path, archived) in files {
             let Some(summary) = read_rollout_summary(&path, archived, &titles)? else {
                 continue;
             };
 
-            match by_id.get(&summary.id) {
+            let key = (summary.id.clone(), summary.archived);
+            match by_id.get(&key) {
                 Some(existing) if existing.updated_at_ms >= summary.updated_at_ms => {}
                 _ => {
-                    by_id.insert(summary.id.clone(), summary);
+                    by_id.insert(key, summary);
                 }
             }
         }
@@ -150,18 +314,131 @@ impl SessionStore {
         let Some(summary) = summary else {
             return Ok(None);
         };
-        let messages = read_rollout_messages(&summary.rollout_path)?;
+        let messages = self
+            .messages_for_path(&summary.rollout_path)?
+            .as_ref()
+            .clone();
         Ok(Some(ThreadSnapshot {
             thread: summary,
             messages,
         }))
     }
 
-    pub fn active_turn_id(&self, thread_id: &str) -> Result<Option<String>> {
+    pub fn read_message_page(
+        &self,
+        thread_id: &str,
+        before: Option<usize>,
+        limit: usize,
+    ) -> Result<Option<(ThreadSummary, MessagePage)>> {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
-        read_active_turn_id(&summary.rollout_path)
+        let messages = self.messages_for_path(&summary.rollout_path)?;
+        let total = messages.len();
+        let end = before.unwrap_or(total).min(total);
+        let start = end.saturating_sub(limit);
+        Ok(Some((
+            summary,
+            MessagePage {
+                messages: messages[start..end].to_vec(),
+                start,
+                end,
+                total,
+                has_more: start > 0,
+            },
+        )))
+    }
+
+    pub fn read_message_content(
+        &self,
+        thread_id: &str,
+        message_index: usize,
+        content_index: usize,
+        content_end: Option<usize>,
+    ) -> Result<Option<Value>> {
+        let Some(summary) = self.find_thread(thread_id)? else {
+            return Ok(None);
+        };
+        let messages = self.messages_for_path(&summary.rollout_path)?;
+        let Some(message) = messages.get(message_index) else {
+            return Ok(None);
+        };
+        if let Some(end) = content_end {
+            if content_index >= end || end > message.content.len() {
+                return Ok(None);
+            }
+            return Ok(Some(Value::Array(
+                message.content[content_index..end].to_vec(),
+            )));
+        }
+        Ok(message.content.get(content_index).cloned())
+    }
+
+    pub fn read_tool_content(
+        &self,
+        thread_id: &str,
+        message_index: usize,
+        tool_index: usize,
+    ) -> Result<Option<ThreadToolCall>> {
+        let Some(summary) = self.find_thread(thread_id)? else {
+            return Ok(None);
+        };
+        let messages = self.messages_for_path(&summary.rollout_path)?;
+        Ok(messages
+            .get(message_index)
+            .and_then(|message| message.tools.get(tool_index))
+            .cloned())
+    }
+
+    fn messages_for_path(&self, path: &Path) -> Result<Arc<Vec<ThreadMessage>>> {
+        let metadata =
+            fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+        let modified = metadata.modified().ok();
+        let file_len = metadata.len();
+        if let Ok(mut cache) = self.message_cache.lock() {
+            if let Some(entry) = cache.get_mut(path) {
+                if entry.modified == modified && entry.file_len == file_len {
+                    entry.used_at = Instant::now();
+                    return Ok(entry.messages.clone());
+                }
+            }
+        }
+
+        let messages = Arc::new(read_rollout_messages(path)?);
+        if let Ok(mut cache) = self.message_cache.lock() {
+            if cache.len() >= MESSAGE_CACHE_ENTRIES && !cache.contains_key(path) {
+                let oldest = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.used_at)
+                    .map(|(path, _)| path.clone());
+                if let Some(oldest) = oldest {
+                    cache.remove(&oldest);
+                }
+            }
+            cache.insert(
+                path.to_path_buf(),
+                CachedMessages {
+                    modified,
+                    file_len,
+                    used_at: Instant::now(),
+                    messages: messages.clone(),
+                },
+            );
+        }
+        Ok(messages)
+    }
+
+    pub fn active_turn_id(&self, thread_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .thread_activity(thread_id)?
+            .and_then(|activity| activity.active_turn_id))
+    }
+
+    pub fn thread_activity(&self, thread_id: &str) -> Result<Option<ThreadActivity>> {
+        let Some(summary) = self.find_thread(thread_id)? else {
+            return Ok(None);
+        };
+        read_thread_activity(&summary.rollout_path, &self.activity_cache).map(Some)
     }
 
     fn read_title_index(&self) -> Result<HashMap<String, String>> {
@@ -201,6 +478,61 @@ impl SessionStore {
             .map(|(id, (_, title))| (id, title))
             .collect())
     }
+}
+
+impl From<ThreadSummary> for ProjectThreadSummary {
+    fn from(thread: ThreadSummary) -> Self {
+        Self {
+            id: thread.id,
+            title: thread.title,
+            cwd: thread.cwd,
+            git_branch: thread.git_branch,
+            created_at: thread.created_at,
+            updated_at_ms: thread.updated_at_ms,
+            source: thread.source,
+            archived: thread.archived,
+        }
+    }
+}
+
+fn filter_archived(mut threads: Vec<ThreadSummary>, include_archived: bool) -> Vec<ThreadSummary> {
+    if !include_archived {
+        threads.retain(|thread| !thread.archived);
+    }
+    let mut by_id = HashMap::<String, ThreadSummary>::new();
+    for thread in threads {
+        match by_id.get(&thread.id) {
+            Some(existing) if !existing.archived || thread.archived => {}
+            _ => {
+                by_id.insert(thread.id.clone(), thread);
+            }
+        }
+    }
+    let mut threads = by_id.into_values().collect::<Vec<_>>();
+    threads.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    threads
+}
+
+fn project_root_for_cwd(cwd: &Path) -> PathBuf {
+    for ancestor in cwd.ancestors() {
+        if ancestor.join(".git").exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    cwd.to_path_buf()
+}
+
+fn project_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Unknown project")
+        .to_owned()
 }
 
 fn collect_rollout_files(
@@ -243,7 +575,10 @@ fn read_rollout_summary(
     let mut source = None;
     let mut fallback_title = None;
 
-    for line in BufReader::new(file).lines() {
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
+        if line_number >= 64 {
+            break;
+        }
         let line = match line {
             Ok(line) => line,
             // A live rollout can end in a partially written UTF-8 sequence. The
@@ -259,13 +594,20 @@ fn read_rollout_summary(
 
         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
             let payload = &record["payload"];
+            if payload.get("source").is_some_and(is_internal_source) {
+                return Ok(None);
+            }
             id = string_field(payload, "id").or_else(|| string_field(payload, "session_id"));
             cwd = string_field(payload, "cwd").map(PathBuf::from);
             created_at =
                 string_field(payload, "timestamp").or_else(|| string_field(&record, "timestamp"));
             source = string_field(payload, "source");
 
-            if id.as_ref().is_some_and(|id| titles.contains_key(id)) {
+            if id.as_ref().is_some_and(|id| {
+                titles
+                    .get(id)
+                    .is_some_and(|title| real_user_text(title).is_some())
+            }) {
                 break;
             }
         } else if fallback_title.is_none() {
@@ -292,8 +634,12 @@ fn read_rollout_summary(
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or(0);
 
+    let indexed_title = titles
+        .get(&id)
+        .and_then(|title| real_user_text(title))
+        .map(str::to_owned);
     Ok(Some(ThreadSummary {
-        title: titles.get(&id).cloned().or(fallback_title),
+        title: indexed_title.or(fallback_title),
         id,
         cwd,
         git_branch: None,
@@ -305,13 +651,57 @@ fn read_rollout_summary(
     }))
 }
 
-fn populate_git_branches(threads: &mut [ThreadSummary]) {
-    let mut by_cwd = HashMap::<PathBuf, Option<String>>::new();
+fn populate_git_branches(threads: &mut [ThreadSummary], cache: &GitBranchCache) {
+    let now = Instant::now();
+    let mut by_cwd = cache
+        .lock()
+        .map(|mut cache| {
+            cache
+                .retain(|_, (cached_at, _)| now.duration_since(*cached_at) <= GIT_BRANCH_CACHE_TTL);
+            cache
+                .iter()
+                .map(|(cwd, (_, branch))| (cwd.clone(), branch.clone()))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let missing = threads
+        .iter()
+        .map(|thread| thread.cwd.clone())
+        .filter(|cwd| !by_cwd.contains_key(cwd))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let mut resolved = Vec::new();
+    for chunk in missing.chunks(GIT_BRANCH_PARALLELISM) {
+        let results = std::thread::scope(|scope| {
+            chunk
+                .iter()
+                .map(|cwd| {
+                    let cwd = cwd.clone();
+                    scope.spawn(move || {
+                        let branch = git_branch_for_cwd(&cwd);
+                        (cwd, branch)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .collect::<Vec<_>>()
+        });
+        by_cwd.extend(results.iter().cloned());
+        resolved.extend(results);
+    }
+
+    if let Ok(mut cache) = cache.lock() {
+        for (cwd, branch) in resolved {
+            cache.insert(cwd, (now, branch));
+        }
+    }
+
     for thread in threads {
-        thread.git_branch = by_cwd
-            .entry(thread.cwd.clone())
-            .or_insert_with(|| git_branch_for_cwd(&thread.cwd))
-            .clone();
+        thread.git_branch = by_cwd.get(&thread.cwd).cloned().flatten();
     }
 }
 
@@ -351,11 +741,7 @@ fn git_branch_for_cwd(cwd: &Path) -> Option<String> {
         return None;
     }
     let mut stdout = String::new();
-    child
-        .stdout
-        .take()?
-        .read_to_string(&mut stdout)
-        .ok()?;
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
     if stdout.len() > 4 * 1024 {
         return None;
     }
@@ -365,8 +751,9 @@ fn git_branch_for_cwd(cwd: &Path) -> Option<String> {
 
 fn read_rollout_messages(path: &Path) -> Result<Vec<ThreadMessage>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut messages = Vec::new();
+    let mut messages = Vec::<ThreadMessage>::new();
     let mut seen_ids = HashSet::new();
+    let mut tool_locations = HashMap::<String, (usize, usize)>::new();
 
     for line in BufReader::new(file).lines() {
         let line = match line {
@@ -385,7 +772,67 @@ fn read_rollout_messages(path: &Path) -> Result<Vec<ThreadMessage>> {
         }
 
         let payload = &record["payload"];
-        if payload.get("type").and_then(Value::as_str) != Some("message") {
+        let payload_type = payload.get("type").and_then(Value::as_str);
+        if matches!(payload_type, Some("custom_tool_call" | "function_call")) {
+            let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let message_index = messages
+                .last()
+                .filter(|message| message.role == "assistant")
+                .map(|_| messages.len() - 1)
+                .unwrap_or_else(|| {
+                    messages.push(ThreadMessage {
+                        timestamp: string_field(&record, "timestamp"),
+                        id: None,
+                        role: "assistant".to_owned(),
+                        phase: Some("tool".to_owned()),
+                        content: Vec::new(),
+                        tools: Vec::new(),
+                    });
+                    messages.len() - 1
+                });
+            let name = match (
+                payload.get("namespace").and_then(Value::as_str),
+                payload.get("name").and_then(Value::as_str),
+            ) {
+                (Some(namespace), Some(name)) => format!("{namespace}.{name}"),
+                (_, Some(name)) => name.to_owned(),
+                _ => "tool".to_owned(),
+            };
+            let input = payload
+                .get("input")
+                .or_else(|| payload.get("arguments"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let tool_index = messages[message_index].tools.len();
+            messages[message_index].tools.push(ThreadToolCall {
+                call_id: call_id.to_owned(),
+                name,
+                status: string_field(payload, "status").unwrap_or_else(|| "running".to_owned()),
+                input,
+                output: None,
+            });
+            tool_locations.insert(call_id.to_owned(), (message_index, tool_index));
+            continue;
+        }
+        if matches!(
+            payload_type,
+            Some("custom_tool_call_output" | "function_call_output")
+        ) {
+            let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(&(message_index, tool_index)) = tool_locations.get(call_id) {
+                let tool = &mut messages[message_index].tools[tool_index];
+                tool.output = payload.get("output").cloned();
+                if tool.status == "running" {
+                    tool.status = "completed".to_owned();
+                }
+            }
+            continue;
+        }
+        if payload_type != Some("message") {
             continue;
         }
         let Some(role) = payload.get("role").and_then(Value::as_str) else {
@@ -408,46 +855,98 @@ fn read_rollout_messages(path: &Path) -> Result<Vec<ThreadMessage>> {
             role: role.to_owned(),
             phase: string_field(payload, "phase"),
             content: content.clone(),
+            tools: Vec::new(),
         });
     }
 
     Ok(messages)
 }
 
-fn read_active_turn_id(path: &Path) -> Result<Option<String>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut active_turn_id = None;
+fn read_thread_activity(
+    path: &Path,
+    cache: &Arc<Mutex<HashMap<PathBuf, CachedActivity>>>,
+) -> Result<ThreadActivity> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    let file_len = metadata.len();
+    let updated_at_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    let cached = cache.lock().ok().and_then(|cache| cache.get(path).cloned());
+    if let Some(cached) = cached
+        .as_ref()
+        .filter(|cached| cached.processed_len == file_len)
+    {
+        return Ok(ThreadActivity {
+            file_len,
+            updated_at_ms,
+            active_turn_id: cached.active_turn_id.clone(),
+        });
+    }
 
-    for line in BufReader::new(file).lines() {
-        let line = match line {
-            Ok(line) => line,
+    let (start, mut active_turn_id) = cached
+        .filter(|cached| cached.processed_len <= file_len)
+        .map(|cached| (cached.processed_len, cached.active_turn_id))
+        .unwrap_or((0, None));
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut processed_len = start;
+    loop {
+        let mut line = String::new();
+        let bytes = match reader.read_line(&mut line) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::InvalidData => break,
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to read {}", path.display()));
             }
         };
+        if bytes == 0 || !line.ends_with('\n') {
+            break;
+        }
+        processed_len = processed_len.saturating_add(bytes as u64);
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if record.get("type").and_then(Value::as_str) != Some("event_msg") {
-            continue;
-        }
-
-        let payload = &record["payload"];
-        let event_type = payload.get("type").and_then(Value::as_str);
-        let turn_id = payload.get("turn_id").and_then(Value::as_str);
-        match event_type {
-            Some("task_started") => active_turn_id = turn_id.map(str::to_owned),
-            Some("task_complete" | "turn_aborted")
-                if turn_id.is_none() || turn_id == active_turn_id.as_deref() =>
-            {
-                active_turn_id = None;
-            }
-            _ => {}
-        }
+        update_active_turn(&record, &mut active_turn_id);
     }
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(
+            path.to_path_buf(),
+            CachedActivity {
+                processed_len,
+                active_turn_id: active_turn_id.clone(),
+            },
+        );
+    }
+    Ok(ThreadActivity {
+        file_len,
+        updated_at_ms,
+        active_turn_id,
+    })
+}
 
-    Ok(active_turn_id)
+fn update_active_turn(record: &Value, active_turn_id: &mut Option<String>) {
+    if record.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return;
+    }
+    let payload = &record["payload"];
+    let event_type = payload.get("type").and_then(Value::as_str);
+    let turn_id = payload.get("turn_id").and_then(Value::as_str);
+    match event_type {
+        Some("task_started") => *active_turn_id = turn_id.map(str::to_owned),
+        Some("task_complete" | "turn_aborted")
+            if turn_id.is_none() || turn_id == active_turn_id.as_deref() =>
+        {
+            *active_turn_id = None;
+        }
+        _ => {}
+    }
 }
 
 fn first_user_message_title(record: &Value) -> Option<String> {
@@ -466,6 +965,7 @@ fn first_user_message_title(record: &Value) -> Option<String> {
         .as_array()?
         .iter()
         .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter_map(real_user_text)
         .collect::<Vec<_>>()
         .join(" ");
     let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -476,15 +976,59 @@ fn first_user_message_title(record: &Value) -> Option<String> {
     }
 }
 
+fn real_user_text(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("# Files mentioned by the user:") {
+        return text
+            .split_once("## My request:")
+            .map(|(_, request)| request.trim())
+            .filter(|request| !request.is_empty());
+    }
+    if trimmed.starts_with(
+        "The following is the Codex agent history whose request action you are assessing.",
+    ) {
+        return text
+            .split_once("\n[1] user:")
+            .map(|(_, transcript)| transcript)
+            .and_then(|transcript| transcript.split_once("\n\n[2]").map(|(request, _)| request))
+            .map(str::trim)
+            .filter(|request| !request.is_empty());
+    }
+    if let Some(request) = trimmed.strip_prefix("[1] user:") {
+        return (!request.trim().is_empty()).then_some(request.trim());
+    }
+    let injected = trimmed.starts_with(">>> TRANSCRIPT DELTA START")
+        || trimmed.starts_with(">>> TRANSCRIPT START")
+        || trimmed.starts_with("<recommended_plugins>")
+        || trimmed.starts_with("# AGENTS.md instructions")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<permissions instructions>")
+        || trimmed.starts_with("<skills_instructions>")
+        || trimmed.starts_with("<collaboration_mode>")
+        || trimmed.starts_with("<multi_agent_mode>")
+        || trimmed.starts_with("<image name=")
+        || trimmed == "</image>";
+    (!injected && !trimmed.is_empty()).then_some(trimmed)
+}
+
 fn string_field(value: &Value, name: &str) -> Option<String> {
     value.get(name).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn is_internal_source(source: &Value) -> bool {
+    source
+        .as_object()
+        .is_some_and(|source| source.contains_key("subagent"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct Fixture {
         path: PathBuf,
@@ -497,8 +1041,9 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = env::temp_dir().join(format!(
-                "codex-bridge-session-test-{}-{nonce}",
-                std::process::id()
+                "codex-bridge-session-test-{}-{nonce}-{}",
+                std::process::id(),
+                FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(path.join("sessions/2026/08/30")).unwrap();
             Self { path }
@@ -575,6 +1120,161 @@ mod tests {
         assert_eq!(snapshot.messages[1].role, "assistant");
         assert_eq!(snapshot.thread.cwd, Path::new("/tmp/project"));
         assert_eq!(snapshot.thread.git_branch, None);
+    }
+
+    #[test]
+    fn groups_nested_session_directories_under_the_repository_root() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("workspace");
+        init_git_repo(&workspace, "main");
+        let first_cwd = workspace.join("crates/one");
+        let second_cwd = workspace.join("examples/two");
+        fs::create_dir_all(&first_cwd).unwrap();
+        fs::create_dir_all(&second_cwd).unwrap();
+        let first = format!(
+            r#"{{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{{"id":"thread-one","cwd":{},"source":"fixture"}}}}"#,
+            serde_json::to_string(&first_cwd).unwrap()
+        );
+        let second = format!(
+            r#"{{"timestamp":"2026-08-30T02:00:00Z","type":"session_meta","payload":{{"id":"thread-two","cwd":{},"source":"fixture"}}}}"#,
+            serde_json::to_string(&second_cwd).unwrap()
+        );
+        fixture.write_rollout("rollout-one.jsonl", &[&first]);
+        fixture.write_rollout("rollout-two.jsonl", &[&second]);
+
+        let store = SessionStore::new(fixture.path.clone());
+        let projects = store.list_projects(false).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, workspace);
+        assert_eq!(projects[0].thread_count, 2);
+
+        let (threads, available) = store
+            .list_project_threads(&projects[0].path, false, 0, 1)
+            .unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(available, 2);
+        assert_ne!(threads[0].cwd, projects[0].path);
+    }
+
+    #[test]
+    fn message_pages_only_return_the_requested_slice() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-page.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-page","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"m1","role":"user","content":[{"text":"one"}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","id":"m2","role":"assistant","content":[{"text":"two"}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:03Z","type":"response_item","payload":{"type":"message","id":"m3","role":"user","content":[{"text":"three"}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:04Z","type":"response_item","payload":{"type":"message","id":"m4","role":"assistant","content":[{"text":"four"}]}}"#,
+            ],
+        );
+        fs::write(
+            fixture.path.join("session_index.jsonl"),
+            r#"{"id":"thread-title","thread_name":"<environment_context>automatic</environment_context>","updated_at":"2026-08-30T01:00:03Z"}
+"#,
+        )
+        .unwrap();
+        let store = SessionStore::new(fixture.path.clone());
+
+        let (_, latest) = store
+            .read_message_page("thread-page", None, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!((latest.start, latest.end, latest.total), (2, 4, 4));
+        assert!(latest.has_more);
+        assert_eq!(latest.messages[0].id.as_deref(), Some("m3"));
+
+        let (_, older) = store
+            .read_message_page("thread-page", Some(latest.start), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!((older.start, older.end), (0, 2));
+        assert!(!older.has_more);
+        assert_eq!(older.messages[1].id.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn tool_calls_and_outputs_attach_to_the_preceding_assistant_message() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-tools.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-tools","cwd":"/tmp/project","source":"vscode"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"I will inspect it."}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"exec","status":"completed","input":"{\"cmd\":\"git status --short\"}"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":"clean"}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let snapshot = store.read_thread("thread-tools").unwrap().unwrap();
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].tools.len(), 1);
+        assert_eq!(snapshot.messages[0].tools[0].name, "exec");
+        assert_eq!(
+            snapshot.messages[0].tools[0]
+                .output
+                .as_ref()
+                .and_then(Value::as_str),
+            Some("clean")
+        );
+        assert_eq!(
+            store
+                .read_tool_content("thread-tools", 0, 0)
+                .unwrap()
+                .unwrap()
+                .call_id,
+            "call-1"
+        );
+    }
+
+    #[test]
+    fn fallback_title_skips_injected_user_context() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-title.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-title","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":">>> TRANSCRIPT DELTA START\nautomatic\n>>> TRANSCRIPT DELTA END"},{"type":"input_text","text":"<environment_context>automatic</environment_context>"}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real user request"}]}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let threads = store.list_threads(false).unwrap();
+        assert_eq!(threads[0].title.as_deref(), Some("real user request"));
+        assert_eq!(
+            real_user_text(
+                "The following is the Codex agent history whose request action you are assessing.\n\n>>> TRANSCRIPT START\n\n[1] user: original request\n\n[2] assistant: working"
+            ),
+            Some("original request")
+        );
+    }
+
+    #[test]
+    fn internal_subagent_rollouts_are_not_user_threads() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-user.jsonl",
+            &[r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-user","cwd":"/tmp/project","source":"vscode"}}"#],
+        );
+        fixture.write_rollout(
+            "rollout-guardian.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"session_meta","payload":{"id":"thread-guardian","cwd":"/tmp/project","source":{"subagent":{"other":"guardian"}}}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing."}]}}"#,
+            ],
+        );
+        fixture.write_rollout(
+            "rollout-worker.jsonl",
+            &[r#"{"timestamp":"2026-08-30T01:00:03Z","type":"session_meta","payload":{"id":"thread-worker","cwd":"/tmp/project","source":{"subagent":{"thread_spawn":{"parent_thread_id":"thread-user","depth":1}}}}}"#],
+        );
+
+        let store = SessionStore::new(fixture.path.clone());
+        let threads = store.list_threads(false).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "thread-user");
+        assert_eq!(store.list_projects(false).unwrap()[0].thread_count, 1);
+        assert!(store.find_thread("thread-guardian").unwrap().is_none());
     }
 
     #[test]

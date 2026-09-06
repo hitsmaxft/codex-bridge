@@ -96,6 +96,10 @@ impl CodexCliBackend {
         self.run_app_server_rpc("turn/interrupt", params, "codex_app_server_interrupt")
     }
 
+    pub fn app_server_rpc(&self, method: &str, params: Value) -> Result<Value, BackendFailure> {
+        self.with_app_server(method, params)
+    }
+
     fn run(&self, invocation: Invocation) -> Result<BackendSuccess, BackendFailure> {
         let mut command = Command::new(&self.program);
         command.args(&invocation.args).stdin(Stdio::null());
@@ -135,6 +139,16 @@ impl CodexCliBackend {
         params: Value,
         backend_name: &'static str,
     ) -> Result<BackendSuccess, BackendFailure> {
+        self.with_app_server(method, params)?;
+        Ok(BackendSuccess {
+            backend: backend_name.to_owned(),
+            exit_code: 0,
+            stdout: None,
+            stderr: None,
+        })
+    }
+
+    fn with_app_server(&self, method: &str, params: Value) -> Result<Value, BackendFailure> {
         let metadata =
             std::fs::metadata(&self.app_server_socket).map_err(|error| BackendFailure {
                 code: "app_server_unavailable",
@@ -205,15 +219,9 @@ impl CodexCliBackend {
                 "params": params
             }),
         )?;
-        ensure_rpc_success(wait_for_response(&mut websocket, 1, RPC_TIMEOUT)?)?;
+        let result = rpc_result(wait_for_response(&mut websocket, 1, RPC_TIMEOUT)?)?;
         let _ = websocket.close(None);
-
-        Ok(BackendSuccess {
-            backend: backend_name.to_owned(),
-            exit_code: 0,
-            stdout: None,
-            stderr: None,
-        })
+        Ok(result)
     }
 }
 
@@ -297,6 +305,10 @@ fn websocket_failure(context: &str, error: tungstenite::Error) -> BackendFailure
 }
 
 fn ensure_rpc_success(response: Value) -> Result<(), BackendFailure> {
+    rpc_result(response).map(|_| ())
+}
+
+fn rpc_result(response: Value) -> Result<Value, BackendFailure> {
     if let Some(error) = response.get("error") {
         let code = error.get("code").map(Value::to_string).unwrap_or_default();
         let message = error
@@ -308,13 +320,13 @@ fn ensure_rpc_success(response: Value) -> Result<(), BackendFailure> {
             message: format!("app-server error {code}: {message}"),
         });
     }
-    if response.get("result").is_none() {
-        return Err(BackendFailure {
+    match response.get("result") {
+        Some(result) => Ok(result.clone()),
+        None => Err(BackendFailure {
             code: "app_server_protocol_error",
             message: "app-server response has neither result nor error".to_owned(),
-        });
+        }),
     }
-    Ok(())
 }
 
 fn captured_text(bytes: &[u8]) -> Option<String> {
@@ -403,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn steer_and_interrupt_use_json_rpc_over_websocket_uds() {
+    fn steer_interrupt_and_generic_rpc_use_websocket_uds() {
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let sock_dir = std::env::temp_dir().join(format!(
             "codexctl-websocket-test-{}-{sequence}",
@@ -414,7 +426,7 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for stream in listener.incoming().take(2) {
+            for stream in listener.incoming().take(3) {
                 let mut websocket = tungstenite::accept(stream.unwrap()).unwrap();
 
                 requests.push(read_json(&mut websocket));
@@ -447,8 +459,13 @@ mod tests {
         let interrupt = backend.interrupt_turn("thread-1", "turn-1").unwrap();
         assert_eq!(interrupt.backend, "codex_app_server_interrupt");
 
+        let generic = backend
+            .app_server_rpc("thread/read", json!({"threadId": "thread-1"}))
+            .unwrap();
+        assert_eq!(generic, json!({}));
+
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 9);
         assert_eq!(requests[0]["method"], "initialize");
         assert_eq!(requests[1]["method"], "initialized");
         assert_eq!(requests[2]["method"], "turn/steer");
@@ -460,6 +477,10 @@ mod tests {
         assert_eq!(requests[5]["method"], "turn/interrupt");
         assert_eq!(requests[5]["params"]["threadId"], "thread-1");
         assert_eq!(requests[5]["params"]["turnId"], "turn-1");
+        assert_eq!(requests[6]["method"], "initialize");
+        assert_eq!(requests[7]["method"], "initialized");
+        assert_eq!(requests[8]["method"], "thread/read");
+        assert_eq!(requests[8]["params"]["threadId"], "thread-1");
 
         std::fs::remove_file(&sock_path).unwrap();
         std::fs::remove_dir(&sock_dir).unwrap();

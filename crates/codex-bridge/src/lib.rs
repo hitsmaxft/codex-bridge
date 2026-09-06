@@ -14,13 +14,14 @@ pub use host_executor::{
     MAX_HOST_EXEC_TIMEOUT_SECONDS,
 };
 pub use sessions::{
-    default_codex_home, SessionStore, ThreadMessage, ThreadSnapshot, ThreadSummary, CODEX_HOME_ENV,
+    default_codex_home, MessagePage, ProjectSummary, ProjectThreadSummary, SessionStore,
+    ThreadActivity, ThreadMessage, ThreadSnapshot, ThreadSummary, ThreadToolCall, CODEX_HOME_ENV,
 };
 pub use write_backend::{
     BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,6 +30,34 @@ pub enum Request {
     Ls {
         limit: u32,
         include_archived: bool,
+    },
+    Projects {
+        include_archived: bool,
+    },
+    ProjectThreads {
+        project_path: PathBuf,
+        include_archived: bool,
+        offset: u32,
+        limit: u32,
+    },
+    Messages {
+        thread_id: String,
+        before: Option<u32>,
+        limit: u32,
+    },
+    MessageContent {
+        thread_id: String,
+        message_index: u32,
+        content_index: u32,
+        content_end: Option<u32>,
+    },
+    ToolContent {
+        thread_id: String,
+        message_index: u32,
+        tool_index: u32,
+    },
+    ThreadActivity {
+        thread_id: String,
     },
     Select {
         thread_id: String,
@@ -69,12 +98,22 @@ pub enum Request {
         argv: Vec<String>,
         timeout_seconds: Option<u64>,
     },
+    AppServerRpc {
+        method: String,
+        params: serde_json::Value,
+    },
 }
 
 impl Request {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Ls { .. } => "ls",
+            Self::Projects { .. } => "projects",
+            Self::ProjectThreads { .. } => "project_threads",
+            Self::Messages { .. } => "messages",
+            Self::MessageContent { .. } => "message_content",
+            Self::ToolContent { .. } => "tool_content",
+            Self::ThreadActivity { .. } => "thread_activity",
             Self::Select { .. } => "select",
             Self::Current => "current",
             Self::Status => "status",
@@ -88,6 +127,7 @@ impl Request {
             Self::Decline { .. } => "decline",
             Self::Interrupt { .. } => "interrupt",
             Self::HostExec { .. } => "host_exec",
+            Self::AppServerRpc { .. } => "app_server_rpc",
         }
     }
 }
@@ -188,6 +228,62 @@ mod tests {
     }
 
     #[test]
+    fn web_index_and_message_requests_are_separately_pageable() {
+        let projects = serde_json::to_value(Request::Projects {
+            include_archived: false,
+        })
+        .unwrap();
+        assert_eq!(projects["command"], "projects");
+
+        let threads = serde_json::to_value(Request::ProjectThreads {
+            project_path: PathBuf::from("/tmp/project"),
+            include_archived: false,
+            offset: 50,
+            limit: 50,
+        })
+        .unwrap();
+        assert_eq!(threads["command"], "project_threads");
+        assert_eq!(threads["offset"], 50);
+
+        let messages = serde_json::to_value(Request::Messages {
+            thread_id: "thread-1".into(),
+            before: Some(90),
+            limit: 30,
+        })
+        .unwrap();
+        assert_eq!(messages["command"], "messages");
+        assert_eq!(messages["before"], 90);
+        assert_eq!(messages["limit"], 30);
+
+        let content = serde_json::to_value(Request::MessageContent {
+            thread_id: "thread-1".into(),
+            message_index: 12,
+            content_index: 2,
+            content_end: Some(8),
+        })
+        .unwrap();
+        assert_eq!(content["command"], "message_content");
+        assert_eq!(content["message_index"], 12);
+        assert_eq!(content["content_end"], 8);
+
+        let tool = serde_json::to_value(Request::ToolContent {
+            thread_id: "thread-1".into(),
+            message_index: 12,
+            tool_index: 3,
+        })
+        .unwrap();
+        assert_eq!(tool["command"], "tool_content");
+        assert_eq!(tool["tool_index"], 3);
+
+        let activity = serde_json::to_value(Request::ThreadActivity {
+            thread_id: "thread-1".into(),
+        })
+        .unwrap();
+        assert_eq!(activity["command"], "thread_activity");
+        assert_eq!(activity["thread_id"], "thread-1");
+    }
+
+    #[test]
     fn write_requests_carry_optional_thread_targets() {
         let request = Request::Send {
             thread_id: Some("thread-1".into()),
@@ -212,5 +308,17 @@ mod tests {
         assert_eq!(json["command"], "host_exec");
         assert_eq!(json["argv"][0], "wlink");
         assert_eq!(json["timeout_seconds"], 120);
+    }
+
+    #[test]
+    fn native_app_server_request_carries_method_and_params() {
+        let request = Request::AppServerRpc {
+            method: "thread/read".into(),
+            params: serde_json::json!({"threadId": "thread-1"}),
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["command"], "app_server_rpc");
+        assert_eq!(json["method"], "thread/read");
+        assert_eq!(json["params"]["threadId"], "thread-1");
     }
 }

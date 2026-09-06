@@ -1,5 +1,7 @@
 # codexapp-cli
 
+[Project site](https://hitsmaxft.github.io/codexapp-cli/) · Local CLI · Private Web UI · Codex Desktop
+
 `codexapp-cli` wraps a running Codex Desktop as a local CLI/RPC service. Following
 [DESIGN.md](DESIGN.md), it uses a hybrid architecture with separate read and write paths:
 rollout/app-server state is used to read sessions, while writes are performed by the Codex CLI.
@@ -76,10 +78,55 @@ cargo run -p codex-bridge
 cargo run -p codexctl -- status
 ```
 
+Start the optional Web UI with a same-user private password file:
+
+```sh
+chmod 600 ~/.codex-bridge/web-ui-password
+cargo run -p codex-bridge -- \
+  --web-ui \
+  --web-ui-user codex \
+  --web-ui-password-file ~/.codex-bridge/web-ui-password
+```
+
+The default listener is `127.0.0.1:18791`; use `--web-ui-listen IP:PORT` for another interface.
+HTTP Basic Auth is mandatory, and the daemon rejects password files that are not regular,
+same-user, and private from group/other users. It also checks browser `Host` and `Origin` headers;
+IP-address hosts and `localhost` are accepted on the configured port, while arbitrary hostnames
+are rejected. Binding a LAN interface exposes session content and write operations to that
+network, so use it only on a trusted LAN and keep the password private.
+
+The embedded UI first transfers a compact project index, then fetches sessions only for an opened
+project (50 at a time), and conversation messages only for the selected thread (30 at a time).
+Nested working directories are grouped under their nearest Git repository root. Older messages
+are prepended by cursor without retransmitting or rebuilding the messages already on screen.
+Internal `subagent` rollouts (including command-policy guardian evaluations) are excluded from the
+project counts and thread list, matching the user-visible Codex history. Session summaries and
+parsed messages are cached briefly in the daemon. The mobile layout follows
+a single-column Codex-style conversation view with project and tool drawers, touch-sized controls,
+an independently scrolling message area, and a safe-area-aware bottom composer. The composer has
+an explicit `Steer`/`Queue` mode selector and keeps submitted messages visible while they are being
+steered or queued. If no turn is active, a requested steer is automatically changed to queue/send.
+A lightweight incremental activity poll updates the running/idle indicator every 1.5 seconds and
+reloads messages only when the rollout changed and the reader is at the bottom; it does not poll
+the full conversation. Message text is rendered as safe Markdown. Automatically inserted transcript
+deltas, environment and instruction blocks, memory citations, and complete attachment groups are
+transferred as compact summaries; opening a summary fetches its full content on demand. Tool calls
+are likewise grouped below their preceding assistant message: the initial page includes only names,
+status, and short previews, while nested expansion loads full arguments and results.
+`exec_command` wrappers are reduced to their command and execution options; `apply_patch` wrappers
+are shown as edited file lists with added/deleted line counts and expose the full patch only after
+expansion. Session titles skip injected blocks. The HTML response disables browser caching so a
+restarted daemon is reflected by the next reload.
+
+The UI exposes the same typed request set as `codexctl`, including explicit session selection,
+send, steer, interrupt, approval commands, scroll, and allowlisted host execution. A one-shot
+native app-server RPC panel also covers methods that `codexctl` has not wrapped. Commands whose
+daemon backend is still a skeleton return the same `not_implemented` response in both interfaces.
+
 `status` is wired end to end through the CLI, JSON-lines protocol, and daemon. It returns service
-status, protocol version, and read-only rollout-store state. This first-stage backend does not
-connect to a running Codex App. It reads `$CODEX_HOME/sessions` (default: `~/.codex/sessions`) and
-`session_index.jsonl` instead:
+status, protocol version, and rollout-store state. Reads use `$CODEX_HOME/sessions` (default:
+`~/.codex/sessions`) and `session_index.jsonl` without resuming or taking ownership of a thread;
+writes use `codex queue` or the configured shared app-server control endpoint:
 
 ```sh
 codexctl ls --limit 20
