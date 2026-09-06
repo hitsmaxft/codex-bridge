@@ -1894,6 +1894,9 @@ mod tests {
         assert!(html.contains("bindSwipe(document.querySelector('main'),1"));
         assert!(html.contains("bindSwipe($('sidebar'),-1"));
         assert!(html.contains("touch-action:pan-y"));
+        assert!(html.contains("codex-bridge.drafts.v1"));
+        assert!(html.contains("saveDraft(state.current.id,$('messageText').value,true)"));
+        assert!(html.contains("window.addEventListener('pagehide',persistDrafts)"));
         assert!(!html.contains("sessionStorage"));
     }
 
