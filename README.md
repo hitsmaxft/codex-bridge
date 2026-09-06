@@ -95,6 +95,19 @@ IP-address hosts and `localhost` are accepted on the configured port, while arbi
 are rejected. Binding a LAN interface exposes session content and write operations to that
 network, so use it only on a trusted LAN and keep the password private.
 
+When the UI is published through an HTTPS reverse proxy such as Cloudflare Tunnel, add the exact
+external origin. The value may be repeated for multiple trusted hostnames:
+
+```sh
+codex-bridge --web-ui --web-ui-listen 127.0.0.1:47653 \
+  --web-ui-user codex \
+  --web-ui-password-file ~/.codex-bridge/web-ui-password \
+  --web-ui-public-origin https://codex.example.com
+```
+
+Public origins must use HTTPS and cannot contain a path, query, or fragment. Their `Host` and
+`Origin` values are matched exactly; arbitrary proxied hostnames remain rejected.
+
 The embedded UI first transfers a compact project index, then fetches sessions only for an opened
 project (50 at a time), and conversation messages only for the selected thread (30 at a time).
 Nested working directories are grouped under their nearest Git repository root. Older messages

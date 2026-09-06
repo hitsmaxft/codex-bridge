@@ -71,6 +71,10 @@ struct Args {
     /// Read the HTTP Basic Auth password from a same-user mode-0600 file.
     #[arg(long, value_name = "PATH")]
     web_ui_password_file: Option<PathBuf>,
+
+    /// Exact HTTPS origin allowed through a trusted reverse proxy. May be repeated.
+    #[arg(long, value_name = "HTTPS_ORIGIN")]
+    web_ui_public_origin: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -88,6 +92,13 @@ struct WebState {
     bridge: BridgeState,
     port: u16,
     auth: Arc<WebAuth>,
+    public_origins: Arc<Vec<WebOrigin>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebOrigin {
+    scheme: String,
+    authority: String,
 }
 
 struct WebAuth {
@@ -312,6 +323,11 @@ async fn main() -> Result<()> {
         .web_ui
         .then(|| load_web_auth(&args.web_ui_user, args.web_ui_password_file.as_deref()))
         .transpose()?;
+    let web_public_origins = args
+        .web_ui_public_origin
+        .iter()
+        .map(|origin| parse_public_web_origin(origin))
+        .collect::<Result<Vec<_>>>()?;
 
     prepare_socket_path(&socket_path, secure_existing_parent).await?;
     let listener = UnixListener::bind(&socket_path)
@@ -344,6 +360,7 @@ async fn main() -> Result<()> {
             bridge: bridge_state.clone(),
             port: web_addr.port(),
             auth: Arc::new(web_auth.context("Web UI authentication is unavailable")?),
+            public_origins: Arc::new(web_public_origins),
         };
         println!("codex-bridge Web UI listening on http://{web_addr}/");
         Some(tokio::spawn(async move {
@@ -522,7 +539,7 @@ async fn web_index(State(state): State<WebState>, headers: HeaderMap) -> HttpRes
     if !basic_auth_allowed(&headers, &state.auth) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(&headers, state.port, false) {
+    if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let mut response = Html(include_str!("web_ui.html")).into_response();
@@ -541,12 +558,12 @@ async fn web_command(
     if !basic_auth_allowed(&headers, &state.auth) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(&headers, state.port, true) {
+    if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
         return (
             StatusCode::FORBIDDEN,
             Json(Response::error(
                 "forbidden",
-                "Web UI requests must come from this loopback origin",
+                "Web UI request Host and Origin are not allowed",
             )),
         )
             .into_response();
@@ -620,21 +637,32 @@ async fn web_command(
     }
 }
 
-fn web_headers_allowed(headers: &HeaderMap, port: u16, require_origin: bool) -> bool {
+fn web_headers_allowed(
+    headers: &HeaderMap,
+    port: u16,
+    require_origin: bool,
+    public_origins: &[WebOrigin],
+) -> bool {
     let Some(host) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
     else {
         return false;
     };
-    if !web_authority_allowed(host, port) {
+    if !web_authority_allowed(host, port)
+        && !public_origins
+            .iter()
+            .any(|origin| origin.authority.eq_ignore_ascii_case(host))
+    {
         return false;
     }
 
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok());
-    if require_origin && origin.is_some_and(|origin| !web_origin_allowed(origin, port)) {
+    if require_origin
+        && origin.is_some_and(|origin| !web_origin_allowed(origin, port, public_origins))
+    {
         return false;
     }
     true
@@ -656,14 +684,45 @@ fn web_authority_allowed(authority: &str, port: u16) -> bool {
             .is_ok()
 }
 
-fn web_origin_allowed(origin: &str, port: u16) -> bool {
+fn web_origin_allowed(origin: &str, port: u16, public_origins: &[WebOrigin]) -> bool {
     let Ok(uri) = origin.parse::<axum::http::Uri>() else {
         return false;
     };
-    uri.scheme_str() == Some("http")
+    let local = uri.scheme_str() == Some("http")
         && uri
             .authority()
-            .is_some_and(|authority| web_authority_allowed(authority.as_str(), port))
+            .is_some_and(|authority| web_authority_allowed(authority.as_str(), port));
+    local
+        || public_origins.iter().any(|allowed| {
+            uri.scheme_str()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(&allowed.scheme))
+                && uri.authority().is_some_and(|authority| {
+                    authority.as_str().eq_ignore_ascii_case(&allowed.authority)
+                })
+        })
+}
+
+fn parse_public_web_origin(value: &str) -> Result<WebOrigin> {
+    let uri = value
+        .parse::<axum::http::Uri>()
+        .with_context(|| format!("invalid --web-ui-public-origin {value:?}"))?;
+    let scheme = uri
+        .scheme_str()
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https"))
+        .context("--web-ui-public-origin must use https")?;
+    let authority = uri
+        .authority()
+        .context("--web-ui-public-origin must include a hostname")?;
+    if uri
+        .path_and_query()
+        .is_some_and(|path| path.as_str() != "/")
+    {
+        bail!("--web-ui-public-origin must not include a path, query, or fragment");
+    }
+    Ok(WebOrigin {
+        scheme: scheme.to_ascii_lowercase(),
+        authority: authority.as_str().to_ascii_lowercase(),
+    })
 }
 
 fn basic_auth_allowed(headers: &HeaderMap, auth: &WebAuth) -> bool {
@@ -1919,10 +1978,37 @@ mod tests {
 
     #[test]
     fn web_ui_rejects_cross_origin_browser_requests() {
-        assert!(web_origin_allowed("http://127.0.0.1:47653", 47653));
-        assert!(web_origin_allowed("http://192.168.1.20:47653", 47653));
-        assert!(!web_origin_allowed("https://localhost:47653", 47653));
-        assert!(!web_origin_allowed("https://example.com", 47653));
+        let public = vec![parse_public_web_origin("https://codex.example.com").unwrap()];
+        assert!(web_origin_allowed("http://127.0.0.1:47653", 47653, &public));
+        assert!(web_origin_allowed(
+            "http://192.168.1.20:47653",
+            47653,
+            &public
+        ));
+        assert!(web_origin_allowed(
+            "https://codex.example.com",
+            47653,
+            &public
+        ));
+        assert!(!web_origin_allowed(
+            "https://localhost:47653",
+            47653,
+            &public
+        ));
+        assert!(!web_origin_allowed("https://example.com", 47653, &public));
+    }
+
+    #[test]
+    fn public_web_origins_are_exact_https_origins() {
+        assert_eq!(
+            parse_public_web_origin("https://Codex.Example.com/").unwrap(),
+            WebOrigin {
+                scheme: "https".into(),
+                authority: "codex.example.com".into(),
+            }
+        );
+        assert!(parse_public_web_origin("http://codex.example.com").is_err());
+        assert!(parse_public_web_origin("https://codex.example.com/path").is_err());
     }
 
     #[test]
