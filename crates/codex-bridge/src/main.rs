@@ -1617,6 +1617,8 @@ mod tests {
         }
         assert!(html.contains("id=\"rawRequest\""));
         assert!(html.contains("Any codex-bridge Request JSON"));
+        assert!(html.contains("appendToolValue(body,r.tool.output)"));
+        assert!(html.contains(".tools select option{background:#fff;color:#151515}"));
     }
 
     #[test]
