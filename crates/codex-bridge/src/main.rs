@@ -2089,8 +2089,10 @@ mod tests {
         assert!(html.contains("transform:rotate(225deg)"));
         assert!(html.contains("id=\"modelPicker\""));
         assert!(html.contains("thread_settings_update"));
-        assert!(html.contains("prefers-color-scheme:dark"));
-        assert!(html.contains("--composer-surface:#1b1e1b"));
+        assert!(html.contains("prefers-color-scheme:light"));
+        assert!(html.contains("id=\"themeSelect\""));
+        assert!(html.contains("codex-bridge.theme.v1"));
+        assert!(html.contains("localStorage.getItem(THEME_STORAGE_KEY)||'dark'"));
         assert!(!html.contains("sessionStorage"));
     }
 
