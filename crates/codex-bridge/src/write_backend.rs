@@ -100,6 +100,23 @@ impl CodexCliBackend {
         self.with_app_server(method, params)
     }
 
+    pub fn latest_item_type(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<String>, BackendFailure> {
+        let result = self.with_app_server(
+            "thread/items/list",
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "limit": 1,
+                "sortDirection": "desc",
+            }),
+        )?;
+        Ok(latest_item_type_from_response(&result, turn_id))
+    }
+
     fn run(&self, invocation: Invocation) -> Result<BackendSuccess, BackendFailure> {
         let mut command = Command::new(&self.program);
         command.args(&invocation.args).stdin(Stdio::null());
@@ -223,6 +240,12 @@ impl CodexCliBackend {
         let _ = websocket.close(None);
         Ok(result)
     }
+}
+
+fn latest_item_type_from_response(response: &Value, expected_turn_id: &str) -> Option<String> {
+    let entry = response.get("data")?.as_array()?.first()?;
+    (entry.get("turnId")?.as_str()? == expected_turn_id)
+        .then(|| entry.pointer("/item/type")?.as_str().map(str::to_owned))?
 }
 
 fn queue_invocation(thread_id: &str, text: &str) -> Invocation {
@@ -402,6 +425,28 @@ mod tests {
         .unwrap_err();
         assert_eq!(failure.code, "app_server_rejected");
         assert!(failure.message.contains("turn id mismatch"));
+    }
+
+    #[test]
+    fn reads_latest_item_type_only_for_the_expected_turn() {
+        let response = json!({
+            "data": [{
+                "turnId": "turn-active",
+                "item": {"id": "item-1", "type": "contextCompaction"}
+            }]
+        });
+        assert_eq!(
+            latest_item_type_from_response(&response, "turn-active").as_deref(),
+            Some("contextCompaction")
+        );
+        assert_eq!(
+            latest_item_type_from_response(&response, "turn-other"),
+            None
+        );
+        assert_eq!(
+            latest_item_type_from_response(&json!({"data": []}), "turn-active"),
+            None
+        );
     }
 
     #[test]

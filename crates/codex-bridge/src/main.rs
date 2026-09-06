@@ -904,10 +904,25 @@ fn dispatch(
             Err(error) => backend_error(error),
         },
         Request::ThreadActivity { thread_id } => match session_store.thread_activity(&thread_id) {
-            Ok(Some(activity)) => Response::success(json!({
-                "thread_id": thread_id,
-                "activity": activity,
-            })),
+            Ok(Some(mut activity)) => {
+                if activity.phase.as_deref() == Some("model") {
+                    if let Some(turn_id) = activity.active_turn_id.as_deref() {
+                        if write_backend
+                            .latest_item_type(&thread_id, turn_id)
+                            .is_ok_and(|item_type| {
+                                item_type.as_deref() == Some("contextCompaction")
+                            })
+                        {
+                            activity.phase = Some("compacting".to_owned());
+                            activity.active_tool = None;
+                        }
+                    }
+                }
+                Response::success(json!({
+                    "thread_id": thread_id,
+                    "activity": activity,
+                }))
+            }
             Ok(None) => Response::error(
                 "thread_not_found",
                 format!("thread {thread_id} was not found in the rollout store"),
