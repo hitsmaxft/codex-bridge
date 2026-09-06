@@ -2063,7 +2063,7 @@ mod tests {
         assert!(html.contains("id=\"rawRequest\""));
         assert!(html.contains("Any codex-bridge Request JSON"));
         assert!(html.contains("appendToolValue(body,r.tool.output)"));
-        assert!(html.contains(".tools select option{background:#fff;color:#151515}"));
+        assert!(html.contains("input,textarea,select,select option{background:var(--panel)"));
         assert!(html.contains("id=\"outboxTray\""));
         assert!(html.contains("await refreshPending()"));
         assert!(html.contains("bindSwipe(document.querySelector('main'),1"));
@@ -2089,7 +2089,8 @@ mod tests {
         assert!(html.contains("transform:rotate(225deg)"));
         assert!(html.contains("id=\"modelPicker\""));
         assert!(html.contains("thread_settings_update"));
-        assert!(html.contains("select,select option{background:#fff;color:#151515"));
+        assert!(html.contains("prefers-color-scheme:dark"));
+        assert!(html.contains("--composer-surface:#1b1e1b"));
         assert!(!html.contains("sessionStorage"));
     }
 
