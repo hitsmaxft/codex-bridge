@@ -1960,6 +1960,8 @@ mod tests {
         assert!(html.contains("document.activeElement?.blur()"));
         assert!(html.contains("m.role==='assistant'"));
         assert!(html.contains("toLocaleTimeString"));
+        assert!(html.contains("contain:inline-size"));
+        assert!(html.contains("settleHorizontalPosition()"));
         assert!(!html.contains("sessionStorage"));
     }
 
