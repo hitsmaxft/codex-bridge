@@ -2089,6 +2089,7 @@ mod tests {
         assert!(html.contains("transform:rotate(225deg)"));
         assert!(html.contains("id=\"modelPicker\""));
         assert!(html.contains("thread_settings_update"));
+        assert!(html.contains("select,select option{background:#fff;color:#151515"));
         assert!(!html.contains("sessionStorage"));
     }
 
