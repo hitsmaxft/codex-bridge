@@ -1907,7 +1907,10 @@ mod tests {
         assert_eq!(usage["remaining_percent"], 66);
         assert_eq!(usage["used_percent"], 34);
         assert_eq!(usage["resets_at"], 1789147537);
-        assert!(weekly_usage(&json!({"rateLimits":{"primary":{"usedPercent":12,"windowDurationMins":300}}})).is_none());
+        assert!(weekly_usage(
+            &json!({"rateLimits":{"primary":{"usedPercent":12,"windowDurationMins":300}}})
+        )
+        .is_none());
     }
 
     #[test]
@@ -1953,6 +1956,10 @@ mod tests {
         assert!(html.contains("正在压缩上下文…"));
         assert!(html.contains("周剩余 ${weekly.remaining_percent}%"));
         assert!(html.contains("思考 ${r.reasoning_effort}"));
+        assert!(html.contains("-webkit-text-size-adjust:100%"));
+        assert!(html.contains("document.activeElement?.blur()"));
+        assert!(html.contains("m.role==='assistant'"));
+        assert!(html.contains("toLocaleTimeString"));
         assert!(!html.contains("sessionStorage"));
     }
 
