@@ -30,7 +30,7 @@ is available, tool groups are overlaid from typed `thread/turns/list` items such
 
 ## Web UI preview
 
-[Try the interactive Web UI demo](https://hitsmaxft.github.io/codex-bridge/demo/). It runs the
+[Try the interactive Web UI demo](https://gh.bhee.online/codex-bridge/demo/). It runs the
 same Vite frontend against a small Rust/WASM server in the browser, so its session navigation,
 typed tool details, model picker, responsive layout, and message handoff can be explored without
 connecting to a Mac. Demo submissions stay in the browser and do not contact Codex.
