@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "web-ui/**"
+      - "crates/codex-bridge-demo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -25,10 +29,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - name: Build demo server WASM
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build --locked --release --target wasm32-unknown-unknown -p codex-bridge-demo
+          mkdir -p target/codex-bridge-demo-public
+          cp target/wasm32-unknown-unknown/release/codex_bridge_demo.wasm \
+            target/codex-bridge-demo-public/codex_bridge_demo.wasm
+      - name: Build Pages site and interactive demo
+        run: |
+          mkdir -p _site
+          cp -R docs/. _site/
+          npm ci --prefix web-ui
+          VITE_CODEX_BRIDGE_DEMO=1 npm --prefix web-ui run build -- \
+            --base /codex-bridge/demo/ --outDir ../_site/demo
+          test -s _site/demo/codex_bridge_demo.wasm
+          grep -q "assets/app.js" _site/demo/index.html
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: docs
+          path: _site
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5

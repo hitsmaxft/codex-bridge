@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/codex-bridge",
+    "crates/codex-bridge-demo",
     "crates/codexctl",
     "crates/codex-gui-bridge",
 ]

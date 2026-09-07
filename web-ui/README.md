@@ -6,6 +6,12 @@ and pin or archive tasks without operating the Electron window directly. When di
 access is available, pins use the same native pinned section as Codex Desktop. It is not a
 standalone backend; all data and control requests go through the bridge daemon.
 
+GitHub Pages builds this same frontend with `VITE_CODEX_BRIDGE_DEMO=1`. In that build,
+`src/api.js` sends the existing request objects to the Rust `codex-bridge-demo` WebAssembly state
+machine instead of `/api/command`. The demo is deliberately local and finite: it provides sample
+sessions, pagination, typed tool details, model settings, and a simulated queue-to-response flow,
+but never connects to Codex or executes host operations.
+
 Clean Git states are hidden. Queued-message delivery uses compact, background-free status text in
 the empty lane beside the message, with its withdrawal action arranged vertically underneath.
 The lane only shows the withdrawal action while a message is buffered; transient delivery labels

@@ -30,6 +30,11 @@ is available, tool groups are overlaid from typed `thread/turns/list` items such
 
 ## Web UI preview
 
+[Try the interactive Web UI demo](https://hitsmaxft.github.io/codex-bridge/demo/). It runs the
+same Vite frontend against a small Rust/WASM server in the browser, so its session navigation,
+typed tool details, model picker, responsive layout, and message handoff can be explored without
+connecting to a Mac. Demo submissions stay in the browser and do not contact Codex.
+
 [<img src="docs/assets/codex-bridge-mobile.jpg" alt="codex-bridge mobile Web UI showing a live Codex task" width="360">](docs/assets/codex-bridge-mobile.jpg)
 
 The private browser UI keeps task history, tool activity, the creation-SHA Git diff, usage, model
@@ -55,6 +60,7 @@ codexctl / Web UI / local clients
 
 - `crates/codexctl`: the user-facing CLI, which encodes commands as JSON requests.
 - `crates/codex-bridge`: the local daemon and shared protocol, listening on a Unix socket.
+- `crates/codex-bridge-demo`: the finite Rust/WASM protocol simulator used only by GitHub Pages.
 - `web-ui`: the Vite frontend source and deterministic production bundle embedded by
   `codex-bridge`.
 - `crates/codex-gui-bridge`: Desktop/app-server transports. The deployed path is the transparent

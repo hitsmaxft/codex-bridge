@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { defineConfig } from "vite";
 
+const demoBuild = process.env.VITE_CODEX_BRIDGE_DEMO === "1";
+
 function fixedAssetCacheBuster() {
   return {
     name: "fixed-asset-cache-buster",
@@ -25,6 +27,7 @@ function fixedAssetCacheBuster() {
 export default defineConfig({
   plugins: [fixedAssetCacheBuster()],
   base: "/",
+  publicDir: demoBuild ? "../target/codex-bridge-demo-public" : false,
   server: {
     proxy: {
       "/api": "http://127.0.0.1:18791",
@@ -37,7 +40,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         entryFileNames: "assets/app.js",
-        chunkFileNames: "assets/[name].js",
+        chunkFileNames: "assets/[name]-[hash].js",
         assetFileNames: "assets/app[extname]",
       },
     },

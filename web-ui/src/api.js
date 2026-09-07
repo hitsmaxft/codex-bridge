@@ -1,12 +1,24 @@
 export const $ = (id) => document.getElementById(id);
 
-export async function command(request, showResult = true) {
+const demoMode = import.meta.env.VITE_CODEX_BRIDGE_DEMO === "1";
+let demoClient;
+
+async function sendCommand(request) {
+  if (demoMode) {
+    demoClient ||= import("./demo-client.js");
+    const client = await demoClient;
+    return client.demoCommand(request);
+  }
   const response = await fetch("/api/command", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
   });
-  const data = await response.json();
+  return response.json();
+}
+
+export async function command(request, showResult = true) {
+  const data = await sendCommand(request);
   if (showResult) {
     $("result").removeAttribute("data-i18n");
     $("result").textContent = JSON.stringify(data, null, 2);
@@ -38,3 +50,5 @@ export async function run(action) {
 export function timeText(milliseconds, locale) {
   return milliseconds ? new Date(milliseconds).toLocaleString(locale) : "";
 }
+
+export { demoMode };

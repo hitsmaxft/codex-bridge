@@ -1,5 +1,5 @@
 import "./styles.css";
-import { $, command, notify, run, timeText } from "./api.js";
+import { $, command, demoMode, notify, run, timeText } from "./api.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import {
@@ -10,6 +10,8 @@ import {
   saveDraft,
   state,
 } from "./state.js";
+document.documentElement.toggleAttribute("data-demo", demoMode);
+
 async function loadStatus() {
   const r = await command({ command: "status" }, false),
     backend = r.write_backend || {};
@@ -20,10 +22,12 @@ async function loadStatus() {
     : state.appServerMode === "desktop_bundled_only"
       ? tr("bundledPrivate")
       : tr("directOffline");
-  $("bridgeState").textContent = tr("bridgeReady", {
-    protocol: r.protocol_version,
-    backend: appServer,
-  });
+  $("bridgeState").textContent = r.demo
+    ? tr("demoReady", { protocol: r.protocol_version })
+    : tr("bridgeReady", {
+        protocol: r.protocol_version,
+        backend: appServer,
+      });
 }
 function setThreadHeaderExpanded(expanded) {
   if (!matchMedia("(max-width:800px)").matches) expanded = false;
