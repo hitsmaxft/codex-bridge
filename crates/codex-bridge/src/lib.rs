@@ -4,9 +4,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+mod app_server_schema;
 mod host_executor;
 mod sessions;
 mod write_backend;
+
+pub use app_server_schema::APP_SERVER_SCHEMA_VERSION;
 
 pub use host_executor::{
     HostExecFailure, HostExecPolicyConfig, HostExecPolicySummary, HostExecResult, HostExecutor,
@@ -18,10 +21,11 @@ pub use sessions::{
     ThreadActivity, ThreadMessage, ThreadSnapshot, ThreadSummary, ThreadToolCall, CODEX_HOME_ENV,
 };
 pub use write_backend::{
-    BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
+    AppServerRuntimeInfo, BackendFailure, BackendSuccess, CodexCliBackend, NativeQueueReceipt,
+    APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +61,9 @@ pub enum Request {
         tool_index: u32,
     },
     ThreadActivity {
+        thread_id: String,
+    },
+    ThreadWatch {
         thread_id: String,
     },
     ComposerStatus {
@@ -109,7 +116,9 @@ pub enum Request {
         message_id: Option<String>,
     },
     Pending,
-    PendingMessages,
+    PendingMessages {
+        thread_id: Option<String>,
+    },
     PendingMessageDelete {
         id: String,
         thread_id: String,
@@ -144,6 +153,7 @@ impl Request {
             Self::MessageContent { .. } => "message_content",
             Self::ToolContent { .. } => "tool_content",
             Self::ThreadActivity { .. } => "thread_activity",
+            Self::ThreadWatch { .. } => "thread_watch",
             Self::ComposerStatus { .. } => "composer_status",
             Self::ComposerOptions => "composer_options",
             Self::ThreadCreate { .. } => "thread_create",
@@ -161,7 +171,7 @@ impl Request {
             Self::Steer { .. } => "steer",
             Self::Scroll { .. } => "scroll",
             Self::Pending => "pending",
-            Self::PendingMessages => "pending_messages",
+            Self::PendingMessages { .. } => "pending_messages",
             Self::PendingMessageDelete { .. } => "pending_message_delete",
             Self::Approve { .. } => "approve",
             Self::Decline { .. } => "decline",

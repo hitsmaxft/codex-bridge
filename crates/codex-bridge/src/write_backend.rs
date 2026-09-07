@@ -1,13 +1,17 @@
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{mpsc as std_mpsc, Arc, RwLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::sync::broadcast;
 use tungstenite::{Message, WebSocket};
 
 pub const CODEX_BIN_ENV: &str = "CODEX_BRIDGE_CODEX_BIN";
@@ -15,11 +19,47 @@ pub const APP_SERVER_SOCKET_ENV: &str = "CODEX_BRIDGE_APP_SERVER_SOCKET";
 
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+const APP_SERVER_IDLE_POLL: Duration = Duration::from_millis(200);
+const APP_SERVER_EVENT_CAPACITY: usize = 512;
+const APP_SERVER_MAX_MESSAGE_BYTES: usize = 64 << 20;
 
 #[derive(Debug, Clone)]
 pub struct CodexCliBackend {
     program: PathBuf,
     app_server_socket: Option<PathBuf>,
+    app_server: Option<Arc<AppServerSession>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NativeQueueReceipt {
+    pub backend: String,
+    pub queued_submission_id: String,
+}
+
+#[derive(Debug)]
+enum AppServerCommand {
+    Rpc {
+        method: String,
+        params: Value,
+        response: std_mpsc::SyncSender<Result<Value, BackendFailure>>,
+    },
+    WatchThread {
+        thread_id: String,
+        response: std_mpsc::SyncSender<Result<Value, BackendFailure>>,
+    },
+}
+
+#[derive(Debug)]
+struct AppServerSession {
+    commands: std_mpsc::Sender<AppServerCommand>,
+    events: broadcast::Sender<Value>,
+    runtime: Arc<RwLock<AppServerRuntimeInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppServerRuntimeInfo {
+    pub connected: bool,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -47,9 +87,24 @@ struct Invocation {
 
 impl CodexCliBackend {
     pub fn new(program: PathBuf, app_server_socket: Option<PathBuf>) -> Self {
+        Self::new_with_thread_cache(program, app_server_socket, 3)
+    }
+
+    pub fn new_with_thread_cache(
+        program: PathBuf,
+        app_server_socket: Option<PathBuf>,
+        thread_cache_limit: usize,
+    ) -> Self {
+        let app_server = app_server_socket.as_ref().map(|socket| {
+            Arc::new(AppServerSession::spawn(
+                socket.clone(),
+                thread_cache_limit.max(1),
+            ))
+        });
         Self {
             program,
             app_server_socket,
+            app_server,
         }
     }
 
@@ -65,8 +120,60 @@ impl CodexCliBackend {
         &self,
         thread_id: &str,
         text: &str,
+        client_user_message_id: &str,
+    ) -> Result<NativeQueueReceipt, BackendFailure> {
+        let result = self.app_server_rpc(
+            "thread/queue/add",
+            json!({
+                "threadId": thread_id,
+                "input": [{
+                    "type": "text",
+                    "text": text,
+                    "text_elements": []
+                }],
+                "clientUserMessageId": client_user_message_id,
+            }),
+        )?;
+        let queued_submission_id = result
+            .pointer("/queuedSubmission/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| BackendFailure {
+                code: "app_server_protocol_error",
+                message: "thread/queue/add response has no queuedSubmission.id".to_owned(),
+            })?;
+        Ok(NativeQueueReceipt {
+            backend: "app_server_queue".to_owned(),
+            queued_submission_id: queued_submission_id.to_owned(),
+        })
+    }
+
+    pub fn queue_message_via_cli(
+        &self,
+        thread_id: &str,
+        text: &str,
     ) -> Result<BackendSuccess, BackendFailure> {
         self.run(queue_invocation(thread_id, text))
+    }
+
+    pub fn watch_thread(&self, thread_id: &str) -> Result<Value, BackendFailure> {
+        let app_server = self
+            .app_server
+            .as_ref()
+            .ok_or_else(app_server_unavailable)?;
+        app_server.watch_thread(thread_id)
+    }
+
+    pub fn subscribe_app_server_events(&self) -> Option<broadcast::Receiver<Value>> {
+        self.app_server
+            .as_ref()
+            .map(|session| session.events.subscribe())
+    }
+
+    pub fn app_server_runtime_info(&self) -> Option<AppServerRuntimeInfo> {
+        self.app_server
+            .as_ref()
+            .and_then(|session| session.runtime.read().ok().map(|info| info.clone()))
     }
 
     pub fn steer_via_app_server(
@@ -97,7 +204,11 @@ impl CodexCliBackend {
     }
 
     pub fn app_server_rpc(&self, method: &str, params: Value) -> Result<Value, BackendFailure> {
-        self.with_app_server(method, params)
+        let app_server = self
+            .app_server
+            .as_ref()
+            .ok_or_else(app_server_unavailable)?;
+        app_server.call(method, params)
     }
 
     pub fn latest_item_type(
@@ -105,7 +216,7 @@ impl CodexCliBackend {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<Option<String>, BackendFailure> {
-        let result = self.with_app_server(
+        let result = self.app_server_rpc(
             "thread/items/list",
             serde_json::json!({
                 "threadId": thread_id,
@@ -156,7 +267,7 @@ impl CodexCliBackend {
         params: Value,
         backend_name: &'static str,
     ) -> Result<BackendSuccess, BackendFailure> {
-        self.with_app_server(method, params)?;
+        self.app_server_rpc(method, params)?;
         Ok(BackendSuccess {
             backend: backend_name.to_owned(),
             exit_code: 0,
@@ -164,45 +275,249 @@ impl CodexCliBackend {
             stderr: None,
         })
     }
+}
 
-    fn with_app_server(&self, method: &str, params: Value) -> Result<Value, BackendFailure> {
-        let app_server_socket = self.app_server_socket.as_deref().ok_or_else(|| BackendFailure {
-            code: "app_server_unavailable",
-            message: "Desktop bundled app-server uses a private stdio connection; no external app-server endpoint is configured and standalone fallback is disabled".to_owned(),
-        })?;
-        let metadata = std::fs::metadata(app_server_socket).map_err(|error| BackendFailure {
-            code: "app_server_unavailable",
-            message: format!(
-                "cannot inspect app-server socket {}: {error}",
-                app_server_socket.display()
-            ),
-        })?;
-        if !metadata.file_type().is_socket() {
-            return Err(BackendFailure {
-                code: "app_server_unavailable",
-                message: format!(
-                    "app-server endpoint is not a Unix socket: {}",
-                    app_server_socket.display()
-                ),
-            });
+fn app_server_unavailable() -> BackendFailure {
+    BackendFailure {
+        code: "app_server_unavailable",
+        message: "Desktop bundled app-server uses a private stdio connection; no external app-server endpoint is configured and standalone fallback is disabled".to_owned(),
+    }
+}
+
+impl AppServerSession {
+    fn spawn(socket: PathBuf, thread_cache_limit: usize) -> Self {
+        let (command_tx, command_rx) = std_mpsc::channel();
+        let (events, _) = broadcast::channel(APP_SERVER_EVENT_CAPACITY);
+        let worker_events = events.clone();
+        let runtime = Arc::new(RwLock::new(AppServerRuntimeInfo {
+            connected: false,
+            user_agent: None,
+        }));
+        let worker_runtime = Arc::clone(&runtime);
+        thread::Builder::new()
+            .name("codex-app-server".to_owned())
+            .spawn(move || {
+                app_server_worker(
+                    socket,
+                    thread_cache_limit,
+                    command_rx,
+                    worker_events,
+                    worker_runtime,
+                )
+            })
+            .expect("failed to start app-server connection worker");
+        Self {
+            commands: command_tx,
+            events,
+            runtime,
         }
+    }
 
-        let stream = UnixStream::connect(app_server_socket).map_err(|error| BackendFailure {
+    fn call(&self, method: &str, params: Value) -> Result<Value, BackendFailure> {
+        let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+        self.commands
+            .send(AppServerCommand::Rpc {
+                method: method.to_owned(),
+                params,
+                response: response_tx,
+            })
+            .map_err(|_| BackendFailure {
+                code: "app_server_unavailable",
+                message: "app-server connection worker stopped".to_owned(),
+            })?;
+        response_rx
+            .recv_timeout(RPC_TIMEOUT + Duration::from_secs(2))
+            .map_err(|error| BackendFailure {
+                code: "app_server_timeout",
+                message: format!("failed waiting for app-server connection worker: {error}"),
+            })?
+    }
+
+    fn watch_thread(&self, thread_id: &str) -> Result<Value, BackendFailure> {
+        let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+        self.commands
+            .send(AppServerCommand::WatchThread {
+                thread_id: thread_id.to_owned(),
+                response: response_tx,
+            })
+            .map_err(|_| BackendFailure {
+                code: "app_server_unavailable",
+                message: "app-server connection worker stopped".to_owned(),
+            })?;
+        response_rx
+            .recv_timeout(RPC_TIMEOUT + Duration::from_secs(2))
+            .map_err(|error| BackendFailure {
+                code: "app_server_timeout",
+                message: format!("failed waiting for app-server thread subscription: {error}"),
+            })?
+    }
+}
+
+fn app_server_worker(
+    socket: PathBuf,
+    thread_cache_limit: usize,
+    commands: std_mpsc::Receiver<AppServerCommand>,
+    events: broadcast::Sender<Value>,
+    runtime: Arc<RwLock<AppServerRuntimeInfo>>,
+) {
+    let mut websocket = None;
+    let mut next_request_id = 1_i64;
+    let mut watched_threads = VecDeque::<String>::new();
+    loop {
+        match commands.recv_timeout(APP_SERVER_IDLE_POLL) {
+            Ok(command) => {
+                if let Err(error) = ensure_app_server_connection(
+                    &socket,
+                    &mut websocket,
+                    &mut next_request_id,
+                    &watched_threads,
+                    &events,
+                    &runtime,
+                ) {
+                    match command {
+                        AppServerCommand::Rpc { response, .. }
+                        | AppServerCommand::WatchThread { response, .. } => {
+                            let _ = response.send(Err(error));
+                        }
+                    }
+                    continue;
+                }
+                match command {
+                    AppServerCommand::Rpc {
+                        method,
+                        params,
+                        response,
+                    } => {
+                        let result = session_rpc(
+                            websocket.as_mut().expect("connection ensured"),
+                            &mut next_request_id,
+                            &method,
+                            params,
+                            &events,
+                        );
+                        if result.is_err() {
+                            websocket = None;
+                            emit_connection_event(&events, &runtime, "disconnected", None, None);
+                        }
+                        let _ = response.send(result.clone());
+                    }
+                    AppServerCommand::WatchThread {
+                        thread_id,
+                        response,
+                    } => {
+                        if let Some(index) = watched_threads.iter().position(|id| id == &thread_id)
+                        {
+                            watched_threads.remove(index);
+                            watched_threads.push_back(thread_id.clone());
+                            let result = Ok(json!({"threadId": thread_id, "cached": true}));
+                            let _ = response.send(result.clone());
+                        } else {
+                            let result = session_rpc(
+                                websocket.as_mut().expect("connection ensured"),
+                                &mut next_request_id,
+                                "thread/resume",
+                                json!({"threadId": thread_id, "excludeTurns": true}),
+                                &events,
+                            );
+                            if result.is_ok() {
+                                watched_threads.push_back(thread_id.clone());
+                                if watched_threads.len() > thread_cache_limit {
+                                    if let Some(evicted) = watched_threads.pop_front() {
+                                        let _ = session_rpc(
+                                            websocket.as_mut().expect("connection ensured"),
+                                            &mut next_request_id,
+                                            "thread/unsubscribe",
+                                            json!({"threadId": evicted}),
+                                            &events,
+                                        );
+                                    }
+                                }
+                            } else {
+                                websocket = None;
+                                emit_connection_event(
+                                    &events,
+                                    &runtime,
+                                    "disconnected",
+                                    None,
+                                    None,
+                                );
+                            }
+                            let _ = response.send(result.clone());
+                        }
+                    }
+                }
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(active) = websocket.as_mut() {
+                    match read_app_server_message(active, &events) {
+                        Ok(_) => {}
+                        Err(error) if error.code == "app_server_timeout" => {}
+                        Err(error) => {
+                            websocket = None;
+                            emit_connection_event(
+                                &events,
+                                &runtime,
+                                "disconnected",
+                                None,
+                                Some(&error.message),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn ensure_app_server_connection(
+    app_server_socket: &Path,
+    websocket: &mut Option<WebSocket<UnixStream>>,
+    next_request_id: &mut i64,
+    watched_threads: &VecDeque<String>,
+    events: &broadcast::Sender<Value>,
+    runtime: &Arc<RwLock<AppServerRuntimeInfo>>,
+) -> Result<(), BackendFailure> {
+    if websocket.is_some() {
+        return Ok(());
+    }
+    let metadata = std::fs::metadata(app_server_socket).map_err(|error| BackendFailure {
+        code: "app_server_unavailable",
+        message: format!(
+            "cannot inspect app-server socket {}: {error}",
+            app_server_socket.display()
+        ),
+    })?;
+    if !metadata.file_type().is_socket() {
+        return Err(BackendFailure {
             code: "app_server_unavailable",
             message: format!(
-                "failed to connect to app-server socket {}: {error}",
+                "app-server endpoint is not a Unix socket: {}",
                 app_server_socket.display()
             ),
+        });
+    }
+
+    let stream = UnixStream::connect(app_server_socket).map_err(|error| BackendFailure {
+        code: "app_server_unavailable",
+        message: format!(
+            "failed to connect to app-server socket {}: {error}",
+            app_server_socket.display()
+        ),
+    })?;
+    stream
+        .set_read_timeout(Some(RPC_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(RPC_TIMEOUT)))
+        .map_err(|error| BackendFailure {
+            code: "app_server_protocol_error",
+            message: format!("failed to configure app-server socket timeout: {error}"),
         })?;
-        stream
-            .set_read_timeout(Some(RPC_TIMEOUT))
-            .and_then(|()| stream.set_write_timeout(Some(RPC_TIMEOUT)))
-            .map_err(|error| BackendFailure {
-                code: "app_server_protocol_error",
-                message: format!("failed to configure app-server socket timeout: {error}"),
-            })?;
-        let (mut websocket, _response) =
-            tungstenite::client("ws://localhost/", stream).map_err(|error| match error {
+    let websocket_config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(APP_SERVER_MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(APP_SERVER_MAX_MESSAGE_BYTES));
+    let (mut connected, _response) =
+        tungstenite::client::client_with_config("ws://localhost/", stream, Some(websocket_config))
+            .map_err(|error| match error {
                 tungstenite::HandshakeError::Failure(error) => {
                     websocket_failure("upgrade app-server control socket", error)
                 }
@@ -212,36 +527,145 @@ impl CodexCliBackend {
                 },
             })?;
 
-        write_rpc_message(
-            &mut websocket,
-            &json!({
-                "id": 0,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {
-                        "name": "codex-bridge",
-                        "title": "codex-bridge",
-                        "version": env!("CARGO_PKG_VERSION")
-                    },
-                    "capabilities": {"experimentalApi": true}
-                }
-            }),
+    write_rpc_message(
+        &mut connected,
+        &json!({
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "codex-bridge",
+                    "title": "codex-bridge",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {"experimentalApi": true}
+            }
+        }),
+    )?;
+    let initialize = rpc_result(wait_for_response(&mut connected, 0, RPC_TIMEOUT)?)?;
+    write_rpc_message(
+        &mut connected,
+        &json!({"method": "initialized", "params": {}}),
+    )?;
+    connected
+        .get_mut()
+        .set_read_timeout(Some(APP_SERVER_IDLE_POLL))
+        .map_err(|error| BackendFailure {
+            code: "app_server_protocol_error",
+            message: format!("failed to configure app-server event timeout: {error}"),
+        })?;
+    let user_agent = initialize
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    emit_connection_event(events, runtime, "connected", user_agent.as_deref(), None);
+    for thread_id in watched_threads {
+        session_rpc(
+            &mut connected,
+            next_request_id,
+            "thread/resume",
+            json!({"threadId": thread_id, "excludeTurns": true}),
+            events,
         )?;
-        ensure_rpc_success(wait_for_response(&mut websocket, 0, RPC_TIMEOUT)?)?;
-
-        write_rpc_message(&mut websocket, &json!({"method": "initialized"}))?;
-        write_rpc_message(
-            &mut websocket,
-            &json!({
-                "id": 1,
-                "method": method,
-                "params": params
-            }),
-        )?;
-        let result = rpc_result(wait_for_response(&mut websocket, 1, RPC_TIMEOUT)?)?;
-        let _ = websocket.close(None);
-        Ok(result)
     }
+    *websocket = Some(connected);
+    Ok(())
+}
+
+fn session_rpc(
+    websocket: &mut WebSocket<UnixStream>,
+    next_request_id: &mut i64,
+    method: &str,
+    params: Value,
+    events: &broadcast::Sender<Value>,
+) -> Result<Value, BackendFailure> {
+    let id = *next_request_id;
+    *next_request_id = next_request_id.saturating_add(1);
+    websocket
+        .get_mut()
+        .set_read_timeout(Some(RPC_TIMEOUT))
+        .map_err(|error| BackendFailure {
+            code: "app_server_protocol_error",
+            message: format!("failed to configure app-server response timeout: {error}"),
+        })?;
+    write_rpc_message(
+        websocket,
+        &json!({"id": id, "method": method, "params": params}),
+    )?;
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(BackendFailure {
+                code: "app_server_timeout",
+                message: format!("timed out waiting for app-server response {id}"),
+            });
+        }
+        websocket
+            .get_mut()
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| BackendFailure {
+                code: "app_server_protocol_error",
+                message: format!("failed to update app-server response timeout: {error}"),
+            })?;
+        if let Some(response) = read_app_server_message(websocket, events)? {
+            if response.get("id").and_then(Value::as_i64) == Some(id) {
+                websocket
+                    .get_mut()
+                    .set_read_timeout(Some(APP_SERVER_IDLE_POLL))
+                    .ok();
+                return rpc_result(response);
+            }
+        }
+    }
+}
+
+fn read_app_server_message(
+    websocket: &mut WebSocket<UnixStream>,
+    events: &broadcast::Sender<Value>,
+) -> Result<Option<Value>, BackendFailure> {
+    let message = websocket
+        .read()
+        .map_err(|error| websocket_failure("read app-server message", error))?;
+    let Message::Text(payload) = message else {
+        return Ok(None);
+    };
+    let value = serde_json::from_str::<Value>(&payload).map_err(|error| BackendFailure {
+        code: "app_server_protocol_error",
+        message: format!("app-server returned invalid JSON: {error}"),
+    })?;
+    if value.get("method").is_some() {
+        let event_type = if value.get("id").is_some() {
+            "app_server_request"
+        } else {
+            "app_server"
+        };
+        let _ = events.send(json!({"type": event_type, "message": value}));
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn emit_connection_event(
+    events: &broadcast::Sender<Value>,
+    runtime: &Arc<RwLock<AppServerRuntimeInfo>>,
+    status: &str,
+    user_agent: Option<&str>,
+    error: Option<&str>,
+) {
+    if let Ok(mut info) = runtime.write() {
+        info.connected = status == "connected";
+        if user_agent.is_some() {
+            info.user_agent = user_agent.map(str::to_owned);
+        }
+    }
+    let _ = events.send(json!({
+        "type": "bridge_app_server_connection",
+        "status": status,
+        "user_agent": user_agent,
+        "error": error,
+    }));
 }
 
 fn latest_item_type_from_response(response: &Value, expected_turn_id: &str) -> Option<String> {
@@ -329,6 +753,7 @@ fn websocket_failure(context: &str, error: tungstenite::Error) -> BackendFailure
     }
 }
 
+#[cfg(test)]
 fn ensure_rpc_success(response: Value) -> Result<(), BackendFailure> {
     rpc_result(response).map(|_| ())
 }
@@ -456,7 +881,7 @@ mod tests {
         let fake_codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/fake-codex");
         let backend = CodexCliBackend::new(fake_codex, None);
 
-        let queue = backend.queue_message("thread-1", "hello").unwrap();
+        let queue = backend.queue_message_via_cli("thread-1", "hello").unwrap();
         assert_eq!(queue.backend, "codex_queue");
         assert!(queue.stdout.unwrap().contains("<--message> <hello>"));
     }
@@ -484,23 +909,35 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for stream in listener.incoming().take(3) {
-                let mut websocket = tungstenite::accept(stream.unwrap()).unwrap();
-
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            requests.push(read_json(&mut websocket));
+            websocket
+                .send(Message::Text(
+                    json!({"id": 0, "result": {"userAgent": "fake/0.1"}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            requests.push(read_json(&mut websocket));
+            for index in 0..3 {
                 requests.push(read_json(&mut websocket));
-                websocket
-                    .send(Message::Text(
-                        json!({"id": 0, "result": {"userAgent": "fake/0.1"}})
+                let id = requests.last().unwrap()["id"].as_i64().unwrap();
+                if index == 0 {
+                    websocket
+                        .send(Message::Text(
+                            json!({
+                                "method": "thread/status/changed",
+                                "params": {"threadId": "thread-1", "status": {"type": "active", "activeFlags": []}}
+                            })
                             .to_string()
                             .into(),
-                    ))
-                    .unwrap();
-
-                requests.push(read_json(&mut websocket));
-                requests.push(read_json(&mut websocket));
+                        ))
+                        .unwrap();
+                }
                 websocket
                     .send(Message::Text(
-                        json!({"id": 1, "result": {}}).to_string().into(),
+                        json!({"id": id, "result": {}}).to_string().into(),
                     ))
                     .unwrap();
             }
@@ -508,6 +945,7 @@ mod tests {
         });
 
         let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(sock_path.clone()));
+        let mut events = backend.subscribe_app_server_events().unwrap();
 
         let steer = backend
             .steer_via_app_server("thread-1", "turn-1", "guide")
@@ -521,25 +959,153 @@ mod tests {
             .app_server_rpc("thread/read", json!({"threadId": "thread-1"}))
             .unwrap();
         assert_eq!(generic, json!({}));
+        let received_status = (0..3).any(|_| {
+            events.try_recv().ok().is_some_and(|event| {
+                event.pointer("/message/method") == Some(&json!("thread/status/changed"))
+            })
+        });
+        assert!(received_status);
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 5);
         assert_eq!(requests[0]["method"], "initialize");
         assert_eq!(requests[1]["method"], "initialized");
         assert_eq!(requests[2]["method"], "turn/steer");
         assert_eq!(requests[2]["params"]["threadId"], "thread-1");
         assert_eq!(requests[2]["params"]["expectedTurnId"], "turn-1");
         assert_eq!(requests[2]["params"]["input"][0]["text"], "guide");
-        assert_eq!(requests[3]["method"], "initialize");
-        assert_eq!(requests[4]["method"], "initialized");
-        assert_eq!(requests[5]["method"], "turn/interrupt");
-        assert_eq!(requests[5]["params"]["threadId"], "thread-1");
-        assert_eq!(requests[5]["params"]["turnId"], "turn-1");
-        assert_eq!(requests[6]["method"], "initialize");
-        assert_eq!(requests[7]["method"], "initialized");
-        assert_eq!(requests[8]["method"], "thread/read");
-        assert_eq!(requests[8]["params"]["threadId"], "thread-1");
+        assert_eq!(requests[3]["method"], "turn/interrupt");
+        assert_eq!(requests[3]["params"]["threadId"], "thread-1");
+        assert_eq!(requests[3]["params"]["turnId"], "turn-1");
+        assert_eq!(requests[4]["method"], "thread/read");
+        assert_eq!(requests[4]["params"]["threadId"], "thread-1");
 
+        std::fs::remove_file(&sock_path).unwrap();
+        std::fs::remove_dir(&sock_dir).unwrap();
+    }
+
+    #[test]
+    fn watched_threads_use_one_connection_and_evict_the_oldest_subscription() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "codex-thread-cache-test-{}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {"userAgent": "fake/0.1"}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let initialized = read_json(&mut websocket);
+            let mut requests = Vec::new();
+            for _ in 0..5 {
+                let request = read_json(&mut websocket);
+                let id = request["id"].clone();
+                let result = if request["method"] == "thread/resume" {
+                    json!({"thread": {"id": request["params"]["threadId"], "status": {"type": "idle"}}})
+                } else {
+                    json!({})
+                };
+                websocket
+                    .send(Message::Text(
+                        json!({"id": id, "result": result}).to_string().into(),
+                    ))
+                    .unwrap();
+                requests.push(request);
+            }
+            (initialize, initialized, requests)
+        });
+        let backend = CodexCliBackend::new_with_thread_cache(
+            PathBuf::from("/unused/codex"),
+            Some(sock_path.clone()),
+            3,
+        );
+        for thread_id in ["thread-1", "thread-2", "thread-3", "thread-4"] {
+            backend.watch_thread(thread_id).unwrap();
+        }
+        let (initialize, initialized, requests) = server.join().unwrap();
+        assert_eq!(initialize["method"], "initialize");
+        assert_eq!(initialized["method"], "initialized");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "thread/resume",
+                "thread/resume",
+                "thread/resume",
+                "thread/resume",
+                "thread/unsubscribe"
+            ]
+        );
+        assert_eq!(requests[4]["params"]["threadId"], "thread-1");
+        std::fs::remove_file(&sock_path).unwrap();
+        std::fs::remove_dir(&sock_dir).unwrap();
+    }
+
+    #[test]
+    fn native_queue_uses_stable_client_and_server_submission_ids() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "codex-native-queue-test-{}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {"userAgent": "fake/0.1"}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let _initialized = read_json(&mut websocket);
+            let request = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": request["id"],
+                        "result": {"queuedSubmission": {
+                            "id": "server-queue-1",
+                            "clientUserMessageId": request["params"]["clientUserMessageId"],
+                            "input": request["params"]["input"]
+                        }}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            request
+        });
+        let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(sock_path.clone()));
+        let receipt = backend
+            .queue_message("thread-1", "queued text", "browser-message-1")
+            .unwrap();
+        assert_eq!(receipt.backend, "app_server_queue");
+        assert_eq!(receipt.queued_submission_id, "server-queue-1");
+        let request = server.join().unwrap();
+        assert_eq!(request["method"], "thread/queue/add");
+        assert_eq!(request["params"]["threadId"], "thread-1");
+        assert_eq!(
+            request["params"]["clientUserMessageId"],
+            "browser-message-1"
+        );
+        assert_eq!(request["params"]["input"][0]["text"], "queued text");
         std::fs::remove_file(&sock_path).unwrap();
         std::fs::remove_dir(&sock_dir).unwrap();
     }

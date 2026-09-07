@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
+use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response as HttpResponse};
@@ -23,8 +24,10 @@ use clap::Parser;
 use codex_bridge::{
     default_codex_home, default_socket_path, BackendFailure, CodexCliBackend, HostExecFailure,
     HostExecutor, Request, Response, SessionStore, ThreadMessage, ThreadSummary, ThreadToolCall,
-    APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
+    APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV,
+    PROTOCOL_VERSION, SOCKET_ENV,
 };
+use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -60,6 +63,10 @@ struct Args {
     /// No endpoint is selected by default; the standalone daemon is never used as a fallback.
     #[arg(long, value_name = "PATH")]
     app_server_socket: Option<PathBuf>,
+
+    /// Maximum number of recently viewed threads kept subscribed on the app-server connection.
+    #[arg(long, value_name = "COUNT", default_value_t = 3, value_parser = parse_thread_cache_limit)]
+    app_server_thread_cache: usize,
 
     /// JSON policy replacing the built-in host-exec allowlist.
     #[arg(long, value_name = "PATH")]
@@ -168,7 +175,22 @@ impl PendingMessages {
         }
     }
 
-    fn reconcile(&self, session_store: &SessionStore) -> Vec<PendingMessage> {
+    fn finish_queue(&self, id: &str, queued_submission_id: String) {
+        if let Ok(mut entries) = self.entries.write() {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.status = "queued".to_owned();
+                entry.source = "app_server_queue".to_owned();
+                entry.queued_submission_id = Some(queued_submission_id);
+                entry.error = None;
+            }
+        }
+    }
+
+    fn reconcile(
+        &self,
+        session_store: &SessionStore,
+        queued: Vec<PendingMessage>,
+    ) -> Vec<PendingMessage> {
         let Ok(mut entries) = self.entries.write() else {
             return Vec::new();
         };
@@ -191,7 +213,6 @@ impl PendingMessages {
             let is_landed = pending_message_landed(entry, messages, &mut landed);
             !is_landed
         });
-        let queued = read_codex_queue(session_store.home());
         let mut matched_queue_ids = HashSet::new();
         for entry in entries
             .iter_mut()
@@ -200,7 +221,12 @@ impl PendingMessages {
             if let Some(queued_entry) = queued.iter().find(|queued_entry| {
                 !matched_queue_ids.contains(&queued_entry.id)
                     && queued_entry.thread_id == entry.thread_id
-                    && queued_entry.text == entry.text
+                    && (entry.queued_submission_id.as_deref()
+                        == queued_entry.queued_submission_id.as_deref()
+                        || queued_entry.id == entry.id
+                        || (entry.queued_submission_id.is_none()
+                            && entry.source != "app_server_queue"
+                            && queued_entry.text == entry.text))
             }) {
                 entry.queued_submission_id = Some(queued_entry.id.clone());
                 matched_queue_ids.insert(queued_entry.id.clone());
@@ -262,6 +288,93 @@ fn read_codex_queue(codex_home: &Path) -> Vec<PendingMessage> {
         .collect()
 }
 
+fn read_native_queue(
+    write_backend: &CodexCliBackend,
+    thread_id: &str,
+) -> Result<Vec<PendingMessage>, BackendFailure> {
+    let mut cursor = None;
+    let mut queued = Vec::new();
+    loop {
+        let result = write_backend.app_server_rpc(
+            "thread/queue/list",
+            json!({"threadId": thread_id, "cursor": cursor, "limit": 100}),
+        )?;
+        for submission in result
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = submission.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(text) = submission
+                .get("input")
+                .and_then(queue_input_text)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let client_id = submission
+                .get("clientUserMessageId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(id);
+            queued.push(PendingMessage {
+                id: client_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                text,
+                action: "queue".to_owned(),
+                status: "queued".to_owned(),
+                source: "app_server_queue".to_owned(),
+                queued_submission_id: Some(id.to_owned()),
+                after_message_index: -1,
+                error: None,
+            });
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            return Ok(queued);
+        }
+    }
+}
+
+fn queue_input_text(input: &Value) -> Option<String> {
+    let text = input
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| item.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn queued_messages_for_thread(
+    session_store: &SessionStore,
+    write_backend: &CodexCliBackend,
+    thread_id: Option<&str>,
+) -> (Vec<PendingMessage>, &'static str) {
+    if let Some(thread_id) = thread_id {
+        if let Ok(messages) = read_native_queue(write_backend, thread_id) {
+            return (messages, "app_server");
+        }
+    }
+    (
+        read_codex_queue(session_store.home())
+            .into_iter()
+            .filter(|entry| thread_id.is_none_or(|thread_id| entry.thread_id == thread_id))
+            .collect(),
+        "compatibility",
+    )
+}
+
 fn queue_payload_text(payload: &str) -> Option<String> {
     let payload: Value = serde_json::from_str(payload).ok()?;
     let content = payload.get("UserInput")?.get("content")?.as_array()?;
@@ -308,6 +421,29 @@ fn default_codex_program() -> PathBuf {
     }
 }
 
+fn app_server_version_from_user_agent(user_agent: &str) -> Option<&str> {
+    user_agent
+        .split(|character: char| character.is_whitespace() || character == '/')
+        .find(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_digit())
+                && part.chars().any(|character| character == '.')
+        })
+}
+
+fn parse_thread_cache_limit(value: &str) -> std::result::Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "thread cache size must be an integer".to_owned())?;
+    (1..=64)
+        .contains(&limit)
+        .then_some(limit)
+        .ok_or_else(|| "thread cache size must be between 1 and 64".to_owned())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -330,7 +466,11 @@ async fn main() -> Result<()> {
             .map(PathBuf::from)
     });
     let session_store = Arc::new(SessionStore::new(codex_home));
-    let write_backend = Arc::new(CodexCliBackend::new(codex_program, app_server_socket));
+    let write_backend = Arc::new(CodexCliBackend::new_with_thread_cache(
+        codex_program,
+        app_server_socket,
+        args.app_server_thread_cache,
+    ));
     let host_exec_policy = args.host_exec_policy.or_else(|| {
         env::var_os(HOST_EXEC_POLICY_ENV)
             .filter(|value| !value.is_empty())
@@ -566,6 +706,7 @@ fn web_router(state: WebState) -> Router {
         .route("/assets/app.js", get(web_app_js))
         .route("/assets/app.css", get(web_app_css))
         .route("/api/command", post(web_command))
+        .route("/api/events", get(web_events))
         .with_state(state)
 }
 
@@ -692,6 +833,73 @@ async fn web_command(
         Ok(response) => Json(response).into_response(),
         Err(error) => {
             Json(Response::error("bridge_worker_error", error.to_string())).into_response()
+        }
+    }
+}
+
+async fn web_events(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> HttpResponse {
+    if !basic_auth_allowed(&headers, &state.auth) {
+        return basic_auth_required();
+    }
+    if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let backend = Arc::clone(&state.bridge.write_backend);
+    upgrade
+        .on_upgrade(move |socket| web_event_socket(socket, backend))
+        .into_response()
+}
+
+async fn web_event_socket(socket: WebSocket, backend: Arc<CodexCliBackend>) {
+    let (mut sender, mut receiver) = socket.split();
+    let Some(mut events) = backend.subscribe_app_server_events() else {
+        let _ = sender
+            .send(AxumWsMessage::Text(
+                json!({
+                    "type": "bridge_app_server_connection",
+                    "status": "unavailable"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        return;
+    };
+    if sender
+        .send(AxumWsMessage::Text(
+            json!({"type": "bridge_event_stream", "status": "ready"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        json!({"type": "bridge_event_gap", "skipped": skipped})
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+            message = receiver.next() => {
+                match message {
+                    Some(Ok(AxumWsMessage::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -1343,7 +1551,29 @@ fn dispatch(
     pending_messages: &PendingMessages,
 ) -> Response {
     match request {
-        Request::Status => Response::success(json!({
+        Request::Status => {
+            if write_backend.app_server_socket().is_some() {
+                let _ = write_backend.app_server_rpc("thread/loaded/list", json!({}));
+            }
+            let runtime = write_backend.app_server_runtime_info();
+            let runtime_kind = if write_backend.program() == Path::new(DESKTOP_CODEX_PATH) {
+                "bundled"
+            } else {
+                "standalone"
+            };
+            let app_server_mode = if write_backend.app_server_socket().is_some() {
+                runtime_kind
+            } else if runtime_kind == "bundled" {
+                "desktop_bundled_only"
+            } else {
+                "standalone_unconfigured"
+            };
+            let runtime_version = runtime
+                .as_ref()
+                .and_then(|info| info.user_agent.as_deref())
+                .and_then(app_server_version_from_user_agent)
+                .map(|version| format!("{version}-{runtime_kind}"));
+            Response::success(json!({
             "service": "codex-bridge",
             "status": "ready",
             "protocol_version": PROTOCOL_VERSION,
@@ -1360,17 +1590,29 @@ fn dispatch(
                 "app_server_available": write_backend.app_server_socket().is_some_and(|socket|
                     fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket())
                 ),
-                "app_server_mode": "desktop_bundled_only",
+                "app_server_mode": app_server_mode,
                 "standalone_fallback": false,
+                "schema_version": APP_SERVER_SCHEMA_VERSION,
+                "runtime_kind": runtime_kind,
+                "runtime_version": runtime_version,
+                "runtime_user_agent": runtime.and_then(|info| info.user_agent),
             },
             "host_executor": host_executor.summary(),
-        })),
-        Request::PendingMessages => Response::success(json!({
-            "messages": pending_messages.reconcile(session_store),
-        })),
+            }))
+        }
+        Request::PendingMessages { thread_id } => {
+            let (queued, queue_backend) =
+                queued_messages_for_thread(session_store, write_backend, thread_id.as_deref());
+            Response::success(json!({
+                "messages": pending_messages.reconcile(session_store, queued),
+                "queue_backend": queue_backend,
+            }))
+        }
         Request::PendingMessageDelete { id, thread_id } => {
+            let (queued, _) =
+                queued_messages_for_thread(session_store, write_backend, Some(&thread_id));
             let entry = pending_messages
-                .reconcile(session_store)
+                .reconcile(session_store, queued)
                 .into_iter()
                 .find(|entry| entry.id == id && entry.thread_id == thread_id);
             let Some(entry) = entry else {
@@ -1639,6 +1881,17 @@ fn dispatch(
                 format!("thread {thread_id} was not found in the rollout store"),
             ),
             Err(error) => backend_error(error),
+        },
+        Request::ThreadWatch { thread_id } => match write_backend.watch_thread(&thread_id) {
+            Ok(result) => Response::success(json!({
+                "thread_id": thread_id,
+                "subscribed": true,
+                "thread": {
+                    "id": result.pointer("/thread/id").and_then(Value::as_str),
+                    "status": result.pointer("/thread/status").cloned(),
+                },
+            })),
+            Err(error) => write_backend_error(error),
         },
         Request::ComposerStatus { thread_id } => {
             let thread = write_backend
@@ -2035,21 +2288,52 @@ fn dispatch(
                 "queue",
                 latest_message_index(session_store, &resolved.thread.id),
             );
-            match write_backend.queue_message(&resolved.thread.id, &text) {
-                Ok(backend) => {
-                    pending_messages.finish(&pending_id, "queued", None);
+            match write_backend.queue_message(&resolved.thread.id, &text, &pending_id) {
+                Ok(receipt) => {
+                    pending_messages
+                        .finish_queue(&pending_id, receipt.queued_submission_id.clone());
                     Response::success(json!({
                         "action": "send",
                         "status": "queued",
                         "pending_id": pending_id,
                         "thread_id": resolved.thread.id,
                         "target": resolved.method,
-                        "backend": backend,
+                        "backend": receipt,
                     }))
                 }
                 Err(error) => {
-                    pending_messages.finish(&pending_id, "failed", Some(error.message.clone()));
-                    write_backend_error(error)
+                    let compatible_fallback = error.code == "app_server_unavailable"
+                        || (error.code == "app_server_rejected"
+                            && (error.message.contains("requires experimentalApi")
+                                || error.message.contains("Method not found")
+                                || error.message.contains("does not support thread/queue/add")));
+                    if compatible_fallback {
+                        match write_backend.queue_message_via_cli(&resolved.thread.id, &text) {
+                            Ok(backend) => {
+                                pending_messages.finish(&pending_id, "queued", None);
+                                Response::success(json!({
+                                    "action": "send",
+                                    "status": "queued",
+                                    "pending_id": pending_id,
+                                    "thread_id": resolved.thread.id,
+                                    "target": resolved.method,
+                                    "backend": backend,
+                                    "queue_backend": "codex_cli_compatibility",
+                                }))
+                            }
+                            Err(fallback_error) => {
+                                pending_messages.finish(
+                                    &pending_id,
+                                    "failed",
+                                    Some(fallback_error.message.clone()),
+                                );
+                                write_backend_error(fallback_error)
+                            }
+                        }
+                    } else {
+                        pending_messages.finish(&pending_id, "failed", Some(error.message.clone()));
+                        write_backend_error(error)
+                    }
                 }
             }
         }
@@ -3097,6 +3381,31 @@ mod tests {
     }
 
     #[test]
+    fn app_server_version_comes_from_initialize_user_agent() {
+        assert_eq!(
+            app_server_version_from_user_agent("codex_cli_rs/0.152.1 (macos)"),
+            Some("0.152.1")
+        );
+        assert_eq!(app_server_version_from_user_agent("unknown"), None);
+        assert_eq!(parse_thread_cache_limit("3"), Ok(3));
+        assert!(parse_thread_cache_limit("0").is_err());
+        assert!(parse_thread_cache_limit("65").is_err());
+    }
+
+    #[test]
+    fn native_queue_text_uses_only_text_inputs() {
+        assert_eq!(
+            queue_input_text(&json!([
+                {"type":"text", "text":"first"},
+                {"type":"localImage", "path":"/tmp/image.png"},
+                {"type":"text", "text":"second"}
+            ]))
+            .as_deref(),
+            Some("first\nsecond")
+        );
+    }
+
+    #[test]
     fn web_ui_rejects_cross_origin_browser_requests() {
         let public = vec![parse_public_web_origin("https://codex.example.com").unwrap()];
         assert!(web_origin_allowed("http://127.0.0.1:47653", 47653, &public));
@@ -3228,7 +3537,8 @@ mod tests {
         let second = pending.begin("thread-1", "same text", "queue", -1);
         pending.finish(&first, "queued", None);
         pending.finish(&second, "queued", None);
-        let entries = pending.reconcile(&SessionStore::new(home.clone()));
+        let queued = read_codex_queue(&home);
+        let entries = pending.reconcile(&SessionStore::new(home.clone()), queued);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].queued_submission_id.as_deref(), Some("queue-1"));
         assert_eq!(entries[1].queued_submission_id.as_deref(), Some("queue-2"));
@@ -3301,8 +3611,11 @@ mod tests {
 
         let source = concat!(
             include_str!("../../../web-ui/index.html"),
+            include_str!("../../../web-ui/src/api.js"),
             include_str!("../../../web-ui/src/main.js"),
             include_str!("../../../web-ui/src/i18n.js"),
+            include_str!("../../../web-ui/src/composer-state.js"),
+            include_str!("../../../web-ui/src/session-route.js"),
             include_str!("../../../web-ui/src/state.js"),
             include_str!("../../../web-ui/src/theme.js"),
             include_str!("../../../web-ui/src/styles.css"),
@@ -3314,6 +3627,7 @@ mod tests {
             "message_content",
             "tool_content",
             "thread_activity",
+            "thread_watch",
             "composer_status",
             "composer_options",
             "thread_create",
@@ -3337,6 +3651,7 @@ mod tests {
             "interrupt",
             "host_exec",
             "app_server_rpc",
+            "/api/events",
         ] {
             assert!(source.contains(command), "missing {command}");
         }
@@ -3372,6 +3687,15 @@ mod tests {
             "id=\"settingsPanel\"",
             "github.com/hitsmaxft/codex-bridge",
             "setComposerSubmitting",
+            "submit-stop",
+            "stopRunConfirm",
+            "interruptCurrentRun",
+            "shouldOfferStop",
+            "sessionIdFromHash",
+            "hashchange",
+            "codex-bridge.last-session.v1",
+            "preserveView: true",
+            "visibilitychange",
             "setDeliveryState",
             "serverQueued",
             "submit-spin",
@@ -3383,8 +3707,9 @@ mod tests {
             "diff-line",
             "fileChange",
             ".outbox-item.submitting .message-body",
+            "outbox-mode",
             "border: 1px dashed",
-            "classList.add(\"focused\")",
+            "classList.add(\"focused\", \"input-focused\")",
             "border-width: 2px",
         ] {
             assert!(source.contains(marker), "missing {marker}");
@@ -3397,6 +3722,7 @@ mod tests {
         assert_eq!(source.matches(".composer-shell {").count(), 2);
         assert_eq!(source.matches(".outbox-item {").count(), 1);
         assert!(!source.contains("--mobile-code"));
+        assert!(!source.contains("project-path"));
         assert!(!source.contains("max-height: min(52dvh, 480px)"));
         assert!(!source.contains("sessionStorage"));
     }

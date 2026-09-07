@@ -12,6 +12,13 @@ machine instead of `/api/command`. The demo is deliberately local and finite: it
 sessions, pagination, typed tool details, model settings, and a simulated queue-to-response flow,
 but never connects to Codex or executes host operations.
 
+The demo state machine is also the regression-test fixture. Run
+`CARGO_INCREMENTAL=0 cargo test -p codex-bridge-demo` to verify its frontend-facing baseline,
+queue-to-history refresh lifecycle, and active-turn interruption behavior. After compiling the
+WASM target, `npm run test:demo-wasm` exercises the same binary through the browser client's memory
+adapter. The Pages workflow runs both gates, so the published demo cannot drift onto a separate
+mock implementation.
+
 Clean Git states are hidden. Queued-message delivery uses compact, background-free status text in
 the empty lane beside the message, with its withdrawal action arranged vertically underneath.
 The lane only shows the withdrawal action while a message is buffered; transient delivery labels

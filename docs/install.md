@@ -130,7 +130,8 @@ Start the bridge daemon:
 ```sh
 codex-bridge \
   --codex-bin /Applications/ChatGPT.app/Contents/Resources/codex \
-  --app-server-socket "$HOME/.codex-bridge/bundled-app-server.sock"
+  --app-server-socket "$HOME/.codex-bridge/bundled-app-server.sock" \
+  --app-server-thread-cache 3
 ```
 
 Finally, start a new Desktop process with the intercepted WebSocket URL:

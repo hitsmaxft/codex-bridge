@@ -1,7 +1,14 @@
 import "./styles.css";
-import { $, command, demoMode, notify, run, timeText } from "./api.js";
+import { $, command, demoMode, notify, run, subscribeEvents, timeText } from "./api.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
+import { shouldOfferStop } from "./composer-state.js";
+import {
+  rememberSessionId,
+  sessionHash,
+  sessionIdFromHash,
+  storedSessionId,
+} from "./session-route.js";
 import {
   DRAFT_STORAGE_KEY,
   applyTheme,
@@ -23,12 +30,27 @@ async function loadStatus() {
     : state.appServerMode === "desktop_bundled_only"
       ? tr("bundledPrivate")
       : tr("directOffline");
-  $("bridgeState").textContent = r.demo
+  const base = r.demo
     ? tr("demoReady", { protocol: r.protocol_version })
     : tr("bridgeReady", {
         protocol: r.protocol_version,
         backend: appServer,
       });
+  const schemaVersion = backend.schema_version,
+    runtimeVersion = backend.runtime_version,
+    runtimeBase = runtimeVersion?.replace(/-(?:bundled|standalone)$/, ""),
+    mismatch = Boolean(schemaVersion && runtimeBase && schemaVersion !== runtimeBase);
+  $("bridgeState").textContent = [
+    base,
+    schemaVersion ? `schema ${schemaVersion}` : "",
+    runtimeVersion ? `app-server ${runtimeVersion}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  $("bridgeState").classList.toggle("version-mismatch", mismatch);
+  $("bridgeState").title = mismatch
+    ? `Schema ${schemaVersion} does not match app-server ${runtimeVersion}`
+    : backend.runtime_user_agent || "";
 }
 function setThreadHeaderExpanded(expanded) {
   if (!matchMedia("(max-width:800px)").matches) expanded = false;
@@ -56,7 +78,27 @@ async function loadProjects() {
   state.projectThreads.clear();
   state.expanded.clear();
   renderProjects();
-  if (!state.current && state.projects.length) await toggleProject(state.projects[0], true);
+  if (!state.current) {
+    const hashedId = sessionIdFromHash(window.location.hash),
+      requestedId = hashedId || storedSessionId(window.localStorage);
+    if (requestedId) {
+      try {
+        await openSessionById(requestedId, {
+          fromHash: Boolean(hashedId),
+          replaceHash: !hashedId,
+        });
+        return;
+      } catch {
+        state.current = null;
+      }
+    }
+    if (state.projects.length) {
+      const project = state.projects[0];
+      state.expanded.add(project.path);
+      const threads = await loadProjectThreads(project);
+      if (threads.length) await openThread(threads[0], { replaceHash: true });
+    }
+  }
 }
 async function loadPins() {
   if (!state.directAppServer) {
@@ -159,7 +201,16 @@ function threadRow(thread) {
   const button = document.createElement("button");
   button.className = "thread" + (state.current?.id === thread.id ? " active" : "");
   button.innerHTML = '<div class="thread-name"></div><div class="thread-meta"></div>';
-  button.children[0].textContent = thread.title || thread.id;
+  const name = document.createElement("span");
+  name.textContent = thread.title || thread.id;
+  button.children[0].appendChild(name);
+  if (state.updatingThreads.has(thread.id)) {
+    const live = document.createElement("span");
+    live.className = "thread-live";
+    live.setAttribute("aria-label", tr("modelRunning"));
+    live.title = tr("modelRunning");
+    button.children[0].appendChild(live);
+  }
   button.children[1].textContent = `${thread.git_branch || tr("noBranch")} · ${timeText(thread.updated_at_ms, getLanguage() === "zh" ? "zh-CN" : "en")}${thread.archived ? ` · ${tr("archived")}` : ""}`;
   button.onclick = () => openThread(thread);
   row.appendChild(button);
@@ -187,6 +238,40 @@ function pinnedProject(thread) {
       return cwd === path || cwd.startsWith(`${path}/`);
     })
     .sort((left, right) => String(right.path).length - String(left.path).length)[0];
+}
+function updateSessionHash(threadId, replace = false) {
+  const hash = sessionHash(threadId);
+  if (window.location.hash === hash) return;
+  window.history[replace ? "replaceState" : "pushState"](null, "", hash);
+}
+async function revealSessionProject(thread) {
+  if (state.pinnedIds.has(thread.id)) return renderProjects();
+  const project = pinnedProject(thread);
+  if (!project) return renderProjects();
+  state.expanded.add(project.path);
+  if (!state.projectThreads.has(project.path)) await loadProjectThreads(project);
+  else renderProjects();
+}
+async function openSessionById(threadId, { fromHash = false, replaceHash = false } = {}) {
+  const previous = state.current;
+  const known = state.pinnedThreads.find((thread) => thread.id === threadId) ||
+    [...state.projectThreads.values()]
+      .flatMap((entry) => entry.threads)
+      .find((thread) => thread.id === threadId) || {
+      id: threadId,
+      title: threadId,
+      cwd: "",
+      git_branch: null,
+    };
+  try {
+    await openThread(known, { writeHash: !fromHash, replaceHash });
+    await revealSessionProject(state.current);
+  } catch (error) {
+    state.current = previous;
+    renderProjects();
+    if (previous) await openThread(previous, { quiet: true, writeHash: false });
+    throw error;
+  }
 }
 function renderProjects() {
   const q = $("search").value.trim().toLowerCase(),
@@ -226,10 +311,9 @@ function renderProjects() {
     const button = document.createElement("button");
     button.className = "project-button";
     button.innerHTML =
-      '<span class="chevron"></span><span class="project-copy"><span class="project-name"></span><span class="project-path"></span></span><span class="project-count"></span>';
+      '<span class="chevron"></span><span class="project-name"></span><span class="project-count"></span>';
     button.children[0].textContent = state.expanded.has(p.path) ? "▾" : "▸";
-    button.children[1].children[0].textContent = p.name;
-    button.children[1].children[1].textContent = p.path;
+    button.children[1].textContent = p.name;
     const pinnedCount = state.pinnedThreads.filter(
       (thread) => pinnedProject(thread)?.path === p.path,
     ).length;
@@ -625,6 +709,7 @@ function localizedToolPreview(tool) {
 function messageNode(m, keepToolsRunning = false) {
   const box = document.createElement("article");
   box.className = `message ${m.category || m.role || ""}`;
+  box.dataset.messageIndex = String(m.message_index);
   const head = document.createElement("div");
   head.className = "message-head";
   const a = document.createElement("span"),
@@ -656,6 +741,12 @@ function pendingNode(entry) {
   const body = document.createElement("div");
   body.className = "message-body";
   body.appendChild(markdownNode(entry.text));
+  if (!entry.handoff && ["queue", "steer"].includes(entry.action)) {
+    const mode = document.createElement("div");
+    mode.className = "outbox-mode";
+    mode.textContent = tr(entry.action === "steer" ? "followUp" : "queue");
+    body.appendChild(mode);
+  }
   const actions = document.createElement("div"),
     busy = ["queueing", "steering"].includes(entry.status);
   actions.className = "outbox-actions";
@@ -706,7 +797,10 @@ function renderPending() {
   tray.hidden = !tray.childElementCount;
 }
 async function refreshPending() {
-  const r = await command({ command: "pending_messages" }, false);
+  const r = await command(
+    { command: "pending_messages", thread_id: state.current?.id || null },
+    false,
+  );
   state.pending = Array.isArray(r.messages) ? r.messages : [];
   if (
     state.delivery?.pendingId &&
@@ -793,7 +887,15 @@ function setSendMode(mode, automatic = false) {
 let deliveryClearTimer = null;
 function setDeliveryState(phase, details = {}) {
   clearTimeout(deliveryClearTimer);
-  state.delivery = phase ? { ...(state.delivery || {}), ...details, phase } : null;
+  const previousPhase = state.delivery?.phase;
+  state.delivery = phase
+    ? {
+        ...(state.delivery || {}),
+        ...details,
+        phase,
+        announcedPhase: phase === previousPhase ? state.delivery?.announcedPhase : null,
+      }
+    : null;
   showActivity();
   if (phase === "completed" || phase === "failed") {
     deliveryClearTimer = setTimeout(() => {
@@ -841,6 +943,7 @@ function renderTransientStatus(active) {
     existing?.remove();
     return;
   }
+  if (!existing && state.delivery?.announcedPhase === statusState[0]) return;
   const metrics = messageScrollMetrics(),
     stickToBottom = metrics.height - metrics.top - metrics.client < 100,
     status = existing || document.createElement("div");
@@ -863,6 +966,7 @@ function renderTransientStatus(active) {
     }
   };
   if (!existing) root.appendChild(status);
+  if (state.delivery) state.delivery.announcedPhase = statusState[0];
   if (stickToBottom) scrollMessagesToBottom();
 }
 function showActivity() {
@@ -876,6 +980,7 @@ function showActivity() {
           : tr("modelRunning");
   el.classList.toggle("active", active);
   document.querySelector(".composer-shell").classList.toggle("agent-active", active);
+  syncSubmitAction();
   el.textContent = active
     ? state.pendingChanges
       ? tr("hasUpdates", { label })
@@ -1104,19 +1209,83 @@ async function pollActivity() {
     }
     if (state.pendingChanges) {
       if (Date.now() - state.lastMessageRefresh < 3500) return;
-      const root = $("messages"),
-        metrics = messageScrollMetrics(),
-        atBottom = metrics.height - metrics.top - metrics.client < 100,
-        detailsOpen = Boolean(root.querySelector("details[open]"));
-      if (atBottom && !detailsOpen) {
-        await openThread(state.current, { quiet: true });
-      } else showActivity();
+      await openThread(state.current, { quiet: true, preserveView: true });
       return;
     }
     await refreshPending();
   } finally {
     state.polling = false;
   }
+}
+let eventRefreshTimer = null;
+function scheduleEventRefresh(threadId, immediate = false) {
+  if (threadId !== state.current?.id) return;
+  state.pendingChanges = true;
+  clearTimeout(eventRefreshTimer);
+  eventRefreshTimer = setTimeout(
+    () => {
+      eventRefreshTimer = null;
+      pollActivity().catch(() => {});
+    },
+    immediate ? 0 : 280,
+  );
+}
+function handleBridgeEvent(event) {
+  if (event?.type === "bridge_event_gap") {
+    state.lastMessageRefresh = 0;
+    scheduleEventRefresh(state.current?.id, true);
+    loadProjects().catch(() => {});
+    return;
+  }
+  if (event?.type === "bridge_app_server_connection") {
+    loadStatus().catch(() => {});
+    return;
+  }
+  if (event?.type !== "app_server") return;
+  const message = event.message || {},
+    method = message.method,
+    params = message.params || {},
+    threadId = params.threadId || null;
+  if (!method) return;
+  if (method === "thread/status/changed" && threadId) {
+    updateThreadLiveFromStatus(threadId, params.status);
+  } else if (method === "turn/started" && threadId) {
+    state.updatingThreads.add(threadId);
+    renderProjects();
+    if (threadId === state.current?.id) {
+      state.activeTurnId = params.turn?.id || state.activeTurnId;
+      const delivery = state.delivery?.threadId === threadId ? state.delivery : null;
+      if (delivery && ["queued", "accepted"].includes(delivery.phase)) {
+        state.delivery = { ...delivery, phase: "processing", started: true };
+      }
+      showActivity();
+    }
+  } else if (method === "turn/completed" && threadId) {
+    state.updatingThreads.delete(threadId);
+    renderProjects();
+    if (threadId === state.current?.id) {
+      state.activeTurnId = null;
+      if (state.delivery?.started) setDeliveryState("completed");
+      showActivity();
+    }
+  }
+  if (method === "thread/queue/changed" && threadId === state.current?.id) {
+    refreshPending().catch(() => {});
+  }
+  if (
+    threadId === state.current?.id &&
+    (method.startsWith("turn/") ||
+      method.startsWith("item/") ||
+      method === "thread/status/changed" ||
+      method === "thread/reverted")
+  ) {
+    scheduleEventRefresh(threadId, method === "turn/completed");
+  }
+}
+function updateThreadLiveFromStatus(threadId, status) {
+  if (status?.type === "active") state.updatingThreads.add(threadId);
+  else if (status) state.updatingThreads.delete(threadId);
+  renderProjects();
 }
 function resetHorizontalPosition() {
   const root = $("messages");
@@ -1151,9 +1320,39 @@ function settleHorizontalPosition() {
     requestAnimationFrame(resetHorizontalPosition);
   });
 }
-async function openThread(thread, { quiet = false } = {}) {
+function captureMessageView() {
+  const root = $("messages"),
+    metrics = messageScrollMetrics();
+  return {
+    atBottom: metrics.height - metrics.top - metrics.client < 100,
+    top: metrics.top,
+    openDetails: [...root.querySelectorAll(".message details[open]")].map((detail) => {
+      const message = detail.closest(".message");
+      return `${message?.dataset.messageIndex || ""}:${[
+        ...message.querySelectorAll("details"),
+      ].indexOf(detail)}`;
+    }),
+  };
+}
+function restoreMessageView(view) {
+  if (!view) return scrollMessagesToBottom();
+  const openDetails = new Set(view.openDetails);
+  for (const message of $("messages").querySelectorAll(".message")) {
+    [...message.querySelectorAll("details")].forEach((detail, index) => {
+      detail.open = openDetails.has(`${message.dataset.messageIndex || ""}:${index}`);
+    });
+  }
+  if (view.atBottom) scrollMessagesToBottom();
+  else if (usesDocumentMessageScroll()) window.scrollTo(0, view.top);
+  else $("messages").scrollTop = view.top;
+}
+async function openThread(
+  thread,
+  { quiet = false, preserveView = false, writeHash = true, replaceHash = false } = {},
+) {
   const token = ++state.openToken,
-    changedThread = state.current?.id !== thread.id;
+    changedThread = state.current?.id !== thread.id,
+    messageView = quiet && preserveView && !changedThread ? captureMessageView() : null;
   if (!quiet) {
     closePanels();
     setThreadHeaderExpanded(false);
@@ -1192,10 +1391,20 @@ async function openThread(thread, { quiet = false } = {}) {
     `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
   const root = $("messages");
   if (!quiet) root.innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
-  const [r] = await Promise.all([fetchMessages(), refreshActivity()]);
+  const [r] = await Promise.all([
+    fetchMessages(),
+    refreshActivity(),
+    demoMode
+      ? Promise.resolve()
+      : command({ command: "thread_watch", thread_id: thread.id }, false)
+          .then((watch) => updateThreadLiveFromStatus(thread.id, watch.thread?.status))
+          .catch(() => {}),
+  ]);
   if (token !== state.openToken) return;
   requireMessagePage(r, { latest: true });
   state.current = { ...thread, ...r.thread };
+  rememberSessionId(window.localStorage, state.current.id);
+  if (writeHash) updateSessionHash(state.current.id, replaceHash);
   const delivery = state.delivery?.threadId === thread.id ? state.delivery : null;
   if (
     delivery?.text &&
@@ -1230,7 +1439,7 @@ async function openThread(thread, { quiet = false } = {}) {
   state.historyEnd = r.page.end;
   state.historyTotal = r.page.total;
   renderPending();
-  scrollMessagesToBottom();
+  restoreMessageView(messageView);
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
   await refreshPending();
@@ -1286,10 +1495,43 @@ function targetRequest(name, extra = {}) {
   return { command: name, thread_id: state.current.id, ...extra };
 }
 function setComposerSubmitting(active) {
-  document.querySelector(".composer-shell").classList.toggle("submitting", active);
+  const shell = document.querySelector(".composer-shell");
+  shell.classList.toggle("submitting", active);
   $("messageText").disabled = active;
   $("sendModeToggle").disabled = active;
   $("submitBtn").disabled = active;
+  syncSubmitAction();
+}
+function syncSubmitAction() {
+  const shell = document.querySelector(".composer-shell"),
+    stopReady = shouldOfferStop({
+      activeTurnId: state.activeTurnId,
+      inputFocused: shell.classList.contains("input-focused"),
+      submitting: shell.classList.contains("submitting"),
+      interrupting: state.interrupting,
+    }),
+    button = $("submitBtn");
+  shell.classList.toggle("stop-ready", stopReady);
+  shell.classList.toggle("interrupting", state.interrupting);
+  button.dataset.action = stopReady ? "interrupt" : "submit";
+  button.title = tr(stopReady ? "stopRunAria" : "submitAria");
+  button.setAttribute("aria-label", button.title);
+}
+async function interruptCurrentRun({ confirm = true, requireActive = false } = {}) {
+  if ((requireActive && !state.activeTurnId) || state.interrupting) return;
+  if (confirm && !window.confirm(tr("stopRunConfirm"))) return;
+  state.interrupting = true;
+  $("submitBtn").disabled = true;
+  syncSubmitAction();
+  try {
+    await command(targetRequest("interrupt"));
+    notify(tr("turnInterrupted"));
+    await refreshActivity();
+  } finally {
+    state.interrupting = false;
+    $("submitBtn").disabled = false;
+    syncSubmitAction();
+  }
 }
 async function write(name) {
   const draft = $("messageText").value,
@@ -1384,12 +1626,20 @@ $("selectBtn").onclick = () =>
   });
 $("sendModeToggle").onclick = () =>
   setSendMode($("sendMode").value === "steer" ? "send" : "steer", false);
-$("submitBtn").onclick = () => run(() => write($("sendMode").value));
-$("interruptBtn").onclick = () =>
-  run(async () => {
-    await command(targetRequest("interrupt"));
-    notify(tr("turnInterrupted"));
-  });
+$("submitBtn").onpointerdown = () => {
+  $("submitBtn").dataset.pointerAction = $("submitBtn").dataset.action;
+};
+$("submitBtn").onpointercancel = () => delete $("submitBtn").dataset.pointerAction;
+$("submitBtn").onclick = () => {
+  const action = $("submitBtn").dataset.pointerAction || $("submitBtn").dataset.action;
+  delete $("submitBtn").dataset.pointerAction;
+  run(() =>
+    action === "interrupt"
+      ? interruptCurrentRun({ requireActive: true })
+      : write($("sendMode").value),
+  );
+};
+$("interruptBtn").onclick = () => run(() => interruptCurrentRun());
 $("mobileInterruptBtn").onclick = () => $("interruptBtn").click();
 $("archiveThreadBtn").onclick = () =>
   run(async () => {
@@ -1431,16 +1681,26 @@ $("messageText").oninput = () => {
   saveDraft(state.current?.id, $("messageText").value);
   resizeComposerTextarea();
 };
-$("messageText").onpointerdown = () =>
-  document.querySelector(".composer-shell").classList.add("focused");
+$("messageText").onpointerdown = () => (
+  document.querySelector(".composer-shell").classList.add("focused", "input-focused"),
+  syncSubmitAction()
+);
 $("messageText").onfocus = () => {
-  document.querySelector(".composer-shell").classList.add("focused");
+  document.querySelector(".composer-shell").classList.add("focused", "input-focused");
+  syncSubmitAction();
   requestAnimationFrame(resizeComposerTextarea);
 };
+$("messageText").onblur = () =>
+  requestAnimationFrame(() => {
+    const shell = document.querySelector(".composer-shell");
+    if (document.activeElement !== $("messageText")) shell.classList.remove("input-focused");
+    syncSubmitAction();
+  });
 document.querySelector(".composer-shell").addEventListener("focusout", () =>
   requestAnimationFrame(() => {
     const shell = document.querySelector(".composer-shell");
     if (!shell.contains(document.activeElement)) shell.classList.remove("focused");
+    syncSubmitAction();
   }),
 );
 $("messageText").onkeydown = (e) => {
@@ -1596,6 +1856,25 @@ bindSwipe(
   { ignoreInteractive: true },
 );
 window.addEventListener("pagehide", persistDrafts);
+const refreshAfterResume = () => {
+  if (!state.current || document.visibilityState === "hidden") return;
+  state.pendingChanges = true;
+  state.lastMessageRefresh = 0;
+  pollActivity().catch(() => {});
+};
+document.addEventListener("visibilitychange", refreshAfterResume);
+window.addEventListener("focus", refreshAfterResume);
+window.addEventListener("online", refreshAfterResume);
+window.addEventListener("hashchange", () => {
+  const hashedId = sessionIdFromHash(window.location.hash),
+    threadId = hashedId || storedSessionId(window.localStorage);
+  if (!threadId) return;
+  if (threadId === state.current?.id) {
+    if (!hashedId) updateSessionHash(threadId, true);
+    return;
+  }
+  run(() => openSessionById(threadId, { fromHash: Boolean(hashedId), replaceHash: !hashedId }));
+});
 const composer = document.querySelector(".composer"),
   mainPanel = document.querySelector("main"),
   threadHead = document.querySelector(".thread-head"),
@@ -1624,6 +1903,20 @@ document.addEventListener("click", (event) => {
   )
     $("modelPicker").hidden = true;
 });
+document.addEventListener(
+  "pointerdown",
+  (event) => {
+    const textarea = $("messageText"),
+      submit = $("submitBtn"),
+      shell = document.querySelector(".composer-shell"),
+      target = event.target;
+    if (target === textarea || textarea.contains(target) || submit.contains(target)) return;
+    shell.classList.remove("input-focused");
+    textarea.blur();
+    syncSubmitAction();
+  },
+  true,
+);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("createDialog").hidden) closeCreateDialog();
 });
@@ -1668,6 +1961,7 @@ applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
 setSendMode("steer", false);
 applyTheme(storedTheme(), false);
 watchSystemTheme();
+subscribeEvents(handleBridgeEvent);
 run(async () => {
   await loadStatus();
   await loadProjects();

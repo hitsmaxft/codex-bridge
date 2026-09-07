@@ -26,8 +26,7 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-export async function demoCommand(request) {
-  const instance = await demoInstance();
+export function demoCommandWithInstance(instance, request) {
   const bytes = encoder.encode(JSON.stringify(request));
   const requestPointer = instance.exports.demo_alloc(bytes.length);
   new Uint8Array(instance.exports.memory.buffer, requestPointer, bytes.length).set(bytes);
@@ -46,7 +45,13 @@ export async function demoCommand(request) {
   ).slice();
   instance.exports.demo_free(responsePointer, responseLength);
 
+  return JSON.parse(decoder.decode(responseBytes));
+}
+
+export async function demoCommand(request) {
+  const response = demoCommandWithInstance(await demoInstance(), request);
+
   // Keep the real UI's submitting state visible long enough to inspect in the public demo.
   if (["send", "steer"].includes(request.command)) await delay(420);
-  return JSON.parse(decoder.decode(responseBytes));
+  return response;
 }

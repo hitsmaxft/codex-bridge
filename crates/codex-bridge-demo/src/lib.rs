@@ -309,7 +309,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "service": "codex-bridge-demo",
             "status": "ready",
             "demo": true,
-            "protocol_version": 16,
+            "protocol_version": 17,
             "rollout_store": {"available": true, "codex_home": "/demo/.codex", "read_only": true},
             "selected_thread_id": PRIMARY_THREAD,
             "write_backend": {"app_server_available": true, "app_server_mode": "demo_wasm", "standalone_fallback": false}
@@ -397,6 +397,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             detail["tool_index"] = json!(tool_index);
             detail
         }
+        "thread_watch" => json!({"thread_id": thread_id, "subscribed": true}),
         "pending_messages" => state.pending_messages(),
         "pending_message_delete" => {
             let Some(pending) = state.pending.take() else {
@@ -437,8 +438,15 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
         }
         "thread_activity" => state.activity(thread_id),
         "interrupt" => {
+            if state.active_thread.as_deref() != Some(thread_id) || state.active_ticks == 0 {
+                return error(
+                    "no_active_turn",
+                    format!("thread {thread_id} has no active demo turn"),
+                );
+            }
             state.active_ticks = 0;
             state.active_thread = None;
+            state.file_len += 1;
             json!({"thread_id": thread_id, "status": "interrupted", "backend": "demo_wasm"})
         }
         "composer_status" => json!({
@@ -547,12 +555,23 @@ pub unsafe extern "C" fn demo_command(pointer: *const u8, len: usize) -> u64 {
 mod tests {
     use super::*;
 
+    fn result(response: Value) -> Value {
+        assert_eq!(response["ok"], true, "unexpected demo response: {response}");
+        response["result"].clone()
+    }
+
+    fn land_pending_message(state: &mut DemoState) {
+        for _ in 0..3 {
+            result(dispatch(json!({"command": "pending_messages"}), state));
+        }
+    }
+
     #[test]
     fn status_identifies_the_wasm_demo() {
         let response: Value =
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
-        assert_eq!(response["result"]["protocol_version"], 16);
+        assert_eq!(response["result"]["protocol_version"], 17);
     }
 
     #[test]
@@ -571,15 +590,14 @@ mod tests {
     fn queued_message_moves_through_buffer_and_into_history() {
         let mut state = DemoState::new();
         let before = state.messages.len();
-        let response = dispatch(
+        let response = result(dispatch(
             json!({"command": "send", "thread_id": PRIMARY_THREAD, "text": "Try the demo"}),
             &mut state,
-        );
-        assert_eq!(response["result"]["status"], "queued");
-        assert_eq!(
-            state.pending_messages()["messages"][0]["status"],
-            "queueing"
-        );
+        ));
+        assert_eq!(response["status"], "queued");
+        let pending = state.pending_messages();
+        assert_eq!(pending["messages"][0]["status"], "queueing");
+        assert_eq!(pending["messages"][0]["action"], "queue");
         assert_eq!(state.pending_messages()["messages"][0]["status"], "queued");
         assert!(state.pending_messages()["messages"]
             .as_array()
@@ -587,6 +605,105 @@ mod tests {
             .is_empty());
         assert_eq!(state.messages.len(), before + 1);
         assert_eq!(state.active_ticks, 3);
+    }
+
+    #[test]
+    fn polling_refreshes_activity_and_lands_the_demo_reply() {
+        let mut state = DemoState::new();
+        let initial_messages = state.messages.len();
+        let initial_file_len = state.file_len;
+        result(dispatch(
+            json!({"command": "send", "thread_id": PRIMARY_THREAD, "text": "Refresh me"}),
+            &mut state,
+        ));
+        land_pending_message(&mut state);
+
+        let active = result(dispatch(
+            json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        ));
+        assert_eq!(active["activity"]["active_turn_id"], "demo-turn-processing");
+        assert!(active["activity"]["file_len"].as_u64().unwrap() > initial_file_len);
+
+        result(dispatch(
+            json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        ));
+        let completed = result(dispatch(
+            json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        ));
+        assert!(completed["activity"]["active_turn_id"].is_null());
+
+        let messages = result(dispatch(
+            json!({"command": "messages", "thread_id": PRIMARY_THREAD, "limit": 30}),
+            &mut state,
+        ));
+        assert_eq!(messages["page"]["total"], initial_messages + 2);
+        assert_eq!(
+            messages["messages"][initial_messages]["content"][0]["text"],
+            "Refresh me"
+        );
+        assert!(
+            messages["messages"][initial_messages + 1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("in-browser WASM demo server")
+        );
+    }
+
+    #[test]
+    fn active_demo_turn_can_be_interrupted_once() {
+        let mut state = DemoState::new();
+        result(dispatch(
+            json!({"command": "send", "thread_id": PRIMARY_THREAD, "text": "Stop me"}),
+            &mut state,
+        ));
+        land_pending_message(&mut state);
+        let messages_after_handoff = state.messages.len();
+        let file_len_before_interrupt = state.file_len;
+
+        let interrupted = result(dispatch(
+            json!({"command": "interrupt", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        ));
+        assert_eq!(interrupted["status"], "interrupted");
+        assert_eq!(state.active_thread, None);
+        assert_eq!(state.active_ticks, 0);
+        assert_eq!(state.messages.len(), messages_after_handoff);
+        assert!(state.file_len > file_len_before_interrupt);
+
+        let inactive = result(dispatch(
+            json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        ));
+        assert!(inactive["activity"]["active_turn_id"].is_null());
+        let duplicate = dispatch(
+            json!({"command": "interrupt", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        );
+        assert_eq!(duplicate["ok"], false);
+        assert_eq!(duplicate["error"]["code"], "no_active_turn");
+    }
+
+    #[test]
+    fn demo_exposes_the_frontend_baseline_contract() {
+        let mut state = DemoState::new();
+        for (request, field) in [
+            (json!({"command": "status"}), "service"),
+            (json!({"command": "projects"}), "projects"),
+            (
+                json!({"command": "project_threads", "project_path": PROJECT_PATH}),
+                "threads",
+            ),
+            (json!({"command": "composer_options"}), "models"),
+            (
+                json!({"command": "workspace_diff", "thread_id": PRIMARY_THREAD}),
+                "files_changed",
+            ),
+        ] {
+            assert!(result(dispatch(request, &mut state)).get(field).is_some());
+        }
     }
 
     #[test]
