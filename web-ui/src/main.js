@@ -1207,14 +1207,21 @@ bindSwipe(
 window.addEventListener("pagehide", persistDrafts);
 const composer = document.querySelector(".composer"),
   mainPanel = document.querySelector("main"),
-  syncComposerHeight = () => {
+  threadHead = document.querySelector(".thread-head"),
+  syncFrameInsets = () => {
     mainPanel.style.setProperty(
       "--composer-height",
       `${Math.ceil(composer.getBoundingClientRect().height)}px`,
     );
+    mainPanel.style.setProperty(
+      "--thread-head-height",
+      `${Math.ceil(threadHead.getBoundingClientRect().height)}px`,
+    );
   };
-new ResizeObserver(syncComposerHeight).observe(composer);
-syncComposerHeight();
+const frameResizeObserver = new ResizeObserver(syncFrameInsets);
+frameResizeObserver.observe(composer);
+frameResizeObserver.observe(threadHead);
+syncFrameInsets();
 document.addEventListener("click", (event) => {
   if (
     !$("modelPicker").hidden &&

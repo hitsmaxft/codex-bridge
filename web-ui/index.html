@@ -58,13 +58,13 @@
             </button>
           </div>
         </div>
-        <div class="outbox-tray" id="outboxTray" aria-live="polite" hidden></div>
         <div id="messages">
           <div class="empty" data-i18n="selectSessionHint">
             Select a session to inspect its conversation.
           </div>
         </div>
         <div class="composer">
+          <div class="outbox-tray" id="outboxTray" aria-live="polite" hidden></div>
           <div class="composer-status" id="composerStatus" hidden>
             <button class="workspace-diff" id="workspaceDiff" type="button" data-i18n="gitStatus">
               Git status…
@@ -138,6 +138,7 @@
             ><button class="danger" id="interruptBtn" data-i18n="interrupt">Interrupt</button>
           </div>
         </div>
+        <div class="toast" id="toast" role="status" aria-live="polite"></div>
       </main>
       <section class="tools" id="tools">
         <div class="tool-section">
@@ -290,7 +291,6 @@
       </div>
     </div>
     <div class="scrim" id="scrim"></div>
-    <div class="toast" id="toast"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
