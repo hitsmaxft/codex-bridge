@@ -439,20 +439,16 @@ impl SessionStore {
         Ok(message.content.get(content_index).cloned())
     }
 
-    pub fn read_tool_content(
+    pub fn read_message(
         &self,
         thread_id: &str,
         message_index: usize,
-        tool_index: usize,
-    ) -> Result<Option<ThreadToolCall>> {
+    ) -> Result<Option<ThreadMessage>> {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
         let messages = self.messages_for_path(&summary.rollout_path)?;
-        Ok(messages
-            .get(message_index)
-            .and_then(|message| message.tools.get(tool_index))
-            .cloned())
+        Ok(messages.get(message_index).cloned())
     }
 
     fn messages_for_path(&self, path: &Path) -> Result<Arc<Vec<ThreadMessage>>> {
@@ -1369,9 +1365,10 @@ mod tests {
         );
         assert_eq!(
             store
-                .read_tool_content("thread-tools", 0, 0)
+                .read_message("thread-tools", 0)
                 .unwrap()
                 .unwrap()
+                .tools[0]
                 .call_id,
             "call-1"
         );

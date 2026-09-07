@@ -24,6 +24,10 @@ Codex rollout files, while live operations use the app-server bundled in ChatGPT
 Desktop's writer-ownership boundary. See [DESIGN.md](DESIGN.md) for the original architecture and
 its evidence limits.
 
+Conversation text and attachments retain the rollout store's durable pagination. When app-server
+is available, tool groups are overlaid from typed `thread/turns/list` items such as
+`commandExecution`, `fileChange`, and `mcpToolCall`; raw rollout tool wrappers are only a fallback.
+
 ## Web UI preview
 
 [<img src="docs/assets/codex-bridge-mobile.jpg" alt="codex-bridge mobile Web UI showing a live Codex task" width="360">](docs/assets/codex-bridge-mobile.jpg)

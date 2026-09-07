@@ -808,6 +808,9 @@ main {
   border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
   box-shadow: 0 4px 14px #0000000d;
 }
+.outbox-item.submitting .message-body {
+  border: 1px dashed color-mix(in srgb, var(--accent) 58%, var(--line));
+}
 .outbox-actions {
   display: flex;
   flex-direction: column;
@@ -1263,15 +1266,20 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
 }
 .composer-shell textarea {
   grid-area: input;
+  display: block;
+  box-sizing: border-box;
   width: 100%;
   height: 44px;
   min-width: 0;
   min-height: 44px;
   max-height: 112px;
+  margin: 0;
   padding: 10px 5px;
   border: 0;
   border-radius: 0;
   background: transparent;
+  appearance: none;
+  caret-color: var(--text);
   box-shadow: none;
   resize: none;
   overflow-y: hidden;
@@ -1747,6 +1755,7 @@ label.caption {
     align-items: center;
   }
   .composer-shell:focus-within,
+  .composer-shell.focused,
   .composer-shell.has-text,
   .composer-shell.submitting {
     grid-template-areas:
@@ -1757,6 +1766,7 @@ label.caption {
     align-items: start;
   }
   .composer-shell:focus-within #submitBtn,
+  .composer-shell.focused #submitBtn,
   .composer-shell.has-text #submitBtn,
   .composer-shell.submitting #submitBtn {
     width: 100%;
@@ -1858,6 +1868,11 @@ html[data-theme="light"] {
   --user-text: #0874c9;
   --active-thread: #edf6ff;
 }
+html[data-theme="light"] .composer-shell.submitting,
+html[data-theme="light"] .composer-shell.agent-active:not(.submitting) {
+  padding: 4px 5px 4px 6px;
+  border-width: 2px;
+}
 @media (prefers-color-scheme: light) {
   html[data-theme="system"] {
     color-scheme: light;
@@ -1875,6 +1890,11 @@ html[data-theme="light"] {
     --user-bg: #dff1ff;
     --user-text: #0874c9;
     --active-thread: #edf6ff;
+  }
+  html[data-theme="system"] .composer-shell.submitting,
+  html[data-theme="system"] .composer-shell.agent-active:not(.submitting) {
+    padding: 4px 5px 4px 6px;
+    border-width: 2px;
   }
 }
 .nav-toggle {

@@ -387,7 +387,7 @@ function appendToolValue(parent, value) {
     parent.appendChild(pre);
   }
 }
-function appendPatchDiff(parent, patch) {
+function appendPatchDiff(parent, patch, label = "Diff") {
   const card = document.createElement("div"),
     head = document.createElement("div"),
     title = document.createElement("span"),
@@ -395,7 +395,7 @@ function appendPatchDiff(parent, patch) {
     content = document.createElement("pre");
   card.className = "diff-card";
   head.className = "diff-head";
-  title.textContent = "Diff";
+  title.textContent = label;
   copy.className = "diff-copy";
   copy.type = "button";
   copy.textContent = "⧉";
@@ -412,7 +412,8 @@ function appendPatchDiff(parent, patch) {
     if (["*** Begin Patch", "*** End Patch"].includes(line)) continue;
     const row = document.createElement("span");
     row.className = "diff-line";
-    if (/^\*\*\* (?:Add|Update|Delete) File: /.test(line)) row.classList.add("file");
+    if (/^(?:\*\*\* (?:Add|Update|Delete) File: |--- |\+\+\+ )/.test(line))
+      row.classList.add("file");
     else if (line.startsWith("@@")) row.classList.add("hunk");
     else if (line.startsWith("+")) row.classList.add("add");
     else if (line.startsWith("-")) row.classList.add("delete");
@@ -480,7 +481,7 @@ function toolGroupNode(message, keepRunning = false) {
       preview.append(add, del);
     }
     status.className = "tool-state";
-    status.textContent = tool.has_output ? "✓" : "…";
+    status.textContent = toolFinished(tool) ? "✓" : "…";
     head.append(icon, preview, status);
     detail.appendChild(head);
     detail.ontoggle = () => {
@@ -503,7 +504,13 @@ function toolGroupNode(message, keepRunning = false) {
         body.textContent = "";
         const outputTitle = document.createElement("h5");
         outputTitle.textContent = tr("result");
-        if (r.display_input?.operation === "apply_patch" && r.display_input?.patch) {
+        if (r.display_input?.type === "fileChange" && Array.isArray(r.display_input?.changes)) {
+          for (const change of r.display_input.changes) {
+            if (typeof change?.diff === "string")
+              appendPatchDiff(body, change.diff, change.path || "Diff");
+          }
+          body.appendChild(outputTitle);
+        } else if (r.display_input?.operation === "apply_patch" && r.display_input?.patch) {
           appendPatchDiff(body, r.display_input.patch);
           body.appendChild(outputTitle);
         } else {
@@ -586,37 +593,22 @@ function messageNode(m, keepToolsRunning = false) {
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
-  box.className = `outbox-item${entry.handoff ? " handoff" : ""}`;
+  const submitting = ["queueing", "steering"].includes(entry.status);
+  box.className = `outbox-item${entry.handoff ? " handoff" : ""}${submitting ? " submitting" : ""}`;
   box.dataset.pendingId = entry.id;
   const body = document.createElement("div");
   body.className = "message-body";
   body.appendChild(markdownNode(entry.text));
-  const labels = {
-      queueing: tr("queueingShort"),
-      steering: tr("steeringShort"),
-      queued: tr("queuedShort"),
-      steered: tr("steeredShort"),
-      accepted: tr("acceptedShort"),
-      processing: tr("processingShort"),
-      failed: tr("failedShort"),
-    },
-    actions = document.createElement("div"),
-    status = document.createElement("div"),
+  const actions = document.createElement("div"),
     busy = ["queueing", "steering"].includes(entry.status);
   actions.className = "outbox-actions";
-  status.className = "outbox-status";
-  status.textContent = labels[entry.status] || entry.status;
-  status.title =
-    entry.error ||
-    {
-      queued: state.usageUnavailable ? tr("queuedRecovering") : tr("queuedWaiting"),
-      steered: tr("steeredWaiting"),
-      accepted: tr("serverAccepted"),
-      processing: tr("handoffProcessing"),
-    }[entry.status] ||
-    status.textContent;
-  actions.appendChild(status);
-  if (!entry.handoff) {
+  if (entry.handoff) {
+    const status = document.createElement("div");
+    status.className = "outbox-status";
+    status.textContent = tr(entry.status === "processing" ? "processingShort" : "acceptedShort");
+    status.title = tr(entry.status === "processing" ? "handoffProcessing" : "serverAccepted");
+    actions.appendChild(status);
+  } else {
     const remove = document.createElement("button");
     remove.className = "outbox-delete";
     remove.type = "button";
@@ -1382,7 +1374,18 @@ $("messageText").oninput = () => {
   saveDraft(state.current?.id, $("messageText").value);
   resizeComposerTextarea();
 };
-$("messageText").onfocus = resizeComposerTextarea;
+$("messageText").onpointerdown = () =>
+  document.querySelector(".composer-shell").classList.add("focused");
+$("messageText").onfocus = () => {
+  document.querySelector(".composer-shell").classList.add("focused");
+  requestAnimationFrame(resizeComposerTextarea);
+};
+document.querySelector(".composer-shell").addEventListener("focusout", () =>
+  requestAnimationFrame(() => {
+    const shell = document.querySelector(".composer-shell");
+    if (!shell.contains(document.activeElement)) shell.classList.remove("focused");
+  }),
+);
 $("messageText").onkeydown = (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("submitBtn").click();
 };

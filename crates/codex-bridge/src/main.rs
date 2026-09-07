@@ -1169,6 +1169,170 @@ fn pinned_thread_ids(write_backend: &CodexCliBackend) -> Result<Vec<String>, Bac
     Ok(ids)
 }
 
+fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
+    let item_type = item.get("type")?.as_str()?;
+    let name = match item_type {
+        "commandExecution" => "exec_command".to_owned(),
+        "fileChange" => "apply_patch".to_owned(),
+        "mcpToolCall" => match (
+            item.get("server").and_then(Value::as_str),
+            item.get("tool").and_then(Value::as_str),
+        ) {
+            (Some(server), Some(tool)) => format!("{server}.{tool}"),
+            (_, Some(tool)) => tool.to_owned(),
+            _ => "mcp_tool".to_owned(),
+        },
+        "dynamicToolCall" => match (
+            item.get("namespace").and_then(Value::as_str),
+            item.get("tool").and_then(Value::as_str),
+        ) {
+            (Some(namespace), Some(tool)) => format!("{namespace}.{tool}"),
+            (_, Some(tool)) => tool.to_owned(),
+            _ => "dynamic_tool".to_owned(),
+        },
+        "webSearch" => "web_search".to_owned(),
+        "imageView" => "view_image".to_owned(),
+        "collabAgentToolCall" => item
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("collab_agent")
+            .to_owned(),
+        _ => return None,
+    };
+    let call_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or(item_type)
+        .to_owned();
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed")
+        .to_owned();
+    let mut input = item.as_object()?.clone();
+    let mut output = serde_json::Map::new();
+    input.remove("id");
+    input.remove("status");
+    for field in [
+        "aggregatedOutput",
+        "exitCode",
+        "durationMs",
+        "result",
+        "error",
+        "contentItems",
+        "success",
+    ] {
+        if let Some(value) = input.remove(field) {
+            if !value.is_null() {
+                output.insert(field.to_owned(), value);
+            }
+        }
+    }
+    Some(ThreadToolCall {
+        call_id,
+        name,
+        status,
+        input: Value::Object(input),
+        output: (!output.is_empty()).then_some(Value::Object(output)),
+    })
+}
+
+fn app_server_tools_for_messages(
+    write_backend: &CodexCliBackend,
+    thread_id: &str,
+    messages: &[ThreadMessage],
+) -> Result<HashMap<String, Vec<ThreadToolCall>>, BackendFailure> {
+    let wanted = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| message.id.clone())
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut tools = HashMap::<String, Vec<ThreadToolCall>>::new();
+    let mut found = HashSet::<String>::new();
+    let mut cursor = None::<String>;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        let result = write_backend.app_server_rpc(
+            "thread/turns/list",
+            json!({
+                "threadId": thread_id,
+                "cursor": cursor,
+                "limit": 20,
+                "sortDirection": "desc",
+                "itemsView": "full",
+            }),
+        )?;
+        let turns = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| BackendFailure {
+                code: "app_server_protocol_error",
+                message: "thread/turns/list returned no turn data".to_owned(),
+            })?;
+        for turn in turns {
+            let Some(items) = turn.get("items").and_then(Value::as_array) else {
+                continue;
+            };
+            let mut current_message = None::<String>;
+            for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                    current_message = item.get("id").and_then(Value::as_str).map(str::to_owned);
+                    if let Some(id) = current_message.as_ref().filter(|id| wanted.contains(*id)) {
+                        found.insert(id.clone());
+                    }
+                    continue;
+                }
+                let Some(tool) = typed_thread_tool(item) else {
+                    continue;
+                };
+                if let Some(id) = current_message.as_ref().filter(|id| wanted.contains(*id)) {
+                    tools.entry(id.clone()).or_default().push(tool);
+                }
+            }
+        }
+        if found.len() == wanted.len() {
+            break;
+        }
+        let Some(next) = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            break;
+        };
+        if !seen_cursors.insert(next.clone()) {
+            return Err(BackendFailure {
+                code: "app_server_protocol_error",
+                message: "thread/turns/list repeated its cursor".to_owned(),
+            });
+        }
+        cursor = Some(next);
+    }
+    Ok(tools)
+}
+
+fn overlay_app_server_tools(
+    messages: &mut [ThreadMessage],
+    tools: &HashMap<String, Vec<ThreadToolCall>>,
+) -> usize {
+    let mut replaced = 0;
+    for message in messages {
+        let Some(id) = message.id.as_ref() else {
+            continue;
+        };
+        let Some(typed) = tools.get(id) else {
+            continue;
+        };
+        message.tools.clone_from(typed);
+        replaced += 1;
+    }
+    replaced
+}
+
 fn dispatch(
     request: Request,
     socket_path: &Path,
@@ -1339,7 +1503,17 @@ fn dispatch(
                 before.map(|value| value as usize),
                 limit as usize,
             ) {
-                Ok(Some((thread, page))) => {
+                Ok(Some((thread, mut page))) => {
+                    let tool_source = match app_server_tools_for_messages(
+                        write_backend,
+                        &thread_id,
+                        &page.messages,
+                    ) {
+                        Ok(tools) if overlay_app_server_tools(&mut page.messages, &tools) > 0 => {
+                            "app_server"
+                        }
+                        _ => "rollout_jsonl",
+                    };
                     let messages = page
                         .messages
                         .iter()
@@ -1348,6 +1522,7 @@ fn dispatch(
                         .collect::<Vec<_>>();
                     Response::success(json!({
                         "source": "rollout_jsonl",
+                        "tool_source": tool_source,
                         "thread": {
                             "id": thread.id,
                             "title": thread.title,
@@ -1403,19 +1578,34 @@ fn dispatch(
             thread_id,
             message_index,
             tool_index,
-        } => match session_store.read_tool_content(
-            &thread_id,
-            message_index as usize,
-            tool_index as usize,
-        ) {
-            Ok(Some(tool)) => {
-                let display_input = parsed_tool_input(&tool).unwrap_or_else(|| tool.input.clone());
+        } => match session_store.read_message(&thread_id, message_index as usize) {
+            Ok(Some(message)) => {
+                let typed_tools = app_server_tools_for_messages(
+                    write_backend,
+                    &thread_id,
+                    std::slice::from_ref(&message),
+                )
+                .ok();
+                let typed_tool = message.id.as_ref().and_then(|id| {
+                    typed_tools
+                        .as_ref()
+                        .and_then(|tools| tools.get(id))
+                        .and_then(|tools| tools.get(tool_index as usize))
+                        .cloned()
+                });
+                let tool = typed_tool.or_else(|| message.tools.get(tool_index as usize).cloned());
+                let Some(tool) = tool else {
+                    return Response::error(
+                        "tool_content_not_found",
+                        "the requested tool call was not found",
+                    );
+                };
                 Response::success(json!({
                     "thread_id": thread_id,
                     "message_index": message_index,
                     "tool_index": tool_index,
+                    "display_input": tool.input.clone(),
                     "tool": tool,
-                    "display_input": display_input,
                 }))
             }
             Ok(None) => Response::error(
@@ -2385,58 +2575,76 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
 }
 
 fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
-    let patch_stats = tool_patch(tool).map(|patch| patch_line_stats(&patch));
-    let file_count = tool_patch(tool).map(|patch| patch_file_actions(&patch).len());
+    let changes = structured_file_changes(tool);
+    let patch_stats = changes.map(|changes| {
+        changes
+            .iter()
+            .fold((0, 0), |(additions, deletions), change| {
+                let (added, deleted) = change
+                    .get("diff")
+                    .and_then(Value::as_str)
+                    .map(patch_line_stats)
+                    .unwrap_or_default();
+                (additions + added, deletions + deleted)
+            })
+    });
     json!({
         "tool_index": tool_index,
-        "name": display_tool_name(tool),
+        "name": tool.name,
         "status": tool.status,
         "preview": tool_preview(tool),
         "has_output": tool.output.is_some(),
         "bytes": serde_json::to_vec(tool).map_or(0, |encoded| encoded.len()),
         "additions": patch_stats.map(|stats| stats.0),
         "deletions": patch_stats.map(|stats| stats.1),
-        "file_count": file_count,
+        "file_count": changes.map(<[Value]>::len),
     })
 }
 
 fn tool_preview(tool: &ThreadToolCall) -> String {
-    let raw = tool.input.as_str().unwrap_or("");
-    if display_tool_name(tool) == "write_stdin" {
+    if tool.name == "write_stdin" {
         return "等待输出".to_owned();
     }
-    if display_tool_name(tool) == "web_search" {
-        let queries = source_string_fields(raw, "q");
-        return match queries.as_slice() {
-            [query] => format!("搜索 {query}"),
-            [first, ..] => format!("搜索 {first} 等 {} 项", queries.len()),
-            [] => "网页搜索".to_owned(),
-        };
+    if tool.name == "exec_command" {
+        return tool
+            .input
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("exec_command")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(140)
+            .collect();
     }
-    if let Some(patch) = tool_patch(tool) {
-        let files = patch_file_actions(&patch);
-        return match files.as_slice() {
+    if let Some(changes) = structured_file_changes(tool) {
+        return match changes {
             [file] => format!(
                 "已{} {}",
-                patch_action_label(file["action"].as_str().unwrap_or("update")),
+                patch_action_label(
+                    file.pointer("/kind/type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("update")
+                ),
                 Path::new(file["path"].as_str().unwrap_or("file"))
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("file")
             ),
-            files if !files.is_empty() => format!("已编辑 {} 个文件", files.len()),
+            changes if !changes.is_empty() => format!("已编辑 {} 个文件", changes.len()),
             _ => "应用文件补丁".to_owned(),
         };
     }
-    let preferred = if display_tool_name(tool) == "exec_command" {
-        source_string_field(raw, "cmd").unwrap_or_else(|| raw.to_owned())
-    } else if tool.name.ends_with(".js") {
-        source_string_field(raw, "title")
-            .or_else(|| source_string_field(raw, "code"))
-            .unwrap_or_else(|| raw.to_owned())
-    } else {
-        raw.to_owned()
-    };
+    if tool.name == "web_search" {
+        return tool
+            .input
+            .get("query")
+            .and_then(Value::as_str)
+            .map(|query| format!("搜索 {query}"))
+            .unwrap_or_else(|| "网页搜索".to_owned());
+    }
+    let preferred = tool.input.as_str().unwrap_or(&tool.name);
     let normalized = preferred.split_whitespace().collect::<Vec<_>>().join(" ");
     let preview = if normalized.is_empty() {
         tool.name.clone()
@@ -2446,91 +2654,9 @@ fn tool_preview(tool: &ThreadToolCall) -> String {
     preview.chars().take(140).collect()
 }
 
-fn parsed_tool_input(tool: &ThreadToolCall) -> Option<Value> {
-    let source = tool.input.as_str()?;
-    if let Some(patch) = tool_patch(tool) {
-        return Some(json!({
-            "operation": "apply_patch",
-            "files": patch_file_actions(&patch),
-            "patch": patch,
-        }));
-    }
-    if display_tool_name(tool) == "web_search" {
-        return Some(json!({
-            "operation": "web_search",
-            "queries": source_string_fields(source, "q"),
-        }));
-    }
-    if display_tool_name(tool) != "exec_command" {
-        return None;
-    }
-    let mut parsed = serde_json::Map::new();
-    for field in ["cmd", "workdir", "justification"] {
-        if let Some(value) = source_string_field(source, field) {
-            parsed.insert(field.to_owned(), Value::String(value));
-        }
-    }
-    for field in ["yield_time_ms", "max_output_tokens"] {
-        if let Some(value) = source_u64_field(source, field) {
-            parsed.insert(field.to_owned(), Value::from(value));
-        }
-    }
-    (!parsed.is_empty()).then_some(Value::Object(parsed))
-}
-
-fn display_tool_name(tool: &ThreadToolCall) -> &str {
-    let source = tool.input.as_str().unwrap_or("");
-    if tool.name == "apply_patch" || source.contains("tools.apply_patch") {
-        "apply_patch"
-    } else if tool.name == "exec" && source.contains("tools.exec_command") {
-        "exec_command"
-    } else if tool.name == "exec" && source.contains("tools.write_stdin") {
-        "write_stdin"
-    } else if tool.name == "exec"
-        && source.contains("tools.web__run")
-        && source.contains("search_query")
-    {
-        "web_search"
-    } else {
-        &tool.name
-    }
-}
-
-fn tool_patch(tool: &ThreadToolCall) -> Option<String> {
-    let source = tool.input.as_str()?;
-    if tool.name == "apply_patch" && source.trim_start().starts_with("*** Begin Patch") {
-        return Some(source.to_owned());
-    }
-    for marker in ["const patch =", "let patch =", "var patch ="] {
-        if let Some(rest) = source.split_once(marker).map(|(_, rest)| rest.trim_start()) {
-            let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<String>();
-            if let Some(Ok(patch)) = stream.next() {
-                return Some(patch);
-            }
-        }
-    }
-    let rest = source.split_once("tools.apply_patch(")?.1.trim_start();
-    let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<String>();
-    stream.next()?.ok()
-}
-
-fn patch_file_actions(patch: &str) -> Vec<Value> {
-    patch
-        .lines()
-        .filter_map(|line| {
-            [
-                ("*** Add File: ", "add"),
-                ("*** Update File: ", "update"),
-                ("*** Delete File: ", "delete"),
-                ("*** Move to: ", "move"),
-            ]
-            .into_iter()
-            .find_map(|(prefix, action)| {
-                line.strip_prefix(prefix)
-                    .map(|path| json!({"action": action, "path": path}))
-            })
-        })
-        .collect()
+fn structured_file_changes(tool: &ThreadToolCall) -> Option<&[Value]> {
+    (tool.name == "apply_patch")
+        .then(|| tool.input.get("changes")?.as_array().map(Vec::as_slice))?
 }
 
 fn patch_action_label(action: &str) -> &'static str {
@@ -2552,64 +2678,6 @@ fn patch_line_stats(patch: &str) -> (usize, usize) {
             (additions, deletions)
         }
     })
-}
-
-fn source_field_tail<'a>(source: &'a str, field: &str) -> Option<&'a str> {
-    for marker in [format!("\"{field}\""), field.to_owned()] {
-        let mut search_from = 0;
-        while let Some(relative) = source[search_from..].find(&marker) {
-            let start = search_from + relative;
-            let before = source[..start].chars().next_back();
-            let after_name = start + marker.len();
-            let boundary_ok = marker.starts_with('"')
-                || before.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
-            if boundary_ok {
-                let tail = source[after_name..].trim_start();
-                if let Some(tail) = tail.strip_prefix(':') {
-                    return Some(tail.trim_start());
-                }
-            }
-            search_from = after_name;
-        }
-    }
-    None
-}
-
-fn source_string_field(source: &str, field: &str) -> Option<String> {
-    let rest = source_field_tail(source, field)?;
-    let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<String>();
-    stream.next()?.ok()
-}
-
-fn source_string_fields(source: &str, field: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    for (start, _) in source.match_indices(field) {
-        let before = source[..start].chars().next_back();
-        let after_name = start + field.len();
-        if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-            continue;
-        }
-        let tail = source[after_name..].trim_start();
-        let tail = tail.strip_prefix('"').unwrap_or(tail).trim_start();
-        let Some(tail) = tail.strip_prefix(':').map(str::trim_start) else {
-            continue;
-        };
-        let mut stream = serde_json::Deserializer::from_str(tail).into_iter::<String>();
-        if let Some(Ok(value)) = stream.next() {
-            if !values.contains(&value) {
-                values.push(value);
-            }
-        }
-    }
-    values
-}
-
-fn source_u64_field(source: &str, field: &str) -> Option<u64> {
-    let rest = source_field_tail(source, field)?;
-    let end = rest
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest.get(..end)?.parse().ok()
 }
 
 fn lazy_content_range_summary(
@@ -3290,6 +3358,11 @@ mod tests {
             "tool-summary-label",
             "appendPatchDiff",
             "diff-line",
+            "fileChange",
+            ".outbox-item.submitting .message-body",
+            "border: 1px dashed",
+            "classList.add(\"focused\")",
+            "border-width: 2px",
         ] {
             assert!(source.contains(marker), "missing {marker}");
         }
@@ -3298,7 +3371,7 @@ mod tests {
         assert!(source.contains("background: var(--control-bg)"));
         assert!(source.contains("background: var(--code-bg)"));
         assert_eq!(source.matches(".message.user {").count(), 1);
-        assert_eq!(source.matches(".composer-shell {").count(), 1);
+        assert_eq!(source.matches(".composer-shell {").count(), 2);
         assert_eq!(source.matches(".outbox-item {").count(), 1);
         assert!(!source.contains("--mobile-code"));
         assert!(!source.contains("max-height: min(52dvh, 480px)"));
@@ -3337,13 +3410,11 @@ mod tests {
             phase: Some("commentary".into()),
             content: vec![json!({"type":"output_text","text":"Checking."})],
             tools: vec![ThreadToolCall {
-                call_id: "call-1".into(),
-                name: "exec".into(),
+                call_id: "exec-1".into(),
+                name: "exec_command".into(),
                 status: "completed".into(),
-                input: Value::String(
-                    r#"const r = await tools.exec_command({"cmd":"git status --short"});"#.into(),
-                ),
-                output: Some(Value::String("large private output".into())),
+                input: json!({"type":"commandExecution","command":"git status --short","cwd":"/workspace","commandActions":[]}),
+                output: Some(json!({"aggregatedOutput":"large private output","exitCode":0})),
             }],
         };
         let compact = compact_web_message(&message, 5);
@@ -3353,76 +3424,81 @@ mod tests {
         assert_eq!(compact["tools"][0]["tool_index"], 0);
         assert!(compact["tools"][0]["has_output"].as_bool().unwrap());
         assert!(!encoded.contains("large private output"));
-        assert!(!encoded.contains("tools.exec_command"));
     }
 
     #[test]
-    fn exec_wrapper_with_unquoted_properties_is_parsed_for_display() {
-        let tool = ThreadToolCall {
-            call_id: "call-2".into(),
-            name: "exec".into(),
-            status: "completed".into(),
-            input: Value::String(
-                r#"const r = await tools.exec_command({cmd:"CARGO_INCREMENTAL=0 cargo build --release --locked && launchctl kickstart -k gui/501/com.lunghaa.codex-bridge",workdir:"/workspace/codex-bridge",yield_time_ms:30000,max_output_tokens:20000}); text(JSON.stringify(r))"#.into(),
-            ),
-            output: None,
-        };
-        assert_eq!(
-            tool_preview(&tool),
-            "CARGO_INCREMENTAL=0 cargo build --release --locked && launchctl kickstart -k gui/501/com.lunghaa.codex-bridge"
-        );
-        assert_eq!(
-            parsed_tool_input(&tool).unwrap(),
-            json!({
-                "cmd": "CARGO_INCREMENTAL=0 cargo build --release --locked && launchctl kickstart -k gui/501/com.lunghaa.codex-bridge",
-                "workdir": "/workspace/codex-bridge",
-                "yield_time_ms": 30000,
-                "max_output_tokens": 20000,
-            })
-        );
+    fn app_server_command_item_is_kept_structured() {
+        let tool = typed_thread_tool(&json!({
+            "type":"commandExecution",
+            "id":"exec-1",
+            "command":"git status --short",
+            "commandActions":[{"type":"unknown","command":"git status --short"}],
+            "cwd":"/workspace",
+            "status":"completed",
+            "aggregatedOutput":"clean",
+            "exitCode":0,
+            "durationMs":12,
+        }))
+        .unwrap();
+        assert_eq!(tool.name, "exec_command");
+        assert_eq!(tool.input["command"], "git status --short");
+        assert_eq!(tool.output.as_ref().unwrap()["aggregatedOutput"], "clean");
+        assert_eq!(tool_preview(&tool), "git status --short");
     }
 
     #[test]
-    fn apply_patch_wrapper_reports_files_and_line_counts() {
-        let tool = ThreadToolCall {
-            call_id: "call-patch".into(),
-            name: "exec".into(),
-            status: "completed".into(),
-            input: Value::String(
-                r#"const patch = "*** Begin Patch\n*** Update File: /tmp/src/sessions.rs\n@@\n-old\n+new\n+more\n*** End Patch"; const r = await tools.apply_patch(patch);"#.into(),
-            ),
-            output: None,
-        };
-        assert_eq!(display_tool_name(&tool), "apply_patch");
+    fn app_server_file_change_reports_files_and_line_counts() {
+        let tool = typed_thread_tool(&json!({
+            "type":"fileChange",
+            "id":"patch-1",
+            "status":"completed",
+            "changes":[{
+                "path":"/tmp/src/sessions.rs",
+                "kind":{"type":"update","move_path":null},
+                "diff":"@@ -1 +1,2 @@\n-old\n+new\n+more"
+            }]
+        }))
+        .unwrap();
         assert_eq!(tool_preview(&tool), "已编辑 sessions.rs");
         let compact = compact_tool_summary(&tool, 2);
         assert_eq!(compact["additions"], 2);
         assert_eq!(compact["deletions"], 1);
         assert_eq!(compact["file_count"], 1);
         assert_eq!(compact["name"], "apply_patch");
-        let parsed = parsed_tool_input(&tool).unwrap();
-        assert_eq!(parsed["operation"], "apply_patch");
-        assert_eq!(parsed["files"][0]["path"], "/tmp/src/sessions.rs");
-        assert!(parsed["patch"].as_str().unwrap().contains("+more"));
+        assert_eq!(tool.input["changes"][0]["path"], "/tmp/src/sessions.rs");
     }
 
     #[test]
-    fn web_search_wrapper_reports_queries_instead_of_javascript() {
-        let tool = ThreadToolCall {
-            call_id: "call-web".into(),
-            name: "exec".into(),
-            status: "completed".into(),
-            input: Value::String(
-                r#"const result = await tools.web__run({search_query:[{q:"Codex app-server"},{q:"thread/read model"}],response_length:"short"}); text(result);"#.into(),
-            ),
-            output: Some(json!({"ok": true})),
-        };
-        assert_eq!(display_tool_name(&tool), "web_search");
-        assert_eq!(tool_preview(&tool), "搜索 Codex app-server 等 2 项");
-        assert_eq!(
-            parsed_tool_input(&tool).unwrap()["queries"],
-            json!(["Codex app-server", "thread/read model"])
-        );
+    fn app_server_tools_replace_rollout_wrapper_by_message_id() {
+        let mut messages = vec![ThreadMessage {
+            timestamp: None,
+            id: Some("msg-1".into()),
+            role: "assistant".into(),
+            phase: Some("commentary".into()),
+            content: vec![],
+            tools: vec![ThreadToolCall {
+                call_id: "outer".into(),
+                name: "exec".into(),
+                status: "completed".into(),
+                input: Value::String("const result = await tools.exec_command(...)".into()),
+                output: None,
+            }],
+        }];
+        let typed = typed_thread_tool(&json!({
+            "type":"mcpToolCall",
+            "id":"mcp-1",
+            "server":"cua_repl",
+            "tool":"js",
+            "arguments":{"code":"inspect()"},
+            "status":"completed",
+            "result":{"content":[]},
+            "error":null,
+        }))
+        .unwrap();
+        let tools = HashMap::from([("msg-1".to_owned(), vec![typed])]);
+        assert_eq!(overlay_app_server_tools(&mut messages, &tools), 1);
+        assert_eq!(messages[0].tools[0].name, "cua_repl.js");
+        assert!(messages[0].tools[0].input.is_object());
     }
 
     #[test]

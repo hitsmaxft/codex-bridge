@@ -8,6 +8,12 @@ standalone backend; all data and control requests go through the bridge daemon.
 
 Clean Git states are hidden. Queued-message delivery uses compact, background-free status text in
 the empty lane beside the message, with its withdrawal action arranged vertically underneath.
+The lane only shows the withdrawal action while a message is buffered; transient delivery labels
+remain reserved for the handoff phase. Messages being submitted use a light dashed outline.
+
+Message text and attachments come from durable rollout pagination. Tool groups prefer app-server's
+typed `thread/turns/list` items and fall back to raw rollout calls only when app-server data is not
+available, avoiding JavaScript-wrapper parsing in the normal path.
 
 The composer uses a single compact **Steer/Queue** button. Clicking it switches how the next
 message is delivered without consuming space for two side-by-side controls.
