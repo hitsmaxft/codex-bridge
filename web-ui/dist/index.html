@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Codex Bridge</title>
-    <script type="module" crossorigin src="/assets/app.js?v=98db9ce3fdbf"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=a7e997a44a38">
+    <script type="module" crossorigin src="/assets/app.js?v=28a585ed231e"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=49a01715dc36">
   </head>
   <body>
     <div class="app">
@@ -78,8 +78,10 @@
             data-i18n-aria-label="projectsAria"
             aria-label="Projects and sessions"
           >
-            <span class="desktop-icon" aria-hidden="true">‹</span
-            ><span class="mobile-button-label" data-i18n="session">Sessions</span>
+            <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m15 18-6-6 6-6" />
+            </svg>
+            <span class="mobile-button-label" data-i18n="session">Sessions</span>
           </button>
           <div class="head-copy">
             <h2
@@ -91,6 +93,7 @@
             >
               Choose a session
             </h2>
+            <div class="compact-meta" id="threadCompactMeta"></div>
             <div class="meta">
               <span id="threadMeta" data-i18n="projectsHint"
                 >Projects and sessions appear on the left.</span
@@ -101,8 +104,12 @@
             <button id="selectBtn" data-i18n="selectDefault">Select default</button
             ><button id="refreshBtn" data-i18n="refresh">Refresh</button
             ><button class="tool-toggle" data-i18n-aria-label="tools" aria-label="Tools">
-              <span class="desktop-icon" aria-hidden="true">•••</span
-              ><span class="mobile-button-label" data-i18n="tools">Tools</span>
+              <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <circle cx="5" cy="12" r="1.7" />
+                <circle cx="12" cy="12" r="1.7" />
+                <circle cx="19" cy="12" r="1.7" />
+              </svg>
+              <span class="mobile-button-label" data-i18n="tools">Tools</span>
             </button>
           </div>
         </div>

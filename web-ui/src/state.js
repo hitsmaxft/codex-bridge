@@ -62,6 +62,9 @@ export const state = {
   pendingChanges: false,
   delivery: null,
   lastMessageIndex: null,
+  historyStart: null,
+  historyEnd: null,
+  historyTotal: null,
   lastMessageRefresh: 0,
 };
 

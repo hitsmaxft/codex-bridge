@@ -420,6 +420,9 @@ main {
 .head-copy {
   min-width: 0;
 }
+.compact-meta {
+  display: none;
+}
 .head-actions {
   display: flex;
   flex-shrink: 0;
@@ -427,6 +430,19 @@ main {
 }
 .mobile-button-label {
   display: none;
+}
+.desktop-icon {
+  display: block;
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.desktop-icon path {
+  fill: none;
 }
 .run-state {
   margin-left: 7px;
@@ -469,7 +485,7 @@ main {
   max-width: 100%;
 }
 .message {
-  margin: 0 0 18px;
+  margin: 0 0 5px;
   border: 0;
   border-radius: 0;
   overflow: hidden;
@@ -1219,14 +1235,15 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   min-width: 0;
   min-height: 44px;
   max-height: 112px;
-  padding: 11px 5px;
+  padding: 10px 5px;
   border: 0;
   border-radius: 0;
   background: transparent;
   box-shadow: none;
   resize: none;
+  overflow-y: hidden;
   font-size: 16px;
-  line-height: 1.35;
+  line-height: 22px;
 }
 .composer-shell textarea:focus {
   border: 0;
@@ -1556,7 +1573,7 @@ label.caption {
     width: min(92vw, 380px);
     transform: translateX(-105%);
     transition: 0.2s;
-    z-index: 6;
+    z-index: 20;
     box-shadow: 12px 0 40px #0003;
   }
   aside.open {
@@ -1570,7 +1587,7 @@ label.caption {
     width: min(94vw, 380px);
     transform: translateX(105%);
     transition: 0.2s;
-    z-index: 7;
+    z-index: 21;
     background: var(--panel);
     box-shadow: -12px 0 40px #0003;
   }
@@ -1589,10 +1606,10 @@ label.caption {
   .nav-toggle {
     display: inline-grid !important;
     place-items: center;
-    width: auto;
+    width: 30px;
     height: 30px;
     min-height: 30px;
-    padding: 3px 9px;
+    padding: 0;
     border-radius: 16px;
     font-size: 11px;
     font-weight: 600;
@@ -1621,6 +1638,19 @@ label.caption {
   .thread-head h2 {
     cursor: pointer;
     font-size: 15px;
+    line-height: 18px;
+  }
+  .compact-meta {
+    display: block;
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 10px;
+    line-height: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .thread-head.expanded .compact-meta {
+    display: none;
   }
   .thread-head .meta {
     display: none;
@@ -1641,9 +1671,10 @@ label.caption {
   .head-actions .tool-toggle {
     display: inline-grid !important;
     place-items: center;
-    min-width: 0;
+    width: 30px;
+    min-width: 30px;
     min-height: 30px;
-    padding: 3px 9px;
+    padding: 0;
     border-radius: 16px;
     background: var(--panel);
     font-size: 11px;
@@ -1651,10 +1682,10 @@ label.caption {
     letter-spacing: 0;
   }
   .desktop-icon {
-    display: none;
+    display: block;
   }
   .mobile-button-label {
-    display: inline;
+    display: none;
   }
   #messages {
     min-height: calc(100dvh - 42px);
@@ -1671,6 +1702,9 @@ label.caption {
       max(14px, env(safe-area-inset-left));
     overflow: visible;
   }
+  .composer-shell textarea {
+    max-height: none;
+  }
   .outbox-tray {
     max-height: 26vh;
     padding: 8px max(20px, env(safe-area-inset-right)) 4px max(20px, env(safe-area-inset-left));
@@ -1685,7 +1719,7 @@ label.caption {
     position: fixed;
     inset: 0;
     background: #0007;
-    z-index: 5;
+    z-index: 19;
   }
   .toast {
     max-width: calc(100vw - 24px);

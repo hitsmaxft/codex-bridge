@@ -610,6 +610,7 @@ async function deletePending(entry, button) {
     if (state.current?.id !== entry.thread_id) return;
     const text = typeof r.text === "string" ? r.text : entry.text;
     $("messageText").value = text;
+    resizeComposerTextarea();
     saveDraft(entry.thread_id, text, true);
     setSendMode(r.message_action === "queue" ? "send" : "steer", false);
     state.pending = state.pending.filter(
@@ -636,6 +637,30 @@ function olderButton() {
 }
 async function fetchMessages(before = null, limit = state.pageSize) {
   return command({ command: "messages", thread_id: state.current.id, before, limit }, false);
+}
+// Message indices come from the current rollout parse, not immutable event IDs. Continue a
+// page only while its boundary is exact; otherwise rebuild the visible region atomically.
+function isValidMessagePage(result, { latest = false, expectedEnd = null } = {}) {
+  const page = result?.page,
+    messages = result?.messages;
+  if (!page || !Array.isArray(messages)) return false;
+  const bounds = [page.start, page.end, page.total];
+  if (
+    !bounds.every(Number.isSafeInteger) ||
+    page.start < 0 ||
+    page.start > page.end ||
+    page.end > page.total ||
+    page.end - page.start !== messages.length ||
+    page.before !== page.start ||
+    (latest && page.end !== page.total) ||
+    (expectedEnd !== null && page.end !== expectedEnd)
+  )
+    return false;
+  return messages.every((message, offset) => message.message_index === page.start + offset);
+}
+function requireMessagePage(result, options) {
+  if (!isValidMessagePage(result, options)) throw new Error(tr("historyOutOfSync"));
+  return result;
 }
 function setSendMode(mode, automatic = false) {
   $("sendMode").value = mode;
@@ -964,7 +989,6 @@ async function pollActivity() {
         atBottom = metrics.height - metrics.top - metrics.client < 100,
         detailsOpen = Boolean(root.querySelector("details[open]"));
       if (atBottom && !detailsOpen) {
-        state.pendingChanges = false;
         await openThread(state.current, { quiet: true });
       } else showActivity();
       return;
@@ -980,6 +1004,24 @@ function resetHorizontalPosition() {
   document.documentElement.scrollLeft = 0;
   document.body.scrollLeft = 0;
   window.scrollTo(0, window.scrollY);
+}
+function resizeComposerTextarea() {
+  const textarea = $("messageText"),
+    composer = document.querySelector(".composer"),
+    threadHead = document.querySelector(".thread-head");
+  if (!textarea || !composer || !threadHead) return;
+  textarea.style.height = "44px";
+  const viewportHeight = window.visualViewport?.height || window.innerHeight,
+    composerChrome = Math.max(0, composer.getBoundingClientRect().height - 44),
+    available = Math.max(
+      44,
+      viewportHeight - threadHead.getBoundingClientRect().height - composerChrome - 16,
+    ),
+    desktopLimit = Math.min(320, viewportHeight * 0.34),
+    limit = usesDocumentMessageScroll() ? available : desktopLimit,
+    height = Math.min(Math.max(44, textarea.scrollHeight), limit);
+  textarea.style.height = `${Math.ceil(height)}px`;
+  textarea.style.overflowY = textarea.scrollHeight > height + 1 ? "auto" : "hidden";
 }
 function settleHorizontalPosition() {
   requestAnimationFrame(() => {
@@ -997,15 +1039,19 @@ async function openThread(thread, { quiet = false } = {}) {
   if (state.current) saveDraft(state.current.id, $("messageText").value, true);
   state.current = thread;
   $("messageText").value = state.drafts.get(thread.id) || "";
-  state.before = null;
-  state.hasMore = false;
+  resizeComposerTextarea();
   if (changedThread) {
+    state.before = null;
+    state.hasMore = false;
     state.activityFileLen = null;
     state.activeTurnId = null;
     state.activityPhase = null;
     state.activeTool = null;
     state.pendingChanges = false;
     state.lastMessageIndex = null;
+    state.historyStart = null;
+    state.historyEnd = null;
+    state.historyTotal = null;
     state.lastWorkspaceDiffRefresh = 0;
     $("composerStatus").hidden = true;
     $("modelPicker").hidden = true;
@@ -1019,12 +1065,14 @@ async function openThread(thread, { quiet = false } = {}) {
   }
   renderProjects();
   $("threadTitle").textContent = thread.title || thread.id;
+  $("threadCompactMeta").textContent = thread.git_branch || tr("noBranch");
   $("threadMeta").textContent =
     `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
   const root = $("messages");
   if (!quiet) root.innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
   const [r] = await Promise.all([fetchMessages(), refreshActivity()]);
   if (token !== state.openToken) return;
+  requireMessagePage(r, { latest: true });
   state.current = { ...thread, ...r.thread };
   const delivery = state.delivery?.threadId === thread.id ? state.delivery : null;
   if (
@@ -1040,19 +1088,25 @@ async function openThread(thread, { quiet = false } = {}) {
   ) {
     delivery.onScreen = true;
   }
-  state.lastMessageIndex = r.messages.reduce(
-    (latest, message) => Math.max(latest, message.message_index ?? -1),
-    state.lastMessageIndex ?? -1,
-  );
-  state.before = r.page.before;
-  state.hasMore = r.page.has_more;
-  root.textContent = "";
-  if (state.hasMore) root.appendChild(olderButton());
+  const fragment = document.createDocumentFragment();
+  if (r.page.has_more) fragment.appendChild(olderButton());
   const activeToolMessage = state.activeTurnId
     ? r.messages.findLast((message) => message.tools?.length)
     : null;
-  for (const m of r.messages) root.appendChild(messageNode(m, m === activeToolMessage));
-  if (!r.messages.length) root.innerHTML = `<div class="empty">${tr("noMessages")}</div>`;
+  for (const m of r.messages) fragment.appendChild(messageNode(m, m === activeToolMessage));
+  if (!r.messages.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = tr("noMessages");
+    fragment.appendChild(empty);
+  }
+  root.replaceChildren(fragment);
+  state.lastMessageIndex = r.messages.length ? r.page.end - 1 : null;
+  state.before = r.page.before;
+  state.hasMore = r.page.has_more;
+  state.historyStart = r.page.start;
+  state.historyEnd = r.page.end;
+  state.historyTotal = r.page.total;
   renderPending();
   scrollMessagesToBottom();
   state.pendingChanges = false;
@@ -1070,7 +1124,10 @@ async function loadOlder() {
   if (!state.current || !state.hasMore || state.loadingHistory) return;
   state.loadingHistory = true;
   state.userScrolled = false;
-  const root = $("messages"),
+  const threadId = state.current.id,
+    openToken = state.openToken,
+    expectedEnd = state.historyStart ?? state.before,
+    root = $("messages"),
     metrics = messageScrollMetrics(),
     oldHeight = metrics.height,
     oldTop = metrics.top;
@@ -1080,8 +1137,19 @@ async function loadOlder() {
   } finally {
     state.loadingHistory = false;
   }
+  if (state.current?.id !== threadId || state.openToken !== openToken) return;
+  if (
+    !isValidMessagePage(r, { expectedEnd }) ||
+    (state.historyTotal !== null && r.page.total < state.historyTotal)
+  ) {
+    await openThread(state.current, { quiet: true });
+    notify(tr("historyResynced"));
+    return;
+  }
   state.before = r.page.before;
   state.hasMore = r.page.has_more;
+  state.historyStart = r.page.start;
+  state.historyTotal = Math.max(state.historyTotal ?? 0, r.page.total);
   root.querySelector(".older")?.remove();
   const fragment = document.createDocumentFragment();
   if (state.hasMore) fragment.appendChild(olderButton());
@@ -1130,6 +1198,7 @@ async function write(name) {
       }
     }
     $("messageText").value = "";
+    resizeComposerTextarea();
     saveDraft(threadId, "", true);
     const request = command({ command: name, thread_id: threadId, text }).then(
       (value) => ({ value }),
@@ -1162,6 +1231,7 @@ async function write(name) {
       if (!state.drafts.has(threadId)) saveDraft(threadId, draft, true);
       if (state.current?.id === threadId && !$("messageText").value)
         $("messageText").value = state.drafts.get(threadId) || "";
+      resizeComposerTextarea();
     }
     throw error;
   } finally {
@@ -1211,9 +1281,11 @@ $("archiveThreadBtn").onclick = () =>
     state.activeTool = null;
     state.activityPhase = null;
     $("threadTitle").textContent = tr("chooseSession");
+    $("threadCompactMeta").textContent = "";
     $("threadMeta").textContent = tr("archivedRemoved");
     $("messages").innerHTML = `<div class="empty">${tr("loadingAnother")}</div>`;
     $("messageText").value = "";
+    resizeComposerTextarea();
     renderPending();
     closePanels();
     await loadProjects();
@@ -1233,7 +1305,10 @@ $("modelPickerClose").onclick = () => ($("modelPicker").hidden = true);
 $("modelSelect").onchange = () => renderEffortOptions(state.composerEffort);
 $("effortSelect").onchange = renderModelDescription;
 $("modelApply").onclick = () => run(applyThreadSettings);
-$("messageText").oninput = () => saveDraft(state.current?.id, $("messageText").value);
+$("messageText").oninput = () => {
+  saveDraft(state.current?.id, $("messageText").value);
+  resizeComposerTextarea();
+};
 $("messageText").onkeydown = (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("submitBtn").click();
 };
@@ -1404,6 +1479,9 @@ const frameResizeObserver = new ResizeObserver(syncFrameInsets);
 frameResizeObserver.observe(composer);
 frameResizeObserver.observe(threadHead);
 syncFrameInsets();
+resizeComposerTextarea();
+window.addEventListener("resize", resizeComposerTextarea, { passive: true });
+window.visualViewport?.addEventListener("resize", resizeComposerTextarea, { passive: true });
 document.addEventListener("click", (event) => {
   if (
     !$("modelPicker").hidden &&
