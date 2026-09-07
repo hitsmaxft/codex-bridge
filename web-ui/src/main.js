@@ -1205,6 +1205,16 @@ bindSwipe(
   { ignoreInteractive: true },
 );
 window.addEventListener("pagehide", persistDrafts);
+const composer = document.querySelector(".composer"),
+  mainPanel = document.querySelector("main"),
+  syncComposerHeight = () => {
+    mainPanel.style.setProperty(
+      "--composer-height",
+      `${Math.ceil(composer.getBoundingClientRect().height)}px`,
+    );
+  };
+new ResizeObserver(syncComposerHeight).observe(composer);
+syncComposerHeight();
 document.addEventListener("click", (event) => {
   if (
     !$("modelPicker").hidden &&
@@ -1239,7 +1249,7 @@ document.querySelectorAll(".nav-toggle").forEach(
 $("scrim").onclick = closePanels;
 applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
 setSendMode("steer", false);
-applyTheme(localStorage.getItem(THEME_STORAGE_KEY) || "dark");
+applyTheme(localStorage.getItem(THEME_STORAGE_KEY) || "system", false);
 run(async () => {
   await loadStatus();
   await loadProjects();

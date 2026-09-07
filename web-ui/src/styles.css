@@ -277,6 +277,7 @@ h1 {
   text-overflow: ellipsis;
 }
 main {
+  position: relative;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -284,7 +285,7 @@ main {
   overflow: hidden;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
 .thread-head {
   border-bottom: 1px solid var(--line);
@@ -325,7 +326,9 @@ main {
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 18px max(20px, calc((100% - 820px) / 2));
+  padding: 18px max(20px, calc((100% - 820px) / 2))
+    calc(var(--composer-height, 92px) + 18px);
+  scroll-padding-bottom: calc(var(--composer-height, 92px) + 18px);
   overscroll-behavior: contain;
   overflow-anchor: none;
   scrollbar-gutter: stable;
@@ -756,9 +759,12 @@ main {
   line-height: 1;
 }
 .composer {
-  position: relative;
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 3;
   min-width: 0;
-  flex-shrink: 0;
   border: 0;
   padding: 8px max(20px, calc((100% - 820px) / 2)) 10px;
   background: linear-gradient(transparent, var(--bg) 28%);
@@ -1306,7 +1312,8 @@ label.caption {
     min-width: 0;
     max-width: 100%;
     max-inline-size: 100%;
-    padding: 14px max(20px, env(safe-area-inset-right)) 8px max(20px, env(safe-area-inset-left));
+    padding: 14px max(20px, env(safe-area-inset-right))
+      calc(var(--composer-height, 92px) + 12px) max(20px, env(safe-area-inset-left));
     overflow-x: hidden;
     contain: inline-size;
     background: var(--panel);

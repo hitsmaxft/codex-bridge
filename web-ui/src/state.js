@@ -1,12 +1,12 @@
 import { $ } from "./api.js";
 
 export const DRAFT_STORAGE_KEY = "codex-bridge.drafts.v1";
-export const THEME_STORAGE_KEY = "codex-bridge.theme.v1";
+export const THEME_STORAGE_KEY = "codex-bridge.theme.v2";
 
-export function applyTheme(theme) {
-  const value = ["dark", "light", "system"].includes(theme) ? theme : "dark";
+export function applyTheme(theme, persist = true) {
+  const value = ["dark", "light", "system"].includes(theme) ? theme : "system";
   document.documentElement.dataset.theme = value;
-  localStorage.setItem(THEME_STORAGE_KEY, value);
+  if (persist) localStorage.setItem(THEME_STORAGE_KEY, value);
   const select = $("themeSelect");
   if (select) select.value = value;
 }
