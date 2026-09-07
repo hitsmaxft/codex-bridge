@@ -12,6 +12,9 @@ the empty lane beside the message, with its withdrawal action arranged verticall
 The composer uses a single compact **Steer/Queue** button. Clicking it switches how the next
 message is delivered without consuming space for two side-by-side controls.
 
+On mobile, focusing the composer moves its mode and widened submit controls above the text so the
+editor grows downward. On desktop, the editor stays above a bottom control row and expands upward.
+
 The responsive breakpoint is 800 px. Wider desktop layouts keep both the session history and tools
 panels expanded; narrower layouts turn them into left and right drawers.
 

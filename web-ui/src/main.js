@@ -1079,8 +1079,10 @@ function resetHorizontalPosition() {
 function resizeComposerTextarea() {
   const textarea = $("messageText"),
     composer = document.querySelector(".composer"),
+    shell = document.querySelector(".composer-shell"),
     threadHead = document.querySelector(".thread-head");
-  if (!textarea || !composer || !threadHead) return;
+  if (!textarea || !composer || !shell || !threadHead) return;
+  shell.classList.toggle("has-text", Boolean(textarea.value));
   textarea.style.height = "44px";
   const viewportHeight = window.visualViewport?.height || window.innerHeight,
     composerChrome = Math.max(0, composer.getBoundingClientRect().height - 44),
@@ -1380,6 +1382,7 @@ $("messageText").oninput = () => {
   saveDraft(state.current?.id, $("messageText").value);
   resizeComposerTextarea();
 };
+$("messageText").onfocus = resizeComposerTextarea;
 $("messageText").onkeydown = (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("submitBtn").click();
 };
