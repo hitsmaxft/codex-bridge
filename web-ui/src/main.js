@@ -1,5 +1,14 @@
 import "./styles.css";
-import { $, command, demoMode, notify, run, subscribeEvents, timeText } from "./api.js";
+import {
+  $,
+  authenticate,
+  command,
+  demoMode,
+  notify,
+  run,
+  subscribeEvents,
+  timeText,
+} from "./api.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import { shouldOfferStop } from "./composer-state.js";
@@ -439,7 +448,7 @@ function appendContextValue(details, value, label) {
   }
 }
 function contentNode(item) {
-  if (item.kind === "text") return markdownNode(item.text);
+  if (item.kind === "text") return markdownNode(item.text, { threadId: state.current?.id });
   const details = document.createElement("details");
   details.className = "context-block";
   const summary = document.createElement("summary");
@@ -805,7 +814,7 @@ function pendingNode(entry) {
   box.dataset.pendingId = entry.id;
   const body = document.createElement("div");
   body.className = "message-body";
-  body.appendChild(markdownNode(entry.text));
+  body.appendChild(markdownNode(entry.text, { threadId: entry.thread_id || state.current?.id }));
   if (!entry.handoff && ["queue", "steer"].includes(entry.action)) {
     const mode = document.createElement("div");
     mode.className = "outbox-mode";
@@ -1306,6 +1315,15 @@ function handleBridgeEvent(event) {
     loadStatus().catch(() => {});
     return;
   }
+  if (event?.type === "bridge_thread_activity_snapshot") {
+    if (!Array.isArray(event.active_thread_ids)) return;
+    state.updatingThreads.clear();
+    for (const threadId of event.active_thread_ids) {
+      if (typeof threadId === "string" && threadId) state.updatingThreads.add(threadId);
+    }
+    renderProjects();
+    return;
+  }
   if (event?.type !== "app_server") return;
   const message = event.message || {},
     method = message.method,
@@ -1682,6 +1700,7 @@ $("selectBtn").onclick = () =>
   });
 $("sendModeToggle").onclick = () =>
   setSendMode($("sendMode").value === "steer" ? "send" : "steer", false);
+$("sendModeToggle").onpointerdown = (event) => event.preventDefault();
 $("submitBtn").onpointerdown = () => {
   $("submitBtn").dataset.pointerAction = $("submitBtn").dataset.action;
 };
@@ -2020,8 +2039,9 @@ applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
 setSendMode("steer", false);
 applyTheme(storedTheme(), false);
 watchSystemTheme();
-subscribeEvents(handleBridgeEvent);
 run(async () => {
+  await authenticate();
+  subscribeEvents(handleBridgeEvent);
   await loadStatus();
   await loadProjects();
 });

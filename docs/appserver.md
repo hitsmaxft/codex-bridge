@@ -70,7 +70,7 @@ a completed bridge or Web UI feature.
 | `thread/settings/update` | Change the selected model and related thread settings. |
 | `thread/archive` | Archive a session. |
 | `thread/section/move` | Move a pinned session into or out of the pinned section. |
-| `thread/queue/add`, `thread/queue/list`, `thread/queue/delete` | Native queue submission, reconciliation, and withdrawal. |
+| `thread/queue/add`, `thread/queue/list`, `thread/queue/delete`, `thread/queue/start` | Native queue submission, reconciliation, withdrawal, and idle-thread startup. The bridge starts a newly queued submission explicitly when the authoritative thread state is idle. |
 | `turn/steer` | Follow up on an active turn. |
 | `turn/interrupt` | Stop an active turn. |
 | `thread/resume`, `thread/unsubscribe` | Keep a bounded LRU set of recently viewed threads subscribed to events. |
@@ -93,7 +93,9 @@ Event delivery accelerates live updates. The bridge warms local rollout caches a
 threads emit events, periodically discovers active threads through `thread/loaded/list` plus the
 metadata-only `thread/read(includeTurns: false)`, and subscribes those active threads. A bounded set
 of pinned threads is also warmed locally without resuming every inactive pin into app-server
-memory. Polling remains as a compatibility and gap-recovery path.
+memory. Each successful discovery pass sends a compact active-thread ID snapshot over the existing
+Web UI event WebSocket, so sidebar activity dots recover after a browser reconnect even when no new
+`thread/status/changed` transition occurs. Polling remains as a compatibility and gap-recovery path.
 
 ## Client-to-server method catalogue
 

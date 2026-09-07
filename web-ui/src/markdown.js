@@ -5,7 +5,23 @@ function appendPlain(parent, text) {
   });
 }
 
-function appendInline(parent, text) {
+export function localFileDownloadUrl(raw, threadId) {
+  if (!threadId || typeof raw !== "string") return null;
+  let path = null;
+  if (raw.startsWith("/")) path = raw;
+  else if (raw.startsWith("file://")) {
+    try {
+      path = decodeURIComponent(new URL(raw).pathname);
+    } catch {
+      return null;
+    }
+  }
+  if (!path) return null;
+  const query = new URLSearchParams({ thread_id: threadId, path });
+  return `/api/file?${query}`;
+}
+
+function appendInline(parent, text, options) {
   const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^\s)]+\))/g;
   let offset = 0;
   for (const match of text.matchAll(pattern)) {
@@ -23,15 +39,21 @@ function appendInline(parent, text) {
       const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       const link = document.createElement("a");
       link.textContent = parts[1];
-      try {
-        const url = new URL(parts[2], location.href);
-        if (["http:", "https:", "mailto:"].includes(url.protocol)) {
-          link.href = url.href;
-          link.target = "_blank";
-          link.rel = "noopener noreferrer";
+      const downloadUrl = localFileDownloadUrl(parts[2], options.threadId);
+      if (downloadUrl) {
+        link.href = downloadUrl;
+        link.download = parts[2].split("/").at(-1) || "download";
+      } else {
+        try {
+          const url = new URL(parts[2], location.href);
+          if (["http:", "https:", "mailto:"].includes(url.protocol)) {
+            link.href = url.href;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+          }
+        } catch {
+          // Invalid links remain inert text.
         }
-      } catch {
-        // Invalid links remain inert text.
       }
       if (link.href) parent.appendChild(link);
       else parent.appendChild(document.createTextNode(token));
@@ -41,7 +63,7 @@ function appendInline(parent, text) {
   appendPlain(parent, text.slice(offset));
 }
 
-export function markdownNode(source) {
+export function markdownNode(source, options = {}) {
   const root = document.createElement("div");
   root.className = "markdown";
   const lines = String(source || "")
@@ -75,7 +97,7 @@ export function markdownNode(source) {
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       const element = document.createElement(`h${heading[1].length}`);
-      appendInline(element, heading[2]);
+      appendInline(element, heading[2], options);
       root.appendChild(element);
       index += 1;
       continue;
@@ -93,7 +115,7 @@ export function markdownNode(source) {
         const next = lines[index].match(/^\s*([-*+] |\d+[.)] )(.+)$/);
         if (!next || /^\d/.test(next[1]) !== ordered) break;
         const item = document.createElement("li");
-        appendInline(item, next[2]);
+        appendInline(item, next[2], options);
         list.appendChild(item);
         index += 1;
       }
@@ -107,7 +129,7 @@ export function markdownNode(source) {
         parts.push(lines[index].replace(/^\s*>\s?/, ""));
         index += 1;
       }
-      appendInline(quote, parts.join("\n"));
+      appendInline(quote, parts.join("\n"), options);
       root.appendChild(quote);
       continue;
     }
@@ -120,7 +142,7 @@ export function markdownNode(source) {
       parts.push(lines[index]);
     }
     const paragraph = document.createElement("p");
-    appendInline(paragraph, parts.join("\n"));
+    appendInline(paragraph, parts.join("\n"), options);
     root.appendChild(paragraph);
   }
   return root;

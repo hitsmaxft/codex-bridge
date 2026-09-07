@@ -34,7 +34,9 @@ contact Codex.
 
 The private UI is responsive across mobile and desktop. It includes project and task navigation,
 rendered tool calls and diffs, task pinning and archiving, model selection, Git change summaries,
-English and Chinese text, and queue/steer message handoff.
+English and Chinese text, and queue/steer message handoff. Local file links can download regular
+files smaller than 16 MiB; the server resolves each link against that task's workspace and rejects
+paths or symlinks that escape it.
 
 ## How it connects
 

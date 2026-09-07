@@ -1,3 +1,5 @@
+import { createAuthenticationGate } from "./auth-gate.js";
+
 export const $ = (id) => document.getElementById(id);
 
 const demoMode = import.meta.env.VITE_CODEX_BRIDGE_DEMO === "1";
@@ -7,6 +9,16 @@ let eventRetryTimer;
 let eventRetryDelay = 500;
 let eventStreamUnavailable = false;
 const eventListeners = new Set();
+const authentication = createAuthenticationGate(async () => {
+  if (demoMode) return;
+  const response = await fetch("/api/auth", {
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(`authentication failed (${response.status})`);
+});
+
+export const authenticate = () => authentication.wait();
 
 async function sendCommand(request) {
   if (demoMode) {
@@ -14,11 +26,17 @@ async function sendCommand(request) {
     const client = await demoClient;
     return client.demoCommand(request);
   }
+  await authenticate();
   const response = await fetch("/api/command", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
   });
+  if (response.status === 401) {
+    const error = new Error("authentication expired; reload the page to sign in again");
+    authentication.block(error);
+    throw error;
+  }
   return response.json();
 }
 
@@ -60,7 +78,7 @@ function emitEvent(event) {
   for (const listener of eventListeners) listener(event);
 }
 
-function connectEventStream() {
+async function connectEventStream() {
   if (
     demoMode ||
     eventSocket?.readyState === WebSocket.OPEN ||
@@ -68,6 +86,17 @@ function connectEventStream() {
   )
     return;
   clearTimeout(eventRetryTimer);
+  try {
+    await authenticate();
+  } catch {
+    eventStreamUnavailable = true;
+    return;
+  }
+  if (
+    eventSocket?.readyState === WebSocket.OPEN ||
+    eventSocket?.readyState === WebSocket.CONNECTING
+  )
+    return;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   eventSocket = new WebSocket(`${protocol}//${window.location.host}/api/events`);
   eventSocket.onopen = () => {

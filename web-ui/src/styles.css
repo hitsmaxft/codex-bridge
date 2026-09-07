@@ -1266,12 +1266,12 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   from {
     background-position:
       0 0,
-      140% 50%;
+      120% 50%;
   }
   to {
     background-position:
       0 0,
-      -140% 50%;
+      -120% 50%;
   }
 }
 .composer-shell.submitting,
@@ -1281,18 +1281,18 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
     linear-gradient(var(--composer-surface), var(--composer-surface)) padding-box,
     linear-gradient(
         100deg,
-        var(--glow-base) 30%,
-        var(--glow-soft) 41%,
-        var(--glow) 47%,
+        var(--glow-base) 20%,
+        var(--glow-soft) 32%,
+        var(--glow) 42%,
         var(--glow-core) 50%,
-        var(--glow) 53%,
-        var(--glow-soft) 59%,
-        var(--glow-base) 70%
+        var(--glow) 58%,
+        var(--glow-soft) 68%,
+        var(--glow-base) 80%
       )
       border-box;
   background-size:
     100% 100%,
-    320% 100%;
+    240% 100%;
   background-repeat: no-repeat;
   box-shadow:
     0 3px 10px #00000016,
@@ -1305,7 +1305,7 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   --glow-soft: #0a84ffb5;
   --glow-base: #0a84ff36;
   --glow-ring: #0a84ff52;
-  --glow-speed: 1.8s;
+  --glow-speed: 2.6s;
 }
 .composer-shell.agent-active:not(.submitting) {
   --glow-core: #d2f9dd;
@@ -1313,7 +1313,7 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   --glow-soft: #20aa4faa;
   --glow-base: #20a94a32;
   --glow-ring: #20a94a4a;
-  --glow-speed: 2.8s;
+  --glow-speed: 3.4s;
 }
 .composer-shell textarea {
   grid-area: input;
@@ -1838,10 +1838,11 @@ label.caption {
   .composer-shell.focused #submitBtn,
   .composer-shell.has-text #submitBtn,
   .composer-shell.submitting #submitBtn {
-    width: 100%;
+    justify-self: end;
+    width: 44px;
     height: 38px;
     min-height: 38px;
-    border-radius: 18px;
+    border-radius: 50%;
   }
   .composer-shell.stop-ready #submitBtn {
     width: 44px;

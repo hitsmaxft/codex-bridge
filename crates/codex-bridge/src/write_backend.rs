@@ -34,6 +34,8 @@ pub struct CodexCliBackend {
 pub struct NativeQueueReceipt {
     pub backend: String,
     pub queued_submission_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_turn_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -142,9 +144,34 @@ impl CodexCliBackend {
                 code: "app_server_protocol_error",
                 message: "thread/queue/add response has no queuedSubmission.id".to_owned(),
             })?;
+        let started_turn_id = self
+            .app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            )
+            .ok()
+            .filter(|thread| !app_server_thread_is_active(thread))
+            .and_then(|_| {
+                self.app_server_rpc(
+                    "thread/queue/start",
+                    json!({
+                        "threadId": thread_id,
+                        "queuedSubmissionId": queued_submission_id,
+                    }),
+                )
+                .ok()
+            })
+            .and_then(|result| {
+                result
+                    .pointer("/turn/id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+            });
         Ok(NativeQueueReceipt {
             backend: "app_server_queue".to_owned(),
             queued_submission_id: queued_submission_id.to_owned(),
+            started_turn_id,
         })
     }
 
@@ -168,6 +195,12 @@ impl CodexCliBackend {
         self.app_server
             .as_ref()
             .map(|session| session.events.subscribe())
+    }
+
+    pub fn publish_bridge_event(&self, event: Value) -> bool {
+        self.app_server
+            .as_ref()
+            .is_some_and(|session| session.events.send(event).is_ok())
     }
 
     pub fn app_server_runtime_info(&self) -> Option<AppServerRuntimeInfo> {
@@ -275,6 +308,17 @@ impl CodexCliBackend {
             stderr: None,
         })
     }
+}
+
+fn app_server_thread_is_active(result: &Value) -> bool {
+    let status = result
+        .pointer("/thread/status")
+        .or_else(|| result.get("status"));
+    status.and_then(Value::as_str) == Some("active")
+        || status
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)
+            == Some("active")
 }
 
 fn app_server_unavailable() -> BackendFailure {
@@ -985,6 +1029,34 @@ mod tests {
     }
 
     #[test]
+    fn bridge_events_share_the_persistent_app_server_broadcast() {
+        let (commands, _command_rx) = std_mpsc::channel();
+        let (events, _) = broadcast::channel(4);
+        let session = Arc::new(AppServerSession {
+            commands,
+            events,
+            runtime: Arc::new(RwLock::new(AppServerRuntimeInfo {
+                connected: true,
+                user_agent: None,
+            })),
+        });
+        let backend = CodexCliBackend {
+            program: PathBuf::from("/unused/codex"),
+            app_server_socket: Some(PathBuf::from("/unused/app-server.sock")),
+            app_server: Some(session),
+        };
+        let mut receiver = backend.subscribe_app_server_events().unwrap();
+        assert!(backend.publish_bridge_event(json!({
+            "type": "bridge_thread_activity_snapshot",
+            "active_thread_ids": ["thread-1"]
+        })));
+        assert_eq!(
+            receiver.try_recv().unwrap()["active_thread_ids"][0],
+            "thread-1"
+        );
+    }
+
+    #[test]
     fn watched_threads_use_one_connection_and_evict_the_oldest_subscription() {
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let sock_dir = std::env::temp_dir().join(format!(
@@ -1090,7 +1162,23 @@ mod tests {
                     .into(),
                 ))
                 .unwrap();
-            request
+            let read = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": read["id"], "result": {"thread": {"status": {"type": "idle"}}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let start = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": start["id"], "result": {"turn": {"id": "turn-1"}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            (request, read, start)
         });
         let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(sock_path.clone()));
         let receipt = backend
@@ -1098,7 +1186,8 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.backend, "app_server_queue");
         assert_eq!(receipt.queued_submission_id, "server-queue-1");
-        let request = server.join().unwrap();
+        assert_eq!(receipt.started_turn_id.as_deref(), Some("turn-1"));
+        let (request, read, start) = server.join().unwrap();
         assert_eq!(request["method"], "thread/queue/add");
         assert_eq!(request["params"]["threadId"], "thread-1");
         assert_eq!(
@@ -1106,8 +1195,23 @@ mod tests {
             "browser-message-1"
         );
         assert_eq!(request["params"]["input"][0]["text"], "queued text");
+        assert_eq!(read["method"], "thread/read");
+        assert_eq!(read["params"]["includeTurns"], false);
+        assert_eq!(start["method"], "thread/queue/start");
+        assert_eq!(start["params"]["queuedSubmissionId"], "server-queue-1");
         std::fs::remove_file(&sock_path).unwrap();
         std::fs::remove_dir(&sock_dir).unwrap();
+    }
+
+    #[test]
+    fn native_queue_activity_detection_accepts_current_status_shapes() {
+        assert!(app_server_thread_is_active(
+            &json!({"thread": {"status": {"type": "active"}}})
+        ));
+        assert!(app_server_thread_is_active(&json!({"status": "active"})));
+        assert!(!app_server_thread_is_active(
+            &json!({"thread": {"status": {"type": "idle"}}})
+        ));
     }
 
     fn read_json(websocket: &mut WebSocket<UnixStream>) -> Value {

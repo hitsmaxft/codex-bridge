@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{get, post};
@@ -29,13 +29,14 @@ use codex_bridge::{
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
 const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
@@ -123,6 +124,22 @@ struct WebAuth {
     password: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct FileDownloadQuery {
+    thread_id: String,
+    path: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FileDownloadFailure {
+    ThreadNotFound,
+    FileNotFound,
+    OutsideWorkspace,
+    NotAFile,
+    TooLarge,
+    ReadFailed,
+}
+
 #[derive(Debug, Default)]
 struct AppServerToolCache {
     threads: RwLock<HashMap<String, CachedAppServerTools>>,
@@ -203,6 +220,7 @@ impl PendingMessages {
         &self,
         session_store: &SessionStore,
         queued: Vec<PendingMessage>,
+        thread_id: Option<&str>,
     ) -> Vec<PendingMessage> {
         let Ok(mut entries) = self.entries.write() else {
             return Vec::new();
@@ -227,6 +245,7 @@ impl PendingMessages {
             !is_landed
         });
         let mut matched_queue_ids = HashSet::new();
+        let mut matched_entry_ids = HashSet::new();
         for entry in entries
             .iter_mut()
             .filter(|entry| entry.action == "queue" && entry.status != "failed")
@@ -241,10 +260,18 @@ impl PendingMessages {
                             && entry.source != "app_server_queue"
                             && queued_entry.text == entry.text))
             }) {
-                entry.queued_submission_id = Some(queued_entry.id.clone());
+                entry.queued_submission_id = queued_entry.queued_submission_id.clone();
                 matched_queue_ids.insert(queued_entry.id.clone());
+                matched_entry_ids.insert(entry.id.clone());
             }
         }
+        entries.retain(|entry| {
+            let in_scope = thread_id.is_none_or(|thread_id| entry.thread_id == thread_id);
+            entry.action != "queue"
+                || entry.source != "app_server_queue"
+                || !in_scope
+                || matched_entry_ids.contains(&entry.id)
+        });
         let mut combined = entries.clone();
         for queued_entry in queued {
             if !matched_queue_ids.contains(&queued_entry.id) {
@@ -252,6 +279,9 @@ impl PendingMessages {
             }
         }
         combined
+            .into_iter()
+            .filter(|entry| thread_id.is_none_or(|thread_id| entry.thread_id == thread_id))
+            .collect()
     }
 
     fn dismiss(&self, id: &str, thread_id: &str) {
@@ -640,21 +670,34 @@ fn spawn_hot_session_cache(
                     let backend = Arc::clone(&write_backend);
                     let refresh_pins = refresh_count == 1 || refresh_count % 3 == 0;
                     let _ = tokio::task::spawn_blocking(move || {
-                        let loaded = backend
-                            .app_server_rpc("thread/loaded/list", json!({}))
-                            .map(|result| loaded_thread_ids(&result))
-                            .unwrap_or_default();
+                        let Ok(loaded_result) = backend.app_server_rpc("thread/loaded/list", json!({})) else {
+                            return;
+                        };
+                        let loaded = loaded_thread_ids(&loaded_result);
+                        let mut active_thread_ids = Vec::new();
+                        let mut complete_snapshot = true;
                         for thread_id in loaded {
-                            let active = backend
-                                .app_server_rpc(
-                                    "thread/read",
-                                    json!({"threadId": thread_id, "includeTurns": false}),
-                                )
-                                .is_ok_and(|result| thread_result_is_active(&result));
+                            let active = match backend.app_server_rpc(
+                                "thread/read",
+                                json!({"threadId": thread_id, "includeTurns": false}),
+                            ) {
+                                Ok(result) => thread_result_is_active(&result),
+                                Err(_) => {
+                                    complete_snapshot = false;
+                                    false
+                                }
+                            };
                             if active {
+                                active_thread_ids.push(thread_id.clone());
                                 let _ = backend.watch_thread(&thread_id);
                                 let _ = store.warm_thread_messages(&thread_id);
                             }
+                        }
+                        if complete_snapshot {
+                            backend.publish_bridge_event(json!({
+                                "type": "bridge_thread_activity_snapshot",
+                                "active_thread_ids": active_thread_ids,
+                            }));
                         }
                         if refresh_pins {
                             for thread_id in pinned_thread_ids(&backend)
@@ -839,6 +882,8 @@ fn web_router(state: WebState) -> Router {
         .route("/", get(web_index))
         .route("/assets/app.js", get(web_app_js))
         .route("/assets/app.css", get(web_app_css))
+        .route("/api/auth", get(web_auth_check))
+        .route("/api/file", get(web_file_download))
         .route("/api/command", post(web_command))
         .route("/api/events", get(web_events))
         .with_state(state)
@@ -859,6 +904,134 @@ async fn web_app_js(State(state): State<WebState>, headers: HeaderMap) -> HttpRe
 
 async fn web_app_css(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
     web_asset_response(&state, &headers, WEB_APP_CSS, "text/css; charset=utf-8")
+}
+
+async fn web_auth_check(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    if !basic_auth_allowed(&headers, &state.auth) {
+        return basic_auth_required();
+    }
+    if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+async fn web_file_download(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<FileDownloadQuery>,
+) -> HttpResponse {
+    if !basic_auth_allowed(&headers, &state.auth) {
+        return basic_auth_required();
+    }
+    if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let store = Arc::clone(&state.bridge.session_store);
+    let result = tokio::task::spawn_blocking(move || {
+        let thread = store
+            .find_thread(&query.thread_id)
+            .map_err(|_| FileDownloadFailure::ThreadNotFound)?
+            .ok_or(FileDownloadFailure::ThreadNotFound)?;
+        read_workspace_download(&thread.cwd, &query.path)
+    })
+    .await;
+    let (bytes, filename) = match result {
+        Ok(Ok(download)) => download,
+        Ok(Err(FileDownloadFailure::ThreadNotFound | FileDownloadFailure::FileNotFound)) => {
+            return (StatusCode::NOT_FOUND, "file not found").into_response();
+        }
+        Ok(Err(FileDownloadFailure::OutsideWorkspace)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "file is outside the session workspace",
+            )
+                .into_response();
+        }
+        Ok(Err(FileDownloadFailure::TooLarge)) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file must be smaller than 16 MiB",
+            )
+                .into_response();
+        }
+        Ok(Err(FileDownloadFailure::NotAFile | FileDownloadFailure::ReadFailed)) | Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "file cannot be downloaded",
+            )
+                .into_response();
+        }
+    };
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\"")),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn read_workspace_download(
+    workspace: &Path,
+    requested: &str,
+) -> std::result::Result<(Vec<u8>, String), FileDownloadFailure> {
+    if requested.is_empty() {
+        return Err(FileDownloadFailure::FileNotFound);
+    }
+    let workspace = fs::canonicalize(workspace).map_err(|_| FileDownloadFailure::FileNotFound)?;
+    let requested = PathBuf::from(requested);
+    let candidate = if requested.is_absolute() {
+        requested
+    } else {
+        workspace.join(requested)
+    };
+    let candidate = fs::canonicalize(candidate).map_err(|_| FileDownloadFailure::FileNotFound)?;
+    if !candidate.starts_with(&workspace) {
+        return Err(FileDownloadFailure::OutsideWorkspace);
+    }
+    let metadata = fs::metadata(&candidate).map_err(|_| FileDownloadFailure::FileNotFound)?;
+    if !metadata.is_file() {
+        return Err(FileDownloadFailure::NotAFile);
+    }
+    if metadata.len() >= MAX_DOWNLOAD_BYTES {
+        return Err(FileDownloadFailure::TooLarge);
+    }
+    let bytes = fs::read(&candidate).map_err(|_| FileDownloadFailure::ReadFailed)?;
+    if bytes.len() as u64 >= MAX_DOWNLOAD_BYTES {
+        return Err(FileDownloadFailure::TooLarge);
+    }
+    let filename = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Ok((bytes, filename))
 }
 
 fn web_asset_response(
@@ -1778,7 +1951,7 @@ fn dispatch(
             let (queued, queue_backend) =
                 queued_messages_for_thread(session_store, write_backend, thread_id.as_deref());
             Response::success(json!({
-                "messages": pending_messages.reconcile(session_store, queued),
+                "messages": pending_messages.reconcile(session_store, queued, thread_id.as_deref()),
                 "queue_backend": queue_backend,
             }))
         }
@@ -1786,7 +1959,7 @@ fn dispatch(
             let (queued, _) =
                 queued_messages_for_thread(session_store, write_backend, Some(&thread_id));
             let entry = pending_messages
-                .reconcile(session_store, queued)
+                .reconcile(session_store, queued, Some(&thread_id))
                 .into_iter()
                 .find(|entry| entry.id == id && entry.thread_id == thread_id);
             let Some(entry) = entry else {
@@ -2468,9 +2641,15 @@ fn dispatch(
                 Ok(receipt) => {
                     pending_messages
                         .finish_queue(&pending_id, receipt.queued_submission_id.clone());
+                    let status = if receipt.started_turn_id.is_some() {
+                        pending_messages.finish(&pending_id, "accepted", None);
+                        "accepted"
+                    } else {
+                        "queued"
+                    };
                     Response::success(json!({
                         "action": "send",
-                        "status": "queued",
+                        "status": status,
                         "pending_id": pending_id,
                         "thread_id": resolved.thread.id,
                         "target": resolved.method,
@@ -3378,6 +3557,65 @@ mod tests {
     }
 
     #[test]
+    fn workspace_download_accepts_only_small_regular_files_inside_workspace() {
+        let root = unique_test_dir("workspace-download");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join("output")).unwrap();
+        fs::write(workspace.join("output/firmware image.elf"), b"firmware").unwrap();
+
+        let (bytes, filename) =
+            read_workspace_download(&workspace, "output/firmware image.elf").unwrap();
+        assert_eq!(bytes, b"firmware");
+        assert_eq!(filename, "firmware_image.elf");
+
+        let absolute = fs::canonicalize(workspace.join("output/firmware image.elf")).unwrap();
+        assert_eq!(
+            read_workspace_download(&workspace, absolute.to_str().unwrap())
+                .unwrap()
+                .0,
+            b"firmware"
+        );
+        assert_eq!(
+            read_workspace_download(&workspace, "output").unwrap_err(),
+            FileDownloadFailure::NotAFile
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_download_rejects_escape_and_sixteen_mib_files() {
+        let root = unique_test_dir("workspace-download-boundaries");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let outside = root.join("outside.elf");
+        fs::write(&outside, b"outside").unwrap();
+        assert_eq!(
+            read_workspace_download(&workspace, outside.to_str().unwrap()).unwrap_err(),
+            FileDownloadFailure::OutsideWorkspace
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, workspace.join("escape.elf")).unwrap();
+            assert_eq!(
+                read_workspace_download(&workspace, "escape.elf").unwrap_err(),
+                FileDownloadFailure::OutsideWorkspace
+            );
+        }
+
+        let oversized = workspace.join("sixteen-mib.bin");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_DOWNLOAD_BYTES).unwrap();
+        assert_eq!(
+            read_workspace_download(&workspace, oversized.to_str().unwrap()).unwrap_err(),
+            FileDownloadFailure::TooLarge
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn writes_never_fall_back_to_latest_rollout() {
         let store = fixture_store();
         let selected = RwLock::new(None);
@@ -3714,7 +3952,7 @@ mod tests {
         pending.finish(&first, "queued", None);
         pending.finish(&second, "queued", None);
         let queued = read_codex_queue(&home);
-        let entries = pending.reconcile(&SessionStore::new(home.clone()), queued);
+        let entries = pending.reconcile(&SessionStore::new(home.clone()), queued, None);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].queued_submission_id.as_deref(), Some("queue-1"));
         assert_eq!(entries[1].queued_submission_id.as_deref(), Some("queue-2"));
@@ -3722,6 +3960,36 @@ mod tests {
         pending.dismiss(&first, "thread-1");
         assert_eq!(pending.entries.read().unwrap().len(), 1);
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn app_server_queue_reconciliation_preserves_server_id_and_removes_cancelled_entries() {
+        let pending = PendingMessages::default();
+        let local_id = pending.begin("thread-1", "queued text", "queue", -1);
+        pending.finish_queue(&local_id, "server-queue-1".to_owned());
+        let queued = vec![PendingMessage {
+            id: local_id.clone(),
+            thread_id: "thread-1".to_owned(),
+            text: "queued text".to_owned(),
+            action: "queue".to_owned(),
+            status: "queued".to_owned(),
+            source: "app_server_queue".to_owned(),
+            queued_submission_id: Some("server-queue-1".to_owned()),
+            after_message_index: -1,
+            error: None,
+        }];
+        let store = fixture_store();
+        let entries = pending.reconcile(&store, queued, Some("thread-1"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].queued_submission_id.as_deref(),
+            Some("server-queue-1")
+        );
+
+        assert!(pending
+            .reconcile(&store, Vec::new(), Some("thread-1"))
+            .is_empty());
+        assert!(pending.entries.read().unwrap().is_empty());
     }
 
     #[test]
@@ -3834,7 +4102,9 @@ mod tests {
         let source = concat!(
             include_str!("../../../web-ui/index.html"),
             include_str!("../../../web-ui/src/api.js"),
+            include_str!("../../../web-ui/src/auth-gate.js"),
             include_str!("../../../web-ui/src/main.js"),
+            include_str!("../../../web-ui/src/markdown.js"),
             include_str!("../../../web-ui/src/i18n.js"),
             include_str!("../../../web-ui/src/composer-state.js"),
             include_str!("../../../web-ui/src/session-route.js"),
@@ -3918,6 +4188,9 @@ mod tests {
             "codex-bridge.last-session.v1",
             "preserveView: true",
             "visibilitychange",
+            "bridge_thread_activity_snapshot",
+            "/api/file",
+            "/api/auth",
             "setDeliveryState",
             "serverQueued",
             "submit-spin",

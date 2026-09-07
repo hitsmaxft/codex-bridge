@@ -3,7 +3,9 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { shouldOfferStop } from "../src/composer-state.js";
+import { createAuthenticationGate } from "../src/auth-gate.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
+import { localFileDownloadUrl } from "../src/markdown.js";
 import {
   LAST_SESSION_STORAGE_KEY,
   rememberSessionId,
@@ -121,4 +123,41 @@ test("file diffs define distinct light and dark theme palettes", async () => {
   assert.match(stylesheet, /html\[data-theme="light"\]\s*\{[^}]*--diff-surface:\s*#fff/s);
   assert.match(stylesheet, /\.diff-line\.add\s*\{[^}]*var\(--diff-add-bg\)/s);
   assert.match(stylesheet, /\.diff-line\.delete\s*\{[^}]*var\(--diff-delete-bg\)/s);
+  assert.match(
+    stylesheet,
+    /\.composer-shell:focus-within #submitBtn,[\s\S]*?justify-self:\s*end;[\s\S]*?width:\s*44px;/,
+  );
+});
+
+test("local task files use the authenticated workspace download route", () => {
+  assert.equal(
+    localFileDownloadUrl("/Users/bhe/project/firmware image.elf", "thread-1"),
+    "/api/file?thread_id=thread-1&path=%2FUsers%2Fbhe%2Fproject%2Ffirmware+image.elf",
+  );
+  assert.equal(
+    localFileDownloadUrl("file:///Users/bhe/project/firmware.elf", "thread-1"),
+    "/api/file?thread_id=thread-1&path=%2FUsers%2Fbhe%2Fproject%2Ffirmware.elf",
+  );
+  assert.equal(localFileDownloadUrl("https://example.com/firmware.elf", "thread-1"), null);
+  assert.equal(localFileDownloadUrl("/Users/bhe/project/firmware.elf", null), null);
+});
+
+test("authentication gate serializes concurrent startup requests", async () => {
+  let probes = 0;
+  let release;
+  const gate = createAuthenticationGate(
+    () =>
+      new Promise((resolve) => {
+        probes += 1;
+        release = resolve;
+      }),
+  );
+  const first = gate.wait();
+  const second = gate.wait();
+  await Promise.resolve();
+  assert.equal(probes, 1);
+  release();
+  await Promise.all([first, second]);
+  await gate.wait();
+  assert.equal(probes, 1);
 });
