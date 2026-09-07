@@ -550,15 +550,14 @@ function pendingNode(entry) {
     const remove = document.createElement("button");
     remove.className = "outbox-delete";
     remove.type = "button";
-    remove.textContent = tr("delete");
+    remove.textContent = tr("withdraw");
     remove.disabled = busy;
     remove.title = busy ? tr("deleteBusy") : tr("deleteRestore");
     remove.setAttribute("aria-label", remove.title);
     remove.onclick = () => run(() => deletePending(entry, remove));
     actions.appendChild(remove);
   }
-  body.appendChild(actions);
-  box.appendChild(body);
+  box.append(actions, body);
   return box;
 }
 function renderPending() {

@@ -762,20 +762,24 @@ main {
   display: flex;
   max-height: 30vh;
   margin: 0;
-  padding: 8px max(20px, calc((100% - 820px) / 2)) 4px;
+  padding: 4px max(20px, calc((100% - 820px) / 2)) 2px;
   overflow: auto;
   flex-direction: column;
   align-items: flex-end;
-  gap: 6px;
+  gap: 4px;
   background: linear-gradient(var(--panel) 74%, transparent);
 }
 .outbox-tray[hidden] {
   display: none;
 }
 .outbox-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
   width: fit-content;
   max-width: min(88%, 680px);
-  padding: 8px 12px;
+  padding: 5px 9px;
   border: 0;
   border-radius: 18px;
   background: var(--user-bg);
@@ -793,16 +797,22 @@ main {
 .outbox-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 5px;
+  justify-content: flex-start;
+  gap: 4px;
+  min-width: 0;
 }
 .outbox-actions .outbox-status {
+  max-width: min(34vw, 180px);
   margin-top: 0;
+  overflow: hidden;
+  font-size: 10px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .outbox-delete {
-  min-height: 26px;
-  padding: 2px 7px;
+  min-height: 22px;
+  padding: 0 4px;
   border-color: transparent;
   background: transparent;
   color: var(--muted);
@@ -1707,7 +1717,7 @@ label.caption {
   }
   .outbox-tray {
     max-height: 26vh;
-    padding: 8px max(20px, env(safe-area-inset-right)) 4px max(20px, env(safe-area-inset-left));
+    padding: 4px max(20px, env(safe-area-inset-right)) 2px max(20px, env(safe-area-inset-left));
     background: linear-gradient(var(--panel) 74%, transparent);
   }
   .model-picker {
