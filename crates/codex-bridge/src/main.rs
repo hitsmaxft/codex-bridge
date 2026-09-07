@@ -3190,6 +3190,12 @@ mod tests {
         }
         assert!(WEB_APP_JS.contains("pending_message_delete"));
         assert!(WEB_APP_CSS.contains("touch-action:pan-y"));
+        assert!(source.contains("background: var(--control-bg)"));
+        assert!(source.contains("background: var(--code-bg)"));
+        assert_eq!(source.matches(".message.user {").count(), 1);
+        assert_eq!(source.matches(".composer-shell {").count(), 1);
+        assert_eq!(source.matches(".outbox-item {").count(), 1);
+        assert!(!source.contains("--mobile-code"));
         assert!(!source.contains("sessionStorage"));
     }
 
