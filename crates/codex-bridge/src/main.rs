@@ -3196,6 +3196,7 @@ mod tests {
         assert_eq!(source.matches(".composer-shell {").count(), 1);
         assert_eq!(source.matches(".outbox-item {").count(), 1);
         assert!(!source.contains("--mobile-code"));
+        assert!(!source.contains("max-height: min(52dvh, 480px)"));
         assert!(!source.contains("sessionStorage"));
     }
 

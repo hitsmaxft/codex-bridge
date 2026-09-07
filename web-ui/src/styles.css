@@ -839,7 +839,7 @@ main {
   right: 0;
   bottom: 0;
   left: 0;
-  z-index: 3;
+  z-index: 10;
   min-width: 0;
   border: 0;
   padding: 8px max(20px, calc((100% - 820px) / 2)) 10px;
@@ -1248,12 +1248,6 @@ label.caption {
   font-size: 12px;
 }
 @media (min-width: 801px) {
-  .composer {
-    min-height: 0;
-    max-height: min(52dvh, 480px);
-    overflow-y: auto;
-    overscroll-behavior: contain;
-  }
   .composer-shell textarea {
     max-height: min(34dvh, 320px);
   }
