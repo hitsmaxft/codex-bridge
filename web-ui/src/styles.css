@@ -360,6 +360,31 @@ aside {
 .project-threads[hidden] {
   display: none;
 }
+.pinned-section {
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.pinned-heading {
+  min-height: 30px;
+  padding: 7px 10px 5px 14px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.pinned-count {
+  font-variant-numeric: tabular-nums;
+}
+.pinned-threads {
+  padding: 0 4px 5px;
+}
+.pinned-threads .thread.active {
+  background: var(--active-thread);
+}
 .thread {
   width: 100%;
   border: 0;
@@ -1872,30 +1897,6 @@ html[data-theme="light"] .composer-shell.submitting,
 html[data-theme="light"] .composer-shell.agent-active:not(.submitting) {
   padding: 4px 5px 4px 6px;
   border-width: 2px;
-}
-@media (prefers-color-scheme: light) {
-  html[data-theme="system"] {
-    color-scheme: light;
-    --bg: #f7f7f5;
-    --panel: #fff;
-    --panel2: #f3f3f1;
-    --line: #e3e3df;
-    --text: #151515;
-    --muted: #8a8a86;
-    --accent: #0a84ff;
-    --accent2: #0878e3;
-    --danger: #e34c4c;
-    --composer-surface: #fff;
-    --code-bg: #f5f5f3;
-    --user-bg: #dff1ff;
-    --user-text: #0874c9;
-    --active-thread: #edf6ff;
-  }
-  html[data-theme="system"] .composer-shell.submitting,
-  html[data-theme="system"] .composer-shell.agent-active:not(.submitting) {
-    padding: 4px 5px 4px 6px;
-    border-width: 2px;
-  }
 }
 .nav-toggle {
   display: none;

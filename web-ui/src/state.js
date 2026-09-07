@@ -1,15 +1,5 @@
-import { $ } from "./api.js";
-
 export const DRAFT_STORAGE_KEY = "codex-bridge.drafts.v1";
-export const THEME_STORAGE_KEY = "codex-bridge.theme.v2";
-
-export function applyTheme(theme, persist = true) {
-  const value = ["dark", "light", "system"].includes(theme) ? theme : "system";
-  document.documentElement.dataset.theme = value;
-  if (persist) localStorage.setItem(THEME_STORAGE_KEY, value);
-  const select = $("themeSelect");
-  if (select) select.value = value;
-}
+export { applyTheme, storedTheme, watchSystemTheme } from "./theme.js";
 
 function loadDrafts() {
   try {
@@ -36,6 +26,7 @@ export const state = {
   projectThreads: new Map(),
   pinAvailable: false,
   pinnedIds: new Set(),
+  pinnedThreads: [],
   pinBusy: new Set(),
   expanded: new Set(),
   current: null,

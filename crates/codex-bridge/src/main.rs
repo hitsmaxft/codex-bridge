@@ -1890,11 +1890,30 @@ fn dispatch(
             }
         }
         Request::ThreadPins => match pinned_thread_ids(write_backend) {
-            Ok(thread_ids) => Response::success(json!({
-                "available": true,
-                "section_id": PINNED_THREAD_SECTION_ID,
-                "thread_ids": thread_ids,
-            })),
+            Ok(thread_ids) => {
+                let mut threads = Vec::new();
+                for thread_id in &thread_ids {
+                    if let Ok(Some(thread)) = session_store.find_thread(thread_id) {
+                        threads.push(json!({
+                            "id": thread.id,
+                            "title": thread.title,
+                            "cwd": thread.cwd,
+                            "git_branch": thread.git_branch,
+                            "created_at": thread.created_at,
+                            "updated_at_ms": thread.updated_at_ms,
+                            "source": thread.source,
+                            "archived": thread.archived,
+                            "pinned": true,
+                        }));
+                    }
+                }
+                Response::success(json!({
+                    "available": true,
+                    "section_id": PINNED_THREAD_SECTION_ID,
+                    "thread_ids": thread_ids,
+                    "threads": threads,
+                }))
+            }
             Err(error) => write_backend_error(error),
         },
         Request::ThreadPin { thread_id, pinned } => {
@@ -3285,6 +3304,7 @@ mod tests {
             include_str!("../../../web-ui/src/main.js"),
             include_str!("../../../web-ui/src/i18n.js"),
             include_str!("../../../web-ui/src/state.js"),
+            include_str!("../../../web-ui/src/theme.js"),
             include_str!("../../../web-ui/src/styles.css"),
         );
         for command in [
@@ -3338,9 +3358,12 @@ mod tests {
             "-webkit-text-size-adjust: 100%",
             "contain: inline-size",
             "id=\"modelPicker\"",
-            "prefers-color-scheme: light",
+            "prefers-color-scheme: dark",
             "id=\"themeSelect\"",
             "codex-bridge.theme.v2",
+            "watchSystemTheme",
+            "pinnedSessions",
+            "pinnedThreads",
             "--composer-height",
             "--thread-head-height",
             "ResizeObserver",

@@ -328,7 +328,12 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "available": 2
         }),
         "thread_pins" => {
-            json!({"available": true, "section_id": "demo-pins", "thread_ids": state.pinned_thread.iter().collect::<Vec<_>>()})
+            let thread_ids = state.pinned_thread.iter().collect::<Vec<_>>();
+            let threads = thread_ids
+                .iter()
+                .map(|thread_id| state.thread(thread_id))
+                .collect::<Vec<_>>();
+            json!({"available": true, "section_id": "demo-pins", "thread_ids": thread_ids, "threads": threads})
         }
         "thread_pin" => {
             let pinned = request
@@ -593,6 +598,7 @@ mod tests {
         );
         let pins = dispatch(json!({"command": "thread_pins"}), &mut state);
         assert_eq!(pins["result"]["thread_ids"], json!([SECONDARY_THREAD]));
+        assert_eq!(pins["result"]["threads"][0]["id"], SECONDARY_THREAD);
         assert_eq!(state.thread(PRIMARY_THREAD)["pinned"], false);
         assert_eq!(state.thread(SECONDARY_THREAD)["pinned"], true);
     }

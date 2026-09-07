@@ -4,11 +4,12 @@ import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18
 import { markdownNode } from "./markdown.js";
 import {
   DRAFT_STORAGE_KEY,
-  THEME_STORAGE_KEY,
   applyTheme,
   persistDrafts,
   saveDraft,
   state,
+  storedTheme,
+  watchSystemTheme,
 } from "./state.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
 
@@ -61,6 +62,7 @@ async function loadPins() {
   if (!state.directAppServer) {
     state.pinAvailable = false;
     state.pinnedIds.clear();
+    state.pinnedThreads = [];
     return;
   }
   try {
@@ -68,6 +70,18 @@ async function loadPins() {
       ids = Array.isArray(result.thread_ids) ? result.thread_ids : [];
     state.pinAvailable = Boolean(result.available);
     state.pinnedIds = new Set(ids);
+    const returned = new Map(
+      (Array.isArray(result.threads) ? result.threads : []).map((thread) => [thread.id, thread]),
+    );
+    for (const data of state.projectThreads.values()) {
+      for (const thread of data.threads) {
+        if (!returned.has(thread.id)) returned.set(thread.id, thread);
+      }
+    }
+    state.pinnedThreads = ids
+      .map((id) => returned.get(id))
+      .filter(Boolean)
+      .map((thread) => ({ ...thread, pinned: true }));
     const ranks = new Map(ids.map((id, rank) => [id, rank]));
     for (const data of state.projectThreads.values()) {
       for (const thread of data.threads) thread.pinned = state.pinnedIds.has(thread.id);
@@ -80,6 +94,7 @@ async function loadPins() {
   } catch {
     state.pinAvailable = false;
     state.pinnedIds.clear();
+    state.pinnedThreads = [];
   }
 }
 async function loadProjectThreads(project, offset = 0) {
@@ -113,9 +128,10 @@ async function toggleProject(project, autoOpen = false) {
   else renderProjects();
   if (autoOpen && !state.current && threads.length) await openThread(threads[0]);
 }
-async function toggleThreadPin(project, thread) {
+async function toggleThreadPin(thread) {
   if (!state.pinAvailable || state.pinBusy.has(thread.id)) return;
-  const pinned = !thread.pinned;
+  const pinned = !thread.pinned,
+    project = pinnedProject(thread);
   state.pinBusy.add(thread.id);
   renderProjects();
   try {
@@ -123,27 +139,84 @@ async function toggleThreadPin(project, thread) {
     if (pinned) state.pinnedIds.add(thread.id);
     else state.pinnedIds.delete(thread.id);
     await loadPins();
-    await loadProjectThreads(project);
+    if (!pinned && project && state.projectThreads.has(project.path)) {
+      await loadProjectThreads(project);
+    }
     notify(tr(pinned ? "sessionPinned" : "sessionUnpinned"));
   } finally {
     state.pinBusy.delete(thread.id);
     renderProjects();
   }
 }
+function threadMatches(thread, query) {
+  return `${thread.title || ""} ${thread.id} ${thread.cwd || ""} ${thread.git_branch || ""}`
+    .toLowerCase()
+    .includes(query);
+}
+function threadRow(thread) {
+  const row = document.createElement("div");
+  row.className = `thread-row${state.pinAvailable && !thread.archived ? "" : " no-pin"}`;
+  const button = document.createElement("button");
+  button.className = "thread" + (state.current?.id === thread.id ? " active" : "");
+  button.innerHTML = '<div class="thread-name"></div><div class="thread-meta"></div>';
+  button.children[0].textContent = thread.title || thread.id;
+  button.children[1].textContent = `${thread.git_branch || tr("noBranch")} · ${timeText(thread.updated_at_ms, getLanguage() === "zh" ? "zh-CN" : "en")}${thread.archived ? ` · ${tr("archived")}` : ""}`;
+  button.onclick = () => openThread(thread);
+  row.appendChild(button);
+  if (state.pinAvailable && !thread.archived) {
+    const pin = document.createElement("button"),
+      label = tr(thread.pinned ? "unpinSession" : "pinSession");
+    pin.className = `thread-pin${thread.pinned ? " pinned" : ""}`;
+    pin.type = "button";
+    pin.innerHTML =
+      '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6Zm3 11v7" /></svg>';
+    pin.title = label;
+    pin.setAttribute("aria-label", label);
+    pin.setAttribute("aria-pressed", String(Boolean(thread.pinned)));
+    pin.disabled = state.pinBusy.has(thread.id);
+    pin.onclick = () => run(() => toggleThreadPin(thread));
+    row.appendChild(pin);
+  }
+  return row;
+}
+function pinnedProject(thread) {
+  const cwd = String(thread.cwd || "").replace(/\/+$/, "");
+  return state.projects
+    .filter((project) => {
+      const path = String(project.path).replace(/\/+$/, "");
+      return cwd === path || cwd.startsWith(`${path}/`);
+    })
+    .sort((left, right) => String(right.path).length - String(left.path).length)[0];
+}
 function renderProjects() {
   const q = $("search").value.trim().toLowerCase(),
     root = $("projects");
   root.textContent = "";
+  const pinned = state.pinnedThreads.filter((thread) => threadMatches(thread, q));
   const projects = state.projects.filter(
     (p) =>
       `${p.name} ${p.path}`.toLowerCase().includes(q) ||
       state.projectThreads
         .get(p.path)
-        ?.threads.some((t) => `${t.title || ""} ${t.id}`.toLowerCase().includes(q)),
+        ?.threads.some((t) => !state.pinnedIds.has(t.id) && threadMatches(t, q)),
   );
-  if (!projects.length) {
+  if (!projects.length && !pinned.length) {
     root.innerHTML = `<div class="empty" style="padding:12px">${tr("noMatchingProjects")}</div>`;
     return;
+  }
+  if (pinned.length) {
+    const section = document.createElement("section"),
+      heading = document.createElement("div"),
+      list = document.createElement("div");
+    section.className = "pinned-section";
+    heading.className = "pinned-heading";
+    heading.innerHTML = '<span class="pinned-title"></span><span class="pinned-count"></span>';
+    heading.children[0].textContent = tr("pinnedSessions");
+    heading.children[1].textContent = `${pinned.length}`;
+    list.className = "pinned-threads";
+    for (const thread of pinned) list.appendChild(threadRow(thread));
+    section.append(heading, list);
+    root.appendChild(section);
   }
   for (const p of projects) {
     const wrap = document.createElement("section");
@@ -157,7 +230,10 @@ function renderProjects() {
     button.children[0].textContent = state.expanded.has(p.path) ? "▾" : "▸";
     button.children[1].children[0].textContent = p.name;
     button.children[1].children[1].textContent = p.path;
-    button.children[2].textContent = `${p.thread_count}`;
+    const pinnedCount = state.pinnedThreads.filter(
+      (thread) => pinnedProject(thread)?.path === p.path,
+    ).length;
+    button.children[2].textContent = `${Math.max(0, p.thread_count - pinnedCount)}`;
     button.onclick = () => run(() => toggleProject(p));
     const add = document.createElement("button");
     add.className = "project-add";
@@ -175,30 +251,7 @@ function renderProjects() {
       list.innerHTML = `<div class="empty" style="padding:8px">${tr("openToLoad")}</div>`;
     } else {
       for (const t of data.threads) {
-        const row = document.createElement("div");
-        row.className = `thread-row${state.pinAvailable && !t.archived ? "" : " no-pin"}`;
-        const b = document.createElement("button");
-        b.className = "thread" + (state.current?.id === t.id ? " active" : "");
-        b.innerHTML = '<div class="thread-name"></div><div class="thread-meta"></div>';
-        b.children[0].textContent = t.title || t.id;
-        b.children[1].textContent = `${t.git_branch || tr("noBranch")} · ${timeText(t.updated_at_ms, getLanguage() === "zh" ? "zh-CN" : "en")}${t.archived ? ` · ${tr("archived")}` : ""}`;
-        b.onclick = () => openThread(t);
-        row.appendChild(b);
-        if (state.pinAvailable && !t.archived) {
-          const pin = document.createElement("button"),
-            label = tr(t.pinned ? "unpinSession" : "pinSession");
-          pin.className = `thread-pin${t.pinned ? " pinned" : ""}`;
-          pin.type = "button";
-          pin.innerHTML =
-            '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6Zm3 11v7" /></svg>';
-          pin.title = label;
-          pin.setAttribute("aria-label", label);
-          pin.setAttribute("aria-pressed", String(Boolean(t.pinned)));
-          pin.disabled = state.pinBusy.has(t.id);
-          pin.onclick = () => run(() => toggleThreadPin(p, t));
-          row.appendChild(pin);
-        }
-        list.appendChild(row);
+        if (!state.pinnedIds.has(t.id)) list.appendChild(threadRow(t));
       }
       if (data.threads.length < data.available) {
         const more = document.createElement("button");
@@ -1613,7 +1666,8 @@ document.querySelectorAll(".nav-toggle").forEach(
 $("scrim").onclick = closePanels;
 applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
 setSendMode("steer", false);
-applyTheme(localStorage.getItem(THEME_STORAGE_KEY) || "system", false);
+applyTheme(storedTheme(), false);
+watchSystemTheme();
 run(async () => {
   await loadStatus();
   await loadProjects();
