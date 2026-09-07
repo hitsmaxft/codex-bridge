@@ -25,6 +25,15 @@ async function loadStatus() {
     backend: appServer,
   });
 }
+function setSettingsPanel(open) {
+  $("sessionPanel").hidden = open;
+  $("settingsPanel").hidden = !open;
+  $("settingsBtn").setAttribute("aria-expanded", String(open));
+  $("settingsBtn").classList.toggle("active", open);
+  const label = open ? "backToSessions" : "settingsAria";
+  $("settingsBtn").dataset.i18nAriaLabel = label;
+  $("settingsBtn").setAttribute("aria-label", tr(label));
+}
 async function toggleLanguage() {
   applyLanguage(getLanguage() === "en" ? "zh" : "en");
   setSendMode($("sendMode").value, state.modeAutomatic);
@@ -558,6 +567,13 @@ function renderPending() {
 async function refreshPending() {
   const r = await command({ command: "pending_messages" }, false);
   state.pending = Array.isArray(r.messages) ? r.messages : [];
+  if (
+    state.delivery?.pendingId &&
+    state.delivery.phase === "queued" &&
+    !state.pending.some((entry) => entry.id === state.delivery.pendingId)
+  ) {
+    setDeliveryState("accepted");
+  }
   renderPending();
 }
 async function deletePending(entry, button) {
@@ -576,6 +592,7 @@ async function deletePending(entry, button) {
     state.pending = state.pending.filter(
       (item) => item.id !== entry.id || item.thread_id !== entry.thread_id,
     );
+    if (state.delivery?.pendingId === entry.id) setDeliveryState(null);
     renderPending();
     $("messageText").focus();
     $("messageText").setSelectionRange(text.length, text.length);
@@ -607,21 +624,50 @@ function setSendMode(mode, automatic = false) {
   button.title = tr(isSteer ? "switchToQueue" : "switchToSteer");
   button.setAttribute("aria-label", button.title);
 }
+let deliveryClearTimer = null;
+function setDeliveryState(phase, details = {}) {
+  clearTimeout(deliveryClearTimer);
+  state.delivery = phase ? { ...(state.delivery || {}), ...details, phase } : null;
+  showActivity();
+  if (phase === "completed" || phase === "failed") {
+    deliveryClearTimer = setTimeout(() => {
+      state.delivery = null;
+      showActivity();
+    }, 1800);
+  }
+}
+function transientStatus(active) {
+  const delivery = state.delivery?.threadId === state.current?.id ? state.delivery : null;
+  if (delivery?.phase === "submitting") return ["submitting", tr("submittingToServer")];
+  if (state.pendingChanges) return ["updating", tr("newContentReceived")];
+  if (delivery?.phase === "queued") return ["queued", tr("serverQueued")];
+  if (delivery?.phase === "accepted" && !delivery.started)
+    return ["accepted", tr("serverAccepted")];
+  if (active) {
+    if (state.activityPhase === "compacting") return ["processing", tr("compactingWaiting")];
+    if (state.activityPhase === "tool")
+      return ["processing", tr("toolProcessingWaiting", { tool: state.activeTool || tr("tools") })];
+    return ["processing", tr("processingWaiting")];
+  }
+  if (delivery?.phase === "completed") return ["completed", tr("requestCompleted")];
+  if (delivery?.phase === "failed") return ["failed", tr("requestFailed")];
+  return null;
+}
 function renderTransientStatus(active) {
   const root = $("messages"),
-    visible = active && state.activityPhase === "compacting",
+    statusState = transientStatus(active),
     existing = root.querySelector(".transient-status");
-  if (!visible) {
+  if (!statusState) {
     existing?.remove();
     return;
   }
-  if (existing) return;
   const stickToBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 100,
-    status = document.createElement("div");
+    status = existing || document.createElement("div");
   status.className = "transient-status";
   status.setAttribute("role", "status");
-  status.textContent = tr("compacting");
-  root.appendChild(status);
+  status.dataset.phase = statusState[0];
+  status.textContent = statusState[1];
+  if (!existing) root.appendChild(status);
   if (stickToBottom) root.scrollTop = root.scrollHeight;
 }
 function showActivity() {
@@ -673,6 +719,7 @@ async function refreshComposerStatus() {
     return;
   }
   const threadId = state.current.id;
+  let acknowledged = false;
   let r;
   try {
     r = await command({ command: "composer_status", thread_id: threadId }, false);
@@ -827,6 +874,21 @@ async function refreshActivity() {
   state.activeTurnId = activity.active_turn_id || null;
   state.activityPhase = activity.phase || null;
   state.activeTool = activity.active_tool || null;
+  const delivery = state.delivery?.threadId === threadId ? state.delivery : null,
+    pendingDelivery = delivery?.pendingId
+      ? state.pending.some((entry) => entry.id === delivery.pendingId)
+      : false;
+  if (
+    state.activeTurnId &&
+    delivery &&
+    (delivery.mode === "steer" ||
+      (state.activeTurnId !== delivery.initialTurnId && !pendingDelivery)) &&
+    ["accepted", "queued"].includes(delivery.phase)
+  ) {
+    state.delivery = { ...delivery, phase: "processing", started: true };
+  } else if (!state.activeTurnId && delivery?.started && delivery.phase === "processing") {
+    setDeliveryState("completed");
+  }
   if (!state.activeTurnId && $("sendMode").value === "steer") setSendMode("send", true);
   else if (state.activeTurnId && state.modeAutomatic) setSendMode("steer", true);
   showActivity();
@@ -839,6 +901,7 @@ async function pollActivity() {
     const result = await refreshActivity();
     if (result?.changed) {
       state.pendingChanges = true;
+      showActivity();
       refreshWorkspaceDiff().catch(() => {});
     }
     if (state.pendingChanges) {
@@ -918,6 +981,7 @@ async function openThread(thread, { quiet = false } = {}) {
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
   await refreshPending();
+  showActivity();
   await refreshWorkspaceDiff(true);
   if (!quiet) settleHorizontalPosition();
 }
@@ -951,14 +1015,26 @@ function targetRequest(name, extra = {}) {
   if (!state.current) throw new Error(tr("chooseSessionError"));
   return { command: name, thread_id: state.current.id, ...extra };
 }
+function setComposerSubmitting(active) {
+  document.querySelector(".composer-shell").classList.toggle("submitting", active);
+  $("messageText").disabled = active;
+  $("sendModeToggle").disabled = active;
+  $("submitBtn").disabled = active;
+}
 async function write(name) {
   const draft = $("messageText").value,
     text = draft.trim();
   if (!text) throw new Error(tr("messageRequired"));
   if (!state.current) throw new Error(tr("chooseSessionError"));
-  const shell = document.querySelector(".composer-shell");
-  let threadId = null;
-  shell.classList.add("submitting");
+  const threadId = state.current.id;
+  setDeliveryState("submitting", {
+    threadId,
+    mode: name,
+    pendingId: null,
+    initialTurnId: state.activeTurnId,
+    started: false,
+  });
+  setComposerSubmitting(true);
   try {
     if (name === "steer") {
       const activity = await refreshActivity();
@@ -968,10 +1044,9 @@ async function write(name) {
         notify(tr("noActiveTurnQueued"));
       }
     }
-    threadId = state.current.id;
     $("messageText").value = "";
     saveDraft(threadId, "", true);
-    const request = command(targetRequest(name, { text })).then(
+    const request = command({ command: name, thread_id: threadId, text }).then(
       (value) => ({ value }),
       (error) => ({ error }),
     );
@@ -982,16 +1057,30 @@ async function write(name) {
       await refreshPending();
       throw outcome.error;
     }
-    if (state.current?.id === threadId) await openThread(state.current, { quiet: true });
-    else await refreshPending();
+    setComposerSubmitting(false);
+    acknowledged = true;
+    setDeliveryState(outcome.value.status === "queued" ? "queued" : "accepted", {
+      mode: name,
+      pendingId: outcome.value.pending_id || null,
+    });
+    try {
+      if (state.current?.id === threadId) await openThread(state.current, { quiet: true });
+      else await refreshPending();
+    } catch {
+      notify(tr("acceptedRefreshFailed"), true);
+      return;
+    }
     notify(name === "send" ? tr("messageQueued") : tr("guidanceSteered"));
   } catch (error) {
-    if (threadId && !state.drafts.has(threadId)) saveDraft(threadId, draft, true);
-    if (state.current?.id === threadId && !$("messageText").value)
-      $("messageText").value = state.drafts.get(threadId) || "";
+    if (!acknowledged) {
+      setDeliveryState("failed", { threadId });
+      if (!state.drafts.has(threadId)) saveDraft(threadId, draft, true);
+      if (state.current?.id === threadId && !$("messageText").value)
+        $("messageText").value = state.drafts.get(threadId) || "";
+    }
     throw error;
   } finally {
-    shell.classList.remove("submitting");
+    setComposerSubmitting(false);
   }
 }
 function approval(name) {
@@ -1004,6 +1093,8 @@ $("archived").onchange = () => run(loadProjects);
 $("reloadBtn").onclick = () => run(loadProjects);
 $("statusBtn").onclick = () => run(loadStatus);
 $("languageBtn").onclick = () => run(toggleLanguage);
+$("settingsBtn").onclick = () => setSettingsPanel(!$("settingsPanel").hidden);
+$("settingsBackBtn").onclick = () => setSettingsPanel(false);
 $("refreshBtn").onclick = () => run(refreshThread);
 $("createCurrentBtn").onclick = () => run(() => createThread(false));
 $("createWorktreeBtn").onclick = () => run(() => createThread(true));

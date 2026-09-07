@@ -60,6 +60,7 @@ export const state = {
   modeAutomatic: false,
   polling: false,
   pendingChanges: false,
+  delivery: null,
   lastMessageRefresh: 0,
 };
 

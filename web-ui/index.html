@@ -9,28 +9,59 @@
     <div class="app">
       <aside id="sidebar">
         <div class="brand">
-          <div class="brand-row">
-            <h1><span class="dot"></span>Codex Bridge</h1>
-            <div class="brand-actions">
-              <button id="statusBtn" data-i18n="status">Status</button
-              ><button id="languageBtn" type="button">中文</button>
-            </div>
-          </div>
-          <div class="sub" id="bridgeState" data-i18n="connecting">Connecting…</div>
-        </div>
-        <div class="filters">
-          <input
-            id="search"
-            data-i18n-placeholder="filter"
-            placeholder="Filter projects or sessions"
-          /><button id="reloadBtn" data-i18n="reload">Reload</button
-          ><label class="check"
-            ><input id="archived" type="checkbox" />
-            <span data-i18n="includeArchived">Include archived sessions</span></label
+          <a
+            class="brand-link"
+            href="https://github.com/hitsmaxft/codex-bridge"
+            target="_blank"
+            rel="noreferrer"
+            ><span class="dot"></span><span>Codex Bridge</span></a
+          ><button
+            class="settings-toggle"
+            id="settingsBtn"
+            type="button"
+            aria-expanded="false"
+            data-i18n-aria-label="settingsAria"
+            aria-label="Settings"
           >
+            <span aria-hidden="true">⚙</span>
+          </button>
         </div>
-        <div id="projects">
-          <div class="empty" data-i18n="loadingSessions">Loading sessions…</div>
+        <div class="sidebar-panel sidebar-sessions" id="sessionPanel">
+          <div class="filters">
+            <input
+              id="search"
+              data-i18n-placeholder="filter"
+              placeholder="Filter projects or sessions"
+            /><button id="reloadBtn" data-i18n="reload">Reload</button
+            ><label class="check"
+              ><input id="archived" type="checkbox" />
+              <span data-i18n="includeArchived">Include archived sessions</span></label
+            >
+          </div>
+          <div id="projects">
+            <div class="empty" data-i18n="loadingSessions">Loading sessions…</div>
+          </div>
+        </div>
+        <div class="sidebar-panel sidebar-settings" id="settingsPanel" hidden>
+          <div class="settings-head">
+            <h2 data-i18n="settings">Settings</h2>
+            <button id="settingsBackBtn" type="button" data-i18n="backToSessions">Sessions</button>
+          </div>
+          <section class="settings-card">
+            <h3 data-i18n="bridgeStatus">Bridge status</h3>
+            <div class="settings-value" id="bridgeState" data-i18n="connecting">Connecting…</div>
+            <button id="statusBtn" data-i18n="refreshStatus">Refresh status</button>
+          </section>
+          <section class="settings-card">
+            <label for="languageBtn" data-i18n="language">Language</label>
+            <button id="languageBtn" type="button">中文</button>
+            <label for="themeSelect" data-i18n="theme">Theme</label>
+            <select id="themeSelect">
+              <option value="dark" data-i18n="dark">Dark</option>
+              <option value="light" data-i18n="light">Light</option>
+              <option value="system" data-i18n="followSystem">Follow system</option>
+            </select>
+          </section>
         </div>
       </aside>
       <main>
@@ -167,15 +198,6 @@
               Archive current session
             </button>
           </div>
-        </div>
-        <div class="tool-section">
-          <h2 data-i18n="appearance">Appearance</h2>
-          <label class="caption" for="themeSelect" data-i18n="theme">Theme</label
-          ><select id="themeSelect">
-            <option value="dark" data-i18n="dark">Dark</option>
-            <option value="light" data-i18n="light">Light</option>
-            <option value="system" data-i18n="followSystem">Follow system</option>
-          </select>
         </div>
         <div class="tool-section">
           <h2 data-i18n="history">History</h2>
