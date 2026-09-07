@@ -888,6 +888,20 @@ fn model_supports(options: &[Value], model: &str, effort: &str) -> bool {
     })
 }
 
+fn composer_config_settings(response: &Value) -> (Option<String>, Option<String>) {
+    let config = response.get("config").unwrap_or(response);
+    (
+        config
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        config
+            .get("model_reasoning_effort")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    )
+}
+
 #[derive(Debug)]
 struct PreparedThreadCwd {
     cwd: PathBuf,
@@ -1382,24 +1396,39 @@ fn dispatch(
             Err(error) => backend_error(error),
         },
         Request::ComposerStatus { thread_id } => {
-            let thread = match write_backend.app_server_rpc(
-                "thread/read",
-                json!({"threadId": thread_id, "includeTurns": false}),
-            ) {
-                Ok(result) => result,
-                Err(error) => return write_backend_error(error),
-            };
-            let app_model = thread
-                .pointer("/thread/model")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let app_effort = thread
-                .pointer("/thread/reasoningEffort")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            let thread = write_backend
+                .app_server_rpc(
+                    "thread/read",
+                    json!({"threadId": thread_id, "includeTurns": false}),
+                )
+                .ok();
+            let app_model = thread.as_ref().and_then(|thread| {
+                thread
+                    .pointer("/thread/model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+            let app_effort = thread.as_ref().and_then(|thread| {
+                thread
+                    .pointer("/thread/reasoningEffort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
             let (rollout_model, rollout_effort) = session_store
                 .composer_settings(&thread_id)
                 .unwrap_or_default();
+            let resolved_model = app_model.or(rollout_model);
+            let resolved_effort = app_effort.or(rollout_effort);
+            let (config_model, config_effort) =
+                if resolved_model.is_none() || resolved_effort.is_none() {
+                    write_backend
+                        .app_server_rpc("config/read", json!({}))
+                        .ok()
+                        .map(|config| composer_config_settings(&config))
+                        .unwrap_or_default()
+                } else {
+                    (None, None)
+                };
             let (weekly_usage, weekly_usage_error) =
                 match write_backend.app_server_rpc("account/rateLimits/read", json!({})) {
                     Ok(rate_limits) => match weekly_usage(&rate_limits) {
@@ -1422,8 +1451,8 @@ fn dispatch(
                 };
             Response::success(json!({
                 "thread_id": thread_id,
-                "model": app_model.or(rollout_model),
-                "reasoning_effort": app_effort.or(rollout_effort),
+                "model": resolved_model.or(config_model),
+                "reasoning_effort": resolved_effort.or(config_effort),
                 "weekly_usage": weekly_usage,
                 "weekly_usage_error": weekly_usage_error,
             }))
@@ -3067,6 +3096,18 @@ mod tests {
         assert!(model_supports(&options, "gpt-test", "low"));
         assert!(!model_supports(&options, "gpt-test", "high"));
         assert!(!model_supports(&options, "gpt-missing", "low"));
+    }
+
+    #[test]
+    fn composer_settings_fall_back_to_config_read_shape() {
+        let settings = composer_config_settings(&json!({
+            "config": {
+                "model": "gpt-default",
+                "model_reasoning_effort": "medium"
+            }
+        }));
+        assert_eq!(settings.0.as_deref(), Some("gpt-default"));
+        assert_eq!(settings.1.as_deref(), Some("medium"));
     }
 
     #[test]

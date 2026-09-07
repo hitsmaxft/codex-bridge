@@ -888,8 +888,8 @@ async function openThread(thread, { quiet = false } = {}) {
     state.lastWorkspaceDiffRefresh = 0;
     $("composerStatus").hidden = true;
     $("modelPicker").hidden = true;
-    refreshComposerStatus().catch(() => {});
   }
+  refreshComposerStatus().catch(() => {});
   renderPending();
   if (!quiet) {
     state.userScrolled = false;
