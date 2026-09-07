@@ -637,20 +637,16 @@ function setDeliveryState(phase, details = {}) {
   }
 }
 function transientStatus(active) {
-  const delivery = state.delivery?.threadId === state.current?.id ? state.delivery : null;
-  if (delivery?.phase === "submitting") return ["submitting", tr("submittingToServer")];
-  if (state.pendingChanges) return ["updating", tr("newContentReceived")];
-  if (delivery?.phase === "queued") return ["queued", tr("serverQueued")];
-  if (delivery?.phase === "accepted" && !delivery.started)
-    return ["accepted", tr("serverAccepted")];
-  if (active) {
-    if (state.activityPhase === "compacting") return ["processing", tr("compactingWaiting")];
-    if (state.activityPhase === "tool")
-      return ["processing", tr("toolProcessingWaiting", { tool: state.activeTool || tr("tools") })];
-    return ["processing", tr("processingWaiting")];
-  }
-  if (delivery?.phase === "completed") return ["completed", tr("requestCompleted")];
-  if (delivery?.phase === "failed") return ["failed", tr("requestFailed")];
+  const delivery =
+    state.delivery?.threadId === state.current?.id && !state.delivery.dismissed
+      ? state.delivery
+      : null;
+  if (!delivery) return null;
+  if (delivery.phase === "submitting") return ["submitting", tr("submittingToServer")];
+  if (delivery.phase === "queued") return ["queued", tr("serverQueued")];
+  if (delivery.phase === "accepted" && !delivery.started) return ["accepted", tr("serverAccepted")];
+  if (delivery.phase === "processing" && active) return ["processing", tr("handoffProcessing")];
+  if (delivery.phase === "failed") return ["failed", tr("requestFailed")];
   return null;
 }
 function renderTransientStatus(active) {
@@ -664,9 +660,23 @@ function renderTransientStatus(active) {
   const stickToBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 100,
     status = existing || document.createElement("div");
   status.className = "transient-status";
-  status.setAttribute("role", "status");
+  status.setAttribute("role", "button");
+  status.setAttribute("tabindex", "0");
+  status.setAttribute("aria-live", "polite");
   status.dataset.phase = statusState[0];
   status.textContent = statusState[1];
+  status.title = tr("dismissStatus");
+  status.setAttribute("aria-label", `${statusState[1]}. ${tr("dismissStatus")}`);
+  status.onclick = () => {
+    if (state.delivery) state.delivery.dismissed = true;
+    status.remove();
+  };
+  status.onkeydown = (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      status.click();
+    }
+  };
   if (!existing) root.appendChild(status);
   if (stickToBottom) root.scrollTop = root.scrollHeight;
 }
@@ -719,7 +729,6 @@ async function refreshComposerStatus() {
     return;
   }
   const threadId = state.current.id;
-  let acknowledged = false;
   let r;
   try {
     r = await command({ command: "composer_status", thread_id: threadId }, false);
@@ -901,6 +910,7 @@ async function pollActivity() {
     const result = await refreshActivity();
     if (result?.changed) {
       state.pendingChanges = true;
+      if (state.delivery?.phase === "processing") state.delivery.dismissed = true;
       showActivity();
       refreshWorkspaceDiff().catch(() => {});
     }
@@ -1027,12 +1037,14 @@ async function write(name) {
   if (!text) throw new Error(tr("messageRequired"));
   if (!state.current) throw new Error(tr("chooseSessionError"));
   const threadId = state.current.id;
+  let acknowledged = false;
   setDeliveryState("submitting", {
     threadId,
     mode: name,
     pendingId: null,
     initialTurnId: state.activeTurnId,
     started: false,
+    dismissed: false,
   });
   setComposerSubmitting(true);
   try {

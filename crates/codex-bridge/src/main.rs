@@ -3114,6 +3114,8 @@ mod tests {
     fn vite_web_ui_uses_split_data_feeds_and_keeps_raw_protocol_access() {
         assert!(WEB_INDEX.contains("/assets/app.js"));
         assert!(WEB_INDEX.contains("/assets/app.css"));
+        assert!(WEB_INDEX.contains("/assets/app.js?v="));
+        assert!(WEB_INDEX.contains("/assets/app.css?v="));
 
         let source = concat!(
             include_str!("../../../web-ui/index.html"),

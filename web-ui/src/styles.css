@@ -665,6 +665,16 @@ main {
   background: color-mix(in srgb, var(--panel2) 88%, transparent);
   color: var(--muted);
   font-size: 12px;
+  cursor: pointer;
+  transition:
+    border-color 0.16s ease,
+    background 0.16s ease,
+    color 0.16s ease;
+}
+.transient-status:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
+  background: color-mix(in srgb, var(--panel2) 76%, var(--accent) 8%);
+  color: var(--text);
 }
 .transient-status::before {
   content: "";
@@ -1132,27 +1142,24 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
     320% 100%;
   background-repeat: no-repeat;
   box-shadow:
-    0 5px 18px #0000001f,
-    0 0 0 1px var(--glow-ring),
-    0 0 25px var(--glow-haze);
+    0 3px 10px #00000016,
+    0 0 0 1px var(--glow-ring);
   animation: edge-flow var(--glow-speed) linear infinite;
 }
 .composer-shell.submitting {
   --glow-core: #d9eeff;
   --glow: #168cff;
   --glow-soft: #0a84ffb5;
-  --glow-base: #0a84ff4d;
-  --glow-ring: #0a84ff66;
-  --glow-haze: #0a84ff3d;
+  --glow-base: #0a84ff36;
+  --glow-ring: #0a84ff52;
   --glow-speed: 1.8s;
 }
 .composer-shell.agent-active:not(.submitting) {
   --glow-core: #d2f9dd;
   --glow: #24bd59;
   --glow-soft: #20aa4faa;
-  --glow-base: #20a94a47;
-  --glow-ring: #20a94a5c;
-  --glow-haze: #20a94a38;
+  --glow-base: #20a94a32;
+  --glow-ring: #20a94a4a;
   --glow-speed: 2.8s;
 }
 .composer-shell textarea {
@@ -1198,6 +1205,8 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   box-shadow: 0 1px 4px #0002;
 }
 .composer-shell #submitBtn {
+  display: grid;
+  place-items: center;
   width: 44px;
   height: 44px;
   min-height: 44px;
@@ -1215,6 +1224,8 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
 }
 .composer-shell.submitting #submitBtn::after {
   content: "";
+  display: block;
+  box-sizing: border-box;
   width: 18px;
   height: 18px;
   border: 2px solid color-mix(in srgb, var(--action-text) 36%, transparent);
