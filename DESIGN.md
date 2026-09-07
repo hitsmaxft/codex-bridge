@@ -180,16 +180,22 @@ thread ... already has an active writer
 
 Also, the App has a problem of not releasing the writer in a timely manner.
 
-The ideal architecture is a single app-server shared by both the App and codexctl. Codex supports a Unix-socket app-server: `~/.codex/app-server-control/app-server-control.sock`. This Unix socket carries WebSocket: the client must first perform an HTTP Upgrade, then send JSON-RPC as WebSocket text frames; it is **not** a JSONL/raw Unix stream. Codex 0.151.0's `app-server proxy` only byte-copies between stdio and the socket, so it can't act as a protocol adapter for this control socket. macOS Desktop used to be able to share the managed daemon with the CLI via `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`.
-
-⚠️ **Last live observation (2026-08-29)**: Desktop 26.820.60940 ignored the
-local-daemon configuration and started its own private stdio app-server. This
-observation has not been refreshed in the current broker work. **Do not make
-"shared App Server" the sole implementation foundation.**
+The adopted architecture is one app-server process shared by Desktop and
+`codex-bridge`. It runs the `codex` binary bundled inside ChatGPT.app with an
+explicit Unix listener at `~/.codex-bridge/bundled-app-server.sock`. That Unix
+socket carries WebSocket: clients must first perform an HTTP Upgrade and then
+send JSON-RPC as WebSocket text frames; it is **not** a JSONL/raw Unix stream.
+The managed standalone socket under `~/.codex/app-server-control/` is retired
+and must never be selected as a fallback.
 
 ### GUI transport experiments
 
-The currently registered `ws-unix-bridge` is a minimal transparent adapter layer: Desktop connects to a loopback TCP WebSocket, and the bridge completes the WebSocket handshake against the official daemon's Unix socket, then neither parses nor rewrites JSON-RPC. If Desktop actually honors `CODEX_APP_SERVER_WS_URL`, this could land the GUI and `codexctl` on the same app-server instance. Right now there are only bidirectional frame tests against a fake endpoint, with no live Desktop acceptance yet, so it remains a non-default experimental path.
+The deployed `ws-unix-bridge` is a minimal transparent adapter layer: Desktop
+connects to a loopback TCP WebSocket selected by
+`CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc`, and the bridge completes the
+WebSocket handshake against the bundled app-server's Unix socket. It neither
+parses nor rewrites JSON-RPC. Desktop and `codex-bridge` therefore reach the
+same app-server instance and stay within one writer-ownership boundary.
 
 The workspace now builds a broker/supervisor experiment that starts its own TCP
 WebSocket app-server and shares one upstream connection between GUI traffic and
@@ -202,7 +208,10 @@ the existing `codex-bridge` or claim to have solved Desktop GUI control until
 an explicitly authorized temporary GUI thread proves the real environment
 variable, notification/approval flow, and UI behavior.
 
-Both experiments share the same acceptance boundary: a fake WebSocket only proves the transport; a standalone thread only proves the shared daemon; only a brand-new temporary GUI thread explicitly authorized by the user can prove Desktop integration. You must not use a real, actively working project session as the first validation.
+The evidence boundary remains important: a fake WebSocket proves only frame
+forwarding. Live Desktop connection, initialization, history loading, and
+write operations must be validated separately, using a disposable GUI thread
+for the first write test rather than an active project session.
 
 ## First-version plan
 

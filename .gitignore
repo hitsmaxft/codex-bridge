@@ -1,3 +1,4 @@
 /target/
+/web-ui/node_modules/
 .DS_Store
 .env*

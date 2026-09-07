@@ -5,14 +5,16 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use axum::response::{Html, IntoResponse, Response as HttpResponse};
+use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -32,6 +34,11 @@ use tokio::sync::mpsc;
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
+const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
+const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
+const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
+const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
+static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Local bridge daemon for Codex Desktop")]
@@ -48,7 +55,8 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     codex_bin: Option<PathBuf>,
 
-    /// Shared app-server WebSocket-over-UDS endpoint used for steer and interrupt.
+    /// Explicit external app-server WebSocket-over-UDS endpoint used for RPC experiments.
+    /// No endpoint is selected by default; the standalone daemon is never used as a fallback.
     #[arg(long, value_name = "PATH")]
     app_server_socket: Option<PathBuf>,
 
@@ -114,6 +122,8 @@ struct PendingMessage {
     action: String,
     status: String,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_submission_id: Option<String>,
     #[serde(skip)]
     after_message_index: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,6 +150,7 @@ impl PendingMessages {
                 action: action.to_owned(),
                 status: format!("{action}ing"),
                 source: "bridge".to_owned(),
+                queued_submission_id: None,
                 after_message_index,
                 error: None,
             });
@@ -179,18 +190,34 @@ impl PendingMessages {
             let is_landed = pending_message_landed(entry, messages, &mut landed);
             !is_landed
         });
+        let queued = read_codex_queue(session_store.home());
+        let mut matched_queue_ids = HashSet::new();
+        for entry in entries
+            .iter_mut()
+            .filter(|entry| entry.action == "queue" && entry.status != "failed")
+        {
+            if let Some(queued_entry) = queued.iter().find(|queued_entry| {
+                !matched_queue_ids.contains(&queued_entry.id)
+                    && queued_entry.thread_id == entry.thread_id
+                    && queued_entry.text == entry.text
+            }) {
+                entry.queued_submission_id = Some(queued_entry.id.clone());
+                matched_queue_ids.insert(queued_entry.id.clone());
+            }
+        }
         let mut combined = entries.clone();
-        for queued in read_codex_queue(session_store.home()) {
-            let duplicate = combined.iter().any(|entry| {
-                entry.thread_id == queued.thread_id
-                    && entry.action == "queue"
-                    && entry.text == queued.text
-            });
-            if !duplicate {
-                combined.push(queued);
+        for queued_entry in queued {
+            if !matched_queue_ids.contains(&queued_entry.id) {
+                combined.push(queued_entry);
             }
         }
         combined
+    }
+
+    fn dismiss(&self, id: &str, thread_id: &str) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.retain(|entry| entry.id != id || entry.thread_id != thread_id);
+        }
     }
 }
 
@@ -220,6 +247,7 @@ fn read_codex_queue(codex_home: &Path) -> Vec<PendingMessage> {
         .filter_map(|(id, thread_id, payload)| {
             let text = queue_payload_text(&payload)?;
             Some(PendingMessage {
+                queued_submission_id: Some(id.clone()),
                 id,
                 thread_id,
                 text,
@@ -268,6 +296,17 @@ fn pending_message_landed(
         })
 }
 
+/// Prefer the CLI shipped with Codex Desktop because launchd does not inherit
+/// an interactive shell's PATH. Other installations retain the PATH lookup.
+fn default_codex_program() -> PathBuf {
+    let bundled = PathBuf::from(DESKTOP_CODEX_PATH);
+    if bundled.is_file() {
+        bundled
+    } else {
+        PathBuf::from("codex")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -283,20 +322,12 @@ async fn main() -> Result<()> {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         })
-        .unwrap_or_else(|| PathBuf::from("codex"));
-    let app_server_socket = args
-        .app_server_socket
-        .clone()
-        .or_else(|| {
-            env::var_os(APP_SERVER_SOCKET_ENV)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| {
-            codex_home
-                .join("app-server-control")
-                .join("app-server-control.sock")
-        });
+        .unwrap_or_else(default_codex_program);
+    let app_server_socket = args.app_server_socket.clone().or_else(|| {
+        env::var_os(APP_SERVER_SOCKET_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
     let session_store = Arc::new(SessionStore::new(codex_home));
     let write_backend = Arc::new(CodexCliBackend::new(codex_program, app_server_socket));
     let host_exec_policy = args.host_exec_policy.or_else(|| {
@@ -531,18 +562,45 @@ async fn handle_connection(stream: UnixStream, state: BridgeState) -> Result<()>
 fn web_router(state: WebState) -> Router {
     Router::new()
         .route("/", get(web_index))
+        .route("/assets/app.js", get(web_app_js))
+        .route("/assets/app.css", get(web_app_css))
         .route("/api/command", post(web_command))
         .with_state(state)
 }
 
 async fn web_index(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
-    if !basic_auth_allowed(&headers, &state.auth) {
+    web_asset_response(&state, &headers, WEB_INDEX, "text/html; charset=utf-8")
+}
+
+async fn web_app_js(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    web_asset_response(
+        &state,
+        &headers,
+        WEB_APP_JS,
+        "text/javascript; charset=utf-8",
+    )
+}
+
+async fn web_app_css(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    web_asset_response(&state, &headers, WEB_APP_CSS, "text/css; charset=utf-8")
+}
+
+fn web_asset_response(
+    state: &WebState,
+    headers: &HeaderMap,
+    body: &'static str,
+    content_type: &'static str,
+) -> HttpResponse {
+    if !basic_auth_allowed(headers, &state.auth) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
+    if !web_headers_allowed(headers, state.port, false, &state.public_origins) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    let mut response = Html(include_str!("web_ui.html")).into_response();
+    let mut response = body.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, no-cache, must-revalidate"),
@@ -830,6 +888,226 @@ fn model_supports(options: &[Value], model: &str, effort: &str) -> bool {
     })
 }
 
+#[derive(Debug)]
+struct PreparedThreadCwd {
+    cwd: PathBuf,
+    worktree: Option<CreatedWorktree>,
+}
+
+#[derive(Debug)]
+struct CreatedWorktree {
+    repository: PathBuf,
+    root: PathBuf,
+    allocation_dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct ThreadCreateFailure {
+    code: &'static str,
+    message: String,
+}
+
+fn prepare_thread_cwd(
+    project_path: &Path,
+    worktree: bool,
+    bridge_home: &Path,
+) -> Result<PreparedThreadCwd, ThreadCreateFailure> {
+    if !project_path.is_absolute() {
+        return Err(ThreadCreateFailure {
+            code: "invalid_project_path",
+            message: "project path must be absolute".to_owned(),
+        });
+    }
+    let project_path = fs::canonicalize(project_path).map_err(|error| ThreadCreateFailure {
+        code: "invalid_project_path",
+        message: format!("cannot open project {}: {error}", project_path.display()),
+    })?;
+    if !project_path.is_dir() {
+        return Err(ThreadCreateFailure {
+            code: "invalid_project_path",
+            message: format!(
+                "project path is not a directory: {}",
+                project_path.display()
+            ),
+        });
+    }
+    if !worktree {
+        return Ok(PreparedThreadCwd {
+            cwd: project_path,
+            worktree: None,
+        });
+    }
+
+    let repository = git_output(&project_path, &["rev-parse", "--show-toplevel"])?;
+    let repository = fs::canonicalize(repository.trim()).map_err(|error| ThreadCreateFailure {
+        code: "worktree_create_failed",
+        message: format!("cannot resolve the Git repository root: {error}"),
+    })?;
+    let project_name = repository
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ThreadCreateFailure {
+            code: "worktree_create_failed",
+            message: "cannot derive a worktree name from the repository root".to_owned(),
+        })?;
+    let sequence = NEXT_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let worktrees_dir = bridge_home.join("worktrees");
+    fs::create_dir_all(&worktrees_dir).map_err(|error| ThreadCreateFailure {
+        code: "worktree_create_failed",
+        message: format!(
+            "cannot create bridge worktree directory {}: {error}",
+            worktrees_dir.display()
+        ),
+    })?;
+    let allocation_dir =
+        worktrees_dir.join(format!("{timestamp:x}-{}-{sequence}", std::process::id()));
+    let root = allocation_dir.join(project_name);
+    fs::create_dir(&allocation_dir).map_err(|error| ThreadCreateFailure {
+        code: "worktree_create_failed",
+        message: format!(
+            "cannot create worktree allocation {}: {error}",
+            allocation_dir.display()
+        ),
+    })?;
+
+    let output = Command::new("git")
+        .args(["worktree", "add", "--detach"])
+        .arg(&root)
+        .arg("HEAD")
+        .current_dir(&repository)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&allocation_dir);
+            return Err(ThreadCreateFailure {
+                code: "worktree_create_failed",
+                message: format!("failed to run git worktree add: {error}"),
+            });
+        }
+    };
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(&allocation_dir);
+        return Err(ThreadCreateFailure {
+            code: "worktree_create_failed",
+            message: command_output_message("git worktree add", &output),
+        });
+    }
+
+    Ok(PreparedThreadCwd {
+        cwd: root.clone(),
+        worktree: Some(CreatedWorktree {
+            repository,
+            root,
+            allocation_dir,
+        }),
+    })
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Result<String, ThreadCreateFailure> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|error| ThreadCreateFailure {
+            code: "worktree_create_failed",
+            message: format!("failed to run git {}: {error}", args.join(" ")),
+        })?;
+    if !output.status.success() {
+        return Err(ThreadCreateFailure {
+            code: "worktree_create_failed",
+            message: command_output_message(&format!("git {}", args.join(" ")), &output),
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|error| ThreadCreateFailure {
+        code: "worktree_create_failed",
+        message: format!("git returned a non-UTF-8 repository path: {error}"),
+    })
+}
+
+fn command_output_message(label: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    if detail.is_empty() {
+        format!("{label} exited with {}", output.status)
+    } else {
+        format!("{label} failed: {detail}")
+    }
+}
+
+fn remove_created_worktree(worktree: &CreatedWorktree) -> Option<String> {
+    let output = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&worktree.root)
+        .current_dir(&worktree.repository)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
+    let failure = match output {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(command_output_message("git worktree remove", &output)),
+        Err(error) => Some(format!("failed to run git worktree remove: {error}")),
+    };
+    if failure.is_none() {
+        let _ = fs::remove_dir(&worktree.allocation_dir);
+    }
+    failure
+}
+
+fn thread_summary_from_start(result: &Value, cwd: &Path) -> Option<Value> {
+    let thread = result.get("thread")?;
+    let id = thread.get("id")?.as_str()?;
+    let title = thread
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            thread
+                .get("preview")
+                .and_then(Value::as_str)
+                .filter(|preview| !preview.is_empty())
+        });
+    let updated_at_ms = thread
+        .get("updatedAt")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_mul(1_000);
+    Some(json!({
+        "id": id,
+        "title": title,
+        "cwd": thread
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| cwd.to_str().unwrap_or("")),
+        "git_branch": Value::Null,
+        "updated_at_ms": updated_at_ms,
+        "archived": false,
+    }))
+}
+
+fn project_id_for_path(result: &Value, project_path: &Path) -> Option<String> {
+    result.get("data")?.as_array()?.iter().find_map(|project| {
+        let matches = project
+            .get("roots")?
+            .as_array()?
+            .iter()
+            .filter_map(|root| root.get("path").and_then(Value::as_str))
+            .any(|root| fs::canonicalize(root).is_ok_and(|root| root == project_path));
+        matches
+            .then(|| project.get("id")?.as_str().map(str::to_owned))
+            .flatten()
+    })
+}
+
 fn dispatch(
     request: Request,
     socket_path: &Path,
@@ -854,14 +1132,65 @@ fn dispatch(
             "write_backend": {
                 "codex_program": write_backend.program(),
                 "app_server_socket": write_backend.app_server_socket(),
-                "app_server_available": fs::metadata(write_backend.app_server_socket())
-                    .is_ok_and(|metadata| metadata.file_type().is_socket()),
+                "app_server_available": write_backend.app_server_socket().is_some_and(|socket|
+                    fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket())
+                ),
+                "app_server_mode": "desktop_bundled_only",
+                "standalone_fallback": false,
             },
             "host_executor": host_executor.summary(),
         })),
         Request::PendingMessages => Response::success(json!({
             "messages": pending_messages.reconcile(session_store),
         })),
+        Request::PendingMessageDelete { id, thread_id } => {
+            let entry = pending_messages
+                .reconcile(session_store)
+                .into_iter()
+                .find(|entry| entry.id == id && entry.thread_id == thread_id);
+            let Some(entry) = entry else {
+                return Response::error(
+                    "pending_message_not_found",
+                    "the pending message no longer exists",
+                );
+            };
+            if matches!(entry.status.as_str(), "queueing" | "steering") {
+                return Response::error(
+                    "pending_message_busy",
+                    "wait for the pending operation to finish before deleting it",
+                );
+            }
+            let queue_deleted = if let Some(queued_submission_id) = &entry.queued_submission_id {
+                let result = match write_backend.app_server_rpc(
+                    "thread/queue/delete",
+                    json!({
+                        "threadId": entry.thread_id,
+                        "queuedSubmissionId": queued_submission_id,
+                    }),
+                ) {
+                    Ok(result) => result,
+                    Err(error) => return write_backend_error(error),
+                };
+                if result.get("deleted").and_then(Value::as_bool) != Some(true) {
+                    return Response::error(
+                        "pending_message_not_deleted",
+                        "the queued message has already left the app-server queue",
+                    );
+                }
+                true
+            } else {
+                false
+            };
+            pending_messages.dismiss(&entry.id, &entry.thread_id);
+            Response::success(json!({
+                "action": "pending_message_delete",
+                "deleted": true,
+                "queue_deleted": queue_deleted,
+                "thread_id": entry.thread_id,
+                "text": entry.text,
+                "message_action": entry.action,
+            }))
+        }
         Request::Ls {
             limit,
             include_archived,
@@ -1100,6 +1429,121 @@ fn dispatch(
                 Err(error) => write_backend_error(error),
             }
         }
+        Request::ThreadCreate {
+            project_path,
+            worktree,
+            model,
+        } => {
+            if model
+                .as_ref()
+                .is_some_and(|model| model.is_empty() || model.len() > 128)
+            {
+                return Response::error(
+                    "invalid_request",
+                    "model must be omitted or contain between 1 and 128 bytes",
+                );
+            }
+            let canonical_project = match fs::canonicalize(&project_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Response::error(
+                        "invalid_project_path",
+                        format!("cannot open project {}: {error}", project_path.display()),
+                    )
+                }
+            };
+            let known_project = match session_store.list_projects(true) {
+                Ok(projects) => projects.into_iter().any(|project| {
+                    fs::canonicalize(project.path).is_ok_and(|path| path == canonical_project)
+                }),
+                Err(error) => return backend_error(error),
+            };
+            if !known_project {
+                return Response::error(
+                    "unknown_project",
+                    "new threads can only be created for a project already listed by the bridge",
+                );
+            }
+
+            let bridge_home = socket_path.parent().unwrap_or_else(|| session_store.home());
+            let prepared = match prepare_thread_cwd(&canonical_project, worktree, bridge_home) {
+                Ok(prepared) => prepared,
+                Err(error) => return Response::error(error.code, error.message),
+            };
+            let mut params = json!({"cwd": prepared.cwd});
+            if let Some(model) = model {
+                params["model"] = Value::String(model);
+            }
+            if let Ok(projects) = write_backend.app_server_rpc(
+                "project/list",
+                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+            ) {
+                if let Some(project_id) = project_id_for_path(&projects, &canonical_project) {
+                    params["projectId"] = Value::String(project_id);
+                }
+            }
+            let result = match write_backend.app_server_rpc("thread/start", params) {
+                Ok(result) => result,
+                Err(error) => {
+                    let rollback_is_safe =
+                        matches!(error.code, "app_server_unavailable" | "app_server_rejected");
+                    let message = match (&prepared.worktree, rollback_is_safe) {
+                        (Some(created), true) => match remove_created_worktree(created) {
+                            Some(cleanup) => format!(
+                                "{}; worktree rollback also failed: {cleanup}",
+                                error.message
+                            ),
+                            None => error.message,
+                        },
+                        (Some(created), false) => format!(
+                            "{}; thread creation outcome is ambiguous, so the new worktree was retained at {}",
+                            error.message,
+                            created.root.display()
+                        ),
+                        (None, _) => error.message,
+                    };
+                    return Response::error(error.code, message);
+                }
+            };
+            let Some(fallback_thread) = thread_summary_from_start(&result, &prepared.cwd) else {
+                let message = prepared.worktree.as_ref().map_or_else(
+                    || "thread/start returned no valid thread".to_owned(),
+                    |created| {
+                        format!(
+                            "thread/start returned no valid thread; the new worktree was retained at {} because the creation outcome is ambiguous",
+                            created.root.display()
+                        )
+                    },
+                );
+                return Response::error("app_server_protocol_error", message);
+            };
+            let thread_id = fallback_thread["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if let Ok(mut selected) = selected_thread.write() {
+                *selected = Some(thread_id.clone());
+            }
+
+            let mut stored_thread = None;
+            for attempt in 0..5 {
+                session_store.invalidate_summary_cache();
+                if let Ok(Some(thread)) = session_store.find_thread(&thread_id) {
+                    stored_thread = serde_json::to_value(thread).ok();
+                    break;
+                }
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            }
+            Response::success(json!({
+                "action": "thread_create",
+                "project_path": canonical_project,
+                "location": if worktree { "worktree" } else { "current_directory" },
+                "worktree_path": prepared.worktree.as_ref().map(|created| &created.root),
+                "thread": stored_thread.unwrap_or(fallback_thread),
+            }))
+        }
         Request::ThreadSettingsUpdate {
             thread_id,
             model,
@@ -1134,6 +1578,61 @@ fn dispatch(
                     "reasoning_effort": effort,
                 })),
                 Err(error) => write_backend_error(error),
+            }
+        }
+        Request::ThreadArchive { thread_id } => {
+            let resolved =
+                match resolve_write_target(Some(thread_id), session_store, selected_thread) {
+                    Ok(resolved) => resolved,
+                    Err(response) => return response,
+                };
+            match write_backend
+                .app_server_rpc("thread/archive", json!({"threadId": resolved.thread.id}))
+            {
+                Ok(_) => {
+                    session_store.invalidate_summary_cache();
+                    if let Ok(mut selected) = selected_thread.write() {
+                        if selected.as_deref() == Some(resolved.thread.id.as_str()) {
+                            *selected = None;
+                        }
+                    }
+                    Response::success(json!({
+                        "action": "thread_archive",
+                        "status": "archived",
+                        "thread_id": resolved.thread.id,
+                        "backend": "app_server_thread_archive",
+                    }))
+                }
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::WorkspaceDiff { thread_id } => {
+            let thread = match thread_by_id(session_store, &thread_id) {
+                Ok(thread) => thread,
+                Err(response) => return response,
+            };
+            let app_thread = match write_backend.app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            ) {
+                Ok(result) => result,
+                Err(error) => return write_backend_error(error),
+            };
+            let Some(base_sha) = app_thread
+                .pointer("/thread/gitInfo/sha")
+                .and_then(Value::as_str)
+            else {
+                return Response::error(
+                    "git_baseline_unavailable",
+                    "app-server thread/read did not return the Git SHA captured for this thread",
+                );
+            };
+            let base_branch = app_thread
+                .pointer("/thread/gitInfo/branch")
+                .and_then(Value::as_str);
+            match workspace_diff_summary(&thread.id, &thread.cwd, base_sha, base_branch) {
+                Ok(summary) => Response::success(summary),
+                Err(response) => response,
             }
         }
         Request::Select { thread_id } => {
@@ -1382,6 +1881,173 @@ fn latest_message_index(session_store: &SessionStore, thread_id: &str) -> i64 {
         .unwrap_or(-1)
 }
 
+fn workspace_diff_summary(
+    thread_id: &str,
+    cwd: &Path,
+    base_sha: &str,
+    base_branch: Option<&str>,
+) -> Result<Value, Response> {
+    if !(40..=64).contains(&base_sha.len())
+        || !base_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Response::error(
+            "git_baseline_invalid",
+            "app-server returned an invalid Git baseline SHA",
+        ));
+    }
+    let root_output = workspace_git_output(cwd, &["rev-parse", "--show-toplevel"])?;
+    if !root_output.status.success() {
+        return Err(Response::error(
+            "not_git_repository",
+            format!("{} is not inside a Git repository", cwd.display()),
+        ));
+    }
+    let root = String::from_utf8(root_output.stdout)
+        .map_err(|error| {
+            Response::error(
+                "git_output_invalid",
+                format!("Git returned a non-UTF-8 repository path: {error}"),
+            )
+        })?
+        .trim()
+        .to_owned();
+    let root = PathBuf::from(root);
+
+    let diff = workspace_git_success(
+        &root,
+        &[
+            "diff",
+            "--numstat",
+            "--no-ext-diff",
+            "--no-textconv",
+            base_sha,
+            "--",
+        ],
+        "git diff against the thread baseline",
+    )?;
+    let (mut additions, deletions, tracked_files) = parse_numstat(&diff.stdout);
+    let untracked = workspace_git_success(
+        &root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        "git ls-files",
+    )?;
+    let untracked_paths = untracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let (untracked_additions, untracked_lines_skipped) =
+        untracked_text_lines(&root, &untracked_paths);
+    additions = additions.saturating_add(untracked_additions);
+    let files_changed = tracked_files.saturating_add(untracked_paths.len());
+
+    Ok(json!({
+        "thread_id": thread_id,
+        "repository": root,
+        "base_sha": base_sha,
+        "base_branch": base_branch,
+        "files_changed": files_changed,
+        "additions": additions,
+        "deletions": deletions,
+        "untracked_files": untracked_paths.len(),
+        "untracked_lines_skipped": untracked_lines_skipped,
+        "clean": files_changed == 0,
+        "semantics": "working_tree_vs_thread_creation_sha",
+    }))
+}
+
+fn workspace_git_output(cwd: &Path, args: &[&str]) -> Result<Output, Response> {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_EXTERNAL_DIFF", "")
+        .output()
+        .map_err(|error| {
+            Response::error(
+                "git_unavailable",
+                format!("failed to run git in {}: {error}", cwd.display()),
+            )
+        })
+}
+
+fn workspace_git_success(cwd: &Path, args: &[&str], action: &str) -> Result<Output, Response> {
+    let output = workspace_git_output(cwd, args)?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(Response::error(
+        "git_command_failed",
+        if detail.is_empty() {
+            format!("{action} failed with status {}", output.status)
+        } else {
+            format!("{action} failed: {detail}")
+        },
+    ))
+}
+
+fn parse_numstat(output: &[u8]) -> (u64, u64, usize) {
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    let mut files = 0_usize;
+    for line in String::from_utf8_lossy(output).lines() {
+        let mut fields = line.splitn(3, '\t');
+        additions = additions.saturating_add(
+            fields
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0),
+        );
+        deletions = deletions.saturating_add(
+            fields
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0),
+        );
+        files += 1;
+    }
+    (additions, deletions, files)
+}
+
+fn untracked_text_lines(root: &Path, paths: &[&[u8]]) -> (u64, usize) {
+    const MAX_FILE_BYTES: u64 = 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+    const MAX_FILES: usize = 500;
+
+    let mut lines = 0_u64;
+    let mut bytes_read = 0_u64;
+    let mut skipped = 0_usize;
+    for (index, path) in paths.iter().enumerate() {
+        if index >= MAX_FILES || bytes_read >= MAX_TOTAL_BYTES {
+            skipped += 1;
+            continue;
+        }
+        let candidate = root.join(String::from_utf8_lossy(path).as_ref());
+        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+            skipped += 1;
+            continue;
+        };
+        if !metadata.file_type().is_file() || metadata.len() > MAX_FILE_BYTES {
+            skipped += 1;
+            continue;
+        }
+        let Ok(content) = fs::read(&candidate) else {
+            skipped += 1;
+            continue;
+        };
+        if content.contains(&0) {
+            skipped += 1;
+            continue;
+        }
+        bytes_read = bytes_read.saturating_add(content.len() as u64);
+        lines = lines.saturating_add(content.iter().filter(|byte| **byte == b'\n').count() as u64);
+        if !content.is_empty() && !content.ends_with(b"\n") {
+            lines = lines.saturating_add(1);
+        }
+    }
+    (lines, skipped)
+}
+
 fn resolve_read_target(
     requested_thread_id: Option<String>,
     session_store: &SessionStore,
@@ -1496,7 +2162,18 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
             .and_then(Value::as_str);
 
         if let Some(text) = text {
-            if let Some(label) = transcript_block_label(text) {
+            if let Some(objective) = goal_objective(text) {
+                if !objective.trim().is_empty() {
+                    content.push(json!({"kind": "text", "text": objective.trim()}));
+                    has_visible_text = true;
+                }
+                content.push(lazy_content_summary(
+                    "Goal execution context",
+                    item,
+                    message_index,
+                    content_index,
+                ));
+            } else if let Some(label) = transcript_block_label(text) {
                 let content_end = transcript_block_end(&message.content, content_index);
                 content.push(lazy_content_range_summary(
                     label,
@@ -1596,6 +2273,7 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
 
 fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
     let patch_stats = tool_patch(tool).map(|patch| patch_line_stats(&patch));
+    let file_count = tool_patch(tool).map(|patch| patch_file_actions(&patch).len());
     json!({
         "tool_index": tool_index,
         "name": display_tool_name(tool),
@@ -1605,6 +2283,7 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
         "bytes": serde_json::to_vec(tool).map_or(0, |encoded| encoded.len()),
         "additions": patch_stats.map(|stats| stats.0),
         "deletions": patch_stats.map(|stats| stats.1),
+        "file_count": file_count,
     })
 }
 
@@ -1878,6 +2557,28 @@ fn memory_citation_parts(text: &str) -> Option<(&str, &str, &str)> {
     Some((&text[..start], &text[start..end], &text[end..]))
 }
 
+fn goal_objective(text: &str) -> Option<&str> {
+    const CONTEXT_START: &str = "<codex_internal_context";
+    const CONTEXT_END: &str = "</codex_internal_context>";
+    const OBJECTIVE_START: &str = "<objective>";
+    const OBJECTIVE_END: &str = "</objective>";
+
+    let trimmed = text.trim_start();
+    let opening_end = trimmed.find('>')?;
+    let opening = &trimmed[..=opening_end];
+    if !opening.starts_with(CONTEXT_START)
+        || !(opening.contains("source=\"goal\"") || opening.contains("source='goal'"))
+    {
+        return None;
+    }
+    let body = &trimmed[opening_end + 1..];
+    let context_end = body.find(CONTEXT_END)?;
+    let context = &body[..context_end];
+    let objective_start = context.find(OBJECTIVE_START)? + OBJECTIVE_START.len();
+    let objective_end = context[objective_start..].find(OBJECTIVE_END)? + objective_start;
+    Some(&context[objective_start..objective_end])
+}
+
 fn injected_text_label(text: &str) -> Option<&'static str> {
     let trimmed = text.trim_start();
     if trimmed.starts_with(">>> TRANSCRIPT DELTA START") {
@@ -1963,6 +2664,14 @@ mod tests {
         SessionStore::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex-home"))
     }
 
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let sequence = NEXT_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!(
+            "codex-bridge-{label}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn writes_never_fall_back_to_latest_rollout() {
         let store = fixture_store();
@@ -1983,6 +2692,134 @@ mod tests {
         assert_eq!(resolved.method, "selected_thread");
         assert!(resolved.authoritative);
         assert_eq!(resolved.thread.cwd, Path::new("/tmp"));
+    }
+
+    #[test]
+    fn thread_cwd_can_use_the_existing_project_directory() {
+        let project = unique_test_dir("current-project");
+        fs::create_dir_all(&project).unwrap();
+        let prepared = prepare_thread_cwd(&project, false, &unique_test_dir("unused")).unwrap();
+        assert_eq!(prepared.cwd, fs::canonicalize(&project).unwrap());
+        assert!(prepared.worktree.is_none());
+        fs::remove_dir(&project).unwrap();
+    }
+
+    #[test]
+    fn thread_cwd_can_create_and_remove_an_isolated_git_worktree() {
+        let root = unique_test_dir("worktree");
+        let repository = root.join("source");
+        let bridge_home = root.join("bridge");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Codex Bridge Test",
+                "-c",
+                "user.email=codex-bridge@example.invalid",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+
+        let prepared = prepare_thread_cwd(&repository, true, &bridge_home).unwrap();
+        let worktree = prepared.worktree.as_ref().unwrap();
+        assert!(prepared.cwd.starts_with(bridge_home.join("worktrees")));
+        assert_eq!(
+            fs::read_to_string(prepared.cwd.join("README.md")).unwrap(),
+            "fixture\n"
+        );
+        assert!(prepared.cwd.join(".git").is_file());
+        assert_eq!(remove_created_worktree(worktree), None);
+        assert!(!prepared.cwd.exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn workspace_diff_compares_against_the_thread_creation_sha() {
+        let repository = unique_test_dir("workspace-diff");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(repository.join("tracked.txt"), "old\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Codex Bridge Test",
+                "-c",
+                "user.email=codex-bridge@example.invalid",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "baseline",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let base_sha = String::from_utf8(
+            workspace_git_success(&repository, &["rev-parse", "HEAD"], "git rev-parse")
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        fs::write(repository.join("tracked.txt"), "new\nmore\n").unwrap();
+        fs::write(repository.join("untracked.txt"), "first\nsecond\n").unwrap();
+
+        let summary =
+            workspace_diff_summary("thread-1", &repository, base_sha.trim(), Some("main")).unwrap();
+        assert_eq!(summary["semantics"], "working_tree_vs_thread_creation_sha");
+        assert_eq!(summary["files_changed"], 2);
+        assert_eq!(summary["additions"], 4);
+        assert_eq!(summary["deletions"], 1);
+        assert_eq!(summary["untracked_files"], 1);
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn app_server_project_assignment_matches_a_project_root() {
+        let project = unique_test_dir("project-assignment");
+        fs::create_dir_all(&project).unwrap();
+        let canonical = fs::canonicalize(&project).unwrap();
+        let projects = json!({"data":[
+            {"id":"project-1","roots":[{"path":canonical}]},
+            {"id":"project-2","roots":[{"path":"/missing"}]}
+        ]});
+        assert_eq!(
+            project_id_for_path(&projects, &fs::canonicalize(&project).unwrap()).as_deref(),
+            Some("project-1")
+        );
+        fs::remove_dir(&project).unwrap();
     }
 
     #[test]
@@ -2093,6 +2930,50 @@ mod tests {
     }
 
     #[test]
+    fn pending_queue_entries_receive_distinct_app_server_ids_and_can_be_dismissed() {
+        let sequence = NEXT_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
+        let home = env::temp_dir().join(format!(
+            "codex-bridge-pending-queue-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        let connection = Connection::open(home.join("queue_1.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE queued_items (id TEXT, thread_id TEXT, payload_json TEXT, queue_order INTEGER);",
+            )
+            .unwrap();
+        let payload = r#"{"UserInput":{"content":[{"type":"text","text":"same text"}]}}"#;
+        connection
+            .execute(
+                "INSERT INTO queued_items VALUES (?1, 'thread-1', ?2, ?3)",
+                ("queue-1", payload, 0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO queued_items VALUES (?1, 'thread-1', ?2, ?3)",
+                ("queue-2", payload, 1),
+            )
+            .unwrap();
+        drop(connection);
+
+        let pending = PendingMessages::default();
+        let first = pending.begin("thread-1", "same text", "queue", -1);
+        let second = pending.begin("thread-1", "same text", "queue", -1);
+        pending.finish(&first, "queued", None);
+        pending.finish(&second, "queued", None);
+        let entries = pending.reconcile(&SessionStore::new(home.clone()));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].queued_submission_id.as_deref(), Some("queue-1"));
+        assert_eq!(entries[1].queued_submission_id.as_deref(), Some("queue-2"));
+
+        pending.dismiss(&first, "thread-1");
+        assert_eq!(pending.entries.read().unwrap().len(), 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn weekly_usage_reports_remaining_percent_from_the_seven_day_window() {
         let limits = json!({
             "rateLimits": {
@@ -2135,8 +3016,16 @@ mod tests {
     }
 
     #[test]
-    fn embedded_web_ui_uses_split_data_feeds_and_keeps_raw_protocol_access() {
-        let html = include_str!("web_ui.html");
+    fn vite_web_ui_uses_split_data_feeds_and_keeps_raw_protocol_access() {
+        assert!(WEB_INDEX.contains("/assets/app.js"));
+        assert!(WEB_INDEX.contains("/assets/app.css"));
+
+        let source = concat!(
+            include_str!("../../../web-ui/index.html"),
+            include_str!("../../../web-ui/src/main.js"),
+            include_str!("../../../web-ui/src/state.js"),
+            include_str!("../../../web-ui/src/styles.css"),
+        );
         for command in [
             "projects",
             "project_threads",
@@ -2146,7 +3035,10 @@ mod tests {
             "thread_activity",
             "composer_status",
             "composer_options",
+            "thread_create",
             "thread_settings_update",
+            "thread_archive",
+            "workspace_diff",
             "select",
             "current",
             "status",
@@ -2156,52 +3048,45 @@ mod tests {
             "scroll",
             "pending",
             "pending_messages",
+            "pending_message_delete",
             "approve",
             "decline",
             "interrupt",
             "host_exec",
             "app_server_rpc",
         ] {
-            assert!(html.contains(command), "missing {command}");
+            assert!(source.contains(command), "missing {command}");
         }
-        assert!(html.contains("id=\"rawRequest\""));
-        assert!(html.contains("Any codex-bridge Request JSON"));
-        assert!(html.contains("appendToolValue(body,r.tool.output)"));
-        assert!(html.contains("input,textarea,select,select option{background:var(--panel)"));
-        assert!(html.contains("id=\"outboxTray\""));
-        assert!(html.contains("await refreshPending()"));
-        assert!(html.contains("bindSwipe(document.querySelector('main'),1"));
-        assert!(html.contains("bindSwipe($('sidebar'),-1"));
-        assert!(html.contains("touch-action:pan-y"));
-        assert!(html.contains("codex-bridge.drafts.v1"));
-        assert!(html.contains("saveDraft(state.current.id,$('messageText').value,true)"));
-        assert!(html.contains("window.addEventListener('pagehide',persistDrafts)"));
-        assert!(html.contains("正在压缩上下文…"));
-        assert!(html.contains("周剩余 ${weekly.remaining_percent}%"));
-        assert!(html.contains("id=\"usageHealth\""));
-        assert!(html.contains("服务异常 · 等待恢复"));
-        assert!(html.contains("setUsageUnavailable"));
-        assert!(html.contains("[state.composerModel,state.composerEffort]"));
-        assert!(html.contains("-webkit-text-size-adjust:100%"));
-        assert!(html.contains("document.activeElement?.blur()"));
-        assert!(html.contains("m.role==='assistant'"));
-        assert!(html.contains("toLocaleTimeString"));
-        assert!(html.contains("contain:inline-size"));
-        assert!(html.contains("settleHorizontalPosition()"));
-        assert!(html.contains("if(!quiet)closePanels();if(state.current)saveDraft"));
-        assert!(html.contains("--glow-base:#0a84ff4d"));
-        assert!(html.contains("--glow-base:#20a94a47"));
-        assert!(html.contains("--glow-core:#d9eeff"));
-        assert!(html.contains("animation:edge-flow var(--glow-speed) linear infinite"));
-        assert!(html.contains("width:17px;height:17px"));
-        assert!(html.contains("transform:rotate(225deg)"));
-        assert!(html.contains("id=\"modelPicker\""));
-        assert!(html.contains("thread_settings_update"));
-        assert!(html.contains("prefers-color-scheme:light"));
-        assert!(html.contains("id=\"themeSelect\""));
-        assert!(html.contains("codex-bridge.theme.v1"));
-        assert!(html.contains("localStorage.getItem(THEME_STORAGE_KEY)||'dark'"));
-        assert!(!html.contains("sessionStorage"));
+        for marker in [
+            "id=\"rawRequest\"",
+            "Any codex-bridge Request JSON",
+            "id=\"outboxTray\"",
+            "id=\"createDialog\"",
+            "id=\"createWorktreeBtn\"",
+            "deletePending(entry, remove)",
+            "删除并恢复到输入框",
+            "touch-action: pan-y",
+            "codex-bridge.drafts.v1",
+            "正在压缩上下文…",
+            "id=\"usageHealth\"",
+            "服务异常 · 等待恢复",
+            "Desktop bundled app-server · private transport",
+            "standalone fallback 已禁用",
+            "-webkit-text-size-adjust: 100%",
+            "contain: inline-size",
+            "id=\"modelPicker\"",
+            "prefers-color-scheme: light",
+            "id=\"themeSelect\"",
+            "codex-bridge.theme.v1",
+            "id=\"archiveThreadBtn\"",
+            "appendPatchDiff",
+            "diff-line",
+        ] {
+            assert!(source.contains(marker), "missing {marker}");
+        }
+        assert!(WEB_APP_JS.contains("pending_message_delete"));
+        assert!(WEB_APP_CSS.contains("touch-action:pan-y"));
+        assert!(!source.contains("sessionStorage"));
     }
 
     #[test]
@@ -2297,6 +3182,7 @@ mod tests {
         let compact = compact_tool_summary(&tool, 2);
         assert_eq!(compact["additions"], 2);
         assert_eq!(compact["deletions"], 1);
+        assert_eq!(compact["file_count"], 1);
         assert_eq!(compact["name"], "apply_patch");
         let parsed = parsed_tool_input(&tool).unwrap();
         assert_eq!(parsed["operation"], "apply_patch");
@@ -2367,5 +3253,50 @@ mod tests {
         assert_eq!(compact["content"][0]["text"], "## 完成\n\n正文");
         assert_eq!(compact["content"][1]["label"], "Memory citations");
         assert_eq!(compact["content"][2]["text"], "后续");
+    }
+
+    #[test]
+    fn goal_wrapper_only_shows_the_user_objective_by_default() {
+        let message = ThreadMessage {
+            timestamp: None,
+            id: None,
+            role: "user".into(),
+            phase: None,
+            content: vec![json!({
+                "type":"input_text",
+                "text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n\n<objective>\n实现并验证目标功能\n\n保留用户输入的换行\n</objective>\n\nBudget:\n- Tokens used: 123456\n\nCompletion audit:\nprivate injected rules\n</codex_internal_context>"
+            })],
+            tools: Vec::new(),
+        };
+        let compact = compact_web_message(&message, 11);
+        let encoded = serde_json::to_string(&compact).unwrap();
+        assert_eq!(compact["category"], "user");
+        assert_eq!(compact["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            compact["content"][0]["text"],
+            "实现并验证目标功能\n\n保留用户输入的换行"
+        );
+        assert_eq!(compact["content"][1]["kind"], "context");
+        assert_eq!(compact["content"][1]["label"], "Goal execution context");
+        assert_eq!(compact["content"][1]["message_index"], 11);
+        assert_eq!(compact["content"][1]["content_index"], 0);
+        assert!(!encoded.contains("123456"));
+        assert!(!encoded.contains("private injected rules"));
+    }
+
+    #[test]
+    fn ordinary_internal_context_is_not_misclassified_as_a_goal() {
+        assert_eq!(
+            goal_objective(
+                "<codex_internal_context source=\"other\"><objective>text</objective></codex_internal_context>"
+            ),
+            None
+        );
+        assert_eq!(
+            goal_objective(
+                "<codex_internal_context source=\"goal\"></codex_internal_context><objective>outside</objective>"
+            ),
+            None
+        );
     }
 }

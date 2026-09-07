@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Codex Bridge</title>
+  </head>
+  <body>
+    <div class="app">
+      <aside id="sidebar">
+        <div class="brand">
+          <div class="brand-row">
+            <h1><span class="dot"></span>Codex Bridge</h1>
+            <button id="statusBtn">Status</button>
+          </div>
+          <div class="sub" id="bridgeState">Connecting…</div>
+        </div>
+        <div class="filters">
+          <input id="search" placeholder="Filter projects or sessions" /><button id="reloadBtn">
+            Reload</button
+          ><label class="check"
+            ><input id="archived" type="checkbox" /> Include archived sessions</label
+          >
+        </div>
+        <div id="projects"><div class="empty">Loading sessions…</div></div>
+      </aside>
+      <main>
+        <div class="thread-head">
+          <button class="nav-toggle" aria-label="Projects and sessions">‹</button>
+          <div class="head-copy">
+            <h2 id="threadTitle">Choose a session</h2>
+            <div class="meta">
+              <span id="threadMeta">Projects and sessions appear on the left.</span
+              ><span class="run-state" id="runState"></span>
+            </div>
+          </div>
+          <div class="head-actions">
+            <button id="selectBtn">Select default</button><button id="refreshBtn">Refresh</button
+            ><button class="tool-toggle" aria-label="Tools">•••</button>
+          </div>
+        </div>
+        <div id="messages">
+          <div class="empty">Select a session to inspect its conversation.</div>
+        </div>
+        <div class="composer">
+          <div class="outbox-tray" id="outboxTray" aria-live="polite" hidden></div>
+          <div class="composer-status" id="composerStatus" hidden>
+            <button class="workspace-diff" id="workspaceDiff" type="button">Git 状态…</button>
+            <div class="composer-runtime">
+              <span
+                class="usage-health"
+                id="usageHealth"
+                role="button"
+                tabindex="0"
+                aria-label="周余量状态不可用"
+                hidden
+              ></span
+              ><span id="usageState"></span
+              ><button class="model-picker-trigger" id="modelPickerBtn" type="button">
+                <span id="effortState"></span>
+              </button>
+            </div>
+          </div>
+          <div class="model-picker" id="modelPicker" hidden>
+            <div class="model-picker-head">
+              <span>模型与思考强度</span><button id="modelPickerClose" type="button">关闭</button>
+            </div>
+            <label for="modelSelect">模型</label
+            ><select id="modelSelect"></select
+            ><label for="effortSelect">思考强度</label
+            ><select id="effortSelect"></select>
+            <div class="model-description" id="modelDescription"></div>
+            <div class="model-picker-actions">
+              <button class="primary" id="modelApply" type="button">应用</button>
+            </div>
+          </div>
+          <div class="composer-shell">
+            <div class="send-modes" role="group" aria-label="Send mode">
+              <button
+                class="mode-button active"
+                type="button"
+                data-mode="steer"
+                aria-pressed="true"
+              >
+                跟进</button
+              ><button class="mode-button" type="button" data-mode="send" aria-pressed="false">
+                排队
+              </button>
+            </div>
+            <input id="sendMode" type="hidden" value="steer" /><textarea
+              id="messageText"
+              rows="1"
+              placeholder="输入消息…"
+            ></textarea
+            ><button class="primary" id="submitBtn" aria-label="Submit message">Send</button>
+          </div>
+          <div class="composer-foot">
+            <span class="meta">Explicit session target · no mtime fallback</span
+            ><button class="danger" id="interruptBtn">Interrupt</button>
+          </div>
+        </div>
+      </main>
+      <section class="tools" id="tools">
+        <div class="tool-section">
+          <div class="brand-row">
+            <h2>Commands</h2>
+            <button class="tool-toggle">Close</button>
+          </div>
+          <div class="tool-row">
+            <button id="currentBtn">Current</button><button id="tailBtn">Tail</button
+            ><button id="pendingBtn">Pending</button>
+          </div>
+        </div>
+        <div class="tool-section mobile-only">
+          <h2>Turn actions</h2>
+          <div class="tool-row">
+            <button class="danger" id="mobileInterruptBtn">Interrupt current turn</button>
+          </div>
+        </div>
+        <div class="tool-section">
+          <h2>会话</h2>
+          <div class="tool-row">
+            <button class="danger" id="archiveThreadBtn">归档当前会话</button>
+          </div>
+        </div>
+        <div class="tool-section">
+          <h2>Appearance</h2>
+          <label class="caption" for="themeSelect">Theme</label
+          ><select id="themeSelect">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+            <option value="system">Follow system</option>
+          </select>
+        </div>
+        <div class="tool-section">
+          <h2>History</h2>
+          <label class="caption" for="lastCount">Messages per page</label>
+          <div class="tool-row">
+            <select id="lastCount">
+              <option>20</option>
+              <option selected>30</option>
+              <option>50</option>
+              <option>100</option>
+              <option>200</option></select
+            ><button id="applyLastBtn">Reload</button>
+          </div>
+        </div>
+        <div class="tool-section">
+          <h2>Scroll</h2>
+          <div class="tool-row">
+            <select id="scrollMode">
+              <option value="direction">Direction</option>
+              <option value="pixels">Pixels</option>
+              <option value="target">Semantic target</option>
+              <option value="message_id">Message ID</option></select
+            ><input id="scrollValue" value="down" /><button id="scrollBtn">Run</button>
+          </div>
+        </div>
+        <div class="tool-section">
+          <h2>Approvals</h2>
+          <div class="tool-row">
+            <input id="approvalId" type="number" min="0" placeholder="Request ID" /><button
+              id="approveBtn"
+            >
+              Approve</button
+            ><button class="danger" id="declineBtn">Decline</button>
+          </div>
+        </div>
+        <div class="tool-section">
+          <h2>Host exec</h2>
+          <label class="caption" for="argv">JSON argv array (subject to daemon allowlist)</label
+          ><textarea id="argv">["git", "status", "--short"]</textarea>
+          <div class="tool-row">
+            <input
+              id="timeout"
+              type="number"
+              min="1"
+              max="3600"
+              placeholder="Timeout: 300s"
+            /><button id="execBtn">Execute</button>
+          </div>
+        </div>
+        <div class="tool-section">
+          <h2>App-server RPC</h2>
+          <label class="caption" for="rpcMethod"
+            >One-shot native method (including methods not wrapped by codexctl)</label
+          ><input id="rpcMethod" value="thread/read" /><label class="caption" for="rpcParams"
+            >JSON params</label
+          ><textarea id="rpcParams">{"threadId":""}</textarea>
+          <div class="tool-row"><button id="rpcBtn">Call app-server</button></div>
+        </div>
+        <div class="tool-section">
+          <h2>Raw protocol</h2>
+          <label class="caption" for="rawRequest">Any codex-bridge Request JSON</label
+          ><textarea id="rawRequest">{"command":"status"}</textarea>
+          <div class="tool-row"><button id="rawBtn">Dispatch</button></div>
+          <pre id="result">Command results appear here.</pre>
+        </div>
+      </section>
+    </div>
+    <div
+      class="create-dialog"
+      id="createDialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="createTitle"
+      hidden
+    >
+      <div class="create-card">
+        <h2 id="createTitle">创建新会话</h2>
+        <div class="create-project" id="createProject"></div>
+        <div class="create-options">
+          <button class="create-option" id="createCurrentBtn">
+            <strong>当前目录</strong><span>在现有目录中启动，会直接看到当前未提交修改。</span>
+          </button>
+          <button class="create-option" id="createWorktreeBtn">
+            <strong>新 Worktree</strong
+            ><span>从当前 HEAD 创建隔离的 detached worktree；未提交修改不会复制过去。</span>
+          </button>
+        </div>
+        <div class="create-actions">
+          <span class="create-progress" id="createProgress"></span
+          ><button id="createCancelBtn">取消</button>
+        </div>
+      </div>
+    </div>
+    <div class="scrim" id="scrim"></div>
+    <div class="toast" id="toast"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

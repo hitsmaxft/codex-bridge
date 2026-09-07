@@ -21,7 +21,7 @@ struct Args {
     #[arg(long, default_value = DEFAULT_LISTEN_ADDR)]
     listen: SocketAddr,
 
-    /// Unix socket exposed after `codex app-server daemon enable-remote-control`.
+    /// Unix socket served by the ChatGPT.app-bundled `codex app-server`.
     #[arg(long, value_name = "PATH")]
     upstream_socket: Option<PathBuf>,
 }
@@ -54,11 +54,10 @@ async fn main() -> Result<()> {
 
 fn default_upstream_socket() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
-        .context("HOME is unset; pass --upstream-socket with the app-server control socket path")?;
+        .context("HOME is unset; pass --upstream-socket with the bundled app-server socket path")?;
     Ok(PathBuf::from(home)
-        .join(".codex")
-        .join("app-server-control")
-        .join("app-server-control.sock"))
+        .join(".codex-bridge")
+        .join("bundled-app-server.sock"))
 }
 
 async fn serve(listener: TcpListener, upstream_socket: PathBuf) -> Result<()> {

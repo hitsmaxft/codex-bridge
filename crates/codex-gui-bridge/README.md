@@ -6,12 +6,12 @@ This crate contains two registered Desktop transports:
 - `codex-gui-bridge` is a shared-connection broker and app-server supervisor;
   `codex-gui` is its Unix-socket client.
 
-The project adopted `ws-unix-bridge` plus the managed standalone daemon as
-**Solution B**. That path completed live Desktop acceptance on 2026-09-04. The
-broker remains fixture-tested source code, but it was not adopted and has not
-completed its own live acceptance.
+The deployed path uses `ws-unix-bridge` plus the app-server binary bundled in
+ChatGPT.app. The former managed standalone daemon topology is retired and must
+not be used as a fallback. The broker remains fixture-tested source code, but
+it is not the deployed transport.
 
-## Adopted Architecture: Solution B
+## Adopted Architecture
 
 ```text
 Desktop
@@ -23,8 +23,8 @@ Desktop
           |
           | WebSocket over Unix socket
           v
-  managed standalone app-server
-  ~/.codex/app-server-control/app-server-control.sock
+  ChatGPT.app bundled app-server
+  ~/.codex-bridge/bundled-app-server.sock
           |
           +-- local GUI and CLI control
           +-- remote control and mobile history
@@ -35,18 +35,17 @@ ping, pong, and close frames without parsing or rewriting JSON-RPC. Each
 Desktop connection maps to one upstream Unix-socket connection. The Desktop
 still sends `initialize` and every later request itself.
 
-The standalone daemon is a core dependency in this deployment. It provides the
-durable app-server process, remote-control endpoint, and shared thread/writer
-state used by Desktop, CLI control, and the mobile client. This single-instance
-property is the reason Solution B was selected over directly supervising a
-second bundled app-server.
+The upstream process is
+`/Applications/ChatGPT.app/Contents/Resources/codex app-server`; the standalone
+package under `~/.codex/packages/standalone` is not required. Both Desktop and
+`codex-bridge` use the same explicit bundled socket, preserving one
+thread/writer boundary.
 
 ## Install
 
-The bridge tools require the Rust toolchain. The adopted path also requires an
-installed ChatGPT Desktop bundle and the managed standalone Codex package under
-`~/.codex/packages/standalone`. Install all three repository binaries from a
-checkout:
+The bridge tools require the Rust toolchain and an installed ChatGPT Desktop
+bundle. No standalone Codex package is required. Install the repository
+binaries from a checkout:
 
 ```sh
 git clone https://github.com/hitsmaxft/codex-bridge.git
@@ -70,7 +69,7 @@ installation by replacing each binary name with, for example,
 `CARGO_INCREMENTAL=0 cargo run -p codex-gui-bridge --bin codex-gui-bridge --`.
 
 `cargo install` installs only this repository's bridge/client binaries. It does
-not install Desktop or the managed standalone package. On the accepted machine,
+not install Desktop. On the accepted machine,
 the launchd job deliberately runs the repository's release binary directly so
 the deployed artifact is explicit:
 
@@ -88,20 +87,15 @@ closing a window is not sufficient. Interposition affects only a newly started
 Desktop process. It does not patch the app bundle, inject code, or bypass the
 application signature.
 
-First inspect the managed daemon and enable remote control. Use the managed
-binary's explicit path when multiple `codex` versions are installed:
+Start the ChatGPT.app bundled app-server on the private bridge socket:
 
 ```sh
-CODEX_STANDALONE="$HOME/.codex/packages/standalone/current/codex"
-"$CODEX_STANDALONE" app-server daemon start
-"$CODEX_STANDALONE" app-server daemon enable-remote-control
-"$CODEX_STANDALONE" app-server daemon version
-test -S "$HOME/.codex/app-server-control/app-server-control.sock"
+/Applications/ChatGPT.app/Contents/Resources/codex app-server \
+  --listen "unix://$HOME/.codex-bridge/bundled-app-server.sock"
 ```
 
-`daemon version` must report `status: running` and the expected socket path.
-The start command is idempotent; do not start an ad-hoc second app-server when
-the managed daemon already owns the socket.
+The socket must be owned by the current user and mode `0600`. Use launchd for
+the persistent deployment instead of starting a duplicate foreground process.
 
 Check that the bridge port is free, then start the adapter:
 
@@ -110,21 +104,21 @@ lsof -nP -iTCP:18790 -sTCP:LISTEN
 
 ws-unix-bridge \
   --listen 127.0.0.1:18790 \
-  --upstream-socket "$HOME/.codex/app-server-control/app-server-control.sock"
+  --upstream-socket "$HOME/.codex-bridge/bundled-app-server.sock"
 ```
 
 Do not kill an unknown listener. Stop only a process that you knowingly
 started, or choose another loopback port. The bridge has no application-layer
 authentication and must never listen on a non-loopback address.
 
-With Desktop still fully quit, launch it directly with the two local-daemon
-variables used by the accepted deployment:
+With Desktop still fully quit, launch it with only the bridge URL:
 
 ```sh
 CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc \
-CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 \
   /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 ```
+
+`CODEX_APP_SERVER_USE_LOCAL_DAEMON` must be unset.
 
 Do not use `open -a ChatGPT` for this one-process check: macOS may reuse an
 existing process that did not inherit the variables. Before a write test,
@@ -134,7 +128,7 @@ verify the transport and read path:
 ps eww -p "$(pgrep -x ChatGPT | tail -1)" | tr ' ' '\n' | \
   grep '^CODEX_APP_SERVER_'
 lsof -nP -iTCP:18790
-"$CODEX_STANDALONE" app-server daemon version
+test -S "$HOME/.codex-bridge/bundled-app-server.sock"
 ```
 
 Desktop logs should show `transport=websocket`, `initialized=true`, and a
@@ -148,18 +142,18 @@ The accepted machine uses three user LaunchAgents. launchd does not expand
 
 | Label | Role | Important settings |
 | --- | --- | --- |
-| `com.lunghaa.codex-app-server` | Starts the managed daemon at login | `RunAtLoad=true`; runs `~/.codex/packages/standalone/current/codex app-server daemon start`; the command exits after the daemon's own PID manager takes over |
-| `com.lunghaa.ws-unix-bridge` | Keeps the transparent adapter alive | `RunAtLoad=true`, `KeepAlive=true`; runs the release bridge with `--listen 127.0.0.1:18790` and the app-server control socket |
-| `com.lunghaa.codex-app-server-env` | Injects the Desktop transport into the user launchd domain | `RunAtLoad=true`; runs a short script containing the two `launchctl setenv` commands below |
+| `com.lunghaa.codex-app-server` | Keeps the bundled app-server alive | Runs `/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen unix://.../bundled-app-server.sock` |
+| `com.lunghaa.ws-unix-bridge` | Keeps the transparent adapter alive | Forwards `127.0.0.1:18790` to the bundled socket |
+| `com.lunghaa.codex-app-server-env` | Injects the Desktop transport into the user launchd domain | Sets the WebSocket URL and unsets the local-daemon flag |
 
-The accepted launchd user domain contained both variables. For reproducible
-login persistence, the environment script should set both explicitly:
+The environment script must select the bridge and explicitly disable the old
+local-daemon mode:
 
 ```sh
 #!/bin/sh
 launchctl setenv CODEX_APP_SERVER_WS_URL \
   "ws://127.0.0.1:18790/rpc"
-launchctl setenv CODEX_APP_SERVER_USE_LOCAL_DAEMON "1"
+launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
 ```
 
 The bridge LaunchAgent on the accepted machine has these effective arguments
@@ -171,7 +165,7 @@ ProgramArguments:
   --listen
   127.0.0.1:18790
   --upstream-socket
-  /Users/bhe/.codex/app-server-control/app-server-control.sock
+  /Users/bhe/.codex-bridge/bundled-app-server.sock
 StandardOutPath: /Users/bhe/.codex/ws-unix-bridge.log
 StandardErrorPath: /Users/bhe/.codex/ws-unix-bridge.log
 ```
@@ -205,9 +199,9 @@ and relaunch Desktop after login-agent changes.
 
 ### Rollback
 
-To stop interposing Desktop while retaining mobile remote control, quit Desktop,
-unload only the bridge and environment jobs, remove the two variables from the
-launchd user domain, and then launch Desktop normally:
+To stop interposing Desktop, quit Desktop, unload only the bridge and
+environment jobs, remove the two variables from the launchd user domain, and
+then launch Desktop normally:
 
 ```sh
 launchctl bootout gui/"$(id -u)" \
@@ -218,10 +212,14 @@ launchctl unsetenv CODEX_APP_SERVER_WS_URL
 launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
 ```
 
-Do not stop the standalone daemon if remote control or a mobile session still
+Do not stop the bundled app-server if remote control or a mobile session still
 depends on it. Disabling remote control is a separate, explicit operation.
 
-## Live Acceptance Record: 2026-09-04
+## Historical Live Acceptance Record: 2026-09-04
+
+This record describes the superseded standalone-daemon topology and is retained
+only as transport evidence. It is not an installation recipe or the current
+deployment state.
 
 The base live-Desktop acceptance gate passed for this exact deployment:
 

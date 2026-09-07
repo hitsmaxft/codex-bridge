@@ -9,7 +9,7 @@ The project consists of two processes:
 - `codex-bridge` is a local daemon that listens on a Unix socket and reads Codex rollout state.
 - `codexctl` is a one-shot CLI that sends a single line of JSON over the Unix socket to the daemon and reads a single line of JSON back.
 
-The current protocol version is `4`. Implemented commands:
+The current protocol version is `14`. Implemented commands:
 
 | Command | Current behavior |
 | --- | --- |
@@ -22,6 +22,8 @@ The current protocol version is `4`. Implemented commands:
 | `steer` | Calls `turn/steer` via WebSocket-over-UDS on the shared app-server |
 | `interrupt` | Calls `turn/interrupt` on the same control endpoint |
 | `host-exec` | Runs allowlist-permitted host argv in the selected thread's cwd |
+| `thread_archive` | Archives the selected thread through app-server `thread/archive` |
+| `workspace_diff` | Compares the workspace with `thread/read.gitInfo.sha` |
 
 The not-yet-implemented `tail`, `scroll`, `pending`, `approve`, and `decline` must return `not_implemented`. Do not fake execution results to make a demo "succeed".
 
@@ -50,6 +52,7 @@ The read-only fixture flow is fully isolated from a running Codex App.
 - [`crates/codex-bridge/src/write_backend.rs`](crates/codex-bridge/src/write_backend.rs): safe Codex CLI argument invocation and app-server WebSocket-over-UDS JSON-RPC.
 - [`crates/codex-bridge/src/host_executor.rs`](crates/codex-bridge/src/host_executor.rs): host-exec policy validation, output length limits, timeouts, and process-group termination.
 - [`crates/codex-bridge/src/main.rs`](crates/codex-bridge/src/main.rs): socket lifecycle, request size limits, and daemon dispatch.
+- [`web-ui`](web-ui): Vite frontend source; `dist` is the deterministic bundle embedded by the daemon.
 - [`crates/codexctl/src/main.rs`](crates/codexctl/src/main.rs): CLI arguments, protocol client, human/JSON output.
 - [`fixtures/codex-home`](fixtures/codex-home): a minimal Codex state directory for isolated debugging.
 - [`fixtures/fake-codex`](fixtures/fake-codex): an executable write-backend fixture that does not connect to real services.
@@ -72,9 +75,16 @@ In the commands below, `/path/to/codex-bridge` stands for this repository's root
 
 ```sh
 cd /path/to/codex-bridge
+npm --prefix web-ui ci
+npm --prefix web-ui run format:check
+npm --prefix web-ui run build
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo test --workspace
 ```
+
+Run the Vite build before Rust whenever `web-ui/index.html` or `web-ui/src` changes. Cargo does not
+invoke npm implicitly: this keeps offline Rust builds reproducible and makes the checked-in bundle
+an explicit reviewable artifact.
 
 The project's Rust artifacts all share the repository root's `target`. Don't create a new long-lived target for routine debugging. If you work in a linked worktree, explicitly reuse the main project's target:
 
@@ -315,7 +325,10 @@ Policy can be supplied via the daemon's `--host-exec-policy PATH` or `CODEX_BRID
 
 ### `codex_cli_unavailable` or `codex_cli_failed`
 
-- `codex_cli_unavailable` means the program specified by `--codex-bin` couldn't be started; check the absolute path and execute permissions.
+- `codex_cli_unavailable` means the selected Codex program couldn't be started. Without an
+  explicit `--codex-bin` or `CODEX_BRIDGE_CODEX_BIN`, macOS prefers
+  `/Applications/ChatGPT.app/Contents/Resources/codex` and otherwise falls back to `codex` on
+  `PATH`; check the reported absolute path and execute permissions.
 - `codex_cli_failed` means the Codex CLI started but exited non-zero; keep the stderr and check the CLI version, login state, whether the thread exists, and active-writer conflicts.
 - `send` requires the local Codex CLI to provide `codex queue --thread --message`.
 - `steer` doesn't use a Codex subprocess, so steer failures should be diagnosed with the `app_server_*` errors below, not `codex_cli_*`.
@@ -326,7 +339,12 @@ Policy can be supplied via the daemon's `--host-exec-policy PATH` or `CODEX_BRID
 
 ### `app_server_unavailable`, `app_server_timeout`, or `app_server_rejected`
 
-steer/interrupt connect directly to the default `$CODEX_HOME/app-server-control/app-server-control.sock`. A WebSocket runs on this Unix socket: an HTTP Upgrade first, then JSON-RPC over text frames. It can be overridden via the daemon's `--app-server-socket PATH` or `CODEX_BRIDGE_APP_SERVER_SOCKET`.
+steer/interrupt require an explicitly configured bundled app-server socket, normally
+`~/.codex-bridge/bundled-app-server.sock`. A WebSocket runs on this Unix socket: an HTTP Upgrade
+first, then JSON-RPC over text frames. Select it with `--app-server-socket PATH` or
+`CODEX_BRIDGE_APP_SERVER_SOCKET`. There is deliberately no fallback to
+`$CODEX_HOME/app-server-control/app-server-control.sock`, which belongs to the retired standalone
+daemon.
 
 - Socket missing or not a Unix socket: `app_server_unavailable`;
 - WebSocket handshake, initialize, or method response timeout: `app_server_timeout`;
@@ -412,10 +430,11 @@ A real read-only smoke test still cannot prove:
 
 Those are separate acceptance gates for later backends and must be completed in a dedicated debugging window where the user permits affecting the current App.
 
-If you only need to confirm the actual transport layer of the standalone control socket, you can run the opt-in read-only test. It only performs the WebSocket Upgrade, initialize, and `thread/loaded/list`; it won't start or modify a turn:
+To confirm the bundled socket transport, run the opt-in read-only test. It only performs the
+WebSocket Upgrade, initialize, and `thread/loaded/list`; it won't start or modify a turn:
 
 ```sh
-CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$codex_state_dir/app-server-control/app-server-control.sock" \
+CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$HOME/.codex-bridge/bundled-app-server.sock" \
   CARGO_INCREMENTAL=0 cargo test -p codex-bridge \
   live_app_server_websocket_probe -- --ignored --nocapture
 ```
@@ -440,7 +459,7 @@ The repository provides an explicit opt-in live test that creates a new temporar
 
 ```sh
 CODEX_BRIDGE_TEST_ALLOW_WRITE=1 \
-CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$codex_state_dir/app-server-control/app-server-control.sock" \
+CODEX_BRIDGE_TEST_APP_SERVER_SOCKET="$HOME/.codex-bridge/bundled-app-server.sock" \
   CARGO_INCREMENTAL=0 cargo test -p codex-bridge \
   live_app_server_steers_new_isolated_thread -- --ignored --nocapture
 ```

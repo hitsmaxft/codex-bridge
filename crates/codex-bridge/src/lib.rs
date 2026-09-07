@@ -21,7 +21,7 @@ pub use write_backend::{
     BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,10 +63,21 @@ pub enum Request {
         thread_id: String,
     },
     ComposerOptions,
+    ThreadCreate {
+        project_path: PathBuf,
+        worktree: bool,
+        model: Option<String>,
+    },
     ThreadSettingsUpdate {
         thread_id: String,
         model: String,
         effort: String,
+    },
+    ThreadArchive {
+        thread_id: String,
+    },
+    WorkspaceDiff {
+        thread_id: String,
     },
     Select {
         thread_id: String,
@@ -94,6 +105,10 @@ pub enum Request {
     },
     Pending,
     PendingMessages,
+    PendingMessageDelete {
+        id: String,
+        thread_id: String,
+    },
     Approve {
         id: u64,
     },
@@ -126,7 +141,10 @@ impl Request {
             Self::ThreadActivity { .. } => "thread_activity",
             Self::ComposerStatus { .. } => "composer_status",
             Self::ComposerOptions => "composer_options",
+            Self::ThreadCreate { .. } => "thread_create",
             Self::ThreadSettingsUpdate { .. } => "thread_settings_update",
+            Self::ThreadArchive { .. } => "thread_archive",
+            Self::WorkspaceDiff { .. } => "workspace_diff",
             Self::Select { .. } => "select",
             Self::Current => "current",
             Self::Status => "status",
@@ -137,6 +155,7 @@ impl Request {
             Self::Scroll { .. } => "scroll",
             Self::Pending => "pending",
             Self::PendingMessages => "pending_messages",
+            Self::PendingMessageDelete { .. } => "pending_message_delete",
             Self::Approve { .. } => "approve",
             Self::Decline { .. } => "decline",
             Self::Interrupt { .. } => "interrupt",
@@ -303,6 +322,17 @@ mod tests {
         assert_eq!(composer["command"], "composer_status");
         assert_eq!(composer["thread_id"], "thread-1");
 
+        let create = serde_json::to_value(Request::ThreadCreate {
+            project_path: PathBuf::from("/tmp/project"),
+            worktree: true,
+            model: Some("gpt-test".into()),
+        })
+        .unwrap();
+        assert_eq!(create["command"], "thread_create");
+        assert_eq!(create["project_path"], "/tmp/project");
+        assert_eq!(create["worktree"], true);
+        assert_eq!(create["model"], "gpt-test");
+
         let settings = serde_json::to_value(Request::ThreadSettingsUpdate {
             thread_id: "thread-1".into(),
             model: "gpt-test".into(),
@@ -312,6 +342,18 @@ mod tests {
         assert_eq!(settings["command"], "thread_settings_update");
         assert_eq!(settings["model"], "gpt-test");
         assert_eq!(settings["effort"], "high");
+
+        let archive = serde_json::to_value(Request::ThreadArchive {
+            thread_id: "thread-1".into(),
+        })
+        .unwrap();
+        assert_eq!(archive["command"], "thread_archive");
+
+        let diff = serde_json::to_value(Request::WorkspaceDiff {
+            thread_id: "thread-1".into(),
+        })
+        .unwrap();
+        assert_eq!(diff["command"], "workspace_diff");
     }
 
     #[test]
@@ -351,5 +393,17 @@ mod tests {
         assert_eq!(json["command"], "app_server_rpc");
         assert_eq!(json["method"], "thread/read");
         assert_eq!(json["params"]["threadId"], "thread-1");
+    }
+
+    #[test]
+    fn pending_message_delete_targets_one_thread_entry() {
+        let request = Request::PendingMessageDelete {
+            id: "bridge-1".into(),
+            thread_id: "thread-1".into(),
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["command"], "pending_message_delete");
+        assert_eq!(json["id"], "bridge-1");
+        assert_eq!(json["thread_id"], "thread-1");
     }
 }

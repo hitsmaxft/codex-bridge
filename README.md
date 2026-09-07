@@ -11,10 +11,11 @@ A Chromium CDP channel is reserved for UI operations that have not yet been impl
 
 - `crates/codexctl`: the user-facing CLI, which encodes commands as JSON requests.
 - `crates/codex-bridge`: the local daemon and shared protocol, listening on a Unix socket.
+- `web-ui`: the Vite frontend source and deterministic production bundle embedded by
+  `codex-bridge`.
 - `crates/codex-gui-bridge`: Desktop/app-server transports. The deployed path is the transparent
-  `ws-unix-bridge` in front of the managed standalone daemon. The crate also retains the
-  shared-connection broker, supervisor, and `codex-gui` client as a tested but unadopted
-  alternative.
+  `ws-unix-bridge` in front of the app-server binary bundled in ChatGPT.app. The crate also retains
+  the shared-connection broker, supervisor, and `codex-gui` client as experimental alternatives.
 - `launcher`: a reserved macOS launcher that may later start Codex.app with a private CDP endpoint.
 
 The CLI and daemon use `~/.codex-bridge/control.sock` by default. Override it on either side with
@@ -23,56 +24,49 @@ socket directory to mode `0700` and the socket to `0600`. For custom paths, it o
 permissions on directories it creates and leaves existing parent directories unchanged. At
 startup, it removes only stale sockets left by an abnormal exit that can no longer be connected to.
 
-## Deployed GUI transport: Solution B
+## Deployed GUI transport
 
-The adopted local architecture shares the managed standalone app-server between Desktop, CLI
-control, and remote control:
+The local architecture uses the Codex binary bundled in ChatGPT.app. It neither installs nor
+starts the managed standalone daemon, and it never falls back to one:
 
 ```text
-Codex Desktop (TCP 127.0.0.1:61510)
+Codex Desktop
   -> ws-unix-bridge (TCP 127.0.0.1:18790)
-  -> WebSocket over ~/.codex/app-server-control/app-server-control.sock
-  -> managed standalone app-server (PID 50310 during acceptance)
-  -> remote control / mobile client
+  -> WebSocket over ~/.codex-bridge/bundled-app-server.sock
+  -> /Applications/ChatGPT.app/Contents/Resources/codex app-server
 ```
 
 `ws-unix-bridge` changes only the transport. It accepts Desktop's TCP WebSocket, opens a WebSocket
-over the daemon's Unix socket, and forwards frames without parsing or rewriting JSON-RPC. The
-standalone daemon is therefore a core dependency of this deployment, not an optional experiment.
-Keeping one app-server instance also keeps GUI, CLI, and mobile remote control on the same thread
-store and writer-ownership boundary.
+over the bundled app-server's Unix socket, and forwards frames without parsing or rewriting
+JSON-RPC. `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc` selects that bridge.
+`CODEX_APP_SERVER_USE_LOCAL_DAEMON` must be unset. `codex-bridge` receives the bundled socket path
+explicitly; if no endpoint is configured, direct RPC is unavailable rather than silently using
+`~/.codex/app-server-control/app-server-control.sock`.
 
-This path completed live Desktop acceptance on 2026-09-04 with Desktop `26.831.21537`, its bundled
-CLI `0.152.1`, and standalone app-server `0.153.2`. The running Desktop inherited
-`CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc`, established the expected TCP connection to the
-bridge, initialized with `transport=websocket`, and received successful `thread/list`,
-`thread/turns/list`, remote-control, and `turn/steer` responses. GUI history opened successfully;
-mobile full-history synchronization was also accepted during the deployment check.
-
-Those observations prove the current local Desktop-to-daemon path and session-history loading for
-the exact accepted versions. They are not a general compatibility guarantee for future Desktop or
-standalone releases, and they do not replace a login/reboot or long-duration recovery test. The
-fake-endpoint test remains useful as a narrower forwarding regression:
+The transport forwarding regression remains:
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 ```
 
-The shared-connection `codex-gui-bridge` broker remains in the workspace but was not selected for
-deployment. Its fixture tests cover protocol isolation, capability-token enforcement, private CLI
-IPC, reconnect handling, and supervised-child cleanup; no live acceptance claim is made for that
-alternative. See [crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for the
-Solution B topology, manual validation, launchd persistence, rollback, evidence record, and broker
-status.
+See [crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for launchd persistence,
+validation boundaries, and the retained broker experiment.
 
 ## Currently runnable features
 
-Build the project, then start the daemon and CLI separately:
+Build the frontend bundle and Rust workspace, then start the daemon and CLI separately:
 
 ```sh
+npm --prefix web-ui ci
+npm --prefix web-ui run build
 cargo build
 cargo run -p codex-bridge
 ```
+
+Frontend development uses `npm --prefix web-ui run dev`; Vite proxies `/api` to the default
+bridge listener at `127.0.0.1:18791`. The checked-in `web-ui/dist` assets use fixed names and are
+embedded into the Rust executable with `include_str!`, so rebuild them before compiling Rust after
+any UI source change.
 
 ```sh
 cargo run -p codexctl -- status
@@ -118,7 +112,14 @@ parsed messages are cached briefly in the daemon. The mobile layout follows
 a single-column Codex-style conversation view with project and tool drawers, touch-sized controls,
 an independently scrolling message area, and a safe-area-aware bottom composer. The composer has
 an explicit `Steer`/`Queue` mode selector and keeps submitted messages visible while they are being
-steered or queued. If no turn is active, a requested steer is automatically changed to queue/send.
+steered or queued. Remembered items have a delete action that restores their text to the composer;
+for queued submissions it first cancels the real app-server queue item. If no turn is active, a
+requested steer is automatically changed to queue/send.
+A left-aligned composer status compares the working tree with the Git SHA captured by app-server
+when the thread was created, including bounded line counts for untracked text files. Tool groups
+show the latest operation while collapsed, and `apply_patch` details render a colored unified diff.
+The tools drawer can archive the current thread through app-server `thread/archive`; Git commit is
+not exposed.
 A lightweight incremental activity poll updates the running/idle indicator every 1.5 seconds and
 reloads messages only when the rollout changed and the reader is at the bottom; it does not poll
 the full conversation. Message text is rendered as safe Markdown. Automatically inserted transcript
@@ -129,7 +130,8 @@ status, and short previews, while nested expansion loads full arguments and resu
 `exec_command` wrappers are reduced to their command and execution options; `apply_patch` wrappers
 are shown as edited file lists with added/deleted line counts and expose the full patch only after
 expansion. Session titles skip injected blocks. The HTML response disables browser caching so a
-restarted daemon is reflected by the next reload.
+restarted daemon is reflected by the next reload; the same policy and Basic Auth checks apply to
+the separately served JavaScript and CSS assets.
 
 The UI exposes the same typed request set as `codexctl`, including explicit session selection,
 send, steer, interrupt, approval commands, scroll, and allowlisted host execution. A one-shot
@@ -180,10 +182,9 @@ codexctl --thread <THREAD_ID> host-exec --timeout 600 -- \
 - `interrupt` sends `turn/interrupt` through the same endpoint. The target thread must belong to
   that app-server instance, and the rollout's active turn ID must still match. Otherwise the
   command returns an explicit error rather than pretending to succeed.
-- Without transport interposition, Desktop may own a separate private app-server and the commands
-  cannot cross that process boundary. In the deployed Solution B configuration, Desktop connects
-  through `ws-unix-bridge` to the same managed standalone daemon, so `steer` and `interrupt` can
-  target threads owned by that shared instance.
+- Desktop connects through `ws-unix-bridge` to the same bundled app-server endpoint used by
+  `codex-bridge`, so `steer` and `interrupt` stay within one writer-ownership boundary. There is no
+  standalone fallback.
 - `host-exec` runs an allowlisted host command in the selected thread's `cwd`, primarily for USB
   flashing and hardware tests. Requests carry an argv array and never pass through a shell. The
   built-in policy allows only `wlink`, `cases/run-ch585-*.sh`, and restricted Git subcommands.
@@ -196,11 +197,12 @@ app-server or CDP backend is connected, they return `not_implemented` instead of
 an action occurred.
 
 Use `--codex-home PATH` to point the daemon at another read-only state directory for offline or
-isolated testing. On the write path, select the Codex executable with
-`--codex-bin PATH`/`CODEX_BRIDGE_CODEX_BIN`, and select the shared WebSocket-over-UDS endpoint for
-steer and interrupt with `--app-server-socket PATH`/`CODEX_BRIDGE_APP_SERVER_SOCKET`. Do not treat
-that endpoint as JSONL: `codex app-server proxy` forwards raw bytes and cannot perform the
-WebSocket Upgrade.
+isolated testing. On the write path, the bridge prefers the CLI bundled at
+`/Applications/ChatGPT.app/Contents/Resources/codex`, then falls back to `codex` on `PATH`.
+Override it with `--codex-bin PATH`/`CODEX_BRIDGE_CODEX_BIN`, and select the shared
+WebSocket-over-UDS endpoint for steer and interrupt with
+`--app-server-socket PATH`/`CODEX_BRIDGE_APP_SERVER_SOCKET`. Do not treat that endpoint as JSONL:
+`codex app-server proxy` forwards raw bytes and cannot perform the WebSocket Upgrade.
 
 Replace the built-in host-exec policy with a JSON file via `--host-exec-policy PATH` or
 `CODEX_BRIDGE_HOST_EXEC_POLICY`; see

@@ -19,7 +19,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub struct CodexCliBackend {
     program: PathBuf,
-    app_server_socket: PathBuf,
+    app_server_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -46,7 +46,7 @@ struct Invocation {
 }
 
 impl CodexCliBackend {
-    pub fn new(program: PathBuf, app_server_socket: PathBuf) -> Self {
+    pub fn new(program: PathBuf, app_server_socket: Option<PathBuf>) -> Self {
         Self {
             program,
             app_server_socket,
@@ -57,8 +57,8 @@ impl CodexCliBackend {
         &self.program
     }
 
-    pub fn app_server_socket(&self) -> &Path {
-        &self.app_server_socket
+    pub fn app_server_socket(&self) -> Option<&Path> {
+        self.app_server_socket.as_deref()
     }
 
     pub fn queue_message(
@@ -166,32 +166,34 @@ impl CodexCliBackend {
     }
 
     fn with_app_server(&self, method: &str, params: Value) -> Result<Value, BackendFailure> {
-        let metadata =
-            std::fs::metadata(&self.app_server_socket).map_err(|error| BackendFailure {
-                code: "app_server_unavailable",
-                message: format!(
-                    "cannot inspect app-server socket {}: {error}",
-                    self.app_server_socket.display()
-                ),
-            })?;
+        let app_server_socket = self.app_server_socket.as_deref().ok_or_else(|| BackendFailure {
+            code: "app_server_unavailable",
+            message: "Desktop bundled app-server uses a private stdio connection; no external app-server endpoint is configured and standalone fallback is disabled".to_owned(),
+        })?;
+        let metadata = std::fs::metadata(app_server_socket).map_err(|error| BackendFailure {
+            code: "app_server_unavailable",
+            message: format!(
+                "cannot inspect app-server socket {}: {error}",
+                app_server_socket.display()
+            ),
+        })?;
         if !metadata.file_type().is_socket() {
             return Err(BackendFailure {
                 code: "app_server_unavailable",
                 message: format!(
                     "app-server endpoint is not a Unix socket: {}",
-                    self.app_server_socket.display()
+                    app_server_socket.display()
                 ),
             });
         }
 
-        let stream =
-            UnixStream::connect(&self.app_server_socket).map_err(|error| BackendFailure {
-                code: "app_server_unavailable",
-                message: format!(
-                    "failed to connect to app-server socket {}: {error}",
-                    self.app_server_socket.display()
-                ),
-            })?;
+        let stream = UnixStream::connect(app_server_socket).map_err(|error| BackendFailure {
+            code: "app_server_unavailable",
+            message: format!(
+                "failed to connect to app-server socket {}: {error}",
+                app_server_socket.display()
+            ),
+        })?;
         stream
             .set_read_timeout(Some(RPC_TIMEOUT))
             .and_then(|()| stream.set_write_timeout(Some(RPC_TIMEOUT)))
@@ -452,11 +454,22 @@ mod tests {
     #[test]
     fn fake_codex_exercises_queue_without_a_shell() {
         let fake_codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/fake-codex");
-        let backend = CodexCliBackend::new(fake_codex, PathBuf::from("/unused/fake.sock"));
+        let backend = CodexCliBackend::new(fake_codex, None);
 
         let queue = backend.queue_message("thread-1", "hello").unwrap();
         assert_eq!(queue.backend, "codex_queue");
         assert!(queue.stdout.unwrap().contains("<--message> <hello>"));
+    }
+
+    #[test]
+    fn missing_external_endpoint_never_falls_back_to_the_standalone_socket() {
+        let backend = CodexCliBackend::new(PathBuf::from("codex"), None);
+        assert_eq!(backend.app_server_socket(), None);
+        let failure = backend
+            .app_server_rpc("thread/read", json!({}))
+            .unwrap_err();
+        assert_eq!(failure.code, "app_server_unavailable");
+        assert!(failure.message.contains("standalone fallback is disabled"));
     }
 
     #[test]
@@ -494,7 +507,7 @@ mod tests {
             requests
         });
 
-        let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), sock_path.clone());
+        let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(sock_path.clone()));
 
         let steer = backend
             .steer_via_app_server("thread-1", "turn-1", "guide")
@@ -537,19 +550,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an explicitly selected live standalone app-server socket"]
+    #[ignore = "requires an explicitly selected live app-server socket"]
     fn live_app_server_websocket_probe() {
         let socket = std::env::var_os("CODEX_BRIDGE_TEST_APP_SERVER_SOCKET")
             .map(PathBuf::from)
-            .expect("set CODEX_BRIDGE_TEST_APP_SERVER_SOCKET to an isolated/shared daemon socket");
-        let backend = CodexCliBackend::new(PathBuf::from("codex"), socket);
+            .expect(
+                "set CODEX_BRIDGE_TEST_APP_SERVER_SOCKET to an isolated/shared app-server socket",
+            );
+        let backend = CodexCliBackend::new(PathBuf::from("codex"), Some(socket));
         backend
             .run_app_server_rpc("thread/loaded/list", json!({}), "app_server_probe")
             .unwrap();
     }
 
     #[test]
-    #[ignore = "creates and steers a new standalone Codex thread"]
+    #[ignore = "creates and steers a new live Codex thread"]
     fn live_app_server_steers_new_isolated_thread() {
         assert_eq!(
             std::env::var("CODEX_BRIDGE_TEST_ALLOW_WRITE").as_deref(),
@@ -558,7 +573,9 @@ mod tests {
         );
         let socket = std::env::var_os("CODEX_BRIDGE_TEST_APP_SERVER_SOCKET")
             .map(PathBuf::from)
-            .expect("set CODEX_BRIDGE_TEST_APP_SERVER_SOCKET to a standalone daemon socket");
+            .expect(
+                "set CODEX_BRIDGE_TEST_APP_SERVER_SOCKET to an isolated/shared app-server socket",
+            );
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let cwd = std::env::temp_dir().join(format!(
             "codex-bridge-live-steer-{}-{sequence}",
@@ -635,7 +652,7 @@ mod tests {
             "live steer target: thread={thread_id} turn={turn_id} cwd={}",
             cwd.display()
         );
-        let backend = CodexCliBackend::new(PathBuf::from("codex"), socket);
+        let backend = CodexCliBackend::new(PathBuf::from("codex"), Some(socket));
         backend
             .steer_via_app_server(
                 &thread_id,

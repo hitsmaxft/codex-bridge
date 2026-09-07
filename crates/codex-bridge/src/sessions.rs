@@ -175,6 +175,12 @@ impl SessionStore {
         self.codex_home.join("sessions").is_dir()
     }
 
+    pub fn invalidate_summary_cache(&self) {
+        if let Ok(mut cache) = self.summary_cache.lock() {
+            *cache = None;
+        }
+    }
+
     pub fn list_threads(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
         let mut threads = self.cached_threads(include_archived)?;
         populate_git_branches(&mut threads, &self.git_branch_cache);
