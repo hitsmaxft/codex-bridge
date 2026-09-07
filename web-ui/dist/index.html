@@ -60,13 +60,13 @@
             </button>
           </div>
         </div>
+        <div class="outbox-tray" id="outboxTray" aria-live="polite" hidden></div>
         <div id="messages">
           <div class="empty" data-i18n="selectSessionHint">
             Select a session to inspect its conversation.
           </div>
         </div>
         <div class="composer">
-          <div class="outbox-tray" id="outboxTray" aria-live="polite" hidden></div>
           <div class="composer-status" id="composerStatus" hidden>
             <button class="workspace-diff" id="workspaceDiff" type="button" data-i18n="gitStatus">
               Git status…
@@ -109,14 +109,13 @@
               aria-label="Send mode"
             >
               <button
+                id="sendModeToggle"
                 class="mode-button active"
                 type="button"
                 data-mode="steer"
-                aria-pressed="true"
+                aria-label="Switch to Queue"
               >
-                <span data-i18n="followUp">Follow up</span></button
-              ><button class="mode-button" type="button" data-mode="send" aria-pressed="false">
-                <span data-i18n="queue">Queue</span>
+                Steer
               </button>
             </div>
             <input id="sendMode" type="hidden" value="steer" /><textarea

@@ -214,6 +214,40 @@ impl SessionStore {
         Ok(thread)
     }
 
+    pub fn composer_settings(&self, thread_id: &str) -> Result<(Option<String>, Option<String>)> {
+        let Some(thread) = self.find_thread(thread_id)? else {
+            return Ok((None, None));
+        };
+        let file = File::open(&thread.rollout_path)
+            .with_context(|| format!("failed to open {}", thread.rollout_path.display()))?;
+        let mut model = None;
+        let mut effort = None;
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else { continue };
+            let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(payload) = record.get("payload") else {
+                continue;
+            };
+            if let Some(value) = payload.get("model").and_then(Value::as_str) {
+                model = Some(value.to_owned());
+            }
+            if let Some(value) = payload.get("effort").and_then(Value::as_str) {
+                effort = Some(value.to_owned());
+            }
+            if let Some(settings) = payload.get("thread_settings") {
+                if let Some(value) = settings.get("model").and_then(Value::as_str) {
+                    model = Some(value.to_owned());
+                }
+                if let Some(value) = settings.get("reasoning_effort").and_then(Value::as_str) {
+                    effort = Some(value.to_owned());
+                }
+            }
+        }
+        Ok((model, effort))
+    }
+
     pub fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectSummary>> {
         let threads = self.cached_threads(include_archived)?;
         let mut projects = HashMap::<PathBuf, ProjectSummary>::new();
@@ -1192,6 +1226,26 @@ mod tests {
         assert_eq!(snapshot.messages[1].role, "assistant");
         assert_eq!(snapshot.thread.cwd, Path::new("/tmp/project"));
         assert_eq!(snapshot.thread.git_branch, None);
+    }
+
+    #[test]
+    fn reads_latest_composer_settings_from_rollout_records() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-settings.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-settings","cwd":"/tmp/project","model":"gpt-old","effort":"low"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"event_msg","payload":{"thread_settings":{"model":"gpt-new","reasoning_effort":"high"}}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"turn_context","payload":{"model":"gpt-new","effort":"medium"}}"#,
+                "{incomplete",
+            ],
+        );
+
+        let store = SessionStore::new(fixture.path.clone());
+        assert_eq!(
+            store.composer_settings("thread-settings").unwrap(),
+            (Some("gpt-new".to_owned()), Some("medium".to_owned()))
+        );
     }
 
     #[test]

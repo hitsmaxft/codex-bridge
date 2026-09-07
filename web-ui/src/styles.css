@@ -90,7 +90,10 @@ select:focus {
 }
 .app {
   display: grid;
-  grid-template-columns: 320px minmax(420px, 1fr) 330px;
+  grid-template-columns:
+    clamp(220px, 25vw, 320px) minmax(300px, 1fr)
+    clamp(240px, 25vw, 330px);
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
   max-height: 100dvh;
   min-height: 0;
@@ -100,6 +103,7 @@ aside,
 .tools {
   background: var(--panel);
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -279,7 +283,8 @@ main {
   max-height: 100%;
   overflow: hidden;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
 .thread-head {
   border-bottom: 1px solid var(--line);
@@ -317,8 +322,8 @@ main {
   font-size: 9px;
 }
 #messages {
+  min-width: 0;
   min-height: 0;
-  height: 100%;
   overflow: auto;
   padding: 18px max(20px, calc((100% - 820px) / 2));
   overscroll-behavior: contain;
@@ -520,11 +525,13 @@ main {
 .outbox-tray {
   display: flex;
   max-height: 30vh;
-  margin: 0 0 8px;
+  margin: 0;
+  padding: 8px max(20px, calc((100% - 820px) / 2)) 4px;
   overflow: auto;
   flex-direction: column;
   align-items: flex-end;
   gap: 6px;
+  background: linear-gradient(var(--bg) 74%, transparent);
 }
 .outbox-tray[hidden] {
   display: none;
@@ -587,11 +594,7 @@ main {
   height: 17px;
   margin-right: 5px;
 }
-.tool-summary-action {
-  flex: 0 0 auto;
-}
-.tool-group-summary.running .tool-summary-action,
-.tool-group-summary.running .tool-summary-preview {
+.tool-group-summary.running .tool-summary-label {
   color: transparent;
   background: linear-gradient(
     100deg,
@@ -612,22 +615,15 @@ main {
     background-position: -120% 0;
   }
 }
-.tool-summary-preview {
+.tool-summary-label {
   min-width: 0;
-  margin-left: 5px;
   overflow: hidden;
   color: color-mix(in srgb, var(--muted) 82%, transparent);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.tool-summary-count {
-  flex: 0 0 auto;
-  margin-left: 5px;
-  font-size: 10px;
-}
 @media (prefers-reduced-motion: reduce) {
-  .tool-group-summary.running .tool-summary-action,
-  .tool-group-summary.running .tool-summary-preview {
+  .tool-group-summary.running .tool-summary-label {
     color: var(--muted);
     background: none;
     animation: none;
@@ -761,9 +757,11 @@ main {
 }
 .composer {
   position: relative;
-  border-top: 1px solid var(--line);
-  padding: 12px max(20px, calc((100% - 820px) / 2));
-  background: var(--panel);
+  min-width: 0;
+  flex-shrink: 0;
+  border: 0;
+  padding: 8px max(20px, calc((100% - 820px) / 2)) 10px;
+  background: linear-gradient(transparent, var(--bg) 28%);
 }
 .composer-status {
   min-height: 17px;
@@ -806,6 +804,25 @@ main {
 }
 .composer-status[hidden] {
   display: none;
+}
+html[lang="en"] .composer-status:not([hidden]) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  font-size: 10px;
+  line-height: 14px;
+}
+html[lang="en"] .composer-status:not([hidden]) .workspace-diff {
+  line-height: 14px;
+}
+html[lang="en"] .composer-status:not([hidden]) .composer-runtime {
+  min-width: 0;
+  justify-content: flex-end;
+  line-height: 14px;
+}
+html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
+  min-height: 14px;
+  line-height: 14px;
 }
 .usage-health {
   width: 7px;
@@ -886,10 +903,14 @@ main {
 }
 .composer-shell {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 8px;
-  border: 1px solid transparent;
+  grid-template-columns: 64px minmax(0, 1fr) 44px;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 6px 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 30px;
+  background: var(--composer-surface);
+  box-shadow: 0 2px 12px #00000018;
 }
 @keyframes edge-flow {
   from {
@@ -905,6 +926,7 @@ main {
 }
 .composer-shell.submitting,
 .composer-shell.agent-active:not(.submitting) {
+  border-color: transparent;
   background:
     linear-gradient(var(--composer-surface), var(--composer-surface)) padding-box,
     linear-gradient(
@@ -947,28 +969,62 @@ main {
   --glow-speed: 2.8s;
 }
 .composer-shell textarea {
+  width: 100%;
+  height: 44px;
   min-width: 0;
-  min-height: 68px;
-  resize: vertical;
+  min-height: 44px;
+  max-height: 112px;
+  padding: 11px 5px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  resize: none;
+  font-size: 15px;
+  line-height: 1.35;
+}
+.composer-shell textarea:focus {
+  border: 0;
 }
 .send-modes {
-  display: flex;
-  padding: 3px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: #111411;
+  display: block;
+  width: 64px;
+  padding: 2px;
+  border: 0;
+  border-radius: 18px;
+  background: var(--panel2);
 }
 .mode-button {
+  width: 100%;
   min-height: 34px;
-  padding: 5px 9px;
+  padding: 4px 7px;
   border: 0;
-  background: transparent;
-  color: var(--muted);
+  border-radius: 16px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1px 4px #0002;
+  font-size: 13px;
 }
 .mode-button.active {
-  background: var(--panel2);
+  background: var(--panel);
   color: var(--text);
-  box-shadow: 0 1px 4px #0004;
+  box-shadow: 0 1px 4px #0002;
+}
+.composer-shell #submitBtn {
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #0a84ff;
+  font-size: 0;
+}
+.composer-shell #submitBtn::after {
+  content: "↑";
+  color: #fff;
+  font-size: 24px;
+  font-weight: 700;
 }
 .composer-foot {
   margin-top: 8px;
@@ -1105,7 +1161,7 @@ label.caption {
   color: var(--muted);
   font-size: 12px;
 }
-@media (min-width: 701px) {
+@media (min-width: 801px) {
   .composer {
     min-height: 0;
     max-height: min(52dvh, 480px);
@@ -1116,35 +1172,13 @@ label.caption {
     max-height: min(34dvh, 320px);
   }
 }
-@media (max-width: 1050px) {
-  .app {
-    grid-template-columns: 280px 1fr;
-  }
-  .tools {
-    position: fixed;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    width: 330px;
-    transform: translateX(100%);
-    transition: 0.2s;
-    z-index: 4;
-    box-shadow: -12px 0 40px #0008;
-  }
-  .tools.open {
-    transform: none;
-  }
-  .tool-toggle {
-    display: inline-block !important;
-  }
-}
 .scrim {
   display: none;
 }
 .mobile-only {
   display: none;
 }
-@media (max-width: 700px) {
+@media (max-width: 800px) {
   :root {
     --accent: #0a84ff;
     --accent2: #69adff;
@@ -1186,10 +1220,22 @@ label.caption {
     transform: none;
   }
   .tools {
+    position: fixed;
+    right: 0;
+    top: 0;
+    bottom: 0;
     width: min(94vw, 380px);
+    transform: translateX(105%);
+    transition: 0.2s;
     z-index: 7;
     background: var(--panel);
     box-shadow: -12px 0 40px #0003;
+  }
+  .tools.open {
+    transform: none;
+  }
+  .tools .tool-toggle {
+    display: inline-block !important;
   }
   input,
   textarea,
@@ -1386,6 +1432,8 @@ label.caption {
   }
   .outbox-tray {
     max-height: 26vh;
+    padding: 8px max(20px, env(safe-area-inset-right)) 4px max(20px, env(safe-area-inset-left));
+    background: linear-gradient(var(--panel) 74%, transparent);
   }
   .outbox-item {
     border: 0;
@@ -1407,7 +1455,7 @@ label.caption {
   .composer-shell {
     width: 100%;
     min-width: 0;
-    grid-template-columns: 96px minmax(0, 1fr) 44px;
+    grid-template-columns: 64px minmax(0, 1fr) 44px;
     align-items: center;
     gap: 4px;
     padding: 5px 6px 5px 7px;
@@ -1434,7 +1482,7 @@ label.caption {
     border: 0;
   }
   .send-modes {
-    width: 96px;
+    width: 64px;
     padding: 2px;
     border: 0;
     border-radius: 18px;

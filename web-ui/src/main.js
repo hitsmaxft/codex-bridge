@@ -27,6 +27,7 @@ async function loadStatus() {
 }
 async function toggleLanguage() {
   applyLanguage(getLanguage() === "en" ? "zh" : "en");
+  setSendMode($("sendMode").value, state.modeAutomatic);
   renderProjects();
   renderPending();
   showActivity();
@@ -360,31 +361,31 @@ function toolGroupNode(message, keepRunning = false) {
     latest = runningTool || tools.at(-1),
     summary = document.createElement("summary"),
     icon = document.createElement("span"),
-    action = document.createElement("span"),
-    preview = document.createElement("span"),
-    count = document.createElement("span"),
+    label = document.createElement("span"),
     running = Boolean(runningTool) || keepRunning;
   summary.className = "tool-group-summary";
   summary.classList.toggle("running", running);
   icon.className = `tool-icon ${toolIconClass(latest.name)}`;
   icon.title = latest.name;
-  action.className = "tool-summary-action";
-  action.textContent = running ? toolActionText(latest.name, true) : tr("ranTools");
-  preview.className = "tool-summary-preview";
-  preview.textContent = running
-    ? toolSummaryPreview(latest)
-    : tr("toolCount", { count: tools.length });
-  preview.title = running ? latest.preview || latest.name : preview.textContent;
-  count.className = "tool-summary-count";
   const editedFiles = tools.reduce((total, tool) => total + (tool.file_count || 0), 0);
-  count.textContent = running
-    ? tools.length > 1
-      ? `+${tools.length - 1}`
-      : ""
-    : editedFiles
-      ? tr("editedFiles", { count: editedFiles })
-      : "";
-  summary.append(icon, action, preview, count);
+  label.className = "tool-summary-label";
+  label.textContent = running
+    ? [
+        toolActionText(latest.name, true),
+        toolSummaryPreview(latest),
+        tools.length > 1 ? `+${tools.length - 1}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    : [
+        tr("ranTools"),
+        tr("toolCount", { count: tools.length }),
+        editedFiles ? tr("editedFiles", { count: editedFiles }) : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+  label.title = running ? latest.preview || latest.name : label.textContent;
+  summary.append(icon, label);
   group.appendChild(summary);
   const list = document.createElement("div");
   list.className = "tool-list";
@@ -599,11 +600,12 @@ async function fetchMessages(before = null, limit = state.pageSize) {
 function setSendMode(mode, automatic = false) {
   $("sendMode").value = mode;
   state.modeAutomatic = automatic;
-  document.querySelectorAll(".mode-button").forEach((peer) => {
-    const active = peer.dataset.mode === mode;
-    peer.classList.toggle("active", active);
-    peer.setAttribute("aria-pressed", String(active));
-  });
+  const button = $("sendModeToggle"),
+    isSteer = mode === "steer";
+  button.dataset.mode = mode;
+  button.textContent = tr(isSteer ? "followUp" : "queue");
+  button.title = tr(isSteer ? "switchToQueue" : "switchToSteer");
+  button.setAttribute("aria-label", button.title);
 }
 function renderTransientStatus(active) {
   const root = $("messages"),
@@ -1014,9 +1016,8 @@ $("selectBtn").onclick = () =>
     const r = await command(targetRequest("select"));
     notify(tr("selected", { session: r.thread.title || r.thread.id }));
   });
-document
-  .querySelectorAll(".mode-button")
-  .forEach((button) => (button.onclick = () => setSendMode(button.dataset.mode, false)));
+$("sendModeToggle").onclick = () =>
+  setSendMode($("sendMode").value === "steer" ? "send" : "steer", false);
 $("submitBtn").onclick = () => run(() => write($("sendMode").value));
 $("interruptBtn").onclick = () =>
   run(async () => {
@@ -1136,7 +1137,7 @@ function bindSwipe(element, direction, onSwipe, { ignoreInteractive = false } = 
   element.addEventListener(
     "touchstart",
     (event) => {
-      if (!matchMedia("(max-width:700px)").matches || event.touches.length !== 1) return;
+      if (!matchMedia("(max-width:800px)").matches || event.touches.length !== 1) return;
       if (
         !ignoreInteractive &&
         event.target.closest(
@@ -1237,6 +1238,7 @@ document.querySelectorAll(".nav-toggle").forEach(
 );
 $("scrim").onclick = closePanels;
 applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
+setSendMode("steer", false);
 applyTheme(localStorage.getItem(THEME_STORAGE_KEY) || "dark");
 run(async () => {
   await loadStatus();

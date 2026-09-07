@@ -1389,6 +1389,17 @@ fn dispatch(
                 Ok(result) => result,
                 Err(error) => return write_backend_error(error),
             };
+            let app_model = thread
+                .pointer("/thread/model")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let app_effort = thread
+                .pointer("/thread/reasoningEffort")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let (rollout_model, rollout_effort) = session_store
+                .composer_settings(&thread_id)
+                .unwrap_or_default();
             let (weekly_usage, weekly_usage_error) =
                 match write_backend.app_server_rpc("account/rateLimits/read", json!({})) {
                     Ok(rate_limits) => match weekly_usage(&rate_limits) {
@@ -1411,10 +1422,8 @@ fn dispatch(
                 };
             Response::success(json!({
                 "thread_id": thread_id,
-                "model": thread.pointer("/thread/model").and_then(Value::as_str),
-                "reasoning_effort": thread
-                    .pointer("/thread/reasoningEffort")
-                    .and_then(Value::as_str),
+                "model": app_model.or(rollout_model),
+                "reasoning_effort": app_effort.or(rollout_effort),
                 "weekly_usage": weekly_usage,
                 "weekly_usage_error": weekly_usage_error,
             }))
@@ -3126,7 +3135,9 @@ mod tests {
             "codex-bridge.theme.v1",
             "id=\"languageBtn\"",
             "codex-bridge.language.v1",
+            "id=\"sendModeToggle\"",
             "id=\"archiveThreadBtn\"",
+            "tool-summary-label",
             "appendPatchDiff",
             "diff-line",
         ] {

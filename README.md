@@ -24,6 +24,13 @@ Codex rollout files, while live operations use the app-server bundled in ChatGPT
 Desktop's writer-ownership boundary. See [DESIGN.md](DESIGN.md) for the original architecture and
 its evidence limits.
 
+## Web UI preview
+
+[<img src="docs/assets/codex-bridge-mobile.jpg" alt="codex-bridge mobile Web UI showing a live Codex task" width="360">](docs/assets/codex-bridge-mobile.jpg)
+
+The private browser UI keeps task history, tool activity, the creation-SHA Git diff, usage, model
+selection, and Steer/Queue controls available from a phone without replacing Codex Desktop.
+
 ```text
 codexctl / Web UI / local clients
               │
@@ -145,10 +152,10 @@ The embedded UI is designed to stay responsive even with a large task history:
 - Large injected contexts and attachments are transferred as summaries and fetched only when
   expanded. Tool calls initially contain only status, counts, and a short semantic preview.
 
-The composer exposes explicit **Follow up** and **Queue** modes. Submitted text stays visible while
-it is pending, and deleting a remembered item restores its text to the composer. Deleting a queued
-item first cancels the corresponding app-server queue entry. A follow-up requested without an
-active turn is safely converted to a queued send.
+The composer uses one compact **Steer/Queue** button that toggles the send mode on each click.
+Submitted text stays visible while it is pending, and deleting a remembered item restores its text
+to the composer. Deleting a queued item first cancels the corresponding app-server queue entry. A
+steer requested without an active turn is safely converted to a queued send.
 
 The status row compares the working tree with the Git SHA captured when the task was created,
 including bounded counts for untracked text files. Collapsed tool groups keep an animated current
@@ -160,7 +167,8 @@ Git commit is intentionally not exposed.
 The interface defaults to English. The button beside **Status** switches between English and
 Simplified Chinese and persists the selection in browser `localStorage`. The mobile layout uses a
 single conversation column, project and tool drawers, touch-sized controls, safe-area padding, and
-an independently scrolling message pane.
+an independently scrolling message pane. At widths above 800 px, the project history and tools
+panels are both visible by default; at 800 px and below, they become swipeable drawers.
 
 Message Markdown is rendered safely. Session titles skip injected blocks, and the HTML, JavaScript,
 and CSS responses disable browser caching so a restarted daemon appears on the next reload.

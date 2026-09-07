@@ -5,6 +5,12 @@ Codex Desktop tasks, follow live activity, steer or queue messages, inspect tool
 and archive tasks without operating the Electron window directly. It is not a standalone backend;
 all data and control requests go through the bridge daemon.
 
+The composer uses a single compact **Steer/Queue** button. Clicking it switches how the next
+message is delivered without consuming space for two side-by-side controls.
+
+The responsive breakpoint is 800 px. Wider desktop layouts keep both the session history and tools
+panels expanded; narrower layouts turn them into left and right drawers.
+
 ## Development
 
 The frontend is built with Vite and embedded into the `codex-bridge` Rust binary.
