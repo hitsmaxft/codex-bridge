@@ -23,7 +23,12 @@
             data-i18n-aria-label="settingsAria"
             aria-label="Settings"
           >
-            <span aria-hidden="true">⚙</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path
+                fill-rule="evenodd"
+                d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm8 3.5-.1-1-2.1-.8a7 7 0 0 0-.7-1.6l.9-2-1.5-1.5-2 .9a7 7 0 0 0-1.6-.7L12 3h-2l-.8 2.2a7 7 0 0 0-1.6.7l-2-.9-1.5 1.5.9 2a7 7 0 0 0-.7 1.6L2 11v2l2.2.8a7 7 0 0 0 .7 1.6l-.9 2 1.5 1.5 2-.9a7 7 0 0 0 1.6.7L10 21h2l.8-2.2a7 7 0 0 0 1.6-.7l2 .9 1.5-1.5-.9-2a7 7 0 0 0 .7-1.6L20 13v-1Z"
+              />
+            </svg>
           </button>
         </div>
         <div class="sidebar-panel sidebar-sessions" id="sessionPanel">
@@ -156,11 +161,13 @@
             ><button
               class="primary"
               id="submitBtn"
-              data-i18n="send"
               data-i18n-aria-label="submitAria"
               aria-label="Submit message"
             >
-              Send
+              <svg class="submit-arrow" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M12 19V5M6.5 10.5 12 5l5.5 5.5" />
+              </svg>
+              <span class="submit-spinner" aria-hidden="true"></span>
             </button>
           </div>
           <div class="composer-foot">

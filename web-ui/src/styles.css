@@ -171,7 +171,12 @@ aside {
   padding: 0;
   border-radius: 50%;
   color: var(--muted);
-  font-size: 17px;
+}
+.settings-toggle svg {
+  display: block;
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
 }
 .settings-toggle.active {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
@@ -860,9 +865,20 @@ main {
   border: 1px solid var(--line);
   border-radius: 5px;
   font-size: 10px;
+  line-height: 1;
+}
+.tool-icon::before {
+  display: block;
 }
 .tool-icon.exec_command::before {
-  content: "›_";
+  content: ">_";
+  font:
+    600 7px/1 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  letter-spacing: -0.8px;
+  transform: translateX(-0.3px);
 }
 .tool-icon.apply_patch::before {
   content: "✎";
@@ -1205,6 +1221,7 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   box-shadow: 0 1px 4px #0002;
 }
 .composer-shell #submitBtn {
+  position: relative;
   display: grid;
   place-items: center;
   width: 44px;
@@ -1216,21 +1233,31 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   background: var(--action);
   font-size: 0;
 }
-.composer-shell #submitBtn::after {
-  content: "↑";
-  color: var(--action-text);
-  font-size: 24px;
-  font-weight: 700;
-}
-.composer-shell.submitting #submitBtn::after {
-  content: "";
+.submit-arrow {
   display: block;
+  width: 21px;
+  height: 21px;
+  overflow: visible;
+  fill: none;
+  stroke: var(--action-text);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.submit-spinner {
+  display: none;
   box-sizing: border-box;
   width: 18px;
   height: 18px;
   border: 2px solid color-mix(in srgb, var(--action-text) 36%, transparent);
   border-top-color: var(--action-text);
   border-radius: 50%;
+}
+.composer-shell.submitting .submit-arrow {
+  display: none;
+}
+.composer-shell.submitting .submit-spinner {
+  display: block;
   animation: submit-spin 0.72s linear infinite;
 }
 @keyframes submit-spin {
