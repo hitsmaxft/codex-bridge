@@ -5,8 +5,8 @@ function appendPlain(parent, text) {
   });
 }
 
-export function localFileDownloadUrl(raw, threadId) {
-  if (!threadId || typeof raw !== "string") return null;
+export function localFilePath(raw) {
+  if (typeof raw !== "string") return null;
   let path = null;
   if (raw.startsWith("/")) path = raw;
   else if (raw.startsWith("file://")) {
@@ -16,9 +16,7 @@ export function localFileDownloadUrl(raw, threadId) {
       return null;
     }
   }
-  if (!path) return null;
-  const query = new URLSearchParams({ thread_id: threadId, path });
-  return `/api/file?${query}`;
+  return path;
 }
 
 function appendInline(parent, text, options) {
@@ -39,10 +37,29 @@ function appendInline(parent, text, options) {
       const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       const link = document.createElement("a");
       link.textContent = parts[1];
-      const downloadUrl = localFileDownloadUrl(parts[2], options.threadId);
-      if (downloadUrl) {
-        link.href = downloadUrl;
+      const downloadPath = localFilePath(parts[2]);
+      if (downloadPath && options.requestLocalFileDownload) {
+        link.href = "#";
         link.download = parts[2].split("/").at(-1) || "download";
+        link.onclick = async (event) => {
+          event.preventDefault();
+          if (link.getAttribute("aria-busy") === "true") return;
+          link.setAttribute("aria-busy", "true");
+          try {
+            const url = await options.requestLocalFileDownload(downloadPath);
+            const trigger = document.createElement("a");
+            trigger.href = url;
+            trigger.download = link.download;
+            trigger.hidden = true;
+            document.body.appendChild(trigger);
+            trigger.click();
+            trigger.remove();
+          } catch (error) {
+            options.onError?.(error);
+          } finally {
+            link.removeAttribute("aria-busy");
+          }
+        };
       } else {
         try {
           const url = new URL(parts[2], location.href);

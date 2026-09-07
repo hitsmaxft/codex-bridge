@@ -33,10 +33,13 @@ contact Codex.
 [<img src="docs/assets/codex-bridge-mobile.jpg" alt="codex-bridge mobile Web UI showing a live Codex task" width="360">](docs/assets/codex-bridge-mobile.jpg)
 
 The private UI is responsive across mobile and desktop. It includes project and task navigation,
-rendered tool calls and diffs, task pinning and archiving, model selection, Git change summaries,
+rendered tool calls and diffs, task pinning, renaming, and archiving, model selection, Git change summaries,
 English and Chinese text, and queue/steer message handoff. Local file links can download regular
 files smaller than 16 MiB; the server resolves each link against that task's workspace and rejects
-paths or symlinks that escape it.
+paths or symlinks that escape it. Authenticated clients receive a random download ticket that
+expires after five minutes and tolerates browser or proxy retries. Tickets live only in bridge
+process memory and become invalid after a restart, so downloads do not expose a long-lived
+anonymous file endpoint or depend on Basic Auth being forwarded by a navigation.
 
 ## How it connects
 

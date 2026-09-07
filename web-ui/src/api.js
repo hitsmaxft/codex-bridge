@@ -20,6 +20,24 @@ const authentication = createAuthenticationGate(async () => {
 
 export const authenticate = () => authentication.wait();
 
+export async function createFileDownloadTicket(threadId, path) {
+  await authenticate();
+  const response = await fetch("/api/file-ticket", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ thread_id: threadId, path }),
+  });
+  if (response.status === 401) {
+    const error = new Error("authentication expired; reload the page to sign in again");
+    authentication.block(error);
+    throw error;
+  }
+  if (!response.ok)
+    throw new Error((await response.text()) || `download failed (${response.status})`);
+  return response.json();
+}
+
 async function sendCommand(request) {
   if (demoMode) {
     demoClient ||= import("./demo-client.js");

@@ -3,6 +3,7 @@ import {
   $,
   authenticate,
   command,
+  createFileDownloadTicket,
   demoMode,
   notify,
   run,
@@ -71,6 +72,7 @@ function setThreadHeaderExpanded(expanded) {
 }
 async function toggleLanguage() {
   applyLanguage(getLanguage() === "en" ? "zh" : "en");
+  syncComposerPlaceholder();
   setSendMode($("sendMode").value, state.modeAutomatic);
   renderProjects();
   renderPending();
@@ -448,7 +450,7 @@ function appendContextValue(details, value, label) {
   }
 }
 function contentNode(item) {
-  if (item.kind === "text") return markdownNode(item.text, { threadId: state.current?.id });
+  if (item.kind === "text") return markdownNode(item.text, markdownOptions(state.current?.id));
   const details = document.createElement("details");
   details.className = "context-block";
   const summary = document.createElement("summary");
@@ -484,6 +486,17 @@ function contentNode(item) {
     });
   };
   return details;
+}
+function markdownOptions(threadId) {
+  return {
+    requestLocalFileDownload: async (path) => {
+      if (!threadId) throw new Error(tr("chooseSessionError"));
+      const ticket = await createFileDownloadTicket(threadId, path);
+      if (!ticket?.url) throw new Error("download ticket response is invalid");
+      return ticket.url;
+    },
+    onError: (error) => notify(error.message, true),
+  };
 }
 function toolValueText(value) {
   if (typeof value === "string") {
@@ -743,6 +756,25 @@ function messageNode(m, keepToolsRunning = false) {
   if (tools) body.appendChild(tools);
   if (head.childNodes.length) box.appendChild(head);
   box.appendChild(body);
+  const copyText = (m.content || [])
+    .filter((item) => item.kind === "text" && typeof item.text === "string")
+    .map((item) => item.text)
+    .join("\n\n");
+  if (copyText) {
+    const copy = document.createElement("button");
+    copy.className = "message-copy";
+    copy.type = "button";
+    copy.innerHTML =
+      '<svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
+    copy.title = tr("copyMessage");
+    copy.setAttribute("aria-label", copy.title);
+    copy.onclick = () =>
+      run(async () => {
+        await navigator.clipboard.writeText(copyText);
+        notify(tr("messageCopied"));
+      });
+    box.appendChild(copy);
+  }
   renderedMessageState.set(box, {
     signature: JSON.stringify(m),
     keepToolsRunning,
@@ -814,7 +846,7 @@ function pendingNode(entry) {
   box.dataset.pendingId = entry.id;
   const body = document.createElement("div");
   body.className = "message-body";
-  body.appendChild(markdownNode(entry.text, { threadId: entry.thread_id || state.current?.id }));
+  body.appendChild(markdownNode(entry.text, markdownOptions(entry.thread_id || state.current?.id)));
   if (!entry.handoff && ["queue", "steer"].includes(entry.action)) {
     const mode = document.createElement("div");
     mode.className = "outbox-mode";
@@ -947,6 +979,14 @@ function isValidMessagePage(result, { latest = false, expectedEnd = null } = {})
 function requireMessagePage(result, options) {
   if (!isValidMessagePage(result, options)) throw new Error(tr("historyOutOfSync"));
   return result;
+}
+function applyMessagePageState(result) {
+  state.lastMessageIndex = result.messages.length ? result.page.end - 1 : null;
+  state.before = result.page.before;
+  state.hasMore = result.page.has_more;
+  state.historyStart = result.page.start;
+  state.historyEnd = result.page.end;
+  state.historyTotal = result.page.total;
 }
 function setSendMode(mode, automatic = false) {
   $("sendMode").value = mode;
@@ -1384,6 +1424,7 @@ function resizeComposerTextarea() {
     threadHead = document.querySelector(".thread-head");
   if (!textarea || !composer || !shell || !threadHead) return;
   shell.classList.toggle("has-text", Boolean(textarea.value));
+  syncComposerPlaceholder();
   textarea.style.height = "44px";
   const viewportHeight = window.visualViewport?.height || window.innerHeight,
     composerChrome = Math.max(0, composer.getBoundingClientRect().height - 44),
@@ -1396,6 +1437,16 @@ function resizeComposerTextarea() {
     height = Math.min(Math.max(44, textarea.scrollHeight), limit);
   textarea.style.height = `${Math.ceil(height)}px`;
   textarea.style.overflowY = textarea.scrollHeight > height + 1 ? "auto" : "hidden";
+}
+function syncComposerPlaceholder() {
+  const textarea = $("messageText"),
+    shell = document.querySelector(".composer-shell"),
+    compact =
+      usesDocumentMessageScroll() &&
+      !textarea.value &&
+      document.activeElement !== textarea &&
+      !shell.classList.contains("input-focused");
+  textarea.placeholder = tr(compact ? "messagePlaceholderCompact" : "messagePlaceholder");
 }
 function settleHorizontalPosition() {
   requestAnimationFrame(() => {
@@ -1473,7 +1524,17 @@ async function openThread(
   $("threadMeta").textContent =
     `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
   const root = $("messages");
-  if (!quiet) root.innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
+  const cached = changedThread ? state.messageCache.get(thread.id) : null;
+  if (!quiet) {
+    if (cached && isValidMessagePage(cached, { latest: true })) {
+      root.replaceChildren();
+      reconcileMessageNodes(root, cached, null);
+      applyMessagePageState(cached);
+      requestAnimationFrame(scrollMessagesToBottom);
+    } else {
+      root.innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
+    }
+  }
   const [r] = await Promise.all([
     fetchMessages(),
     refreshActivity(),
@@ -1485,6 +1546,7 @@ async function openThread(
   ]);
   if (token !== state.openToken) return;
   requireMessagePage(r, { latest: true });
+  state.messageCache.set(thread.id, r);
   state.current = { ...thread, ...r.thread };
   rememberSessionId(window.localStorage, state.current.id);
   if (writeHash) updateSessionHash(state.current.id, replaceHash);
@@ -1506,12 +1568,7 @@ async function openThread(
     ? r.messages.findLast((message) => message.tools?.length)
     : null;
   reconcileMessageNodes(root, r, activeToolMessage);
-  state.lastMessageIndex = r.messages.length ? r.page.end - 1 : null;
-  state.before = r.page.before;
-  state.hasMore = r.page.has_more;
-  state.historyStart = r.page.start;
-  state.historyEnd = r.page.end;
-  state.historyTotal = r.page.total;
+  applyMessagePageState(r);
   renderPending();
   restoreMessageView(messageView);
   state.pendingChanges = false;
@@ -1590,6 +1647,7 @@ function syncSubmitAction() {
   button.dataset.action = stopReady ? "interrupt" : "submit";
   button.title = tr(stopReady ? "stopRunAria" : "submitAria");
   button.setAttribute("aria-label", button.title);
+  syncComposerPlaceholder();
 }
 async function interruptCurrentRun({ confirm = true, requireActive = false } = {}) {
   if ((requireActive && !state.activeTurnId) || state.interrupting) return;
@@ -1698,9 +1756,19 @@ $("selectBtn").onclick = () =>
     const r = await command(targetRequest("select"));
     notify(tr("selected", { session: r.thread.title || r.thread.id }));
   });
-$("sendModeToggle").onclick = () =>
+function toggleSendModeAndKeepFocus() {
   setSendMode($("sendMode").value === "steer" ? "send" : "steer", false);
-$("sendModeToggle").onpointerdown = (event) => event.preventDefault();
+  $("messageText").focus({ preventScroll: true });
+}
+$("sendModeToggle").onpointerdown = (event) => {
+  if (!event.isPrimary || event.button !== 0) return;
+  event.preventDefault();
+  toggleSendModeAndKeepFocus();
+};
+$("sendModeToggle").onclick = (event) => {
+  if (event.detail !== 0) return;
+  toggleSendModeAndKeepFocus();
+};
 $("submitBtn").onpointerdown = () => {
   $("submitBtn").dataset.pointerAction = $("submitBtn").dataset.action;
 };
@@ -1716,6 +1784,23 @@ $("submitBtn").onclick = () => {
 };
 $("interruptBtn").onclick = () => run(() => interruptCurrentRun());
 $("mobileInterruptBtn").onclick = () => $("interruptBtn").click();
+$("renameThreadBtn").onclick = () =>
+  run(async () => {
+    if (!state.current) throw new Error(tr("chooseSessionError"));
+    const currentName = state.current.title || "";
+    const entered = window.prompt(tr("renamePrompt"), currentName);
+    if (entered === null) return;
+    const name = entered.trim();
+    if (!name || [...name].length > 200) throw new Error(tr("renameInvalid"));
+    const threadId = state.current.id;
+    await command({ command: "thread_rename", thread_id: threadId, name }, false);
+    if (state.current?.id === threadId) {
+      state.current.title = name;
+      $("threadTitle").textContent = name;
+    }
+    await loadProjects();
+    notify(tr("sessionRenamed"));
+  });
 $("archiveThreadBtn").onclick = () =>
   run(async () => {
     if (!state.current) throw new Error(tr("chooseSessionError"));
@@ -1986,9 +2071,16 @@ document.addEventListener(
   (event) => {
     const textarea = $("messageText"),
       submit = $("submitBtn"),
+      mode = $("sendModeToggle"),
       shell = document.querySelector(".composer-shell"),
       target = event.target;
-    if (target === textarea || textarea.contains(target) || submit.contains(target)) return;
+    if (
+      target === textarea ||
+      textarea.contains(target) ||
+      submit.contains(target) ||
+      mode.contains(target)
+    )
+      return;
     shell.classList.remove("input-focused");
     textarea.blur();
     syncSubmitAction();

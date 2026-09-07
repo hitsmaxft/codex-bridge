@@ -18,7 +18,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use clap::Parser;
 use codex_bridge::{
@@ -37,6 +37,8 @@ use tokio::sync::mpsc;
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
+const DOWNLOAD_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_DOWNLOAD_TICKETS: usize = 128;
 const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
 const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
@@ -111,6 +113,7 @@ struct WebState {
     port: u16,
     auth: Arc<WebAuth>,
     public_origins: Arc<Vec<WebOrigin>>,
+    download_tickets: Arc<RwLock<HashMap<String, DownloadTicket>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,9 +128,21 @@ struct WebAuth {
 }
 
 #[derive(Debug, Deserialize)]
-struct FileDownloadQuery {
+struct FileTicketRequest {
     thread_id: String,
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileDownloadQuery {
+    ticket: String,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadTicket {
+    workspace: PathBuf,
+    path: PathBuf,
+    expires_at: Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -583,6 +598,7 @@ async fn main() -> Result<()> {
             port: web_addr.port(),
             auth: Arc::new(web_auth.context("Web UI authentication is unavailable")?),
             public_origins: Arc::new(web_public_origins),
+            download_tickets: Arc::new(RwLock::new(HashMap::new())),
         };
         println!("codex-bridge Web UI listening on http://{web_addr}/");
         Some(tokio::spawn(async move {
@@ -883,6 +899,7 @@ fn web_router(state: WebState) -> Router {
         .route("/assets/app.js", get(web_app_js))
         .route("/assets/app.css", get(web_app_css))
         .route("/api/auth", get(web_auth_check))
+        .route("/api/file-ticket", post(web_file_ticket))
         .route("/api/file", get(web_file_download))
         .route("/api/command", post(web_command))
         .route("/api/events", get(web_events))
@@ -926,19 +943,19 @@ async fn web_file_download(
     headers: HeaderMap,
     Query(query): Query<FileDownloadQuery>,
 ) -> HttpResponse {
-    if !basic_auth_allowed(&headers, &state.auth) {
-        return basic_auth_required();
-    }
     if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    let store = Arc::clone(&state.bridge.session_store);
+    let ticket = get_download_ticket(&state.download_tickets, &query.ticket);
+    let Some(ticket) = ticket else {
+        return (
+            StatusCode::NOT_FOUND,
+            "download ticket is invalid or expired",
+        )
+            .into_response();
+    };
     let result = tokio::task::spawn_blocking(move || {
-        let thread = store
-            .find_thread(&query.thread_id)
-            .map_err(|_| FileDownloadFailure::ThreadNotFound)?
-            .ok_or(FileDownloadFailure::ThreadNotFound)?;
-        read_workspace_download(&thread.cwd, &query.path)
+        read_workspace_download(&ticket.workspace, ticket.path.to_string_lossy().as_ref())
     })
     .await;
     let (bytes, filename) = match result {
@@ -986,6 +1003,117 @@ async fn web_file_download(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+fn get_download_ticket(
+    tickets: &RwLock<HashMap<String, DownloadTicket>>,
+    token: &str,
+) -> Option<DownloadTicket> {
+    let mut tickets = tickets.write().ok()?;
+    let now = Instant::now();
+    tickets.retain(|_, ticket| ticket.expires_at > now);
+    tickets.get(token).cloned()
+}
+
+async fn web_file_ticket(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> HttpResponse {
+    if !basic_auth_allowed(&headers, &state.auth) {
+        return basic_auth_required();
+    }
+    if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    if body.len() as u64 > MAX_REQUEST_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "request is too large").into_response();
+    }
+    let request = match serde_json::from_slice::<FileTicketRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid request").into_response(),
+    };
+    let store = Arc::clone(&state.bridge.session_store);
+    let resolved = tokio::task::spawn_blocking(move || {
+        let thread = store
+            .find_thread(&request.thread_id)
+            .map_err(|_| FileDownloadFailure::ThreadNotFound)?
+            .ok_or(FileDownloadFailure::ThreadNotFound)?;
+        let (path, _, _) = resolve_workspace_download(&thread.cwd, &request.path)?;
+        Ok::<_, FileDownloadFailure>((thread.cwd, path))
+    })
+    .await;
+    let (workspace, path) = match resolved {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(FileDownloadFailure::OutsideWorkspace)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "file is outside the session workspace",
+            )
+                .into_response()
+        }
+        Ok(Err(FileDownloadFailure::TooLarge)) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file must be smaller than 16 MiB",
+            )
+                .into_response()
+        }
+        Ok(Err(_)) | Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
+    };
+    let mut random = [0_u8; 32];
+    if getrandom::fill(&mut random).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to create download ticket",
+        )
+            .into_response();
+    }
+    let token = URL_SAFE_NO_PAD.encode(random);
+    let Ok(mut tickets) = state.download_tickets.write() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "download ticket store is unavailable",
+        )
+            .into_response();
+    };
+    let now = Instant::now();
+    tickets.retain(|_, ticket| ticket.expires_at > now);
+    if tickets.len() >= MAX_DOWNLOAD_TICKETS {
+        if let Some(oldest) = tickets
+            .iter()
+            .min_by_key(|(_, ticket)| ticket.expires_at)
+            .map(|(token, _)| token.clone())
+        {
+            tickets.remove(&oldest);
+        }
+    }
+    tickets.insert(
+        token.clone(),
+        DownloadTicket {
+            workspace,
+            path,
+            expires_at: now + DOWNLOAD_TICKET_TTL,
+        },
+    );
+    let mut response = Json(json!({
+        "url": format!("/api/file?ticket={token}"),
+        "expires_in_seconds": DOWNLOAD_TICKET_TTL.as_secs(),
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     response
 }
 
@@ -993,6 +1121,18 @@ fn read_workspace_download(
     workspace: &Path,
     requested: &str,
 ) -> std::result::Result<(Vec<u8>, String), FileDownloadFailure> {
+    let (candidate, filename, _) = resolve_workspace_download(workspace, requested)?;
+    let bytes = fs::read(&candidate).map_err(|_| FileDownloadFailure::ReadFailed)?;
+    if bytes.len() as u64 >= MAX_DOWNLOAD_BYTES {
+        return Err(FileDownloadFailure::TooLarge);
+    }
+    Ok((bytes, filename))
+}
+
+fn resolve_workspace_download(
+    workspace: &Path,
+    requested: &str,
+) -> std::result::Result<(PathBuf, String, u64), FileDownloadFailure> {
     if requested.is_empty() {
         return Err(FileDownloadFailure::FileNotFound);
     }
@@ -1014,10 +1154,6 @@ fn read_workspace_download(
     if metadata.len() >= MAX_DOWNLOAD_BYTES {
         return Err(FileDownloadFailure::TooLarge);
     }
-    let bytes = fs::read(&candidate).map_err(|_| FileDownloadFailure::ReadFailed)?;
-    if bytes.len() as u64 >= MAX_DOWNLOAD_BYTES {
-        return Err(FileDownloadFailure::TooLarge);
-    }
     let filename = candidate
         .file_name()
         .and_then(|name| name.to_str())
@@ -1031,7 +1167,7 @@ fn read_workspace_download(
             }
         })
         .collect::<String>();
-    Ok((bytes, filename))
+    Ok((candidate, filename, metadata.len()))
 }
 
 fn web_asset_response(
@@ -1188,6 +1324,25 @@ async fn web_event_socket(socket: WebSocket, backend: Arc<CodexCliBackend>) {
     {
         return;
     }
+    let snapshot_backend = Arc::clone(&backend);
+    if let Ok(Ok(active_thread_ids)) =
+        tokio::task::spawn_blocking(move || active_loaded_thread_ids(&snapshot_backend)).await
+    {
+        if sender
+            .send(AxumWsMessage::Text(
+                json!({
+                    "type": "bridge_thread_activity_snapshot",
+                    "active_thread_ids": active_thread_ids,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -1210,6 +1365,23 @@ async fn web_event_socket(socket: WebSocket, backend: Arc<CodexCliBackend>) {
             }
         }
     }
+}
+
+fn active_loaded_thread_ids(
+    backend: &CodexCliBackend,
+) -> std::result::Result<Vec<String>, BackendFailure> {
+    let loaded = loaded_thread_ids(&backend.app_server_rpc("thread/loaded/list", json!({}))?);
+    let mut active = Vec::new();
+    for thread_id in loaded {
+        let thread = backend.app_server_rpc(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+        )?;
+        if thread_result_is_active(&thread) {
+            active.push(thread_id);
+        }
+    }
+    Ok(active)
 }
 
 fn web_headers_allowed(
@@ -2465,6 +2637,36 @@ fn dispatch(
                 Err(error) => write_backend_error(error),
             }
         }
+        Request::ThreadRename { thread_id, name } => {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > 200 {
+                return Response::error(
+                    "invalid_thread_name",
+                    "thread name must contain between 1 and 200 characters",
+                );
+            }
+            let resolved =
+                match resolve_write_target(Some(thread_id), session_store, selected_thread) {
+                    Ok(resolved) => resolved,
+                    Err(response) => return response,
+                };
+            match write_backend.app_server_rpc(
+                "thread/name/set",
+                json!({"threadId": resolved.thread.id, "name": name}),
+            ) {
+                Ok(_) => {
+                    session_store.invalidate_summary_cache();
+                    Response::success(json!({
+                        "action": "thread_rename",
+                        "status": "renamed",
+                        "thread_id": resolved.thread.id,
+                        "name": name,
+                        "backend": "app_server_thread_name_set",
+                    }))
+                }
+                Err(error) => write_backend_error(error),
+            }
+        }
         Request::ThreadArchive { thread_id } => {
             let resolved =
                 match resolve_write_target(Some(thread_id), session_store, selected_thread) {
@@ -3616,6 +3818,32 @@ mod tests {
     }
 
     #[test]
+    fn download_tickets_are_short_lived_and_retryable() {
+        assert_eq!(DOWNLOAD_TICKET_TTL, Duration::from_secs(300));
+        let tickets = RwLock::new(HashMap::from([
+            (
+                "valid".to_owned(),
+                DownloadTicket {
+                    workspace: PathBuf::from("/workspace"),
+                    path: PathBuf::from("/workspace/file.bin"),
+                    expires_at: Instant::now() + DOWNLOAD_TICKET_TTL,
+                },
+            ),
+            (
+                "expired".to_owned(),
+                DownloadTicket {
+                    workspace: PathBuf::from("/workspace"),
+                    path: PathBuf::from("/workspace/old.bin"),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                },
+            ),
+        ]));
+        assert!(get_download_ticket(&tickets, "expired").is_none());
+        assert!(get_download_ticket(&tickets, "valid").is_some());
+        assert!(get_download_ticket(&tickets, "valid").is_some());
+    }
+
+    #[test]
     fn writes_never_fall_back_to_latest_rollout() {
         let store = fixture_store();
         let selected = RwLock::new(None);
@@ -4105,6 +4333,7 @@ mod tests {
             include_str!("../../../web-ui/src/auth-gate.js"),
             include_str!("../../../web-ui/src/main.js"),
             include_str!("../../../web-ui/src/markdown.js"),
+            include_str!("../../../web-ui/src/message-cache.js"),
             include_str!("../../../web-ui/src/i18n.js"),
             include_str!("../../../web-ui/src/composer-state.js"),
             include_str!("../../../web-ui/src/session-route.js"),
@@ -4124,6 +4353,7 @@ mod tests {
             "composer_options",
             "thread_create",
             "thread_settings_update",
+            "thread_rename",
             "thread_archive",
             "thread_pins",
             "thread_pin",
@@ -4190,13 +4420,21 @@ mod tests {
             "visibilitychange",
             "bridge_thread_activity_snapshot",
             "/api/file",
+            "/api/file-ticket",
             "/api/auth",
             "setDeliveryState",
             "serverQueued",
             "submit-spin",
             "codex-bridge.language.v1",
             "id=\"sendModeToggle\"",
+            "toggleSendModeAndKeepFocus",
+            "event.detail !== 0",
+            "messagePlaceholderCompact",
+            "createFileDownloadTicket",
             "id=\"archiveThreadBtn\"",
+            "id=\"renameThreadBtn\"",
+            "message-copy",
+            "SessionMessageCache",
             "tool-summary-label",
             "appendPatchDiff",
             "diff-line",

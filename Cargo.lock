@@ -217,6 +217,7 @@ dependencies = [
  "base64",
  "clap",
  "futures-util",
+ "getrandom",
  "libc",
  "rusqlite",
  "serde",

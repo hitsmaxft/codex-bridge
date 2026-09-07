@@ -5,7 +5,8 @@ import test from "node:test";
 import { shouldOfferStop } from "../src/composer-state.js";
 import { createAuthenticationGate } from "../src/auth-gate.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
-import { localFileDownloadUrl } from "../src/markdown.js";
+import { localFilePath } from "../src/markdown.js";
+import { SessionMessageCache } from "../src/message-cache.js";
 import {
   LAST_SESSION_STORAGE_KEY,
   rememberSessionId,
@@ -129,17 +130,16 @@ test("file diffs define distinct light and dark theme palettes", async () => {
   );
 });
 
-test("local task files use the authenticated workspace download route", () => {
+test("local task file links resolve to workspace paths", () => {
   assert.equal(
-    localFileDownloadUrl("/Users/bhe/project/firmware image.elf", "thread-1"),
-    "/api/file?thread_id=thread-1&path=%2FUsers%2Fbhe%2Fproject%2Ffirmware+image.elf",
+    localFilePath("/Users/bhe/project/firmware image.elf"),
+    "/Users/bhe/project/firmware image.elf",
   );
   assert.equal(
-    localFileDownloadUrl("file:///Users/bhe/project/firmware.elf", "thread-1"),
-    "/api/file?thread_id=thread-1&path=%2FUsers%2Fbhe%2Fproject%2Ffirmware.elf",
+    localFilePath("file:///Users/bhe/project/firmware.elf"),
+    "/Users/bhe/project/firmware.elf",
   );
-  assert.equal(localFileDownloadUrl("https://example.com/firmware.elf", "thread-1"), null);
-  assert.equal(localFileDownloadUrl("/Users/bhe/project/firmware.elf", null), null);
+  assert.equal(localFilePath("https://example.com/firmware.elf"), null);
 });
 
 test("authentication gate serializes concurrent startup requests", async () => {
@@ -160,4 +160,33 @@ test("authentication gate serializes concurrent startup requests", async () => {
   await Promise.all([first, second]);
   await gate.wait();
   assert.equal(probes, 1);
+});
+
+test("demo session rename updates subsequent thread reads", async () => {
+  const command = await demoClient();
+  assert.equal(
+    result(
+      command({
+        command: "thread_rename",
+        thread_id: "demo-thread-web-ui",
+        name: "Renamed demo session",
+      }),
+    ).status,
+    "renamed",
+  );
+  const page = result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 1 }));
+  assert.equal(page.thread.title, "Renamed demo session");
+});
+
+test("message cache keeps three recently used sessions", () => {
+  const cache = new SessionMessageCache(3);
+  cache.set("one", { page: 1 });
+  cache.set("two", { page: 2 });
+  cache.set("three", { page: 3 });
+  assert.equal(cache.get("one").page, 1);
+  cache.set("four", { page: 4 });
+  assert.equal(cache.get("two"), null);
+  assert.equal(cache.get("one").page, 1);
+  assert.equal(cache.get("three").page, 3);
+  assert.equal(cache.get("four").page, 4);
 });

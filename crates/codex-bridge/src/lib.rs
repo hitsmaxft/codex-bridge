@@ -25,7 +25,7 @@ pub use write_backend::{
     APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +79,10 @@ pub enum Request {
         thread_id: String,
         model: String,
         effort: String,
+    },
+    ThreadRename {
+        thread_id: String,
+        name: String,
     },
     ThreadArchive {
         thread_id: String,
@@ -158,6 +162,7 @@ impl Request {
             Self::ComposerOptions => "composer_options",
             Self::ThreadCreate { .. } => "thread_create",
             Self::ThreadSettingsUpdate { .. } => "thread_settings_update",
+            Self::ThreadRename { .. } => "thread_rename",
             Self::ThreadArchive { .. } => "thread_archive",
             Self::ThreadPins => "thread_pins",
             Self::ThreadPin { .. } => "thread_pin",
@@ -365,6 +370,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(archive["command"], "thread_archive");
+
+        let rename = serde_json::to_value(Request::ThreadRename {
+            thread_id: "thread-1".into(),
+            name: "New name".into(),
+        })
+        .unwrap();
+        assert_eq!(rename["command"], "thread_rename");
+        assert_eq!(rename["name"], "New name");
 
         let pins = serde_json::to_value(Request::ThreadPins).unwrap();
         assert_eq!(pins["command"], "thread_pins");

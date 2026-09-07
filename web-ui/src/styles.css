@@ -598,6 +598,35 @@ main {
   font-size: 15px;
   line-height: 1.5;
 }
+.message-copy {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  min-height: 20px;
+  margin: 2px 2px 0 auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  opacity: 0.58;
+}
+.message-copy svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.message-copy:hover,
+.message-copy:focus-visible {
+  opacity: 1;
+}
+.message.user .message-copy {
+  margin-right: 8px;
+  color: currentColor;
+}
 .message.context {
   margin: 7px 0;
 }

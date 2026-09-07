@@ -1,3 +1,5 @@
+import { SessionMessageCache } from "./message-cache.js";
+
 export const DRAFT_STORAGE_KEY = "codex-bridge.drafts.v1";
 export { applyTheme, storedTheme, watchSystemTheme } from "./theme.js";
 
@@ -34,6 +36,7 @@ export const state = {
   before: null,
   hasMore: false,
   loadingHistory: false,
+  messageCache: new SessionMessageCache(3),
   openToken: 0,
   pageSize: 30,
   userScrolled: false,

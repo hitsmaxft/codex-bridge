@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 const PRIMARY_THREAD: &str = "demo-thread-web-ui";
 const SECONDARY_THREAD: &str = "demo-thread-protocol";
@@ -29,6 +30,7 @@ struct DemoState {
     model: String,
     effort: String,
     pinned_thread: Option<String>,
+    renamed_threads: HashMap<String, String>,
 }
 
 impl DemoState {
@@ -43,11 +45,12 @@ impl DemoState {
             model: "gpt-5.6-sol".to_owned(),
             effort: "medium".to_owned(),
             pinned_thread: Some(PRIMARY_THREAD.to_owned()),
+            renamed_threads: HashMap::new(),
         }
     }
 
     fn thread(&self, id: &str) -> Value {
-        let (title, created_at) = if id == SECONDARY_THREAD {
+        let (default_title, created_at) = if id == SECONDARY_THREAD {
             ("Typed app-server tool items", "2026-09-06T09:38:46.147Z")
         } else {
             (
@@ -55,6 +58,11 @@ impl DemoState {
                 "2026-09-07T06:30:15.726Z",
             )
         };
+        let title = self
+            .renamed_threads
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or(default_title);
         json!({
             "id": id,
             "title": title,
@@ -309,7 +317,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "service": "codex-bridge-demo",
             "status": "ready",
             "demo": true,
-            "protocol_version": 17,
+            "protocol_version": 18,
             "rollout_store": {"available": true, "codex_home": "/demo/.codex", "read_only": true},
             "selected_thread_id": PRIMARY_THREAD,
             "write_backend": {"app_server_available": true, "app_server_mode": "demo_wasm", "standalone_fallback": false}
@@ -469,6 +477,24 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .to_owned();
             json!({"thread_id": thread_id, "model": state.model, "reasoning_effort": state.effort, "backend": "demo_wasm"})
         }
+        "thread_rename" => {
+            let name = request
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if name.is_empty() || name.chars().count() > 200 {
+                return error(
+                    "invalid_thread_name",
+                    "thread name must contain between 1 and 200 characters",
+                );
+            }
+            state
+                .renamed_threads
+                .insert(thread_id.to_owned(), name.to_owned());
+            state.file_len += 1;
+            json!({"thread_id": thread_id, "name": name, "status": "renamed", "backend": "demo_wasm"})
+        }
         "workspace_diff" => json!({
             "thread_id": thread_id,
             "repository": PROJECT_PATH,
@@ -571,7 +597,7 @@ mod tests {
         let response: Value =
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
-        assert_eq!(response["result"]["protocol_version"], 17);
+        assert_eq!(response["result"]["protocol_version"], 18);
     }
 
     #[test]

@@ -93,8 +93,9 @@ Event delivery accelerates live updates. The bridge warms local rollout caches a
 threads emit events, periodically discovers active threads through `thread/loaded/list` plus the
 metadata-only `thread/read(includeTurns: false)`, and subscribes those active threads. A bounded set
 of pinned threads is also warmed locally without resuming every inactive pin into app-server
-memory. Each successful discovery pass sends a compact active-thread ID snapshot over the existing
-Web UI event WebSocket, so sidebar activity dots recover after a browser reconnect even when no new
+memory. Each WebSocket connection receives an immediate compact active-thread ID snapshot, and
+each subsequent discovery pass sends another snapshot over the existing Web UI event stream. This
+lets sidebar activity dots recover after a browser reconnect even when no new
 `thread/status/changed` transition occurs. Polling remains as a compatibility and gap-recovery path.
 
 ## Client-to-server method catalogue
@@ -314,8 +315,8 @@ content rather than total session size.
 2. **Search and navigation** — `thread/search`, `thread/searchOccurrences`, and
    `thread/timeline/list` can provide global session search and jump-to-match. These are also
    experimental.
-3. **Rename, restore, and delete** — expose `thread/name/set`, `thread/unarchive`, and optionally
-   guarded `thread/delete` in session management.
+3. **Restore and delete** — session rename already uses `thread/name/set`; expose
+   `thread/unarchive` and optionally guarded `thread/delete` for the remaining lifecycle actions.
 4. **Fork and history undo** — `thread/fork` and `thread/revert` enable “branch from here” and
    “forget turns after here.” Make it explicit that history revert does not undo workspace files;
    do not build new UI on deprecated `thread/rollback`.

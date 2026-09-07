@@ -15,7 +15,7 @@ pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const GIT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
 const GIT_BRANCH_PARALLELISM: usize = 16;
 const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(3);
-const MESSAGE_CACHE_ENTRIES: usize = 4;
+const MESSAGE_CACHE_ENTRIES: usize = 10;
 
 type GitBranchCache = Arc<Mutex<HashMap<PathBuf, (Instant, Option<String>)>>>;
 
