@@ -76,10 +76,19 @@
             data-i18n-aria-label="projectsAria"
             aria-label="Projects and sessions"
           >
-            ‹
+            <span class="desktop-icon" aria-hidden="true">‹</span
+            ><span class="mobile-button-label" data-i18n="session">Sessions</span>
           </button>
           <div class="head-copy">
-            <h2 id="threadTitle" data-i18n="chooseSession">Choose a session</h2>
+            <h2
+              id="threadTitle"
+              data-i18n="chooseSession"
+              role="button"
+              tabindex="0"
+              aria-expanded="false"
+            >
+              Choose a session
+            </h2>
             <div class="meta">
               <span id="threadMeta" data-i18n="projectsHint"
                 >Projects and sessions appear on the left.</span
@@ -90,7 +99,8 @@
             <button id="selectBtn" data-i18n="selectDefault">Select default</button
             ><button id="refreshBtn" data-i18n="refresh">Refresh</button
             ><button class="tool-toggle" data-i18n-aria-label="tools" aria-label="Tools">
-              •••
+              <span class="desktop-icon" aria-hidden="true">•••</span
+              ><span class="mobile-button-label" data-i18n="tools">Tools</span>
             </button>
           </div>
         </div>
@@ -179,112 +189,115 @@
         <div class="toast" id="toast" role="status" aria-live="polite"></div>
       </main>
       <section class="tools" id="tools">
-        <div class="tool-section">
+        <div class="tool-section tool-primary">
           <div class="brand-row">
-            <h2 data-i18n="commands">Commands</h2>
+            <h2 data-i18n="tools">Tools</h2>
             <button class="tool-toggle" data-i18n="close">Close</button>
           </div>
-          <div class="tool-row">
-            <button id="currentBtn" data-i18n="current">Current</button
-            ><button id="tailBtn" data-i18n="tail">Tail</button
-            ><button id="pendingBtn" data-i18n="pending">Pending</button>
-          </div>
-        </div>
-        <div class="tool-section mobile-only">
-          <h2 data-i18n="turnActions">Turn actions</h2>
-          <div class="tool-row">
-            <button class="danger" id="mobileInterruptBtn" data-i18n="interruptCurrent">
-              Interrupt current turn
-            </button>
-          </div>
-        </div>
-        <div class="tool-section">
-          <h2 data-i18n="session">Session</h2>
           <div class="tool-row">
             <button class="danger" id="archiveThreadBtn" data-i18n="archiveCurrent">
               Archive current session
             </button>
           </div>
         </div>
-        <div class="tool-section">
-          <h2 data-i18n="history">History</h2>
-          <label class="caption" for="lastCount" data-i18n="messagesPerPage"
-            >Messages per page</label
-          >
-          <div class="tool-row">
-            <select id="lastCount">
-              <option>20</option>
-              <option selected>30</option>
-              <option>50</option>
-              <option>100</option>
-              <option>200</option></select
-            ><button id="applyLastBtn" data-i18n="reload">Reload</button>
+        <details class="tool-other">
+          <summary data-i18n="otherTools">Other</summary>
+          <div class="tool-section">
+            <h2 data-i18n="commands">Commands</h2>
+            <div class="tool-row">
+              <button id="currentBtn" data-i18n="current">Current</button
+              ><button id="tailBtn" data-i18n="tail">Tail</button
+              ><button id="pendingBtn" data-i18n="pending">Pending</button>
+            </div>
           </div>
-        </div>
-        <div class="tool-section">
-          <h2 data-i18n="scroll">Scroll</h2>
-          <div class="tool-row">
-            <select id="scrollMode">
-              <option value="direction" data-i18n="direction">Direction</option>
-              <option value="pixels" data-i18n="pixels">Pixels</option>
-              <option value="target" data-i18n="semanticTarget">Semantic target</option>
-              <option value="message_id" data-i18n="messageId">Message ID</option></select
-            ><input id="scrollValue" value="down" /><button id="scrollBtn" data-i18n="run">
-              Run
-            </button>
+          <div class="tool-section mobile-only">
+            <h2 data-i18n="turnActions">Turn actions</h2>
+            <div class="tool-row">
+              <button class="danger" id="mobileInterruptBtn" data-i18n="interruptCurrent">
+                Interrupt current turn
+              </button>
+            </div>
           </div>
-        </div>
-        <div class="tool-section">
-          <h2 data-i18n="approvals">Approvals</h2>
-          <div class="tool-row">
-            <input
-              id="approvalId"
-              type="number"
-              min="0"
-              data-i18n-placeholder="requestId"
-              placeholder="Request ID"
-            /><button id="approveBtn" data-i18n="approve">Approve</button
-            ><button class="danger" id="declineBtn" data-i18n="decline">Decline</button>
+          <div class="tool-section">
+            <h2 data-i18n="history">History</h2>
+            <label class="caption" for="lastCount" data-i18n="messagesPerPage"
+              >Messages per page</label
+            >
+            <div class="tool-row">
+              <select id="lastCount">
+                <option>20</option>
+                <option selected>30</option>
+                <option>50</option>
+                <option>100</option>
+                <option>200</option></select
+              ><button id="applyLastBtn" data-i18n="reload">Reload</button>
+            </div>
           </div>
-        </div>
-        <div class="tool-section">
-          <h2 data-i18n="hostExec">Host exec</h2>
-          <label class="caption" for="argv" data-i18n="argvHelp"
-            >JSON argv array (subject to daemon allowlist)</label
-          ><textarea id="argv">["git", "status", "--short"]</textarea>
-          <div class="tool-row">
-            <input
-              id="timeout"
-              type="number"
-              min="1"
-              max="3600"
-              data-i18n-placeholder="timeout"
-              placeholder="Timeout: 300s"
-            /><button id="execBtn" data-i18n="execute">Execute</button>
+          <div class="tool-section">
+            <h2 data-i18n="scroll">Scroll</h2>
+            <div class="tool-row">
+              <select id="scrollMode">
+                <option value="direction" data-i18n="direction">Direction</option>
+                <option value="pixels" data-i18n="pixels">Pixels</option>
+                <option value="target" data-i18n="semanticTarget">Semantic target</option>
+                <option value="message_id" data-i18n="messageId">Message ID</option></select
+              ><input id="scrollValue" value="down" /><button id="scrollBtn" data-i18n="run">
+                Run
+              </button>
+            </div>
           </div>
-        </div>
-        <div class="tool-section">
-          <h2 data-i18n="appServerRpc">App-server RPC</h2>
-          <label class="caption" for="rpcMethod" data-i18n="rpcHelp"
-            >One-shot native method (including methods not wrapped by codexctl)</label
-          ><input id="rpcMethod" value="thread/read" /><label
-            class="caption"
-            for="rpcParams"
-            data-i18n="jsonParams"
-            >JSON params</label
-          ><textarea id="rpcParams">{"threadId":""}</textarea>
-          <div class="tool-row">
-            <button id="rpcBtn" data-i18n="callAppServer">Call app-server</button>
+          <div class="tool-section">
+            <h2 data-i18n="approvals">Approvals</h2>
+            <div class="tool-row">
+              <input
+                id="approvalId"
+                type="number"
+                min="0"
+                data-i18n-placeholder="requestId"
+                placeholder="Request ID"
+              /><button id="approveBtn" data-i18n="approve">Approve</button
+              ><button class="danger" id="declineBtn" data-i18n="decline">Decline</button>
+            </div>
           </div>
-        </div>
-        <div class="tool-section">
-          <h2 data-i18n="rawProtocol">Raw protocol</h2>
-          <label class="caption" for="rawRequest" data-i18n="rawHelp"
-            >Any codex-bridge Request JSON</label
-          ><textarea id="rawRequest">{"command":"status"}</textarea>
-          <div class="tool-row"><button id="rawBtn" data-i18n="dispatch">Dispatch</button></div>
-          <pre id="result" data-i18n="resultsHint">Command results appear here.</pre>
-        </div>
+          <div class="tool-section">
+            <h2 data-i18n="hostExec">Host exec</h2>
+            <label class="caption" for="argv" data-i18n="argvHelp"
+              >JSON argv array (subject to daemon allowlist)</label
+            ><textarea id="argv">["git", "status", "--short"]</textarea>
+            <div class="tool-row">
+              <input
+                id="timeout"
+                type="number"
+                min="1"
+                max="3600"
+                data-i18n-placeholder="timeout"
+                placeholder="Timeout: 300s"
+              /><button id="execBtn" data-i18n="execute">Execute</button>
+            </div>
+          </div>
+          <div class="tool-section">
+            <h2 data-i18n="appServerRpc">App-server RPC</h2>
+            <label class="caption" for="rpcMethod" data-i18n="rpcHelp"
+              >One-shot native method (including methods not wrapped by codexctl)</label
+            ><input id="rpcMethod" value="thread/read" /><label
+              class="caption"
+              for="rpcParams"
+              data-i18n="jsonParams"
+              >JSON params</label
+            ><textarea id="rpcParams">{"threadId":""}</textarea>
+            <div class="tool-row">
+              <button id="rpcBtn" data-i18n="callAppServer">Call app-server</button>
+            </div>
+          </div>
+          <div class="tool-section">
+            <h2 data-i18n="rawProtocol">Raw protocol</h2>
+            <label class="caption" for="rawRequest" data-i18n="rawHelp"
+              >Any codex-bridge Request JSON</label
+            ><textarea id="rawRequest">{"command":"status"}</textarea>
+            <div class="tool-row"><button id="rawBtn" data-i18n="dispatch">Dispatch</button></div>
+            <pre id="result" data-i18n="resultsHint">Command results appear here.</pre>
+          </div>
+        </details>
       </section>
     </div>
     <div
@@ -320,6 +333,23 @@
       </div>
     </div>
     <div class="scrim" id="scrim"></div>
+    <script>
+      (() => {
+        const button = document.getElementById("settingsBtn"),
+          sessions = document.getElementById("sessionPanel"),
+          settings = document.getElementById("settingsPanel"),
+          back = document.getElementById("settingsBackBtn");
+        const showSettings = (open) => {
+          sessions.hidden = open;
+          settings.hidden = !open;
+          button.classList.toggle("active", open);
+          button.setAttribute("aria-expanded", String(open));
+          button.dataset.i18nAriaLabel = open ? "backToSessions" : "settingsAria";
+        };
+        button.addEventListener("click", () => showSettings(settings.hidden));
+        back.addEventListener("click", () => showSettings(false));
+      })();
+    </script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

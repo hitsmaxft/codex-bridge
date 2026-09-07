@@ -1649,26 +1649,7 @@ fn dispatch(
                 Ok(thread) => thread,
                 Err(response) => return response,
             };
-            let app_thread = match write_backend.app_server_rpc(
-                "thread/read",
-                json!({"threadId": thread_id, "includeTurns": false}),
-            ) {
-                Ok(result) => result,
-                Err(error) => return write_backend_error(error),
-            };
-            let Some(base_sha) = app_thread
-                .pointer("/thread/gitInfo/sha")
-                .and_then(Value::as_str)
-            else {
-                return Response::error(
-                    "git_baseline_unavailable",
-                    "app-server thread/read did not return the Git SHA captured for this thread",
-                );
-            };
-            let base_branch = app_thread
-                .pointer("/thread/gitInfo/branch")
-                .and_then(Value::as_str);
-            match workspace_diff_summary(&thread.id, &thread.cwd, base_sha, base_branch) {
+            match workspace_diff_summary(&thread.id, &thread.cwd) {
                 Ok(summary) => Response::success(summary),
                 Err(response) => response,
             }
@@ -1919,20 +1900,7 @@ fn latest_message_index(session_store: &SessionStore, thread_id: &str) -> i64 {
         .unwrap_or(-1)
 }
 
-fn workspace_diff_summary(
-    thread_id: &str,
-    cwd: &Path,
-    base_sha: &str,
-    base_branch: Option<&str>,
-) -> Result<Value, Response> {
-    if !(40..=64).contains(&base_sha.len())
-        || !base_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(Response::error(
-            "git_baseline_invalid",
-            "app-server returned an invalid Git baseline SHA",
-        ));
-    }
+fn workspace_diff_summary(thread_id: &str, cwd: &Path) -> Result<Value, Response> {
     let root_output = workspace_git_output(cwd, &["rev-parse", "--show-toplevel"])?;
     if !root_output.status.success() {
         return Err(Response::error(
@@ -1951,6 +1919,25 @@ fn workspace_diff_summary(
         .to_owned();
     let root = PathBuf::from(root);
 
+    let head = workspace_git_success(&root, &["rev-parse", "HEAD"], "git rev-parse HEAD")?;
+    let head_sha = String::from_utf8(head.stdout)
+        .map_err(|error| {
+            Response::error(
+                "git_output_invalid",
+                format!("Git returned a non-UTF-8 HEAD SHA: {error}"),
+            )
+        })?
+        .trim()
+        .to_owned();
+    let branch = workspace_git_output(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let head_branch = branch
+        .status
+        .success()
+        .then(|| String::from_utf8(branch.stdout).ok())
+        .flatten()
+        .map(|branch| branch.trim().to_owned())
+        .filter(|branch| !branch.is_empty());
+
     let diff = workspace_git_success(
         &root,
         &[
@@ -1958,10 +1945,10 @@ fn workspace_diff_summary(
             "--numstat",
             "--no-ext-diff",
             "--no-textconv",
-            base_sha,
+            "HEAD",
             "--",
         ],
-        "git diff against the thread baseline",
+        "git diff against HEAD",
     )?;
     let (mut additions, deletions, tracked_files) = parse_numstat(&diff.stdout);
     let untracked = workspace_git_success(
@@ -1982,15 +1969,15 @@ fn workspace_diff_summary(
     Ok(json!({
         "thread_id": thread_id,
         "repository": root,
-        "base_sha": base_sha,
-        "base_branch": base_branch,
+        "base_sha": head_sha,
+        "base_branch": head_branch,
         "files_changed": files_changed,
         "additions": additions,
         "deletions": deletions,
         "untracked_files": untracked_paths.len(),
         "untracked_lines_skipped": untracked_lines_skipped,
         "clean": files_changed == 0,
-        "semantics": "working_tree_vs_thread_creation_sha",
+        "semantics": "uncommitted_worktree_vs_head",
     }))
 }
 
@@ -2838,7 +2825,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_diff_compares_against_the_thread_creation_sha() {
+    fn workspace_diff_reports_only_uncommitted_changes() {
         let repository = unique_test_dir("workspace-diff");
         fs::create_dir_all(&repository).unwrap();
         assert!(Command::new("git")
@@ -2870,22 +2857,42 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let base_sha = String::from_utf8(
-            workspace_git_success(&repository, &["rev-parse", "HEAD"], "git rev-parse")
-                .unwrap()
-                .stdout,
-        )
-        .unwrap();
         fs::write(repository.join("tracked.txt"), "new\nmore\n").unwrap();
         fs::write(repository.join("untracked.txt"), "first\nsecond\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
 
-        let summary =
-            workspace_diff_summary("thread-1", &repository, base_sha.trim(), Some("main")).unwrap();
-        assert_eq!(summary["semantics"], "working_tree_vs_thread_creation_sha");
+        let summary = workspace_diff_summary("thread-1", &repository).unwrap();
+        assert_eq!(summary["semantics"], "uncommitted_worktree_vs_head");
         assert_eq!(summary["files_changed"], 2);
         assert_eq!(summary["additions"], 4);
         assert_eq!(summary["deletions"], 1);
         assert_eq!(summary["untracked_files"], 1);
+
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Codex Bridge Test",
+                "-c",
+                "user.email=codex-bridge@example.invalid",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "changes",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_file(repository.join("untracked.txt")).unwrap();
+        let clean = workspace_diff_summary("thread-1", &repository).unwrap();
+        assert_eq!(clean["files_changed"], 0);
+        assert_eq!(clean["clean"], true);
         fs::remove_dir_all(repository).unwrap();
     }
 

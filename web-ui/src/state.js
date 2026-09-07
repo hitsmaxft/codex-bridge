@@ -61,6 +61,7 @@ export const state = {
   polling: false,
   pendingChanges: false,
   delivery: null,
+  lastMessageIndex: null,
   lastMessageRefresh: 0,
 };
 

@@ -25,14 +25,13 @@ async function loadStatus() {
     backend: appServer,
   });
 }
-function setSettingsPanel(open) {
-  $("sessionPanel").hidden = open;
-  $("settingsPanel").hidden = !open;
-  $("settingsBtn").setAttribute("aria-expanded", String(open));
-  $("settingsBtn").classList.toggle("active", open);
-  const label = open ? "backToSessions" : "settingsAria";
-  $("settingsBtn").dataset.i18nAriaLabel = label;
-  $("settingsBtn").setAttribute("aria-label", tr(label));
+function setThreadHeaderExpanded(expanded) {
+  if (!matchMedia("(max-width:800px)").matches) expanded = false;
+  const header = document.querySelector(".thread-head"),
+    title = $("threadTitle");
+  header.classList.toggle("expanded", expanded);
+  title.setAttribute("aria-expanded", String(expanded));
+  title.title = tr(expanded ? "collapseHeader" : "expandHeader");
 }
 async function toggleLanguage() {
   applyLanguage(getLanguage() === "en" ? "zh" : "en");
@@ -525,7 +524,7 @@ function messageNode(m, keepToolsRunning = false) {
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
-  box.className = "outbox-item";
+  box.className = `outbox-item${entry.handoff ? " handoff" : ""}`;
   box.dataset.pendingId = entry.id;
   const body = document.createElement("div");
   body.className = "message-body";
@@ -535,24 +534,29 @@ function pendingNode(entry) {
       steering: tr("steering"),
       queued: state.usageUnavailable ? tr("queuedRecovering") : tr("queuedWaiting"),
       steered: tr("steeredWaiting"),
+      accepted: tr("serverAccepted"),
+      processing: tr("handoffProcessing"),
       failed: tr("sendFailed"),
     },
     actions = document.createElement("div"),
     status = document.createElement("div"),
-    remove = document.createElement("button"),
     busy = ["queueing", "steering"].includes(entry.status);
   actions.className = "outbox-actions";
   status.className = "outbox-status";
   status.textContent = labels[entry.status] || entry.status;
   if (entry.error) status.title = entry.error;
-  remove.className = "outbox-delete";
-  remove.type = "button";
-  remove.textContent = tr("delete");
-  remove.disabled = busy;
-  remove.title = busy ? tr("deleteBusy") : tr("deleteRestore");
-  remove.setAttribute("aria-label", remove.title);
-  remove.onclick = () => run(() => deletePending(entry, remove));
-  actions.append(status, remove);
+  actions.appendChild(status);
+  if (!entry.handoff) {
+    const remove = document.createElement("button");
+    remove.className = "outbox-delete";
+    remove.type = "button";
+    remove.textContent = tr("delete");
+    remove.disabled = busy;
+    remove.title = busy ? tr("deleteBusy") : tr("deleteRestore");
+    remove.setAttribute("aria-label", remove.title);
+    remove.onclick = () => run(() => deletePending(entry, remove));
+    actions.appendChild(remove);
+  }
   body.appendChild(actions);
   box.appendChild(body);
   return box;
@@ -562,7 +566,26 @@ function renderPending() {
     entries = state.pending.filter((entry) => entry.thread_id === state.current?.id);
   tray.textContent = "";
   for (const entry of entries) tray.appendChild(pendingNode(entry));
-  tray.hidden = !entries.length;
+  const delivery = state.delivery?.threadId === state.current?.id ? state.delivery : null,
+    pendingStillVisible = delivery?.pendingId
+      ? entries.some((entry) => entry.id === delivery.pendingId)
+      : false;
+  if (
+    delivery?.text &&
+    !delivery.onScreen &&
+    !pendingStillVisible &&
+    ["accepted", "processing"].includes(delivery.phase)
+  ) {
+    tray.appendChild(
+      pendingNode({
+        id: `handoff-${delivery.threadId}`,
+        text: delivery.text,
+        status: delivery.phase,
+        handoff: true,
+      }),
+    );
+  }
+  tray.hidden = !tray.childElementCount;
 }
 async function refreshPending() {
   const r = await command({ command: "pending_messages" }, false);
@@ -649,6 +672,24 @@ function transientStatus(active) {
   if (delivery.phase === "failed") return ["failed", tr("requestFailed")];
   return null;
 }
+function usesDocumentMessageScroll() {
+  return matchMedia("(max-width:800px)").matches;
+}
+function messageScrollMetrics() {
+  const root = $("messages");
+  if (usesDocumentMessageScroll()) {
+    return {
+      top: window.scrollY,
+      height: document.documentElement.scrollHeight,
+      client: window.innerHeight,
+    };
+  }
+  return { top: root.scrollTop, height: root.scrollHeight, client: root.clientHeight };
+}
+function scrollMessagesToBottom() {
+  if (usesDocumentMessageScroll()) window.scrollTo(0, document.documentElement.scrollHeight);
+  else $("messages").scrollTop = $("messages").scrollHeight;
+}
 function renderTransientStatus(active) {
   const root = $("messages"),
     statusState = transientStatus(active),
@@ -657,7 +698,8 @@ function renderTransientStatus(active) {
     existing?.remove();
     return;
   }
-  const stickToBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 100,
+  const metrics = messageScrollMetrics(),
+    stickToBottom = metrics.height - metrics.top - metrics.client < 100,
     status = existing || document.createElement("div");
   status.className = "transient-status";
   status.setAttribute("role", "button");
@@ -678,7 +720,7 @@ function renderTransientStatus(active) {
     }
   };
   if (!existing) root.appendChild(status);
-  if (stickToBottom) root.scrollTop = root.scrollHeight;
+  if (stickToBottom) scrollMessagesToBottom();
 }
 function showActivity() {
   const active = Boolean(state.activeTurnId),
@@ -816,7 +858,7 @@ function renderWorkspaceDiff(summary) {
     });
   }
   const baseline = summary.base_branch || summary.base_sha.slice(0, 8);
-  button.title = tr("diffBaseline", {
+  button.title = tr("diffWorkingTree", {
     baseline,
     sha: summary.base_sha.slice(0, 8),
     skipped: summary.untracked_lines_skipped
@@ -898,6 +940,7 @@ async function refreshActivity() {
   } else if (!state.activeTurnId && delivery?.started && delivery.phase === "processing") {
     setDeliveryState("completed");
   }
+  renderPending();
   if (!state.activeTurnId && $("sendMode").value === "steer") setSendMode("send", true);
   else if (state.activeTurnId && state.modeAutomatic) setSendMode("steer", true);
   showActivity();
@@ -917,7 +960,8 @@ async function pollActivity() {
     if (state.pendingChanges) {
       if (Date.now() - state.lastMessageRefresh < 3500) return;
       const root = $("messages"),
-        atBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 100,
+        metrics = messageScrollMetrics(),
+        atBottom = metrics.height - metrics.top - metrics.client < 100,
         detailsOpen = Boolean(root.querySelector("details[open]"));
       if (atBottom && !detailsOpen) {
         state.pendingChanges = false;
@@ -935,7 +979,7 @@ function resetHorizontalPosition() {
   root.scrollLeft = 0;
   document.documentElement.scrollLeft = 0;
   document.body.scrollLeft = 0;
-  window.scrollTo(0, 0);
+  window.scrollTo(0, window.scrollY);
 }
 function settleHorizontalPosition() {
   requestAnimationFrame(() => {
@@ -946,7 +990,10 @@ function settleHorizontalPosition() {
 async function openThread(thread, { quiet = false } = {}) {
   const token = ++state.openToken,
     changedThread = state.current?.id !== thread.id;
-  if (!quiet) closePanels();
+  if (!quiet) {
+    closePanels();
+    setThreadHeaderExpanded(false);
+  }
   if (state.current) saveDraft(state.current.id, $("messageText").value, true);
   state.current = thread;
   $("messageText").value = state.drafts.get(thread.id) || "";
@@ -958,6 +1005,7 @@ async function openThread(thread, { quiet = false } = {}) {
     state.activityPhase = null;
     state.activeTool = null;
     state.pendingChanges = false;
+    state.lastMessageIndex = null;
     state.lastWorkspaceDiffRefresh = 0;
     $("composerStatus").hidden = true;
     $("modelPicker").hidden = true;
@@ -978,6 +1026,24 @@ async function openThread(thread, { quiet = false } = {}) {
   const [r] = await Promise.all([fetchMessages(), refreshActivity()]);
   if (token !== state.openToken) return;
   state.current = { ...thread, ...r.thread };
+  const delivery = state.delivery?.threadId === thread.id ? state.delivery : null;
+  if (
+    delivery?.text &&
+    r.messages.some(
+      (message) =>
+        message.role === "user" &&
+        message.message_index > (delivery.initialMessageIndex ?? -1) &&
+        message.content?.some(
+          (item) => item.kind === "text" && item.text?.trim() === delivery.text.trim(),
+        ),
+    )
+  ) {
+    delivery.onScreen = true;
+  }
+  state.lastMessageIndex = r.messages.reduce(
+    (latest, message) => Math.max(latest, message.message_index ?? -1),
+    state.lastMessageIndex ?? -1,
+  );
   state.before = r.page.before;
   state.hasMore = r.page.has_more;
   root.textContent = "";
@@ -987,7 +1053,8 @@ async function openThread(thread, { quiet = false } = {}) {
     : null;
   for (const m of r.messages) root.appendChild(messageNode(m, m === activeToolMessage));
   if (!r.messages.length) root.innerHTML = `<div class="empty">${tr("noMessages")}</div>`;
-  root.scrollTop = root.scrollHeight;
+  renderPending();
+  scrollMessagesToBottom();
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
   await refreshPending();
@@ -1004,8 +1071,9 @@ async function loadOlder() {
   state.loadingHistory = true;
   state.userScrolled = false;
   const root = $("messages"),
-    oldHeight = root.scrollHeight,
-    oldTop = root.scrollTop;
+    metrics = messageScrollMetrics(),
+    oldHeight = metrics.height,
+    oldTop = metrics.top;
   let r;
   try {
     r = await fetchMessages(state.before);
@@ -1019,7 +1087,9 @@ async function loadOlder() {
   if (state.hasMore) fragment.appendChild(olderButton());
   for (const m of r.messages) fragment.appendChild(messageNode(m));
   root.prepend(fragment);
-  root.scrollTop = oldTop + (root.scrollHeight - oldHeight);
+  const newHeight = messageScrollMetrics().height;
+  if (usesDocumentMessageScroll()) window.scrollTo(0, oldTop + (newHeight - oldHeight));
+  else root.scrollTop = oldTop + (newHeight - oldHeight);
 }
 function targetRequest(name, extra = {}) {
   if (!state.current) throw new Error(tr("chooseSessionError"));
@@ -1043,8 +1113,11 @@ async function write(name) {
     mode: name,
     pendingId: null,
     initialTurnId: state.activeTurnId,
+    initialMessageIndex: state.lastMessageIndex,
     started: false,
     dismissed: false,
+    onScreen: false,
+    text,
   });
   setComposerSubmitting(true);
   try {
@@ -1105,8 +1178,6 @@ $("archived").onchange = () => run(loadProjects);
 $("reloadBtn").onclick = () => run(loadProjects);
 $("statusBtn").onclick = () => run(loadStatus);
 $("languageBtn").onclick = () => run(toggleLanguage);
-$("settingsBtn").onclick = () => setSettingsPanel(!$("settingsPanel").hidden);
-$("settingsBackBtn").onclick = () => setSettingsPanel(false);
 $("refreshBtn").onclick = () => run(refreshThread);
 $("createCurrentBtn").onclick = () => run(() => createThread(false));
 $("createWorktreeBtn").onclick = () => run(() => createThread(true));
@@ -1165,6 +1236,14 @@ $("modelApply").onclick = () => run(applyThreadSettings);
 $("messageText").oninput = () => saveDraft(state.current?.id, $("messageText").value);
 $("messageText").onkeydown = (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("submitBtn").click();
+};
+$("threadTitle").onclick = () =>
+  setThreadHeaderExpanded(!document.querySelector(".thread-head").classList.contains("expanded"));
+$("threadTitle").onkeydown = (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    $("threadTitle").click();
+  }
 };
 $("currentBtn").onclick = () =>
   run(async () => {
@@ -1338,10 +1417,26 @@ document.addEventListener("keydown", (event) => {
 });
 $("messages").addEventListener("touchmove", () => (state.userScrolled = true), { passive: true });
 $("messages").addEventListener("wheel", () => (state.userScrolled = true), { passive: true });
-$("messages").onscroll = () => {
-  if (state.userScrolled && $("messages").scrollTop < 8 && !state.loadingHistory && state.hasMore)
+const handleMessageScroll = () => {
+  if (
+    state.userScrolled &&
+    messageScrollMetrics().top < 8 &&
+    !state.loadingHistory &&
+    state.hasMore
+  )
     run(loadOlder);
 };
+$("messages").onscroll = handleMessageScroll;
+window.addEventListener("scroll", handleMessageScroll, { passive: true });
+$("messages").addEventListener("pointerdown", () => setThreadHeaderExpanded(false), {
+  passive: true,
+});
+document
+  .querySelector(".composer")
+  .addEventListener("pointerdown", () => setThreadHeaderExpanded(false));
+document
+  .querySelector(".composer")
+  .addEventListener("focusin", () => setThreadHeaderExpanded(false));
 document.querySelectorAll(".tool-toggle").forEach(
   (b) =>
     (b.onclick = () => {
