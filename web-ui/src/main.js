@@ -564,6 +564,8 @@ function appendPatchDiff(parent, patch, label = "Diff") {
   card.append(head, content);
   parent.appendChild(card);
 }
+const renderedMessageState = new WeakMap();
+
 function toolGroupNode(message, keepRunning = false) {
   const tools = message.tools || [];
   if (!tools.length) return null;
@@ -601,9 +603,10 @@ function toolGroupNode(message, keepRunning = false) {
   group.appendChild(summary);
   const list = document.createElement("div");
   list.className = "tool-list";
-  for (const tool of tools) {
+  for (const [toolPosition, tool] of tools.entries()) {
     const detail = document.createElement("details");
     detail.className = "tool-call";
+    detail.dataset.toolIndex = String(tool.tool_index ?? toolPosition);
     const head = document.createElement("summary"),
       icon = document.createElement("span"),
       preview = document.createElement("span"),
@@ -731,7 +734,69 @@ function messageNode(m, keepToolsRunning = false) {
   if (tools) body.appendChild(tools);
   if (head.childNodes.length) box.appendChild(head);
   box.appendChild(body);
+  renderedMessageState.set(box, {
+    signature: JSON.stringify(m),
+    keepToolsRunning,
+  });
   return box;
+}
+
+function preserveLoadedToolDetails(previous, next) {
+  const previousGroup = previous.querySelector(".tool-group"),
+    nextGroup = next.querySelector(".tool-group");
+  if (!previousGroup || !nextGroup) return;
+  nextGroup.open = previousGroup.open;
+  const previousTools = new Map(
+    [...previousGroup.querySelectorAll(".tool-call")].map((detail) => [
+      detail.dataset.toolIndex,
+      detail,
+    ]),
+  );
+  for (const detail of nextGroup.querySelectorAll(".tool-call")) {
+    const previousDetail = previousTools.get(detail.dataset.toolIndex);
+    if (!previousDetail) continue;
+    detail.open = previousDetail.open;
+    const loadedBody = previousDetail.querySelector(":scope > .tool-detail");
+    if (!loadedBody) continue;
+    detail.dataset.loaded = "1";
+    detail.appendChild(loadedBody);
+  }
+}
+
+function reconcileMessageNodes(root, response, activeToolMessage) {
+  const existing = new Map(
+      [...root.querySelectorAll(":scope > .message[data-message-index]")].map((message) => [
+        message.dataset.messageIndex,
+        message,
+      ]),
+    ),
+    fragment = document.createDocumentFragment();
+  if (response.page.has_more) fragment.appendChild(olderButton());
+  for (const message of response.messages) {
+    const key = String(message.message_index),
+      previous = existing.get(key),
+      keepToolsRunning = message === activeToolMessage,
+      previousState = previous ? renderedMessageState.get(previous) : null,
+      signature = JSON.stringify(message);
+    if (
+      previous &&
+      previousState?.signature === signature &&
+      previousState.keepToolsRunning === keepToolsRunning
+    ) {
+      fragment.appendChild(previous);
+      continue;
+    }
+    const next = messageNode(message, keepToolsRunning);
+    if (previous) preserveLoadedToolDetails(previous, next);
+    fragment.appendChild(next);
+  }
+  if (!response.messages.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = tr("noMessages");
+    fragment.appendChild(empty);
+  }
+  root.replaceChildren(fragment);
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
@@ -1419,19 +1484,10 @@ async function openThread(
   ) {
     delivery.onScreen = true;
   }
-  const fragment = document.createDocumentFragment();
-  if (r.page.has_more) fragment.appendChild(olderButton());
   const activeToolMessage = state.activeTurnId
     ? r.messages.findLast((message) => message.tools?.length)
     : null;
-  for (const m of r.messages) fragment.appendChild(messageNode(m, m === activeToolMessage));
-  if (!r.messages.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = tr("noMessages");
-    fragment.appendChild(empty);
-  }
-  root.replaceChildren(fragment);
+  reconcileMessageNodes(root, r, activeToolMessage);
   state.lastMessageIndex = r.messages.length ? r.page.end - 1 : null;
   state.before = r.page.before;
   state.hasMore = r.page.has_more;
@@ -1704,7 +1760,10 @@ document.querySelector(".composer-shell").addEventListener("focusout", () =>
   }),
 );
 $("messageText").onkeydown = (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("submitBtn").click();
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+    e.preventDefault();
+    $("submitBtn").click();
+  }
 };
 $("threadTitle").onclick = () =>
   setThreadHeaderExpanded(!document.querySelector(".thread-head").classList.contains("expanded"));

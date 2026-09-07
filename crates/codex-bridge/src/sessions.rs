@@ -29,8 +29,12 @@ struct SummaryCache {
 struct CachedMessages {
     modified: Option<SystemTime>,
     file_len: u64,
+    processed_len: u64,
+    file_identity: Option<(u64, u64)>,
     used_at: Instant,
     messages: Arc<Vec<ThreadMessage>>,
+    seen_ids: HashSet<String>,
+    tool_locations: HashMap<String, (usize, usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -451,21 +455,48 @@ impl SessionStore {
         Ok(messages.get(message_index).cloned())
     }
 
+    pub fn warm_thread_messages(&self, thread_id: &str) -> Result<bool> {
+        let Some(summary) = self.find_thread(thread_id)? else {
+            return Ok(false);
+        };
+        self.messages_for_path(&summary.rollout_path)?;
+        Ok(true)
+    }
+
     fn messages_for_path(&self, path: &Path) -> Result<Arc<Vec<ThreadMessage>>> {
         let metadata =
             fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
         let modified = metadata.modified().ok();
         let file_len = metadata.len();
+        let file_identity = file_identity(&metadata);
         if let Ok(mut cache) = self.message_cache.lock() {
             if let Some(entry) = cache.get_mut(path) {
                 if entry.modified == modified && entry.file_len == file_len {
                     entry.used_at = Instant::now();
                     return Ok(entry.messages.clone());
                 }
+                if entry.file_identity == file_identity && file_len > entry.file_len {
+                    entry.processed_len = read_rollout_messages_from(
+                        path,
+                        entry.processed_len,
+                        Arc::make_mut(&mut entry.messages),
+                        &mut entry.seen_ids,
+                        &mut entry.tool_locations,
+                    )?;
+                    entry.modified = modified;
+                    entry.file_len = file_len;
+                    entry.used_at = Instant::now();
+                    return Ok(entry.messages.clone());
+                }
             }
         }
 
-        let messages = Arc::new(read_rollout_messages(path)?);
+        let mut messages = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut tool_locations = HashMap::new();
+        let processed_len =
+            read_rollout_messages_from(path, 0, &mut messages, &mut seen_ids, &mut tool_locations)?;
+        let messages = Arc::new(messages);
         if let Ok(mut cache) = self.message_cache.lock() {
             if cache.len() >= MESSAGE_CACHE_ENTRIES && !cache.contains_key(path) {
                 let oldest = cache
@@ -481,8 +512,12 @@ impl SessionStore {
                 CachedMessages {
                     modified,
                     file_len,
+                    processed_len,
+                    file_identity,
                     used_at: Instant::now(),
                     messages: messages.clone(),
+                    seen_ids,
+                    tool_locations,
                 },
             );
         }
@@ -811,117 +846,303 @@ fn git_branch_for_cwd(cwd: &Path) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_owned())
 }
 
-fn read_rollout_messages(path: &Path) -> Result<Vec<ThreadMessage>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut messages = Vec::<ThreadMessage>::new();
-    let mut seen_ids = HashSet::new();
-    let mut tool_locations = HashMap::<String, (usize, usize)>::new();
-
-    for line in BufReader::new(file).lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) if error.kind() == ErrorKind::InvalidData => break,
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to read {}", path.display()));
-            }
-        };
-        let Ok(record) = serde_json::from_str::<Value>(&line) else {
-            // The final line of an actively written rollout can be incomplete.
-            continue;
-        };
-        if record.get("type").and_then(Value::as_str) != Some("response_item") {
-            continue;
+fn read_rollout_messages_from(
+    path: &Path,
+    start: u64,
+    messages: &mut Vec<ThreadMessage>,
+    seen_ids: &mut HashSet<String>,
+    tool_locations: &mut HashMap<String, (usize, usize, usize)>,
+) -> Result<u64> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut processed_len = start;
+    loop {
+        let mut line = Vec::new();
+        let bytes = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if bytes == 0 || !line.ends_with(b"\n") {
+            break;
         }
+        processed_len = processed_len.saturating_add(bytes as u64);
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        append_rollout_record(record, messages, seen_ids, tool_locations);
+    }
+    Ok(processed_len)
+}
 
-        let payload = &record["payload"];
-        let payload_type = payload.get("type").and_then(Value::as_str);
-        if matches!(payload_type, Some("custom_tool_call" | "function_call")) {
-            let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
-                continue;
-            };
-            let message_index = messages
-                .last()
-                .filter(|message| message.role == "assistant")
-                .map(|_| messages.len() - 1)
-                .unwrap_or_else(|| {
-                    messages.push(ThreadMessage {
-                        timestamp: string_field(&record, "timestamp"),
-                        id: None,
-                        role: "assistant".to_owned(),
-                        phase: Some("tool".to_owned()),
-                        content: Vec::new(),
-                        tools: Vec::new(),
-                    });
-                    messages.len() - 1
+fn append_rollout_record(
+    record: Value,
+    messages: &mut Vec<ThreadMessage>,
+    seen_ids: &mut HashSet<String>,
+    tool_locations: &mut HashMap<String, (usize, usize, usize)>,
+) {
+    if record.get("type").and_then(Value::as_str) != Some("response_item") {
+        return;
+    }
+
+    let payload = &record["payload"];
+    let payload_type = payload.get("type").and_then(Value::as_str);
+    if matches!(payload_type, Some("custom_tool_call" | "function_call")) {
+        let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+            return;
+        };
+        let message_index = messages
+            .last()
+            .filter(|message| message.role == "assistant")
+            .map(|_| messages.len() - 1)
+            .unwrap_or_else(|| {
+                messages.push(ThreadMessage {
+                    timestamp: string_field(&record, "timestamp"),
+                    id: None,
+                    role: "assistant".to_owned(),
+                    phase: Some("tool".to_owned()),
+                    content: Vec::new(),
+                    tools: Vec::new(),
                 });
-            let name = match (
-                payload.get("namespace").and_then(Value::as_str),
-                payload.get("name").and_then(Value::as_str),
-            ) {
-                (Some(namespace), Some(name)) => format!("{namespace}.{name}"),
-                (_, Some(name)) => name.to_owned(),
-                _ => "tool".to_owned(),
-            };
-            let input = payload
-                .get("input")
-                .or_else(|| payload.get("arguments"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let tool_index = messages[message_index].tools.len();
+                messages.len() - 1
+            });
+        let name = match (
+            payload.get("namespace").and_then(Value::as_str),
+            payload.get("name").and_then(Value::as_str),
+        ) {
+            (Some(namespace), Some(name)) => format!("{namespace}.{name}"),
+            (_, Some(name)) => name.to_owned(),
+            _ => "tool".to_owned(),
+        };
+        let input = payload
+            .get("input")
+            .or_else(|| payload.get("arguments"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let status = string_field(payload, "status").unwrap_or_else(|| "running".to_owned());
+        let tool_start = messages[message_index].tools.len();
+        let parsed = (name == "exec")
+            .then(|| {
+                input
+                    .as_str()
+                    .and_then(|script| parse_wrapped_tool_calls(call_id, &status, script))
+            })
+            .flatten();
+        if let Some(tools) = parsed {
+            messages[message_index].tools.extend(tools);
+        } else {
             messages[message_index].tools.push(ThreadToolCall {
                 call_id: call_id.to_owned(),
                 name,
-                status: string_field(payload, "status").unwrap_or_else(|| "running".to_owned()),
+                status,
                 input,
                 output: None,
             });
-            tool_locations.insert(call_id.to_owned(), (message_index, tool_index));
-            continue;
         }
-        if matches!(
-            payload_type,
-            Some("custom_tool_call_output" | "function_call_output")
-        ) {
-            let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
-                continue;
-            };
-            if let Some(&(message_index, tool_index)) = tool_locations.get(call_id) {
-                let tool = &mut messages[message_index].tools[tool_index];
-                tool.output = payload.get("output").cloned();
+        let tool_end = messages[message_index].tools.len();
+        tool_locations.insert(call_id.to_owned(), (message_index, tool_start, tool_end));
+        return;
+    }
+    if matches!(
+        payload_type,
+        Some("custom_tool_call_output" | "function_call_output")
+    ) {
+        let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+            return;
+        };
+        if let Some(&(message_index, tool_start, tool_end)) = tool_locations.get(call_id) {
+            for tool in &mut messages[message_index].tools[tool_start..tool_end] {
                 if tool.status == "running" {
                     tool.status = "completed".to_owned();
                 }
             }
-            continue;
+            if let Some(tool) = messages[message_index]
+                .tools
+                .get_mut(tool_end.saturating_sub(1))
+            {
+                tool.output = payload.get("output").cloned();
+            }
         }
-        if payload_type != Some("message") {
-            continue;
-        }
-        let Some(role) = payload.get("role").and_then(Value::as_str) else {
-            continue;
-        };
-        if !matches!(role, "user" | "assistant") {
-            continue;
-        }
-
-        let id = string_field(payload, "id");
-        if id.as_ref().is_some_and(|id| !seen_ids.insert(id.clone())) {
-            continue;
-        }
-        let Some(content) = payload.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        messages.push(ThreadMessage {
-            timestamp: string_field(&record, "timestamp"),
-            id,
-            role: role.to_owned(),
-            phase: string_field(payload, "phase"),
-            content: content.clone(),
-            tools: Vec::new(),
-        });
+        return;
+    }
+    if payload_type != Some("message") {
+        return;
+    }
+    let Some(role) = payload.get("role").and_then(Value::as_str) else {
+        return;
+    };
+    if !matches!(role, "user" | "assistant") {
+        return;
     }
 
-    Ok(messages)
+    let id = string_field(payload, "id");
+    if id.as_ref().is_some_and(|id| !seen_ids.insert(id.clone())) {
+        return;
+    }
+    let Some(content) = payload.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    messages.push(ThreadMessage {
+        timestamp: string_field(&record, "timestamp"),
+        id,
+        role: role.to_owned(),
+        phase: string_field(payload, "phase"),
+        content: content.clone(),
+        tools: Vec::new(),
+    });
+}
+
+fn parse_wrapped_tool_calls(
+    outer_call_id: &str,
+    status: &str,
+    script: &str,
+) -> Option<Vec<ThreadToolCall>> {
+    let mut tools = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = script[search_from..].find("await tools.") {
+        let name_start = search_from + relative + "await tools.".len();
+        let name_end = script[name_start..]
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .map(|offset| name_start + offset)?;
+        if script.as_bytes().get(name_end) != Some(&b'(') {
+            search_from = name_end;
+            continue;
+        }
+        let (argument, end) = balanced_call_argument(script, name_end)?;
+        let raw_name = &script[name_start..name_end];
+        let name = match raw_name {
+            "web__run" => "web_search",
+            "write_stdin" => "write_stdin",
+            "exec_command" => "exec_command",
+            other => other,
+        };
+        let input = match name {
+            "exec_command" => js_string_field(argument, "cmd")
+                .map(|command| serde_json::json!({"command": command}))
+                .unwrap_or_else(|| serde_json::json!({"request": argument.trim()})),
+            "web_search" => js_string_field(argument, "q")
+                .map(|query| serde_json::json!({"query": query, "request": argument.trim()}))
+                .unwrap_or_else(|| serde_json::json!({"request": argument.trim()})),
+            _ => serde_json::json!({"request": argument.trim()}),
+        };
+        tools.push(ThreadToolCall {
+            call_id: format!("{outer_call_id}:{}", tools.len()),
+            name: name.to_owned(),
+            status: status.to_owned(),
+            input,
+            output: None,
+        });
+        search_from = end;
+    }
+    (!tools.is_empty()).then_some(tools)
+}
+
+fn balanced_call_argument(script: &str, open_paren: usize) -> Option<(&str, usize)> {
+    let bytes = script.as_bytes();
+    let mut depth = 0_u32;
+    let mut quote = None::<u8>;
+    let mut escaped = false;
+    for index in open_paren..bytes.len() {
+        let byte = bytes[index];
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+        } else if byte == b'(' {
+            depth = depth.saturating_add(1);
+        } else if byte == b')' {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some((&script[open_paren + 1..index], index + 1));
+            }
+        }
+    }
+    None
+}
+
+fn js_string_field(input: &str, field: &str) -> Option<String> {
+    let mut search_from = 0;
+    while let Some(relative) = input[search_from..].find(field) {
+        let start = search_from + relative;
+        let before_ok = start == 0
+            || !input.as_bytes()[start - 1].is_ascii_alphanumeric()
+                && input.as_bytes()[start - 1] != b'_';
+        let mut cursor = start + field.len();
+        let after_ok = input
+            .as_bytes()
+            .get(cursor)
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
+        if !before_ok || !after_ok {
+            search_from = cursor;
+            continue;
+        }
+        while input
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        if input.as_bytes().get(cursor) != Some(&b':') {
+            search_from = cursor;
+            continue;
+        }
+        cursor += 1;
+        while input
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        let quote = *input.as_bytes().get(cursor)?;
+        if !matches!(quote, b'\'' | b'"' | b'`') {
+            return None;
+        }
+        let value_start = cursor;
+        cursor += 1;
+        let mut escaped = false;
+        while let Some(&byte) = input.as_bytes().get(cursor) {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == quote {
+                let encoded = &input[value_start..=cursor];
+                if quote == b'"' {
+                    return serde_json::from_str(encoded).ok();
+                }
+                return Some(
+                    encoded[1..encoded.len() - 1]
+                        .replace("\\'", "'")
+                        .replace("\\`", "`"),
+                );
+            }
+            cursor += 1;
+        }
+        return None;
+    }
+    None
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 fn read_thread_activity(
@@ -1340,6 +1561,128 @@ mod tests {
     }
 
     #[test]
+    fn message_cache_parses_only_new_complete_lines() {
+        let fixture = Fixture::new();
+        let path = fixture.write_rollout(
+            "rollout-incremental.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-incremental","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"m1","role":"user","content":[{"text":"one"}]}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        assert_eq!(
+            store
+                .read_thread("thread-incremental")
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","id":"m2","role":"assistant","content":[{"text":"tw"#).unwrap();
+        drop(file);
+        assert_eq!(
+            store
+                .read_thread("thread-incremental")
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"o\"}]}}\n").unwrap();
+        drop(file);
+        let snapshot = store.read_thread("thread-incremental").unwrap().unwrap();
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.messages[1].id.as_deref(), Some("m2"));
+
+        let cache = store.message_cache.lock().unwrap();
+        let cached = cache.get(&path).unwrap();
+        assert_eq!(cached.processed_len, fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn message_cache_rebuilds_after_rollout_truncation() {
+        let fixture = Fixture::new();
+        let path = fixture.write_rollout(
+            "rollout-truncated.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-truncated","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"old-1","role":"user","content":[{"text":"old one"}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","id":"old-2","role":"assistant","content":[{"text":"old two"}]}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        assert_eq!(
+            store
+                .read_thread("thread-truncated")
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            2
+        );
+
+        let replacement = concat!(
+            r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-truncated","cwd":"/tmp/project"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T01:00:03Z","type":"response_item","payload":{"type":"message","id":"new-1","role":"user","content":[{"text":"new"}]}}"#,
+            "\n"
+        );
+        fs::write(path, replacement).unwrap();
+
+        let snapshot = store.read_thread("thread-truncated").unwrap().unwrap();
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].id.as_deref(), Some("new-1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn message_cache_rebuilds_after_rollout_replacement() {
+        let fixture = Fixture::new();
+        let path = fixture.write_rollout(
+            "rollout-replaced.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-replaced","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"old","role":"user","content":[{"text":"old"}]}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        assert_eq!(
+            store
+                .read_thread("thread-replaced")
+                .unwrap()
+                .unwrap()
+                .messages[0]
+                .id
+                .as_deref(),
+            Some("old")
+        );
+
+        let replacement_path = path.with_extension("replacement");
+        fs::write(
+            &replacement_path,
+            concat!(
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-replaced","cwd":"/tmp/project"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","id":"new","role":"assistant","content":[{"text":"replacement content is deliberately longer"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::rename(replacement_path, &path).unwrap();
+
+        let snapshot = store.read_thread("thread-replaced").unwrap().unwrap();
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].id.as_deref(), Some("new"));
+    }
+
+    #[test]
     fn tool_calls_and_outputs_attach_to_the_preceding_assistant_message() {
         let fixture = Fixture::new();
         fixture.write_rollout(
@@ -1372,6 +1715,23 @@ mod tests {
                 .call_id,
             "call-1"
         );
+    }
+
+    #[test]
+    fn fixed_tool_wrapper_is_split_into_structured_calls() {
+        let script = r#"text(await tools.exec_command({cmd:"rg -n 'CRC|crc' header.h | tail -60; python3 - <<'PY'\nprint('ok)')\nPY",max_output_tokens:1800}));
+text(await tools.web__run({search_query:[{q:"Codex app-server"}],response_length:"short"}));"#;
+        let tools = parse_wrapped_tool_calls("call-wrapper", "completed", script).unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "exec_command");
+        assert_eq!(
+            tools[0].input["command"],
+            "rg -n 'CRC|crc' header.h | tail -60; python3 - <<'PY'\nprint('ok)')\nPY"
+        );
+        assert_eq!(tools[1].name, "web_search");
+        assert_eq!(tools[1].input["query"], "Codex app-server");
+        assert_eq!(tools[0].call_id, "call-wrapper:0");
+        assert_eq!(tools[1].call_id, "call-wrapper:1");
     }
 
     #[test]

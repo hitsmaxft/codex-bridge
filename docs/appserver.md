@@ -59,8 +59,8 @@ a completed bridge or Web UI feature.
 | --- | --- |
 | `initialize` | One handshake for the persistent app-server connection. |
 | `thread/list` | Fetch app-server thread metadata used by the session list and pin state. |
-| `thread/turns/list` | Fetch structured turns and tool items for rendering. |
-| `thread/items/list` | Inspect recent items, including active-turn state helpers. |
+| `thread/turns/list` | Compatibility inventory only; ordinary message refreshes no longer download full turns. |
+| `thread/items/list` | Page recent native items for structured tool rendering and active-turn state helpers. |
 | `thread/read` | Read a thread and its composer settings. |
 | `config/read` | Fallback source for composer configuration. |
 | `account/rateLimits/read` | Display account usage and limits. |
@@ -76,8 +76,24 @@ a completed bridge or Web UI feature.
 | `thread/resume`, `thread/unsubscribe` | Keep a bounded LRU set of recently viewed threads subscribed to events. |
 | `turn/start` | Started by app-server's native queue processing after `thread/queue/add`. |
 
-Rollout JSONL files remain the authoritative recovery source for paginated history. Event delivery
-accelerates live updates; polling remains as a compatibility and gap-recovery path.
+Rollout JSONL files remain the authoritative recovery source for paginated history. The bridge
+parses append-only updates from its last complete-line offset instead of reparsing a growing file
+on every refresh. File truncation or replacement invalidates that state and triggers a clean
+rebuild. Ordinary message refreshes no longer download `itemsView: "full"` turns from app-server.
+They page the smaller native item stream only until the visible assistant messages are resolved,
+preserving structured `commandExecution`, `fileChange`, and MCP tool rendering without parsing
+wrapper scripts. Large message bodies and tool details remain lazy in the browser.
+
+Some older or very long threads return `-32601` for `thread/items/list` even after a successful
+metadata-only resume. For those threads only, the rollout compatibility path recognizes the fixed
+`text(await tools.<name>(...))` envelope and splits its calls into bounded structured tool entries.
+It does not evaluate JavaScript; unknown or malformed wrappers remain visible as raw rollout data.
+
+Event delivery accelerates live updates. The bridge warms local rollout caches as subscribed
+threads emit events, periodically discovers active threads through `thread/loaded/list` plus the
+metadata-only `thread/read(includeTurns: false)`, and subscribes those active threads. A bounded set
+of pinned threads is also warmed locally without resuming every inactive pin into app-server
+memory. Polling remains as a compatibility and gap-recovery path.
 
 ## Client-to-server method catalogue
 
@@ -271,7 +287,7 @@ use them reliably.
 ### Implemented foundation: persistent app-server session
 
 The bridge now keeps one initialized connection alive, forwards app-server events to authenticated
-Web UI WebSockets, and subscribes up to three recently viewed threads by default. Use
+Web UI WebSockets, and subscribes up to three recently viewed or active threads by default. Use
 `--app-server-thread-cache COUNT` to change the bounded subscription cache. It consumes
 `thread/status/changed`, turn/item lifecycle events, `thread/queue/changed`, and related updates to
 improve:
@@ -280,12 +296,13 @@ improve:
 - the queued-to-accepted-to-processing handoff;
 - incremental assistant/tool output;
 - live diff counts and model/rate-limit refresh;
-- recovery after a brief network gap by reconciling event cursors with `thread/read`,
-  `thread/turns/list`, or `thread/items/list`.
+- recovery after a brief network gap by reconciling event state with metadata-only `thread/read`
+  and incrementally parsed rollout data.
 
 The implementation correlates RPC responses, bounds browser event buffering, reconnects the
-browser event stream, and retains polling/full-state reads after an event gap. Direct incremental
-message rendering remains future work; rollout reads still finalize the displayed history.
+browser event stream, and retains polling after an event gap. Rollout reads still finalize the
+displayed history, but their append-only parser keeps subsequent refresh work proportional to new
+content rather than total session size.
 
 ### Strong user-facing candidates
 

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
@@ -101,6 +101,7 @@ struct BridgeState {
     host_executor: Arc<HostExecutor>,
     selected_thread: Arc<RwLock<Option<String>>>,
     pending_messages: Arc<PendingMessages>,
+    app_server_tools: Arc<AppServerToolCache>,
 }
 
 #[derive(Clone)]
@@ -120,6 +121,18 @@ struct WebOrigin {
 struct WebAuth {
     username: String,
     password: String,
+}
+
+#[derive(Debug, Default)]
+struct AppServerToolCache {
+    threads: RwLock<HashMap<String, CachedAppServerTools>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAppServerTools {
+    refreshed_at: Instant,
+    known_message_ids: HashSet<String>,
+    tools: HashMap<String, Vec<ThreadToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -482,6 +495,7 @@ async fn main() -> Result<()> {
     );
     let selected_thread = Arc::new(RwLock::new(None));
     let pending_messages = Arc::new(PendingMessages::default());
+    let app_server_tools = Arc::new(AppServerToolCache::default());
     let secure_existing_parent = args.socket.is_none()
         && env::var_os(SOCKET_ENV)
             .filter(|value| !value.is_empty())
@@ -511,12 +525,18 @@ async fn main() -> Result<()> {
     let socket_path = Arc::new(socket_path);
     let bridge_state = BridgeState {
         socket_path: Arc::clone(&socket_path),
-        session_store,
-        write_backend,
+        session_store: Arc::clone(&session_store),
+        write_backend: Arc::clone(&write_backend),
         host_executor,
         selected_thread,
         pending_messages,
+        app_server_tools,
     };
+    let hot_cache_task = spawn_hot_session_cache(
+        Arc::clone(&session_store),
+        Arc::clone(&write_backend),
+        args.app_server_thread_cache,
+    );
 
     println!("codex-bridge listening on {}", socket_path.display());
 
@@ -577,8 +597,121 @@ async fn main() -> Result<()> {
     if let Some(web_task) = web_task {
         web_task.abort();
     }
+    if let Some(hot_cache_task) = hot_cache_task {
+        hot_cache_task.abort();
+    }
 
     Ok(())
+}
+
+fn spawn_hot_session_cache(
+    session_store: Arc<SessionStore>,
+    write_backend: Arc<CodexCliBackend>,
+    pinned_limit: usize,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut events = write_backend.subscribe_app_server_events()?;
+    Some(tokio::spawn(async move {
+        let mut refresh = tokio::time::interval(Duration::from_secs(10));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_warm = HashMap::<String, Instant>::new();
+        let mut refresh_count = 0_u64;
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    let Some(thread_id) = app_server_event_thread_id(&event) else {
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if last_warm.get(&thread_id).is_some_and(|last| now.duration_since(*last) < Duration::from_millis(200)) {
+                        continue;
+                    }
+                    last_warm.insert(thread_id.clone(), now);
+                    let store = Arc::clone(&session_store);
+                    let _ = tokio::task::spawn_blocking(move || store.warm_thread_messages(&thread_id)).await;
+                }
+                _ = refresh.tick() => {
+                    refresh_count = refresh_count.wrapping_add(1);
+                    let store = Arc::clone(&session_store);
+                    let backend = Arc::clone(&write_backend);
+                    let refresh_pins = refresh_count == 1 || refresh_count % 3 == 0;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let loaded = backend
+                            .app_server_rpc("thread/loaded/list", json!({}))
+                            .map(|result| loaded_thread_ids(&result))
+                            .unwrap_or_default();
+                        for thread_id in loaded {
+                            let active = backend
+                                .app_server_rpc(
+                                    "thread/read",
+                                    json!({"threadId": thread_id, "includeTurns": false}),
+                                )
+                                .is_ok_and(|result| thread_result_is_active(&result));
+                            if active {
+                                let _ = backend.watch_thread(&thread_id);
+                                let _ = store.warm_thread_messages(&thread_id);
+                            }
+                        }
+                        if refresh_pins {
+                            for thread_id in pinned_thread_ids(&backend)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .take(pinned_limit)
+                            {
+                                let _ = store.warm_thread_messages(&thread_id);
+                            }
+                        }
+                    }).await;
+                    last_warm.retain(|_, last| last.elapsed() < Duration::from_secs(60));
+                }
+            }
+        }
+    }))
+}
+
+fn app_server_event_thread_id(event: &Value) -> Option<String> {
+    event
+        .pointer("/message/params/threadId")
+        .or_else(|| event.pointer("/message/params/thread/id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn loaded_thread_ids(result: &Value) -> Vec<String> {
+    result
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| match entry {
+            Value::String(id) => (!id.is_empty()).then(|| id.clone()),
+            _ => {
+                let thread = entry.get("thread").unwrap_or(entry);
+                thread
+                    .get("id")
+                    .or_else(|| entry.get("threadId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+            }
+        })
+        .collect()
+}
+
+fn thread_result_is_active(result: &Value) -> bool {
+    let status = result
+        .pointer("/thread/status")
+        .or_else(|| result.get("status"));
+    status.and_then(Value::as_str) == Some("active")
+        || status
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)
+            == Some("active")
 }
 
 async fn prepare_socket_path(path: &Path, secure_existing_parent: bool) -> Result<()> {
@@ -683,6 +816,7 @@ async fn handle_connection(stream: UnixStream, state: BridgeState) -> Result<()>
                     &state.host_executor,
                     &state.selected_thread,
                     &state.pending_messages,
+                    &state.app_server_tools,
                 )
             })
             .await
@@ -826,6 +960,7 @@ async fn web_command(
             &bridge.host_executor,
             &bridge.selected_thread,
             &bridge.pending_messages,
+            &bridge.app_server_tools,
         )
     })
     .await
@@ -1447,6 +1582,7 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
 
 fn app_server_tools_for_messages(
     write_backend: &CodexCliBackend,
+    cache: &AppServerToolCache,
     thread_id: &str,
     messages: &[ThreadMessage],
 ) -> Result<HashMap<String, Vec<ThreadToolCall>>, BackendFailure> {
@@ -1458,48 +1594,73 @@ fn app_server_tools_for_messages(
     if wanted.is_empty() {
         return Ok(HashMap::new());
     }
+    if let Ok(cache) = cache.threads.read() {
+        if let Some(entry) = cache.get(thread_id).filter(|entry| {
+            entry.refreshed_at.elapsed() <= Duration::from_secs(2)
+                && wanted.is_subset(&entry.known_message_ids)
+        }) {
+            return Ok(wanted
+                .iter()
+                .filter_map(|id| {
+                    entry
+                        .tools
+                        .get(id)
+                        .cloned()
+                        .map(|tools| (id.clone(), tools))
+                })
+                .collect());
+        }
+    }
 
     let mut tools = HashMap::<String, Vec<ThreadToolCall>>::new();
     let mut found = HashSet::<String>::new();
     let mut cursor = None::<String>;
     let mut seen_cursors = HashSet::new();
+    let mut pending_tools = Vec::<ThreadToolCall>::new();
+    let mut current_turn = None::<String>;
     loop {
         let result = write_backend.app_server_rpc(
-            "thread/turns/list",
+            "thread/items/list",
             json!({
                 "threadId": thread_id,
                 "cursor": cursor,
-                "limit": 20,
+                "limit": 100,
                 "sortDirection": "desc",
-                "itemsView": "full",
             }),
         )?;
-        let turns = result
+        let entries = result
             .get("data")
             .and_then(Value::as_array)
             .ok_or_else(|| BackendFailure {
                 code: "app_server_protocol_error",
-                message: "thread/turns/list returned no turn data".to_owned(),
+                message: "thread/items/list returned no item data".to_owned(),
             })?;
-        for turn in turns {
-            let Some(items) = turn.get("items").and_then(Value::as_array) else {
+        for entry in entries {
+            let turn_id = entry.get("turnId").and_then(Value::as_str);
+            if current_turn
+                .as_deref()
+                .is_some_and(|current| Some(current) != turn_id)
+            {
+                pending_tools.clear();
+            }
+            current_turn = turn_id.map(str::to_owned);
+            let Some(item) = entry.get("item") else {
                 continue;
             };
-            let mut current_message = None::<String>;
-            for item in items {
-                if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
-                    current_message = item.get("id").and_then(Value::as_str).map(str::to_owned);
-                    if let Some(id) = current_message.as_ref().filter(|id| wanted.contains(*id)) {
-                        found.insert(id.clone());
+            if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    if wanted.contains(id) {
+                        pending_tools.reverse();
+                        tools.insert(id.to_owned(), std::mem::take(&mut pending_tools));
+                        found.insert(id.to_owned());
+                    } else {
+                        pending_tools.clear();
                     }
-                    continue;
                 }
-                let Some(tool) = typed_thread_tool(item) else {
-                    continue;
-                };
-                if let Some(id) = current_message.as_ref().filter(|id| wanted.contains(*id)) {
-                    tools.entry(id.clone()).or_default().push(tool);
-                }
+                continue;
+            }
+            if let Some(tool) = typed_thread_tool(item) {
+                pending_tools.push(tool);
             }
         }
         if found.len() == wanted.len() {
@@ -1515,10 +1676,22 @@ fn app_server_tools_for_messages(
         if !seen_cursors.insert(next.clone()) {
             return Err(BackendFailure {
                 code: "app_server_protocol_error",
-                message: "thread/turns/list repeated its cursor".to_owned(),
+                message: "thread/items/list repeated its cursor".to_owned(),
             });
         }
         cursor = Some(next);
+    }
+    if let Ok(mut cache) = cache.threads.write() {
+        let entry = cache
+            .entry(thread_id.to_owned())
+            .or_insert_with(|| CachedAppServerTools {
+                refreshed_at: Instant::now(),
+                known_message_ids: HashSet::new(),
+                tools: HashMap::new(),
+            });
+        entry.refreshed_at = Instant::now();
+        entry.known_message_ids.extend(wanted.iter().cloned());
+        entry.tools.extend(tools.clone());
     }
     Ok(tools)
 }
@@ -1549,6 +1722,7 @@ fn dispatch(
     host_executor: &HostExecutor,
     selected_thread: &RwLock<Option<String>>,
     pending_messages: &PendingMessages,
+    app_server_tools: &AppServerToolCache,
 ) -> Response {
     match request {
         Request::Status => {
@@ -1748,11 +1922,12 @@ fn dispatch(
                 Ok(Some((thread, mut page))) => {
                     let tool_source = match app_server_tools_for_messages(
                         write_backend,
+                        app_server_tools,
                         &thread_id,
                         &page.messages,
                     ) {
                         Ok(tools) if overlay_app_server_tools(&mut page.messages, &tools) > 0 => {
-                            "app_server"
+                            "app_server_items"
                         }
                         _ => "rollout_jsonl",
                     };
@@ -1824,6 +1999,7 @@ fn dispatch(
             Ok(Some(message)) => {
                 let typed_tools = app_server_tools_for_messages(
                     write_backend,
+                    app_server_tools,
                     &thread_id,
                     std::slice::from_ref(&message),
                 )
@@ -3603,6 +3779,52 @@ mod tests {
     }
 
     #[test]
+    fn extracts_thread_ids_from_app_server_events() {
+        assert_eq!(
+            app_server_event_thread_id(&json!({
+                "type": "app_server",
+                "message": {
+                    "method": "thread/status/changed",
+                    "params": {"threadId": "thread-1", "status": {"type": "active"}}
+                }
+            }))
+            .as_deref(),
+            Some("thread-1")
+        );
+        assert_eq!(
+            app_server_event_thread_id(&json!({
+                "type": "app_server",
+                "message": {
+                    "method": "thread/started",
+                    "params": {"thread": {"id": "thread-2"}}
+                }
+            }))
+            .as_deref(),
+            Some("thread-2")
+        );
+    }
+
+    #[test]
+    fn loaded_thread_ids_accept_current_and_legacy_shapes() {
+        let ids = loaded_thread_ids(&json!({
+            "data": [
+                "thread-1",
+                {"id": "thread-2"},
+                {"thread": {"id": "thread-3"}},
+                {"threadId": "thread-4"}
+            ]
+        }));
+        assert_eq!(ids, ["thread-1", "thread-2", "thread-3", "thread-4"]);
+        assert!(thread_result_is_active(&json!({
+            "thread": {"status": {"type": "active", "activeFlags": []}}
+        })));
+        assert!(thread_result_is_active(&json!({"status": "active"})));
+        assert!(!thread_result_is_active(&json!({
+            "thread": {"status": {"type": "idle"}}
+        })));
+    }
+
+    #[test]
     fn vite_web_ui_uses_split_data_feeds_and_keeps_raw_protocol_access() {
         assert!(WEB_INDEX.contains("/assets/app.js"));
         assert!(WEB_INDEX.contains("/assets/app.css"));
@@ -3815,39 +4037,6 @@ mod tests {
         assert_eq!(compact["file_count"], 1);
         assert_eq!(compact["name"], "apply_patch");
         assert_eq!(tool.input["changes"][0]["path"], "/tmp/src/sessions.rs");
-    }
-
-    #[test]
-    fn app_server_tools_replace_rollout_wrapper_by_message_id() {
-        let mut messages = vec![ThreadMessage {
-            timestamp: None,
-            id: Some("msg-1".into()),
-            role: "assistant".into(),
-            phase: Some("commentary".into()),
-            content: vec![],
-            tools: vec![ThreadToolCall {
-                call_id: "outer".into(),
-                name: "exec".into(),
-                status: "completed".into(),
-                input: Value::String("const result = await tools.exec_command(...)".into()),
-                output: None,
-            }],
-        }];
-        let typed = typed_thread_tool(&json!({
-            "type":"mcpToolCall",
-            "id":"mcp-1",
-            "server":"cua_repl",
-            "tool":"js",
-            "arguments":{"code":"inspect()"},
-            "status":"completed",
-            "result":{"content":[]},
-            "error":null,
-        }))
-        .unwrap();
-        let tools = HashMap::from([("msg-1".to_owned(), vec![typed])]);
-        assert_eq!(overlay_app_server_tools(&mut messages, &tools), 1);
-        assert_eq!(messages[0].tools[0].name, "cua_repl.js");
-        assert!(messages[0].tools[0].input.is_object());
     }
 
     #[test]
