@@ -7,7 +7,10 @@ export async function command(request, showResult = true) {
     body: JSON.stringify(request),
   });
   const data = await response.json();
-  if (showResult) $("result").textContent = JSON.stringify(data, null, 2);
+  if (showResult) {
+    $("result").removeAttribute("data-i18n");
+    $("result").textContent = JSON.stringify(data, null, 2);
+  }
   if (!data.ok) {
     throw new Error(`${data.error?.code || "error"}: ${data.error?.message || "request failed"}`);
   }
@@ -32,6 +35,6 @@ export async function run(action) {
   }
 }
 
-export function timeText(milliseconds) {
-  return milliseconds ? new Date(milliseconds).toLocaleString() : "";
+export function timeText(milliseconds, locale) {
+  return milliseconds ? new Date(milliseconds).toLocaleString(locale) : "";
 }

@@ -1,5 +1,6 @@
 import "./styles.css";
 import { $, command, notify, run, timeText } from "./api.js";
+import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import {
   DRAFT_STORAGE_KEY,
@@ -15,11 +16,22 @@ async function loadStatus() {
   state.directAppServer = Boolean(backend.app_server_available);
   state.appServerMode = backend.app_server_mode || null;
   const appServer = state.directAppServer
-    ? "direct app-server online"
+    ? tr("directOnline")
     : state.appServerMode === "desktop_bundled_only"
-      ? "Desktop bundled app-server · private transport"
-      : "direct app-server offline";
-  $("bridgeState").textContent = `Ready · protocol ${r.protocol_version} · ${appServer}`;
+      ? tr("bundledPrivate")
+      : tr("directOffline");
+  $("bridgeState").textContent = tr("bridgeReady", {
+    protocol: r.protocol_version,
+    backend: appServer,
+  });
+}
+async function toggleLanguage() {
+  applyLanguage(getLanguage() === "en" ? "zh" : "en");
+  renderProjects();
+  renderPending();
+  showActivity();
+  await loadStatus();
+  if (state.current) await openThread(state.current, { quiet: true });
 }
 async function loadProjects() {
   const r = await command({ command: "projects", include_archived: $("archived").checked }, false);
@@ -72,7 +84,7 @@ function renderProjects() {
         ?.threads.some((t) => `${t.title || ""} ${t.id}`.toLowerCase().includes(q)),
   );
   if (!projects.length) {
-    root.innerHTML = '<div class="empty" style="padding:12px">No matching projects.</div>';
+    root.innerHTML = `<div class="empty" style="padding:12px">${tr("noMatchingProjects")}</div>`;
     return;
   }
   for (const p of projects) {
@@ -92,7 +104,7 @@ function renderProjects() {
     const add = document.createElement("button");
     add.className = "project-add";
     add.textContent = "+";
-    add.title = `在 ${p.name} 中创建新会话`;
+    add.title = tr("createInProject", { project: p.name });
     add.setAttribute("aria-label", add.title);
     add.onclick = () => showCreateDialog(p);
     head.append(button, add);
@@ -102,21 +114,23 @@ function renderProjects() {
     list.hidden = !state.expanded.has(p.path);
     const data = state.projectThreads.get(p.path);
     if (!data) {
-      list.innerHTML = '<div class="empty" style="padding:8px">Open to load sessions</div>';
+      list.innerHTML = `<div class="empty" style="padding:8px">${tr("openToLoad")}</div>`;
     } else {
       for (const t of data.threads) {
         const b = document.createElement("button");
         b.className = "thread" + (state.current?.id === t.id ? " active" : "");
         b.innerHTML = '<div class="thread-name"></div><div class="thread-meta"></div>';
         b.children[0].textContent = t.title || t.id;
-        b.children[1].textContent = `${t.git_branch || "no branch"} · ${timeText(t.updated_at_ms)}${t.archived ? " · archived" : ""}`;
+        b.children[1].textContent = `${t.git_branch || tr("noBranch")} · ${timeText(t.updated_at_ms, getLanguage() === "zh" ? "zh-CN" : "en")}${t.archived ? ` · ${tr("archived")}` : ""}`;
         b.onclick = () => openThread(t);
         list.appendChild(b);
       }
       if (data.threads.length < data.available) {
         const more = document.createElement("button");
         more.className = "thread";
-        more.textContent = `Load ${data.available - data.threads.length} more sessions`;
+        more.textContent = tr("loadMoreSessions", {
+          count: data.available - data.threads.length,
+        });
         more.onclick = () => run(() => loadProjectThreads(p, data.threads.length));
         list.appendChild(more);
       }
@@ -139,10 +153,10 @@ function closeCreateDialog() {
 }
 async function createThread(worktree) {
   const project = state.creatingProject;
-  if (!project) throw new Error("Choose a project first");
+  if (!project) throw new Error(tr("chooseProject"));
   const buttons = [$("createCurrentBtn"), $("createWorktreeBtn"), $("createCancelBtn")];
   buttons.forEach((button) => (button.disabled = true));
-  $("createProgress").textContent = worktree ? "正在创建 worktree…" : "正在创建会话…";
+  $("createProgress").textContent = worktree ? tr("creatingWorktree") : tr("creatingSession");
   try {
     const r = await command(
       { command: "thread_create", project_path: project.path, worktree, model: null },
@@ -162,7 +176,7 @@ async function createThread(worktree) {
         r.thread
       : r.thread;
     await openThread(thread);
-    notify(worktree ? "已在新 worktree 中创建会话" : "已在当前目录创建会话");
+    notify(worktree ? tr("createdWorktree") : tr("createdCurrent"));
   } finally {
     buttons.forEach((button) => (button.disabled = false));
     $("createProgress").textContent = "";
@@ -180,7 +194,7 @@ function appendContextValue(details, value, label) {
     if (part?.type === "input_image" && typeof part.image_url === "string") {
       const img = document.createElement("img");
       img.src = part.image_url;
-      img.alt = label || "Attachment";
+      img.alt = label || tr("attachment");
       details.appendChild(img);
       rendered = true;
       continue;
@@ -217,7 +231,7 @@ function contentNode(item) {
   const details = document.createElement("details");
   details.className = "context-block";
   const summary = document.createElement("summary");
-  summary.textContent = item.label || "Injected context";
+  summary.textContent = item.label || tr("injectedContext");
   const size = document.createElement("span");
   size.className = "context-size";
   size.textContent = byteText(item.bytes || 0);
@@ -231,7 +245,7 @@ function contentNode(item) {
       return;
     }
     const loading = document.createElement("pre");
-    loading.textContent = "Loading…";
+    loading.textContent = tr("loading");
     details.appendChild(loading);
     run(async () => {
       const r = await command(
@@ -279,7 +293,7 @@ function appendToolValue(parent, value) {
     if (imageUrl && /^(?:data:image\/|https?:\/\/)/i.test(imageUrl)) {
       const img = document.createElement("img");
       img.src = imageUrl;
-      img.alt = "Tool result image";
+      img.alt = tr("toolResultImage");
       img.loading = "lazy";
       parent.appendChild(img);
       continue;
@@ -314,12 +328,12 @@ function appendPatchDiff(parent, patch) {
   copy.className = "diff-copy";
   copy.type = "button";
   copy.textContent = "⧉";
-  copy.title = "复制完整补丁";
+  copy.title = tr("copyPatch");
   copy.setAttribute("aria-label", copy.title);
   copy.onclick = () =>
     run(async () => {
       await navigator.clipboard.writeText(patch);
-      notify("Diff 已复制");
+      notify(tr("diffCopied"));
     });
   head.append(title, copy);
   content.className = "diff-content";
@@ -337,7 +351,7 @@ function appendPatchDiff(parent, patch) {
   card.append(head, content);
   parent.appendChild(card);
 }
-function toolGroupNode(message) {
+function toolGroupNode(message, keepRunning = false) {
   const tools = message.tools || [];
   if (!tools.length) return null;
   const group = document.createElement("details");
@@ -349,15 +363,17 @@ function toolGroupNode(message) {
     action = document.createElement("span"),
     preview = document.createElement("span"),
     count = document.createElement("span"),
-    running = Boolean(runningTool);
+    running = Boolean(runningTool) || keepRunning;
   summary.className = "tool-group-summary";
   summary.classList.toggle("running", running);
   icon.className = `tool-icon ${toolIconClass(latest.name)}`;
   icon.title = latest.name;
   action.className = "tool-summary-action";
-  action.textContent = running ? toolActionText(latest.name, true) : "运行了";
+  action.textContent = running ? toolActionText(latest.name, true) : tr("ranTools");
   preview.className = "tool-summary-preview";
-  preview.textContent = running ? toolSummaryPreview(latest) : `${tools.length} 个工具`;
+  preview.textContent = running
+    ? toolSummaryPreview(latest)
+    : tr("toolCount", { count: tools.length });
   preview.title = running ? latest.preview || latest.name : preview.textContent;
   count.className = "tool-summary-count";
   const editedFiles = tools.reduce((total, tool) => total + (tool.file_count || 0), 0);
@@ -366,7 +382,7 @@ function toolGroupNode(message) {
       ? `+${tools.length - 1}`
       : ""
     : editedFiles
-      ? `· 编辑了 ${editedFiles} 个文件`
+      ? tr("editedFiles", { count: editedFiles })
       : "";
   summary.append(icon, action, preview, count);
   group.appendChild(summary);
@@ -382,7 +398,7 @@ function toolGroupNode(message) {
     icon.className = `tool-icon ${toolIconClass(tool.name)}`;
     icon.title = tool.name;
     preview.className = "tool-preview";
-    preview.appendChild(document.createTextNode(tool.preview || tool.name));
+    preview.appendChild(document.createTextNode(localizedToolPreview(tool)));
     if (tool.additions !== null && tool.additions !== undefined) {
       const add = document.createElement("span"),
         del = document.createElement("span");
@@ -401,7 +417,7 @@ function toolGroupNode(message) {
       detail.dataset.loaded = "1";
       const body = document.createElement("div");
       body.className = "tool-detail";
-      body.textContent = "Loading…";
+      body.textContent = tr("loading");
       detail.appendChild(body);
       run(async () => {
         const r = await command(
@@ -415,13 +431,13 @@ function toolGroupNode(message) {
         );
         body.textContent = "";
         const outputTitle = document.createElement("h5");
-        outputTitle.textContent = "结果";
+        outputTitle.textContent = tr("result");
         if (r.display_input?.operation === "apply_patch" && r.display_input?.patch) {
           appendPatchDiff(body, r.display_input.patch);
           body.appendChild(outputTitle);
         } else {
           const inputTitle = document.createElement("h5");
-          inputTitle.textContent = "参数";
+          inputTitle.textContent = tr("input");
           const input = document.createElement("pre");
           input.textContent = toolValueText(r.display_input);
           body.append(inputTitle, input, outputTitle);
@@ -439,21 +455,39 @@ function toolFinished(tool) {
 }
 function toolIconClass(name) {
   if (["exec", "exec_command"].includes(name)) return "exec_command";
-  return ["apply_patch", "write_stdin"].includes(name) ? name : "other";
+  return ["apply_patch", "write_stdin", "web_search"].includes(name) ? name : "other";
 }
 function toolActionText(name, running) {
-  if (running) return name === "apply_patch" ? "正在编辑" : "正在运行";
-  if (name === "apply_patch") return "已编辑";
-  if (name === "write_stdin") return "已继续";
-  return ["exec", "exec_command"].includes(name) ? "已运行" : "已完成";
+  if (running) {
+    if (name === "apply_patch") return tr("editing");
+    if (name === "write_stdin") return tr("waitingOutput");
+    if (name === "web_search") return tr("searching");
+    return tr("running");
+  }
+  if (name === "apply_patch") return tr("edited");
+  if (name === "write_stdin") return tr("continued");
+  return ["exec", "exec_command"].includes(name) ? tr("ran") : tr("completed");
 }
 function toolSummaryPreview(tool) {
-  const preview = tool.preview || tool.name;
-  return tool.name === "apply_patch"
-    ? preview.replace(/^已(?:编辑|新建|删除|移动)\s+/, "")
-    : preview;
+  if (tool.name === "write_stdin") return "";
+  return localizedToolPreview(tool);
 }
-function messageNode(m) {
+function localizedToolPreview(tool) {
+  const preview = tool.preview || tool.name;
+  if (tool.name === "write_stdin") return tr("waitingOutput");
+  if (tool.name === "web_search") {
+    const match = preview.replace(/^搜索\s+/, "").match(/^(.*) 等 (\d+) 项$/);
+    return match
+      ? `${match[1]} ${tr("queryCount", { count: match[2] })}`
+      : preview.replace(/^搜索\s+/, "");
+  }
+  if (tool.name === "apply_patch") {
+    if (tool.file_count > 1) return tr("filesShort", { count: tool.file_count });
+    return preview.replace(/^已(?:编辑|新建|删除|移动)\s+/, "");
+  }
+  return preview;
+}
+function messageNode(m, keepToolsRunning = false) {
   const box = document.createElement("article");
   box.className = `message ${m.category || m.role || ""}`;
   const head = document.createElement("div");
@@ -462,7 +496,7 @@ function messageNode(m) {
     b = document.createElement("span"),
     date = m.timestamp ? new Date(m.timestamp) : null,
     validDate = date && !Number.isNaN(date.valueOf());
-  a.textContent = m.category === "context" ? "injected context" : m.role || "message";
+  a.textContent = m.category === "context" ? tr("injectedContext") : m.role || "message";
   b.textContent = validDate
     ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : m.timestamp || "";
@@ -473,7 +507,7 @@ function messageNode(m) {
   const body = document.createElement("div");
   body.className = "message-body";
   for (const item of m.content || []) body.appendChild(contentNode(item));
-  const tools = toolGroupNode(m);
+  const tools = toolGroupNode(m, keepToolsRunning);
   if (tools) body.appendChild(tools);
   if (head.childNodes.length) box.appendChild(head);
   box.appendChild(body);
@@ -487,11 +521,11 @@ function pendingNode(entry) {
   body.className = "message-body";
   body.appendChild(markdownNode(entry.text));
   const labels = {
-      queueing: "排队中…",
-      steering: "插入中…",
-      queued: state.usageUnavailable ? "已排队 · 服务异常 · 等待恢复" : "已排队 · 等待上屏",
-      steered: "已插入 · 等待上屏",
-      failed: "发送失败",
+      queueing: tr("queueing"),
+      steering: tr("steering"),
+      queued: state.usageUnavailable ? tr("queuedRecovering") : tr("queuedWaiting"),
+      steered: tr("steeredWaiting"),
+      failed: tr("sendFailed"),
     },
     actions = document.createElement("div"),
     status = document.createElement("div"),
@@ -503,9 +537,9 @@ function pendingNode(entry) {
   if (entry.error) status.title = entry.error;
   remove.className = "outbox-delete";
   remove.type = "button";
-  remove.textContent = "删除";
+  remove.textContent = tr("delete");
   remove.disabled = busy;
-  remove.title = busy ? "正在提交，完成后才能删除" : "删除并恢复到输入框";
+  remove.title = busy ? tr("deleteBusy") : tr("deleteRestore");
   remove.setAttribute("aria-label", remove.title);
   remove.onclick = () => run(() => deletePending(entry, remove));
   actions.append(status, remove);
@@ -526,8 +560,7 @@ async function refreshPending() {
   renderPending();
 }
 async function deletePending(entry, button) {
-  if (state.current?.id !== entry.thread_id)
-    throw new Error("Pending message belongs to another session");
+  if (state.current?.id !== entry.thread_id) throw new Error(tr("pendingWrongSession"));
   button.disabled = true;
   try {
     const r = await command(
@@ -545,14 +578,14 @@ async function deletePending(entry, button) {
     renderPending();
     $("messageText").focus();
     $("messageText").setSelectionRange(text.length, text.length);
-    notify(r.queue_deleted ? "已取消排队并恢复到输入框" : "已删除并恢复到输入框");
+    notify(r.queue_deleted ? tr("queueDeletedRestore") : tr("deletedRestore"));
   } finally {
     if (button.isConnected) button.disabled = false;
   }
 }
 function olderButton() {
   const button = document.createElement("button"),
-    label = `Load ${state.before} older messages`;
+    label = tr("loadOlder", { count: state.before });
   button.className = "older";
   button.textContent = "↑";
   button.title = label;
@@ -585,7 +618,7 @@ function renderTransientStatus(active) {
     status = document.createElement("div");
   status.className = "transient-status";
   status.setAttribute("role", "status");
-  status.textContent = "正在压缩上下文…";
+  status.textContent = tr("compacting");
   root.appendChild(status);
   if (stickToBottom) root.scrollTop = root.scrollHeight;
 }
@@ -594,26 +627,26 @@ function showActivity() {
     el = $("runState"),
     label =
       state.activityPhase === "compacting"
-        ? "会话压缩中"
+        ? tr("sessionCompacting")
         : state.activityPhase === "tool"
-          ? `工具运行中${state.activeTool ? ` · ${state.activeTool}` : ""}`
-          : "模型调用中";
+          ? tr("toolRunning", { tool: state.activeTool ? ` · ${state.activeTool}` : "" })
+          : tr("modelRunning");
   el.classList.toggle("active", active);
   document.querySelector(".composer-shell").classList.toggle("agent-active", active);
   el.textContent = active
     ? state.pendingChanges
-      ? `${label} · 有更新`
+      ? tr("hasUpdates", { label })
       : label
     : state.pendingChanges
-      ? "空闲 · 有更新"
-      : "空闲";
+      ? tr("idleUpdates")
+      : tr("idle");
   renderTransientStatus(active);
 }
 function setUsageUnavailable(error) {
   state.usageUnavailable = true;
   const health = $("usageHealth");
   health.hidden = false;
-  health.title = error?.message || error || "无法从 app-server 获取周余量";
+  health.title = error?.message || error || tr("weeklyUnavailable");
   $("usageState").textContent = "";
   $("composerStatus").hidden = false;
   renderPending();
@@ -630,8 +663,8 @@ async function refreshComposerStatus() {
     usage.textContent = "";
     health.hidden = true;
     health.title = "";
-    effort.textContent = "Desktop 内置 app-server";
-    $("modelPickerBtn").title = "Desktop 内置 app-server 使用私有连接；standalone fallback 已禁用";
+    effort.textContent = tr("bundledOnly");
+    $("modelPickerBtn").title = tr("bundledOnlyHelp");
     $("modelPickerBtn").disabled = true;
     $("composerStatus").hidden = false;
     renderPending();
@@ -650,17 +683,21 @@ async function refreshComposerStatus() {
   state.composerModel = r.model || null;
   state.composerEffort = r.reasoning_effort || null;
   state.usageUnavailable = !weekly;
-  usage.textContent = weekly ? `周剩余 ${weekly.remaining_percent}%` : "";
+  usage.textContent = weekly ? tr("weeklyRemaining", { percent: weekly.remaining_percent }) : "";
   usage.title = weekly?.resets_at
-    ? `重置时间：${new Date(weekly.resets_at * 1000).toLocaleString()}`
+    ? tr("resetsAt", {
+        time: new Date(weekly.resets_at * 1000).toLocaleString(
+          getLanguage() === "zh" ? "zh-CN" : "en",
+        ),
+      })
     : "";
   health.hidden = Boolean(weekly);
   health.title = r.weekly_usage_error?.message || "";
   effort.textContent = state.composerModel
     ? [state.composerModel, state.composerEffort].filter(Boolean).join(" · ")
-    : "";
-  $("modelPickerBtn").title = effort.textContent;
-  $("modelPickerBtn").disabled = !state.composerModel;
+    : tr("selectModel");
+  $("modelPickerBtn").title = state.composerModel ? effort.textContent : tr("selectModelHelp");
+  $("modelPickerBtn").disabled = false;
   $("composerStatus").hidden = !state.current;
   renderPending();
 }
@@ -708,17 +745,26 @@ function renderWorkspaceDiff(summary) {
   const button = $("workspaceDiff");
   button.classList.toggle("dirty", !summary.clean);
   if (summary.clean) {
-    button.textContent = "✓ 与会话基线一致";
+    button.textContent = tr("diffClean");
   } else {
-    const untracked = summary.untracked_files ? ` · ${summary.untracked_files} 未跟踪` : "";
-    button.textContent = `${summary.files_changed} 个文件 · +${summary.additions} −${summary.deletions}${untracked}`;
+    const untracked = summary.untracked_files
+      ? tr("untracked", { count: summary.untracked_files })
+      : "";
+    button.textContent = tr("diffFiles", {
+      count: summary.files_changed,
+      additions: summary.additions,
+      deletions: summary.deletions,
+      untracked,
+    });
   }
   const baseline = summary.base_branch || summary.base_sha.slice(0, 8);
-  button.title = `相对会话创建基线 ${baseline} (${summary.base_sha.slice(0, 8)})${
-    summary.untracked_lines_skipped
-      ? ` · ${summary.untracked_lines_skipped} 个二进制或大文件未计入行数`
-      : ""
-  }`;
+  button.title = tr("diffBaseline", {
+    baseline,
+    sha: summary.base_sha.slice(0, 8),
+    skipped: summary.untracked_lines_skipped
+      ? tr("diffSkipped", { count: summary.untracked_lines_skipped })
+      : "",
+  });
 }
 async function refreshWorkspaceDiff(force = false) {
   if (!state.current || state.workspaceDiffPolling) return;
@@ -736,8 +782,8 @@ async function refreshWorkspaceDiff(force = false) {
     if (state.current?.id !== threadId) return;
     button.classList.remove("dirty");
     button.textContent = error.message.startsWith("not_git_repository")
-      ? "非 Git 工作区"
-      : "Diff 状态不可用";
+      ? tr("notGit")
+      : tr("diffUnavailable");
     button.title = error.message;
   } finally {
     state.workspaceDiffPolling = false;
@@ -750,15 +796,15 @@ async function toggleModelPicker() {
     picker.hidden = true;
     return;
   }
-  if (!state.current) throw new Error("Choose a session first");
+  if (!state.current) throw new Error(tr("chooseSessionError"));
   const r = await command({ command: "composer_options" }, false);
   state.modelOptions = Array.isArray(r.models) ? r.models : [];
-  if (!state.modelOptions.length) throw new Error("No models are available");
+  if (!state.modelOptions.length) throw new Error(tr("noModels"));
   renderModelOptions();
   picker.hidden = false;
 }
 async function applyThreadSettings() {
-  if (!state.current) throw new Error("Choose a session first");
+  if (!state.current) throw new Error(tr("chooseSessionError"));
   const threadId = state.current.id,
     model = $("modelSelect").value,
     effort = $("effortSelect").value;
@@ -766,7 +812,7 @@ async function applyThreadSettings() {
   if (state.current?.id !== threadId) return;
   $("modelPicker").hidden = true;
   await refreshComposerStatus();
-  notify(`已切换到 ${model} · ${effort}`);
+  notify(tr("switchedModel", { model, effort }));
 }
 async function refreshActivity() {
   if (!state.current) return null;
@@ -851,29 +897,30 @@ async function openThread(thread, { quiet = false } = {}) {
   renderProjects();
   $("threadTitle").textContent = thread.title || thread.id;
   $("threadMeta").textContent =
-    `${thread.cwd} · ${thread.git_branch || "branch unknown"} · ${thread.id}`;
+    `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
   const root = $("messages");
-  if (!quiet) root.innerHTML = '<div class="empty">Loading latest messages…</div>';
-  const r = await fetchMessages();
+  if (!quiet) root.innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
+  const [r] = await Promise.all([fetchMessages(), refreshActivity()]);
   if (token !== state.openToken) return;
   state.current = { ...thread, ...r.thread };
   state.before = r.page.before;
   state.hasMore = r.page.has_more;
   root.textContent = "";
   if (state.hasMore) root.appendChild(olderButton());
-  for (const m of r.messages) root.appendChild(messageNode(m));
-  if (!r.messages.length)
-    root.innerHTML = '<div class="empty">No user or assistant messages.</div>';
+  const activeToolMessage = state.activeTurnId
+    ? r.messages.findLast((message) => message.tools?.length)
+    : null;
+  for (const m of r.messages) root.appendChild(messageNode(m, m === activeToolMessage));
+  if (!r.messages.length) root.innerHTML = `<div class="empty">${tr("noMessages")}</div>`;
   root.scrollTop = root.scrollHeight;
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
   await refreshPending();
-  await refreshActivity();
   await refreshWorkspaceDiff(true);
   if (!quiet) settleHorizontalPosition();
 }
 async function refreshThread() {
-  if (!state.current) return notify("Choose a session first", true);
+  if (!state.current) return notify(tr("chooseSessionError"), true);
   return openThread(state.current);
 }
 async function loadOlder() {
@@ -899,14 +946,14 @@ async function loadOlder() {
   root.scrollTop = oldTop + (root.scrollHeight - oldHeight);
 }
 function targetRequest(name, extra = {}) {
-  if (!state.current) throw new Error("Choose a session first");
+  if (!state.current) throw new Error(tr("chooseSessionError"));
   return { command: name, thread_id: state.current.id, ...extra };
 }
 async function write(name) {
   const draft = $("messageText").value,
     text = draft.trim();
-  if (!text) throw new Error("Message cannot be empty");
-  if (!state.current) throw new Error("Choose a session first");
+  if (!text) throw new Error(tr("messageRequired"));
+  if (!state.current) throw new Error(tr("chooseSessionError"));
   const shell = document.querySelector(".composer-shell");
   let threadId = null;
   shell.classList.add("submitting");
@@ -916,7 +963,7 @@ async function write(name) {
       if (!activity?.activity.active_turn_id) {
         name = "send";
         setSendMode("send", true);
-        notify("当前没有活跃任务，已改为排队发送");
+        notify(tr("noActiveTurnQueued"));
       }
     }
     threadId = state.current.id;
@@ -935,7 +982,7 @@ async function write(name) {
     }
     if (state.current?.id === threadId) await openThread(state.current, { quiet: true });
     else await refreshPending();
-    notify(name === "send" ? "Message queued" : "Guidance steered");
+    notify(name === "send" ? tr("messageQueued") : tr("guidanceSteered"));
   } catch (error) {
     if (threadId && !state.drafts.has(threadId)) saveDraft(threadId, draft, true);
     if (state.current?.id === threadId && !$("messageText").value)
@@ -947,13 +994,14 @@ async function write(name) {
 }
 function approval(name) {
   const id = Number($("approvalId").value);
-  if (!Number.isSafeInteger(id) || id < 0) throw new Error("Enter a valid request ID");
+  if (!Number.isSafeInteger(id) || id < 0) throw new Error(tr("validRequestId"));
   return command({ command: name, id });
 }
 $("search").oninput = renderProjects;
 $("archived").onchange = () => run(loadProjects);
 $("reloadBtn").onclick = () => run(loadProjects);
 $("statusBtn").onclick = () => run(loadStatus);
+$("languageBtn").onclick = () => run(toggleLanguage);
 $("refreshBtn").onclick = () => run(refreshThread);
 $("createCurrentBtn").onclick = () => run(() => createThread(false));
 $("createWorktreeBtn").onclick = () => run(() => createThread(true));
@@ -964,7 +1012,7 @@ $("createDialog").onclick = (event) => {
 $("selectBtn").onclick = () =>
   run(async () => {
     const r = await command(targetRequest("select"));
-    notify(`Selected ${r.thread.title || r.thread.id}`);
+    notify(tr("selected", { session: r.thread.title || r.thread.id }));
   });
 document
   .querySelectorAll(".mode-button")
@@ -973,32 +1021,30 @@ $("submitBtn").onclick = () => run(() => write($("sendMode").value));
 $("interruptBtn").onclick = () =>
   run(async () => {
     await command(targetRequest("interrupt"));
-    notify("Turn interrupted");
+    notify(tr("turnInterrupted"));
   });
 $("mobileInterruptBtn").onclick = () => $("interruptBtn").click();
 $("archiveThreadBtn").onclick = () =>
   run(async () => {
-    if (!state.current) throw new Error("Choose a session first");
+    if (!state.current) throw new Error(tr("chooseSessionError"));
     const threadId = state.current.id,
       title = state.current.title || threadId;
-    if (!window.confirm(`归档会话“${title}”？归档后可通过 Include archived sessions 找回。`))
-      return;
+    if (!window.confirm(tr("archiveConfirm", { title }))) return;
     await command({ command: "thread_archive", thread_id: threadId }, false);
     state.current = null;
     state.activeTurnId = null;
     state.activeTool = null;
     state.activityPhase = null;
-    $("threadTitle").textContent = "Choose a session";
-    $("threadMeta").textContent = "The archived session has been removed from the active list.";
-    $("messages").innerHTML = '<div class="empty">Loading another session…</div>';
+    $("threadTitle").textContent = tr("chooseSession");
+    $("threadMeta").textContent = tr("archivedRemoved");
+    $("messages").innerHTML = `<div class="empty">${tr("loadingAnother")}</div>`;
     $("messageText").value = "";
     renderPending();
     closePanels();
     await loadProjects();
-    notify("会话已归档");
+    notify(tr("sessionArchived"));
   });
-$("usageHealth").onclick = () =>
-  notify($("usageHealth").title || "无法从 app-server 获取周余量", true);
+$("usageHealth").onclick = () => notify($("usageHealth").title || tr("weeklyUnavailable"), true);
 $("usageHealth").onkeydown = (event) => {
   if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
@@ -1043,10 +1089,10 @@ $("execBtn").onclick = () =>
     try {
       argv = JSON.parse($("argv").value);
     } catch {
-      throw new Error("argv must be valid JSON");
+      throw new Error(tr("argvValidJson"));
     }
     if (!Array.isArray(argv) || !argv.every((x) => typeof x === "string"))
-      throw new Error("argv must be an array of strings");
+      throw new Error(tr("argvStringArray"));
     const timeout = $("timeout").value;
     return command(
       targetRequest("host_exec", { argv, timeout_seconds: timeout ? Number(timeout) : null }),
@@ -1055,12 +1101,12 @@ $("execBtn").onclick = () =>
 $("rpcBtn").onclick = () =>
   run(() => {
     const method = $("rpcMethod").value.trim();
-    if (!method) throw new Error("Method cannot be empty");
+    if (!method) throw new Error(tr("methodRequired"));
     let params;
     try {
       params = JSON.parse($("rpcParams").value);
     } catch {
-      throw new Error("Params must be valid JSON");
+      throw new Error(tr("paramsValidJson"));
     }
     return command({ command: "app_server_rpc", method, params });
   });
@@ -1070,7 +1116,7 @@ $("rawBtn").onclick = () =>
     try {
       req = JSON.parse($("rawRequest").value);
     } catch {
-      throw new Error("Request must be valid JSON");
+      throw new Error(tr("requestValidJson"));
     }
     return command(req);
   });
@@ -1190,6 +1236,7 @@ document.querySelectorAll(".nav-toggle").forEach(
     }),
 );
 $("scrim").onclick = closePanels;
+applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
 applyTheme(localStorage.getItem(THEME_STORAGE_KEY) || "dark");
 run(async () => {
   await loadStatus();

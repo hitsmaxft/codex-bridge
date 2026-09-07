@@ -2289,6 +2289,17 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
 
 fn tool_preview(tool: &ThreadToolCall) -> String {
     let raw = tool.input.as_str().unwrap_or("");
+    if display_tool_name(tool) == "write_stdin" {
+        return "等待输出".to_owned();
+    }
+    if display_tool_name(tool) == "web_search" {
+        let queries = source_string_fields(raw, "q");
+        return match queries.as_slice() {
+            [query] => format!("搜索 {query}"),
+            [first, ..] => format!("搜索 {first} 等 {} 项", queries.len()),
+            [] => "网页搜索".to_owned(),
+        };
+    }
     if let Some(patch) = tool_patch(tool) {
         let files = patch_file_actions(&patch);
         return match files.as_slice() {
@@ -2331,6 +2342,12 @@ fn parsed_tool_input(tool: &ThreadToolCall) -> Option<Value> {
             "patch": patch,
         }));
     }
+    if display_tool_name(tool) == "web_search" {
+        return Some(json!({
+            "operation": "web_search",
+            "queries": source_string_fields(source, "q"),
+        }));
+    }
     if display_tool_name(tool) != "exec_command" {
         return None;
     }
@@ -2356,6 +2373,11 @@ fn display_tool_name(tool: &ThreadToolCall) -> &str {
         "exec_command"
     } else if tool.name == "exec" && source.contains("tools.write_stdin") {
         "write_stdin"
+    } else if tool.name == "exec"
+        && source.contains("tools.web__run")
+        && source.contains("search_query")
+    {
+        "web_search"
     } else {
         &tool.name
     }
@@ -2444,6 +2466,29 @@ fn source_string_field(source: &str, field: &str) -> Option<String> {
     let rest = source_field_tail(source, field)?;
     let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<String>();
     stream.next()?.ok()
+}
+
+fn source_string_fields(source: &str, field: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for (start, _) in source.match_indices(field) {
+        let before = source[..start].chars().next_back();
+        let after_name = start + field.len();
+        if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            continue;
+        }
+        let tail = source[after_name..].trim_start();
+        let tail = tail.strip_prefix('"').unwrap_or(tail).trim_start();
+        let Some(tail) = tail.strip_prefix(':').map(str::trim_start) else {
+            continue;
+        };
+        let mut stream = serde_json::Deserializer::from_str(tail).into_iter::<String>();
+        if let Some(Ok(value)) = stream.next() {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+    }
+    values
 }
 
 fn source_u64_field(source: &str, field: &str) -> Option<u64> {
@@ -3023,6 +3068,7 @@ mod tests {
         let source = concat!(
             include_str!("../../../web-ui/index.html"),
             include_str!("../../../web-ui/src/main.js"),
+            include_str!("../../../web-ui/src/i18n.js"),
             include_str!("../../../web-ui/src/state.js"),
             include_str!("../../../web-ui/src/styles.css"),
         );
@@ -3078,6 +3124,8 @@ mod tests {
             "prefers-color-scheme: light",
             "id=\"themeSelect\"",
             "codex-bridge.theme.v1",
+            "id=\"languageBtn\"",
+            "codex-bridge.language.v1",
             "id=\"archiveThreadBtn\"",
             "appendPatchDiff",
             "diff-line",
@@ -3188,6 +3236,25 @@ mod tests {
         assert_eq!(parsed["operation"], "apply_patch");
         assert_eq!(parsed["files"][0]["path"], "/tmp/src/sessions.rs");
         assert!(parsed["patch"].as_str().unwrap().contains("+more"));
+    }
+
+    #[test]
+    fn web_search_wrapper_reports_queries_instead_of_javascript() {
+        let tool = ThreadToolCall {
+            call_id: "call-web".into(),
+            name: "exec".into(),
+            status: "completed".into(),
+            input: Value::String(
+                r#"const result = await tools.web__run({search_query:[{q:"Codex app-server"},{q:"thread/read model"}],response_length:"short"}); text(result);"#.into(),
+            ),
+            output: Some(json!({"ok": true})),
+        };
+        assert_eq!(display_tool_name(&tool), "web_search");
+        assert_eq!(tool_preview(&tool), "搜索 Codex app-server 等 2 项");
+        assert_eq!(
+            parsed_tool_input(&tool).unwrap()["queries"],
+            json!(["Codex app-server", "thread/read model"])
+        );
     }
 
     #[test]

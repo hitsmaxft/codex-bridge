@@ -11,48 +11,72 @@
         <div class="brand">
           <div class="brand-row">
             <h1><span class="dot"></span>Codex Bridge</h1>
-            <button id="statusBtn">Status</button>
+            <div class="brand-actions">
+              <button id="statusBtn" data-i18n="status">Status</button
+              ><button id="languageBtn" type="button">中文</button>
+            </div>
           </div>
-          <div class="sub" id="bridgeState">Connecting…</div>
+          <div class="sub" id="bridgeState" data-i18n="connecting">Connecting…</div>
         </div>
         <div class="filters">
-          <input id="search" placeholder="Filter projects or sessions" /><button id="reloadBtn">
-            Reload</button
+          <input
+            id="search"
+            data-i18n-placeholder="filter"
+            placeholder="Filter projects or sessions"
+          /><button id="reloadBtn" data-i18n="reload">Reload</button
           ><label class="check"
-            ><input id="archived" type="checkbox" /> Include archived sessions</label
+            ><input id="archived" type="checkbox" />
+            <span data-i18n="includeArchived">Include archived sessions</span></label
           >
         </div>
-        <div id="projects"><div class="empty">Loading sessions…</div></div>
+        <div id="projects">
+          <div class="empty" data-i18n="loadingSessions">Loading sessions…</div>
+        </div>
       </aside>
       <main>
         <div class="thread-head">
-          <button class="nav-toggle" aria-label="Projects and sessions">‹</button>
+          <button
+            class="nav-toggle"
+            data-i18n-aria-label="projectsAria"
+            aria-label="Projects and sessions"
+          >
+            ‹
+          </button>
           <div class="head-copy">
-            <h2 id="threadTitle">Choose a session</h2>
+            <h2 id="threadTitle" data-i18n="chooseSession">Choose a session</h2>
             <div class="meta">
-              <span id="threadMeta">Projects and sessions appear on the left.</span
+              <span id="threadMeta" data-i18n="projectsHint"
+                >Projects and sessions appear on the left.</span
               ><span class="run-state" id="runState"></span>
             </div>
           </div>
           <div class="head-actions">
-            <button id="selectBtn">Select default</button><button id="refreshBtn">Refresh</button
-            ><button class="tool-toggle" aria-label="Tools">•••</button>
+            <button id="selectBtn" data-i18n="selectDefault">Select default</button
+            ><button id="refreshBtn" data-i18n="refresh">Refresh</button
+            ><button class="tool-toggle" data-i18n-aria-label="tools" aria-label="Tools">
+              •••
+            </button>
           </div>
         </div>
         <div id="messages">
-          <div class="empty">Select a session to inspect its conversation.</div>
+          <div class="empty" data-i18n="selectSessionHint">
+            Select a session to inspect its conversation.
+          </div>
         </div>
         <div class="composer">
           <div class="outbox-tray" id="outboxTray" aria-live="polite" hidden></div>
           <div class="composer-status" id="composerStatus" hidden>
-            <button class="workspace-diff" id="workspaceDiff" type="button">Git 状态…</button>
+            <button class="workspace-diff" id="workspaceDiff" type="button" data-i18n="gitStatus">
+              Git status…
+            </button>
             <div class="composer-runtime">
               <span
                 class="usage-health"
                 id="usageHealth"
                 role="button"
                 tabindex="0"
-                aria-label="周余量状态不可用"
+                data-i18n-aria-label="usageUnavailableAria"
+                aria-label="Weekly usage status unavailable"
                 hidden
               ></span
               ><span id="usageState"></span
@@ -63,78 +87,101 @@
           </div>
           <div class="model-picker" id="modelPicker" hidden>
             <div class="model-picker-head">
-              <span>模型与思考强度</span><button id="modelPickerClose" type="button">关闭</button>
+              <span data-i18n="modelAndEffort">Model and reasoning effort</span
+              ><button id="modelPickerClose" type="button" data-i18n="close">Close</button>
             </div>
-            <label for="modelSelect">模型</label
+            <label for="modelSelect" data-i18n="model">Model</label
             ><select id="modelSelect"></select
-            ><label for="effortSelect">思考强度</label
+            ><label for="effortSelect" data-i18n="reasoningEffort">Reasoning effort</label
             ><select id="effortSelect"></select>
             <div class="model-description" id="modelDescription"></div>
             <div class="model-picker-actions">
-              <button class="primary" id="modelApply" type="button">应用</button>
+              <button class="primary" id="modelApply" type="button" data-i18n="apply">Apply</button>
             </div>
           </div>
           <div class="composer-shell">
-            <div class="send-modes" role="group" aria-label="Send mode">
+            <div
+              class="send-modes"
+              role="group"
+              data-i18n-aria-label="sendModeAria"
+              aria-label="Send mode"
+            >
               <button
                 class="mode-button active"
                 type="button"
                 data-mode="steer"
                 aria-pressed="true"
               >
-                跟进</button
+                <span data-i18n="followUp">Follow up</span></button
               ><button class="mode-button" type="button" data-mode="send" aria-pressed="false">
-                排队
+                <span data-i18n="queue">Queue</span>
               </button>
             </div>
             <input id="sendMode" type="hidden" value="steer" /><textarea
               id="messageText"
               rows="1"
-              placeholder="输入消息…"
+              data-i18n-placeholder="messagePlaceholder"
+              placeholder="Type a message…"
             ></textarea
-            ><button class="primary" id="submitBtn" aria-label="Submit message">Send</button>
+            ><button
+              class="primary"
+              id="submitBtn"
+              data-i18n="send"
+              data-i18n-aria-label="submitAria"
+              aria-label="Submit message"
+            >
+              Send
+            </button>
           </div>
           <div class="composer-foot">
-            <span class="meta">Explicit session target · no mtime fallback</span
-            ><button class="danger" id="interruptBtn">Interrupt</button>
+            <span class="meta" data-i18n="targetPolicy"
+              >Explicit session target · no mtime fallback</span
+            ><button class="danger" id="interruptBtn" data-i18n="interrupt">Interrupt</button>
           </div>
         </div>
       </main>
       <section class="tools" id="tools">
         <div class="tool-section">
           <div class="brand-row">
-            <h2>Commands</h2>
-            <button class="tool-toggle">Close</button>
+            <h2 data-i18n="commands">Commands</h2>
+            <button class="tool-toggle" data-i18n="close">Close</button>
           </div>
           <div class="tool-row">
-            <button id="currentBtn">Current</button><button id="tailBtn">Tail</button
-            ><button id="pendingBtn">Pending</button>
+            <button id="currentBtn" data-i18n="current">Current</button
+            ><button id="tailBtn" data-i18n="tail">Tail</button
+            ><button id="pendingBtn" data-i18n="pending">Pending</button>
           </div>
         </div>
         <div class="tool-section mobile-only">
-          <h2>Turn actions</h2>
+          <h2 data-i18n="turnActions">Turn actions</h2>
           <div class="tool-row">
-            <button class="danger" id="mobileInterruptBtn">Interrupt current turn</button>
+            <button class="danger" id="mobileInterruptBtn" data-i18n="interruptCurrent">
+              Interrupt current turn
+            </button>
           </div>
         </div>
         <div class="tool-section">
-          <h2>会话</h2>
+          <h2 data-i18n="session">Session</h2>
           <div class="tool-row">
-            <button class="danger" id="archiveThreadBtn">归档当前会话</button>
+            <button class="danger" id="archiveThreadBtn" data-i18n="archiveCurrent">
+              Archive current session
+            </button>
           </div>
         </div>
         <div class="tool-section">
-          <h2>Appearance</h2>
-          <label class="caption" for="themeSelect">Theme</label
+          <h2 data-i18n="appearance">Appearance</h2>
+          <label class="caption" for="themeSelect" data-i18n="theme">Theme</label
           ><select id="themeSelect">
-            <option value="dark">Dark</option>
-            <option value="light">Light</option>
-            <option value="system">Follow system</option>
+            <option value="dark" data-i18n="dark">Dark</option>
+            <option value="light" data-i18n="light">Light</option>
+            <option value="system" data-i18n="followSystem">Follow system</option>
           </select>
         </div>
         <div class="tool-section">
-          <h2>History</h2>
-          <label class="caption" for="lastCount">Messages per page</label>
+          <h2 data-i18n="history">History</h2>
+          <label class="caption" for="lastCount" data-i18n="messagesPerPage"
+            >Messages per page</label
+          >
           <div class="tool-row">
             <select id="lastCount">
               <option>20</option>
@@ -142,33 +189,39 @@
               <option>50</option>
               <option>100</option>
               <option>200</option></select
-            ><button id="applyLastBtn">Reload</button>
+            ><button id="applyLastBtn" data-i18n="reload">Reload</button>
           </div>
         </div>
         <div class="tool-section">
-          <h2>Scroll</h2>
+          <h2 data-i18n="scroll">Scroll</h2>
           <div class="tool-row">
             <select id="scrollMode">
-              <option value="direction">Direction</option>
-              <option value="pixels">Pixels</option>
-              <option value="target">Semantic target</option>
-              <option value="message_id">Message ID</option></select
-            ><input id="scrollValue" value="down" /><button id="scrollBtn">Run</button>
+              <option value="direction" data-i18n="direction">Direction</option>
+              <option value="pixels" data-i18n="pixels">Pixels</option>
+              <option value="target" data-i18n="semanticTarget">Semantic target</option>
+              <option value="message_id" data-i18n="messageId">Message ID</option></select
+            ><input id="scrollValue" value="down" /><button id="scrollBtn" data-i18n="run">
+              Run
+            </button>
           </div>
         </div>
         <div class="tool-section">
-          <h2>Approvals</h2>
+          <h2 data-i18n="approvals">Approvals</h2>
           <div class="tool-row">
-            <input id="approvalId" type="number" min="0" placeholder="Request ID" /><button
-              id="approveBtn"
-            >
-              Approve</button
-            ><button class="danger" id="declineBtn">Decline</button>
+            <input
+              id="approvalId"
+              type="number"
+              min="0"
+              data-i18n-placeholder="requestId"
+              placeholder="Request ID"
+            /><button id="approveBtn" data-i18n="approve">Approve</button
+            ><button class="danger" id="declineBtn" data-i18n="decline">Decline</button>
           </div>
         </div>
         <div class="tool-section">
-          <h2>Host exec</h2>
-          <label class="caption" for="argv">JSON argv array (subject to daemon allowlist)</label
+          <h2 data-i18n="hostExec">Host exec</h2>
+          <label class="caption" for="argv" data-i18n="argvHelp"
+            >JSON argv array (subject to daemon allowlist)</label
           ><textarea id="argv">["git", "status", "--short"]</textarea>
           <div class="tool-row">
             <input
@@ -176,25 +229,32 @@
               type="number"
               min="1"
               max="3600"
+              data-i18n-placeholder="timeout"
               placeholder="Timeout: 300s"
-            /><button id="execBtn">Execute</button>
+            /><button id="execBtn" data-i18n="execute">Execute</button>
           </div>
         </div>
         <div class="tool-section">
-          <h2>App-server RPC</h2>
-          <label class="caption" for="rpcMethod"
+          <h2 data-i18n="appServerRpc">App-server RPC</h2>
+          <label class="caption" for="rpcMethod" data-i18n="rpcHelp"
             >One-shot native method (including methods not wrapped by codexctl)</label
-          ><input id="rpcMethod" value="thread/read" /><label class="caption" for="rpcParams"
+          ><input id="rpcMethod" value="thread/read" /><label
+            class="caption"
+            for="rpcParams"
+            data-i18n="jsonParams"
             >JSON params</label
           ><textarea id="rpcParams">{"threadId":""}</textarea>
-          <div class="tool-row"><button id="rpcBtn">Call app-server</button></div>
+          <div class="tool-row">
+            <button id="rpcBtn" data-i18n="callAppServer">Call app-server</button>
+          </div>
         </div>
         <div class="tool-section">
-          <h2>Raw protocol</h2>
-          <label class="caption" for="rawRequest">Any codex-bridge Request JSON</label
+          <h2 data-i18n="rawProtocol">Raw protocol</h2>
+          <label class="caption" for="rawRequest" data-i18n="rawHelp"
+            >Any codex-bridge Request JSON</label
           ><textarea id="rawRequest">{"command":"status"}</textarea>
-          <div class="tool-row"><button id="rawBtn">Dispatch</button></div>
-          <pre id="result">Command results appear here.</pre>
+          <div class="tool-row"><button id="rawBtn" data-i18n="dispatch">Dispatch</button></div>
+          <pre id="result" data-i18n="resultsHint">Command results appear here.</pre>
         </div>
       </section>
     </div>
@@ -207,20 +267,26 @@
       hidden
     >
       <div class="create-card">
-        <h2 id="createTitle">创建新会话</h2>
+        <h2 id="createTitle" data-i18n="createSession">Create new session</h2>
         <div class="create-project" id="createProject"></div>
         <div class="create-options">
           <button class="create-option" id="createCurrentBtn">
-            <strong>当前目录</strong><span>在现有目录中启动，会直接看到当前未提交修改。</span>
+            <strong data-i18n="currentDirectory">Current directory</strong
+            ><span data-i18n="currentDirectoryHelp"
+              >Start in the existing directory and include current uncommitted changes.</span
+            >
           </button>
           <button class="create-option" id="createWorktreeBtn">
-            <strong>新 Worktree</strong
-            ><span>从当前 HEAD 创建隔离的 detached worktree；未提交修改不会复制过去。</span>
+            <strong data-i18n="newWorktree">New worktree</strong
+            ><span data-i18n="newWorktreeHelp"
+              >Create an isolated detached worktree from HEAD; uncommitted changes are not
+              copied.</span
+            >
           </button>
         </div>
         <div class="create-actions">
           <span class="create-progress" id="createProgress"></span
-          ><button id="createCancelBtn">取消</button>
+          ><button id="createCancelBtn" data-i18n="cancel">Cancel</button>
         </div>
       </div>
     </div>

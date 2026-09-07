@@ -119,6 +119,19 @@ aside {
   justify-content: space-between;
   gap: 10px;
 }
+.brand-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+}
+.brand-actions button {
+  min-height: 28px;
+  padding: 3px 8px;
+}
+#languageBtn {
+  min-width: 42px;
+}
 h1 {
   font-size: 17px;
   margin: 0;
@@ -669,6 +682,9 @@ main {
 }
 .tool-icon.write_stdin::before {
   content: "↳";
+}
+.tool-icon.web_search::before {
+  content: "⌕";
 }
 .tool-icon.other::before {
   content: "◆";

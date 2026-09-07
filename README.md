@@ -2,10 +2,40 @@
 
 [Project site](https://gh.bhee.online/codex-bridge/) · Local CLI · Private Web UI · Codex Desktop
 
-`codex-bridge` wraps a running Codex Desktop as a local CLI/RPC service. Following
-[DESIGN.md](DESIGN.md), it uses a hybrid architecture with separate read and write paths:
-rollout/app-server state is used to read sessions, while writes are performed by the Codex CLI.
-A Chromium CDP channel is reserved for UI operations that have not yet been implemented.
+`codex-bridge` is a local control plane for a running Codex Desktop. It makes the same tasks that
+Desktop owns available through a CLI, a typed local RPC protocol, and an authenticated browser UI.
+It is useful when you want to inspect or continue a Codex task from a terminal, phone, or another
+local tool without scraping the Desktop window or creating a competing writer for the thread.
+
+## What the service provides
+
+- **Structured task access:** list projects and sessions, read paginated conversation history,
+  inspect tool calls, approvals, usage, activity, and the Git diff from the task's creation SHA.
+- **Safe task control:** send, queue, steer, interrupt, archive, and update thread settings through
+  the bundled app-server used by Desktop. Targets are explicit; write commands never guess from
+  file modification time.
+- **A mobile-friendly Web UI:** follow active work, restore queued or steered text, inspect rendered
+  patch diffs, and switch between English and Chinese from an authenticated browser.
+- **A small automation surface:** `codexctl` and the JSON-lines daemon protocol expose the same
+  operations for scripts without coupling them to Electron DOM details.
+
+The service deliberately separates persisted reads from live control. Session history comes from
+Codex rollout files, while live operations use the app-server bundled in ChatGPT.app and remain in
+Desktop's writer-ownership boundary. See [DESIGN.md](DESIGN.md) for the original architecture and
+its evidence limits.
+
+```text
+codexctl / Web UI / local clients
+              │
+              ▼
+       codex-bridge daemon
+          │          │
+          │          └── rollout files ── structured history
+          └── bundled app-server ─────── live task control
+                       ▲
+                       │
+                 Codex Desktop
+```
 
 ## Layout
 
@@ -52,7 +82,7 @@ CARGO_INCREMENTAL=0 cargo test -p codex-gui-bridge --bin ws-unix-bridge
 See [crates/codex-gui-bridge/README.md](crates/codex-gui-bridge/README.md) for launchd persistence,
 validation boundaries, and the retained broker experiment.
 
-## Currently runnable features
+## Run the service
 
 Build the frontend bundle and Rust workspace, then start the daemon and CLI separately:
 
@@ -102,36 +132,38 @@ codex-bridge --web-ui --web-ui-listen 127.0.0.1:47653 \
 Public origins must use HTTPS and cannot contain a path, query, or fragment. Their `Host` and
 `Origin` values are matched exactly; arbitrary proxied hostnames remain rejected.
 
-The embedded UI first transfers a compact project index, then fetches sessions only for an opened
-project (50 at a time), and conversation messages only for the selected thread (30 at a time).
-Nested working directories are grouped under their nearest Git repository root. Older messages
-are prepended by cursor without retransmitting or rebuilding the messages already on screen.
-Internal `subagent` rollouts (including command-policy guardian evaluations) are excluded from the
-project counts and thread list, matching the user-visible Codex history. Session summaries and
-parsed messages are cached briefly in the daemon. The mobile layout follows
-a single-column Codex-style conversation view with project and tool drawers, touch-sized controls,
-an independently scrolling message area, and a safe-area-aware bottom composer. The composer has
-an explicit `Steer`/`Queue` mode selector and keeps submitted messages visible while they are being
-steered or queued. Remembered items have a delete action that restores their text to the composer;
-for queued submissions it first cancels the real app-server queue item. If no turn is active, a
-requested steer is automatically changed to queue/send.
-A left-aligned composer status compares the working tree with the Git SHA captured by app-server
-when the thread was created, including bounded line counts for untracked text files. Tool groups
-show the latest operation while collapsed, and `apply_patch` details render a colored unified diff.
-The tools drawer can archive the current thread through app-server `thread/archive`; Git commit is
-not exposed.
-A lightweight incremental activity poll updates the running/idle indicator every 1.5 seconds and
-reloads messages only when the rollout changed and the reader is at the bottom; it does not poll
-the full conversation. Message text is rendered as safe Markdown. Automatically inserted transcript
-deltas, environment and instruction blocks, memory citations, and complete attachment groups are
-transferred as compact summaries; opening a summary fetches its full content on demand. Tool calls
-are likewise grouped below their preceding assistant message: the initial page includes only names,
-status, and short previews, while nested expansion loads full arguments and results.
-`exec_command` wrappers are reduced to their command and execution options; `apply_patch` wrappers
-are shown as edited file lists with added/deleted line counts and expose the full patch only after
-expansion. Session titles skip injected blocks. The HTML response disables browser caching so a
-restarted daemon is reflected by the next reload; the same policy and Basic Auth checks apply to
-the separately served JavaScript and CSS assets.
+## Web UI behavior
+
+The embedded UI is designed to stay responsive even with a large task history:
+
+- It fetches a compact project index first, sessions 50 at a time for expanded projects, and 30
+  messages at a time for the selected task. Older messages are prepended by cursor.
+- Nested working directories are grouped under their nearest Git repository root. Internal
+  `subagent` and command-policy guardian rollouts are excluded from user-facing counts.
+- A lightweight activity poll checks incremental rollout state every 1.5 seconds. Full conversation
+  pages reload only when the rollout changed and the reader is at the bottom.
+- Large injected contexts and attachments are transferred as summaries and fetched only when
+  expanded. Tool calls initially contain only status, counts, and a short semantic preview.
+
+The composer exposes explicit **Follow up** and **Queue** modes. Submitted text stays visible while
+it is pending, and deleting a remembered item restores its text to the composer. Deleting a queued
+item first cancels the corresponding app-server queue entry. A follow-up requested without an
+active turn is safely converted to a queued send.
+
+The status row compares the working tree with the Git SHA captured when the task was created,
+including bounded counts for untracked text files. Collapsed tool groups keep an animated current
+operation until the whole turn completes; completed groups summarize tool and edited-file counts.
+`apply_patch` expands into a colored unified diff, `web__run` shows concise search titles, and
+`write_stdin` is presented as **Waiting for output**. The tools drawer can archive the current task;
+Git commit is intentionally not exposed.
+
+The interface defaults to English. The button beside **Status** switches between English and
+Simplified Chinese and persists the selection in browser `localStorage`. The mobile layout uses a
+single conversation column, project and tool drawers, touch-sized controls, safe-area padding, and
+an independently scrolling message pane.
+
+Message Markdown is rendered safely. Session titles skip injected blocks, and the HTML, JavaScript,
+and CSS responses disable browser caching so a restarted daemon appears on the next reload.
 
 The UI exposes the same typed request set as `codexctl`, including explicit session selection,
 send, steer, interrupt, approval commands, scroll, and allowlisted host execution. A one-shot

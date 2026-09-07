@@ -1,6 +1,13 @@
 # Codex Bridge Web UI
 
-The browser UI is built with Vite and embedded into the `codex-bridge` Rust binary.
+This is the mobile-friendly browser client for `codex-bridge`. It lets an authenticated user read
+Codex Desktop tasks, follow live activity, steer or queue messages, inspect tool output and diffs,
+and archive tasks without operating the Electron window directly. It is not a standalone backend;
+all data and control requests go through the bridge daemon.
+
+## Development
+
+The frontend is built with Vite and embedded into the `codex-bridge` Rust binary.
 
 ```sh
 npm ci
@@ -14,3 +21,10 @@ The development server proxies `/api` to the default bridge address at
 `dist/` is checked in because Rust uses `include_str!` to package these deterministic asset
 names into the executable. Run `npm run build` after changing `index.html` or anything under
 `src/`.
+
+## Language support
+
+The interface defaults to English. The button beside **Status** switches between English and
+Simplified Chinese and stores the choice in browser `localStorage` under
+`codex-bridge.language.v1`. Static labels and dynamic task, tool, queue, model, usage, and Git status
+messages use the same translation layer.

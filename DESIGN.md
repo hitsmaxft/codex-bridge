@@ -1,5 +1,10 @@
 # codex-bridge — Turning the Codex App into a CLI
 
+> **Implementation note:** this document records the original architecture and exploration path.
+> The running service now uses rollout files for structured history and the app-server bundled in
+> ChatGPT.app for live task control inside Desktop's writer boundary. CDP remains a reserved path,
+> not the primary deployed transport. See [README.md](README.md) for current behavior and setup.
+
 ## Goal
 
 Wrap the running Codex App (macOS ChatGPT.app / Codex Desktop) into a stable CLI/RPC service. It uses a hybrid **state layer + UI control layer** approach — **not** pure keyboard/mouse simulation.
