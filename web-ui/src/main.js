@@ -43,12 +43,40 @@ async function toggleLanguage() {
   if (state.current) await openThread(state.current, { quiet: true });
 }
 async function loadProjects() {
-  const r = await command({ command: "projects", include_archived: $("archived").checked }, false);
+  const [r] = await Promise.all([
+    command({ command: "projects", include_archived: $("archived").checked }, false),
+    loadPins(),
+  ]);
   state.projects = r.projects || [];
   state.projectThreads.clear();
   state.expanded.clear();
   renderProjects();
   if (!state.current && state.projects.length) await toggleProject(state.projects[0], true);
+}
+async function loadPins() {
+  if (!state.directAppServer) {
+    state.pinAvailable = false;
+    state.pinnedIds.clear();
+    return;
+  }
+  try {
+    const result = await command({ command: "thread_pins" }, false),
+      ids = Array.isArray(result.thread_ids) ? result.thread_ids : [];
+    state.pinAvailable = Boolean(result.available);
+    state.pinnedIds = new Set(ids);
+    const ranks = new Map(ids.map((id, rank) => [id, rank]));
+    for (const data of state.projectThreads.values()) {
+      for (const thread of data.threads) thread.pinned = state.pinnedIds.has(thread.id);
+      data.threads.sort(
+        (left, right) =>
+          (ranks.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+          (ranks.get(right.id) ?? Number.MAX_SAFE_INTEGER),
+      );
+    }
+  } catch {
+    state.pinAvailable = false;
+    state.pinnedIds.clear();
+  }
 }
 async function loadProjectThreads(project, offset = 0) {
   const r = await command(
@@ -80,6 +108,23 @@ async function toggleProject(project, autoOpen = false) {
   if (!threads) threads = await loadProjectThreads(project);
   else renderProjects();
   if (autoOpen && !state.current && threads.length) await openThread(threads[0]);
+}
+async function toggleThreadPin(project, thread) {
+  if (!state.pinAvailable || state.pinBusy.has(thread.id)) return;
+  const pinned = !thread.pinned;
+  state.pinBusy.add(thread.id);
+  renderProjects();
+  try {
+    await command({ command: "thread_pin", thread_id: thread.id, pinned }, false);
+    if (pinned) state.pinnedIds.add(thread.id);
+    else state.pinnedIds.delete(thread.id);
+    await loadPins();
+    await loadProjectThreads(project);
+    notify(tr(pinned ? "sessionPinned" : "sessionUnpinned"));
+  } finally {
+    state.pinBusy.delete(thread.id);
+    renderProjects();
+  }
 }
 function renderProjects() {
   const q = $("search").value.trim().toLowerCase(),
@@ -126,13 +171,30 @@ function renderProjects() {
       list.innerHTML = `<div class="empty" style="padding:8px">${tr("openToLoad")}</div>`;
     } else {
       for (const t of data.threads) {
+        const row = document.createElement("div");
+        row.className = `thread-row${state.pinAvailable && !t.archived ? "" : " no-pin"}`;
         const b = document.createElement("button");
         b.className = "thread" + (state.current?.id === t.id ? " active" : "");
         b.innerHTML = '<div class="thread-name"></div><div class="thread-meta"></div>';
         b.children[0].textContent = t.title || t.id;
         b.children[1].textContent = `${t.git_branch || tr("noBranch")} · ${timeText(t.updated_at_ms, getLanguage() === "zh" ? "zh-CN" : "en")}${t.archived ? ` · ${tr("archived")}` : ""}`;
         b.onclick = () => openThread(t);
-        list.appendChild(b);
+        row.appendChild(b);
+        if (state.pinAvailable && !t.archived) {
+          const pin = document.createElement("button"),
+            label = tr(t.pinned ? "unpinSession" : "pinSession");
+          pin.className = `thread-pin${t.pinned ? " pinned" : ""}`;
+          pin.type = "button";
+          pin.innerHTML =
+            '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6Zm3 11v7" /></svg>';
+          pin.title = label;
+          pin.setAttribute("aria-label", label);
+          pin.setAttribute("aria-pressed", String(Boolean(t.pinned)));
+          pin.disabled = state.pinBusy.has(t.id);
+          pin.onclick = () => run(() => toggleThreadPin(p, t));
+          row.appendChild(pin);
+        }
+        list.appendChild(row);
       }
       if (data.threads.length < data.available) {
         const more = document.createElement("button");
@@ -530,13 +592,13 @@ function pendingNode(entry) {
   body.className = "message-body";
   body.appendChild(markdownNode(entry.text));
   const labels = {
-      queueing: tr("queueing"),
-      steering: tr("steering"),
-      queued: state.usageUnavailable ? tr("queuedRecovering") : tr("queuedWaiting"),
-      steered: tr("steeredWaiting"),
-      accepted: tr("serverAccepted"),
-      processing: tr("handoffProcessing"),
-      failed: tr("sendFailed"),
+      queueing: tr("queueingShort"),
+      steering: tr("steeringShort"),
+      queued: tr("queuedShort"),
+      steered: tr("steeredShort"),
+      accepted: tr("acceptedShort"),
+      processing: tr("processingShort"),
+      failed: tr("failedShort"),
     },
     actions = document.createElement("div"),
     status = document.createElement("div"),
@@ -544,7 +606,15 @@ function pendingNode(entry) {
   actions.className = "outbox-actions";
   status.className = "outbox-status";
   status.textContent = labels[entry.status] || entry.status;
-  if (entry.error) status.title = entry.error;
+  status.title =
+    entry.error ||
+    {
+      queued: state.usageUnavailable ? tr("queuedRecovering") : tr("queuedWaiting"),
+      steered: tr("steeredWaiting"),
+      accepted: tr("serverAccepted"),
+      processing: tr("handoffProcessing"),
+    }[entry.status] ||
+    status.textContent;
   actions.appendChild(status);
   if (!entry.handoff) {
     const remove = document.createElement("button");
@@ -867,6 +937,7 @@ function renderModelOptions() {
 }
 function renderWorkspaceDiff(summary) {
   const button = $("workspaceDiff");
+  button.hidden = Boolean(summary.clean);
   button.classList.toggle("dirty", !summary.clean);
   if (summary.clean) {
     button.textContent = tr("diffClean");
@@ -904,6 +975,7 @@ async function refreshWorkspaceDiff(force = false) {
     renderWorkspaceDiff(summary);
   } catch (error) {
     if (state.current?.id !== threadId) return;
+    button.hidden = false;
     button.classList.remove("dirty");
     button.textContent = error.message.startsWith("not_git_repository")
       ? tr("notGit")

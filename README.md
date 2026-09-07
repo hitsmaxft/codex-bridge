@@ -11,11 +11,11 @@ local tool without scraping the Desktop window or creating a competing writer fo
 
 - **Structured task access:** list projects and sessions, read paginated conversation history,
   inspect tool calls, approvals, usage, activity, and the Git diff from the task's creation SHA.
-- **Safe task control:** send, queue, steer, interrupt, archive, and update thread settings through
+- **Safe task control:** send, queue, steer, interrupt, pin, archive, and update thread settings through
   the bundled app-server used by Desktop. Targets are explicit; write commands never guess from
   file modification time.
 - **A mobile-friendly Web UI:** follow active work, restore queued or steered text, inspect rendered
-  patch diffs, and switch between English and Chinese from an authenticated browser.
+  patch diffs, pin tasks, and switch between English and Chinese from an authenticated browser.
 - **A small automation surface:** `codexctl` and the JSON-lines daemon protocol expose the same
   operations for scripts without coupling them to Electron DOM details.
 
@@ -30,6 +30,9 @@ its evidence limits.
 
 The private browser UI keeps task history, tool activity, the creation-SHA Git diff, usage, model
 selection, and Steer/Queue controls available from a phone without replacing Codex Desktop.
+Pinned tasks stay synchronized through app-server's native pinned section; the bridge never edits
+Codex's SQLite state directly. Clean worktrees omit the Git status label, while delivery state uses
+compact, background-free text beside queued messages.
 
 ```text
 codexctl / Web UI / local clients

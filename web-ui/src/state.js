@@ -34,6 +34,9 @@ function loadDrafts() {
 export const state = {
   projects: [],
   projectThreads: new Map(),
+  pinAvailable: false,
+  pinnedIds: new Set(),
+  pinBusy: new Set(),
   expanded: new Set(),
   current: null,
   creatingProject: null,

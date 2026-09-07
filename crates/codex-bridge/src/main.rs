@@ -38,6 +38,7 @@ const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/c
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
 const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
 const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
+const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
@@ -1122,6 +1123,52 @@ fn project_id_for_path(result: &Value, project_path: &Path) -> Option<String> {
     })
 }
 
+fn pinned_thread_ids(write_backend: &CodexCliBackend) -> Result<Vec<String>, BackendFailure> {
+    let mut ids = Vec::new();
+    let mut cursor = None::<String>;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        let result = write_backend.app_server_rpc(
+            "thread/list",
+            json!({
+                "cursor": cursor,
+                "limit": 100,
+                "modelProviders": [],
+                "sectionId": PINNED_THREAD_SECTION_ID,
+                "sortKey": "section_position",
+                "sortDirection": "asc",
+                "useStateDbOnly": true,
+            }),
+        )?;
+        let data = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| BackendFailure {
+                code: "app_server_protocol_error",
+                message: "thread/list returned no pinned thread data".to_owned(),
+            })?;
+        ids.extend(
+            data.iter()
+                .filter_map(|thread| thread.get("id").and_then(Value::as_str).map(str::to_owned)),
+        );
+        let Some(next) = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            break;
+        };
+        if !seen_cursors.insert(next.clone()) {
+            return Err(BackendFailure {
+                code: "app_server_protocol_error",
+                message: "thread/list repeated its pinned-thread cursor".to_owned(),
+            });
+        }
+        cursor = Some(next);
+    }
+    Ok(ids)
+}
+
 fn dispatch(
     request: Request,
     socket_path: &Path,
@@ -1248,11 +1295,19 @@ fn dispatch(
                     "project_threads limit must be between 1 and 200",
                 );
             }
+            let pinned = if write_backend.app_server_socket().is_some_and(|socket| {
+                fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket())
+            }) {
+                pinned_thread_ids(write_backend).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             match session_store.list_project_threads(
                 &project_path,
                 include_archived,
                 offset as usize,
                 limit as usize,
+                &pinned,
             ) {
                 Ok((threads, available)) => {
                     let returned = threads.len();
@@ -1641,6 +1696,39 @@ fn dispatch(
                         "backend": "app_server_thread_archive",
                     }))
                 }
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::ThreadPins => match pinned_thread_ids(write_backend) {
+            Ok(thread_ids) => Response::success(json!({
+                "available": true,
+                "section_id": PINNED_THREAD_SECTION_ID,
+                "thread_ids": thread_ids,
+            })),
+            Err(error) => write_backend_error(error),
+        },
+        Request::ThreadPin { thread_id, pinned } => {
+            let thread = match thread_by_id(session_store, &thread_id) {
+                Ok(thread) => thread,
+                Err(response) => return response,
+            };
+            match write_backend.app_server_rpc(
+                "thread/section/move",
+                json!({
+                    "threadId": thread.id,
+                    "sectionId": if pinned {
+                        Some(PINNED_THREAD_SECTION_ID)
+                    } else {
+                        None::<&str>
+                    },
+                    "beforeThreadId": Value::Null,
+                }),
+            ) {
+                Ok(_) => Response::success(json!({
+                    "action": "thread_pin",
+                    "thread_id": thread.id,
+                    "pinned": pinned,
+                })),
                 Err(error) => write_backend_error(error),
             }
         }
@@ -3143,6 +3231,8 @@ mod tests {
             "thread_create",
             "thread_settings_update",
             "thread_archive",
+            "thread_pins",
+            "thread_pin",
             "workspace_diff",
             "select",
             "current",

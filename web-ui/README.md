@@ -2,8 +2,12 @@
 
 This is the mobile-friendly browser client for `codex-bridge`. It lets an authenticated user read
 Codex Desktop tasks, follow live activity, steer or queue messages, inspect tool output and diffs,
-and archive tasks without operating the Electron window directly. It is not a standalone backend;
-all data and control requests go through the bridge daemon.
+and pin or archive tasks without operating the Electron window directly. When direct app-server
+access is available, pins use the same native pinned section as Codex Desktop. It is not a
+standalone backend; all data and control requests go through the bridge daemon.
+
+Clean Git states are hidden. Queued-message delivery uses compact, background-free status text in
+the empty lane beside the message, with its withdrawal action arranged vertically underneath.
 
 The composer uses a single compact **Steer/Queue** button. Clicking it switches how the next
 message is delivered without consuming space for two side-by-side controls.

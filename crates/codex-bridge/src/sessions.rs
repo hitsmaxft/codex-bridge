@@ -117,6 +117,8 @@ pub struct ProjectThreadSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub archived: bool,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -282,12 +284,24 @@ impl SessionStore {
         include_archived: bool,
         offset: usize,
         limit: usize,
+        pinned_thread_ids: &[String],
     ) -> Result<(Vec<ProjectThreadSummary>, usize)> {
         let mut threads = self
             .cached_threads(include_archived)?
             .into_iter()
             .filter(|thread| project_root_for_cwd(&thread.cwd) == project_path)
             .collect::<Vec<_>>();
+        let pinned_ranks = pinned_thread_ids
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (id.as_str(), rank))
+            .collect::<HashMap<_, _>>();
+        threads.sort_by_key(|thread| {
+            pinned_ranks
+                .get(thread.id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         let available = threads.len();
         if offset >= available {
             return Ok((Vec::new(), available));
@@ -298,7 +312,13 @@ impl SessionStore {
         Ok((
             threads
                 .into_iter()
-                .map(ProjectThreadSummary::from)
+                .map(|thread| {
+                    let pinned = pinned_ranks.contains_key(thread.id.as_str());
+                    ProjectThreadSummary {
+                        pinned,
+                        ..ProjectThreadSummary::from(thread)
+                    }
+                })
                 .collect(),
             available,
         ))
@@ -536,6 +556,7 @@ impl From<ThreadSummary> for ProjectThreadSummary {
             updated_at_ms: thread.updated_at_ms,
             source: thread.source,
             archived: thread.archived,
+            pinned: false,
         }
     }
 }
@@ -1275,10 +1296,12 @@ mod tests {
         assert_eq!(projects[0].thread_count, 2);
 
         let (threads, available) = store
-            .list_project_threads(&projects[0].path, false, 0, 1)
+            .list_project_threads(&projects[0].path, false, 0, 1, &["thread-one".to_owned()])
             .unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(available, 2);
+        assert_eq!(threads[0].id, "thread-one");
+        assert!(threads[0].pinned);
         assert_ne!(threads[0].cwd, projects[0].path);
     }
 

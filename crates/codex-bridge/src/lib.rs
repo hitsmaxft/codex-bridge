@@ -21,7 +21,7 @@ pub use write_backend::{
     BackendFailure, BackendSuccess, CodexCliBackend, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +75,11 @@ pub enum Request {
     },
     ThreadArchive {
         thread_id: String,
+    },
+    ThreadPins,
+    ThreadPin {
+        thread_id: String,
+        pinned: bool,
     },
     WorkspaceDiff {
         thread_id: String,
@@ -144,6 +149,8 @@ impl Request {
             Self::ThreadCreate { .. } => "thread_create",
             Self::ThreadSettingsUpdate { .. } => "thread_settings_update",
             Self::ThreadArchive { .. } => "thread_archive",
+            Self::ThreadPins => "thread_pins",
+            Self::ThreadPin { .. } => "thread_pin",
             Self::WorkspaceDiff { .. } => "workspace_diff",
             Self::Select { .. } => "select",
             Self::Current => "current",
@@ -348,6 +355,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(archive["command"], "thread_archive");
+
+        let pins = serde_json::to_value(Request::ThreadPins).unwrap();
+        assert_eq!(pins["command"], "thread_pins");
+
+        let pin = serde_json::to_value(Request::ThreadPin {
+            thread_id: "thread-1".into(),
+            pinned: true,
+        })
+        .unwrap();
+        assert_eq!(pin["command"], "thread_pin");
+        assert_eq!(pin["thread_id"], "thread-1");
+        assert_eq!(pin["pinned"], true);
 
         let diff = serde_json::to_value(Request::WorkspaceDiff {
             thread_id: "thread-1".into(),

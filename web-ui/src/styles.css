@@ -368,6 +368,38 @@ aside {
   background: transparent;
   border-radius: 7px;
 }
+.thread-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 2px;
+}
+.thread-row.no-pin {
+  grid-template-columns: minmax(0, 1fr);
+}
+.thread-pin {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+}
+.thread-pin svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.thread-pin.pinned {
+  color: var(--accent);
+}
 .thread.active {
   background: var(--panel2);
   box-shadow: inset 3px 0 var(--accent);
@@ -691,48 +723,25 @@ main {
 .transient-status {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin: 2px 0 17px;
-  padding: 7px 10px;
-  border: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
-  border-radius: 18px;
-  background: color-mix(in srgb, var(--panel2) 88%, transparent);
-  color: var(--muted);
-  font-size: 12px;
-  cursor: pointer;
-  transition:
-    border-color 0.16s ease,
-    background 0.16s ease,
-    color 0.16s ease;
-}
-.transient-status:hover {
-  border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
-  background: color-mix(in srgb, var(--panel2) 76%, var(--accent) 8%);
-  color: var(--text);
-}
-.transient-status[data-phase="processing"] {
   gap: 5px;
   margin: 0 0 10px;
   padding: 1px 2px;
   border: 0;
   background: transparent;
-  box-shadow: none;
+  color: var(--muted);
   font-size: 10px;
+  cursor: pointer;
+  transition: color 0.16s ease;
 }
-.transient-status[data-phase="processing"]::before {
-  width: 9px;
-  height: 9px;
-  border-width: 1px;
-}
-.transient-status[data-phase="processing"]:hover {
+.transient-status:hover {
   background: transparent;
   color: var(--muted);
 }
 .transient-status::before {
   content: "";
-  width: 13px;
-  height: 13px;
-  border: 1.5px solid currentColor;
+  width: 9px;
+  height: 9px;
+  border: 1px solid currentColor;
   border-right-color: transparent;
   border-radius: 50%;
   animation: status-spin 1.1s linear infinite;
@@ -774,49 +783,58 @@ main {
 }
 .outbox-item {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
+  grid-template-columns: minmax(44px, auto) minmax(0, 1fr);
+  align-items: end;
+  gap: 6px;
   width: fit-content;
   max-width: min(88%, 680px);
-  padding: 5px 9px;
+  padding: 0;
   border: 0;
-  border-radius: 18px;
-  background: var(--user-bg);
+  background: transparent;
 }
 .outbox-item .message-body {
-  padding: 0;
+  padding: 5px 9px;
+  border-radius: 18px;
+  background: var(--user-bg);
 }
 .outbox-item .markdown {
   color: var(--user-text);
 }
 .outbox-item.handoff {
+  border: 0;
+  box-shadow: none;
+}
+.outbox-item.handoff .message-body {
   border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
   box-shadow: 0 4px 14px #0000000d;
 }
 .outbox-actions {
   display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 4px;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 0;
   min-width: 0;
+  padding-bottom: 2px;
 }
 .outbox-actions .outbox-status {
-  max-width: min(34vw, 180px);
+  max-width: 86px;
   margin-top: 0;
   overflow: hidden;
   font-size: 10px;
-  line-height: 14px;
+  line-height: 13px;
+  text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .outbox-delete {
-  min-height: 22px;
+  min-height: 18px;
   padding: 0 4px;
   border-color: transparent;
   background: transparent;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
+  line-height: 16px;
 }
 .outbox-delete:hover {
   color: var(--danger);
