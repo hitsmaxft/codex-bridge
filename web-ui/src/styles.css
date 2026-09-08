@@ -283,6 +283,68 @@ aside {
 .settings-value.version-mismatch {
   color: var(--danger);
 }
+.component-status {
+  display: grid;
+  gap: 5px;
+  margin: 0 0 10px;
+}
+.component-status:empty {
+  display: none;
+}
+.component-status-title {
+  margin: 1px 0 2px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+.component-entry {
+  border-top: 1px solid var(--line);
+}
+.component-entry summary {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 1px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 11px;
+}
+.component-entry summary::-webkit-details-marker {
+  display: none;
+}
+.component-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.component-state {
+  color: var(--muted);
+  font-size: 10px;
+}
+.component-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.component-entry.running .component-dot {
+  background: var(--accent);
+}
+.component-entry.failed .component-dot {
+  background: var(--danger);
+}
+.component-detail {
+  padding: 0 1px 8px 15px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.component-detail div + div {
+  margin-top: 3px;
+}
 .filters {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -854,14 +916,9 @@ main {
   display: none;
 }
 .outbox-tray.compact {
-  max-height: 34px;
-  overflow: hidden;
   cursor: pointer;
 }
-.outbox-tray.compact .outbox-item:not(:last-child) {
-  display: none;
-}
-.outbox-tray.compact > .outbox-item:last-child {
+.outbox-tray.compact > .outbox-item {
   grid-template-columns: minmax(0, 1fr);
   width: min(88%, 680px);
 }

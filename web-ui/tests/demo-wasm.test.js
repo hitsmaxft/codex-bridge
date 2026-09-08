@@ -35,7 +35,9 @@ function result(response) {
 
 test("compiled demo WASM supports refresh and active-run interruption", async () => {
   const command = await demoClient();
-  assert.equal(result(command({ command: "status" })).demo, true);
+  const status = result(command({ command: "status" }));
+  assert.equal(status.demo, true);
+  assert.equal(status.managed_services.app_server.status.running, true);
 
   const before = result(
     command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
@@ -141,8 +143,8 @@ test("mobile composer stays out of the message grid sizing flow", async () => {
   assert.doesNotMatch(mobile, /\.composer\s*\{[^}]*grid-row:\s*2;/s);
   assert.doesNotMatch(source, /textarea\.blur\(\)/);
   assert.match(source, /syncOutboxCompactLabel/);
-  assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-item:not\(:last-child\)/);
-  assert.match(stylesheet, /\.outbox-tray\.compact > \.outbox-item:last-child/);
+  assert.doesNotMatch(stylesheet, /\.outbox-tray\.compact \.outbox-item:not\(:last-child\)/);
+  assert.match(stylesheet, /\.outbox-tray\.compact > \.outbox-item\s*\{/);
   assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-actions/);
 });
 

@@ -1,0 +1,31 @@
+# auto preserves the legacy behavior. Installations should normally choose
+# desktop on macOS with Codex Desktop, or standalone for an external app-server.
+mode = "auto"
+
+# Paths may be absolute or start with ~/.
+# socket = "~/.codex-bridge/control.sock"
+# codex_home = "~/.codex"
+# codex_bin = "/absolute/path/to/codex"
+# app_server_socket = "~/.codex-bridge/app-server.sock"
+app_server_thread_cache = 3
+# host_exec_policy = "~/.config/codex-bridge/host-exec-policy.json"
+
+[web_ui]
+enabled = false
+listen = "127.0.0.1:18791"
+user = "codex"
+# password_file = "~/.codex-bridge/web-ui-password"
+no_auth = false
+public_origins = []
+
+[services]
+# When enabled, codex-bridge starts and restarts `codex app-server` itself.
+manage_app_server = false
+# Desktop mode can also supervise ws-unix-bridge and publish the launchd URL.
+desktop_interposition = false
+ws_bridge_listen = "127.0.0.1:18790"
+# ws_bridge_bin = "~/.cargo/bin/ws-unix-bridge"
+# Optional environment passed only to the managed app-server child.
+# [services.app_server_environment]
+# HTTPS_PROXY = "http://127.0.0.1:7897"
+# HTTP_PROXY = "http://127.0.0.1:7897"

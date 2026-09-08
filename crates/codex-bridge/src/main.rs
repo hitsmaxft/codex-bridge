@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -20,7 +21,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use codex_bridge::{
     default_codex_home, default_socket_path, BackendFailure, CodexCliBackend, ComposerAttachment,
     HostExecFailure, HostExecutor, Request, Response, SessionStore, ThreadMessage, ThreadSummary,
@@ -33,7 +34,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::process::Command as TokioCommand;
+use tokio::sync::{mpsc, watch};
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_WEB_REQUEST_BYTES: usize = 12 * 1024 * 1024;
@@ -46,6 +48,7 @@ const MAX_DOWNLOAD_TICKETS: usize = 128;
 const WEB_SESSION_COOKIE: &str = "codex_bridge_session";
 const WEB_SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
+const DEFAULT_WS_BRIDGE_ADDR: &str = "127.0.0.1:18790";
 const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
 const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
@@ -54,8 +57,23 @@ const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Local bridge daemon for Codex Desktop")]
+#[command(
+    version,
+    about = "Local Web UI and control bridge for Codex app-server"
+)]
 struct Args {
+    /// Read service settings from this TOML file.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
+    config: Option<PathBuf>,
+
+    /// Do not load the default user configuration file.
+    #[arg(long)]
+    no_config: bool,
+
+    /// Select automatic, Codex Desktop, or standalone app-server defaults.
+    #[arg(long, value_enum)]
+    mode: Option<RuntimeMode>,
+
     /// Override the control socket path.
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
@@ -74,36 +92,124 @@ struct Args {
     app_server_socket: Option<PathBuf>,
 
     /// Maximum number of recently viewed threads kept subscribed on the app-server connection.
-    #[arg(long, value_name = "COUNT", default_value_t = 3, value_parser = parse_thread_cache_limit)]
-    app_server_thread_cache: usize,
+    #[arg(long, value_name = "COUNT", value_parser = parse_thread_cache_limit)]
+    app_server_thread_cache: Option<usize>,
 
     /// JSON policy replacing the built-in host-exec allowlist.
     #[arg(long, value_name = "PATH")]
     host_exec_policy: Option<PathBuf>,
 
     /// Start the HTTP Web UI.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_web_ui")]
     web_ui: bool,
 
+    /// Disable a Web UI enabled by the configuration file.
+    #[arg(long)]
+    no_web_ui: bool,
+
     /// Address for the optional Web UI.
-    #[arg(long, value_name = "IP:PORT", default_value = DEFAULT_WEB_UI_ADDR)]
-    web_ui_listen: SocketAddr,
+    #[arg(long, value_name = "IP:PORT")]
+    web_ui_listen: Option<SocketAddr>,
 
     /// Username for HTTP Basic Auth.
-    #[arg(long, value_name = "USER", default_value = "codex")]
-    web_ui_user: String,
+    #[arg(long, value_name = "USER")]
+    web_ui_user: Option<String>,
 
     /// Read the HTTP Basic Auth password from a same-user mode-0600 file.
     #[arg(long, value_name = "PATH")]
     web_ui_password_file: Option<PathBuf>,
 
     /// Disable Web UI authentication. Only allowed with a loopback listener.
-    #[arg(long, requires = "web_ui")]
+    #[arg(long, conflicts_with = "web_ui_auth")]
     web_ui_no_auth: bool,
+
+    /// Require Web UI authentication even when config.toml disables it.
+    #[arg(long)]
+    web_ui_auth: bool,
 
     /// Exact HTTPS origin allowed through a trusted reverse proxy. May be repeated.
     #[arg(long, value_name = "HTTPS_ORIGIN")]
     web_ui_public_origin: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeMode {
+    #[default]
+    Auto,
+    Desktop,
+    Standalone,
+}
+
+impl RuntimeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Desktop => "desktop",
+            Self::Standalone => "standalone",
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeFileConfig {
+    mode: Option<RuntimeMode>,
+    socket: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    codex_bin: Option<PathBuf>,
+    app_server_socket: Option<PathBuf>,
+    app_server_thread_cache: Option<usize>,
+    host_exec_policy: Option<PathBuf>,
+    #[serde(default)]
+    web_ui: WebUiFileConfig,
+    #[serde(default)]
+    services: ServiceFileConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebUiFileConfig {
+    enabled: Option<bool>,
+    listen: Option<SocketAddr>,
+    user: Option<String>,
+    password_file: Option<PathBuf>,
+    no_auth: Option<bool>,
+    public_origins: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceFileConfig {
+    manage_app_server: Option<bool>,
+    desktop_interposition: Option<bool>,
+    ws_bridge_listen: Option<SocketAddr>,
+    ws_bridge_bin: Option<PathBuf>,
+    app_server_environment: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug)]
+struct RuntimeArgs {
+    mode: RuntimeMode,
+    config_path: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    socket_uses_default: bool,
+    codex_home: Option<PathBuf>,
+    codex_bin: Option<PathBuf>,
+    app_server_socket: Option<PathBuf>,
+    app_server_thread_cache: usize,
+    host_exec_policy: Option<PathBuf>,
+    web_ui: bool,
+    web_ui_listen: SocketAddr,
+    web_ui_user: String,
+    web_ui_password_file: Option<PathBuf>,
+    web_ui_no_auth: bool,
+    web_ui_public_origin: Vec<String>,
+    manage_app_server: bool,
+    desktop_interposition: bool,
+    ws_bridge_listen: SocketAddr,
+    ws_bridge_bin: Option<PathBuf>,
+    app_server_environment: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -115,6 +221,13 @@ struct BridgeState {
     selected_thread: Arc<RwLock<Option<String>>>,
     pending_messages: Arc<PendingMessages>,
     app_server_tools: Arc<AppServerToolCache>,
+    runtime_mode: RuntimeMode,
+    config_path: Option<PathBuf>,
+    manage_app_server: bool,
+    desktop_interposition: bool,
+    ws_bridge_listen: Option<SocketAddr>,
+    managed_app_server_status: Option<watch::Receiver<ManagedProcessStatus>>,
+    ws_bridge_status: Option<watch::Receiver<ManagedProcessStatus>>,
 }
 
 #[derive(Clone)]
@@ -313,6 +426,13 @@ impl PendingMessages {
         if let Ok(mut entries) = self.entries.write() {
             entries.retain(|entry| entry.id != id || entry.thread_id != thread_id);
         }
+    }
+
+    fn finish_steer(&self, id: &str, thread_id: &str) {
+        // A successful turn/steer response means app-server has consumed the
+        // input. It is no longer withdrawable, so do not wait for rollout
+        // reconciliation before removing it from the local outbox.
+        self.dismiss(id, thread_id);
     }
 }
 
@@ -612,9 +732,429 @@ fn parse_thread_cache_limit(value: &str) -> std::result::Result<usize, String> {
         .ok_or_else(|| "thread cache size must be between 1 and 64".to_owned())
 }
 
+fn default_config_path() -> Option<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
+        .map(|root| root.join("codex-bridge/config.toml"))
+}
+
+fn expand_home_path(path: PathBuf) -> PathBuf {
+    let Some(path_text) = path.to_str() else {
+        return path;
+    };
+    if path_text == "~" {
+        return env::var_os("HOME").map(PathBuf::from).unwrap_or(path);
+    }
+    let Some(relative) = path_text.strip_prefix("~/") else {
+        return path;
+    };
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(relative))
+        .unwrap_or(path)
+}
+
+fn read_bridge_config(args: &Args) -> Result<(Option<PathBuf>, BridgeFileConfig)> {
+    if args.no_config {
+        return Ok((None, BridgeFileConfig::default()));
+    }
+    let explicit = args.config.is_some();
+    let Some(path) = args.config.clone().or_else(default_config_path) else {
+        return Ok((None, BridgeFileConfig::default()));
+    };
+    let path = expand_home_path(path);
+    let encoded = match fs::read_to_string(&path) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == ErrorKind::NotFound && !explicit => {
+            return Ok((None, BridgeFileConfig::default()));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let config =
+        toml::from_str(&encoded).with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok((Some(path), config))
+}
+
+fn mode_app_server_socket(mode: RuntimeMode) -> Option<PathBuf> {
+    match mode {
+        RuntimeMode::Auto => None,
+        RuntimeMode::Desktop => env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|home| home.join(".codex-bridge/bundled-app-server.sock")),
+        RuntimeMode::Standalone => env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".codex-bridge"))
+            })
+            .map(|root| root.join("codex-app-server.sock")),
+    }
+}
+
+fn resolve_args(args: Args) -> Result<RuntimeArgs> {
+    let (config_path, config) = read_bridge_config(&args)?;
+    let mode = args.mode.or(config.mode).unwrap_or_default();
+    let app_server_thread_cache = args
+        .app_server_thread_cache
+        .or(config.app_server_thread_cache)
+        .unwrap_or(3);
+    parse_thread_cache_limit(&app_server_thread_cache.to_string())
+        .map_err(|message| anyhow::anyhow!(message))?;
+
+    let socket_env = env::var_os(SOCKET_ENV).filter(|value| !value.is_empty());
+    let socket_uses_default =
+        args.socket.is_none() && socket_env.is_none() && config.socket.is_none();
+    let socket = args
+        .socket
+        .or_else(|| socket_env.map(PathBuf::from))
+        .or(config.socket)
+        .map(expand_home_path);
+    let codex_home = args
+        .codex_home
+        .or_else(|| {
+            env::var_os("CODEX_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or(config.codex_home)
+        .map(expand_home_path);
+    let codex_bin = args
+        .codex_bin
+        .or_else(|| {
+            env::var_os(CODEX_BIN_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or(config.codex_bin)
+        .map(expand_home_path)
+        .or_else(|| match mode {
+            RuntimeMode::Desktop => Some(PathBuf::from(DESKTOP_CODEX_PATH)),
+            RuntimeMode::Standalone => Some(PathBuf::from("codex")),
+            RuntimeMode::Auto => None,
+        });
+    let app_server_socket = args
+        .app_server_socket
+        .or_else(|| {
+            env::var_os(APP_SERVER_SOCKET_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or(config.app_server_socket)
+        .map(expand_home_path)
+        .or_else(|| mode_app_server_socket(mode));
+    let host_exec_policy = args
+        .host_exec_policy
+        .or_else(|| {
+            env::var_os(HOST_EXEC_POLICY_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or(config.host_exec_policy)
+        .map(expand_home_path);
+    let web_ui_public_origin = if args.web_ui_public_origin.is_empty() {
+        config.web_ui.public_origins.unwrap_or_default()
+    } else {
+        args.web_ui_public_origin
+    };
+    let manage_app_server = config.services.manage_app_server.unwrap_or(false);
+    let desktop_interposition = config.services.desktop_interposition.unwrap_or(false);
+    if desktop_interposition && !matches!(mode, RuntimeMode::Desktop) {
+        bail!("services.desktop_interposition requires mode = \"desktop\"");
+    }
+    if manage_app_server && app_server_socket.is_none() {
+        bail!(
+            "services.manage_app_server requires an app-server socket or a concrete runtime mode"
+        );
+    }
+
+    Ok(RuntimeArgs {
+        mode,
+        config_path,
+        socket,
+        socket_uses_default,
+        codex_home,
+        codex_bin,
+        app_server_socket,
+        app_server_thread_cache,
+        host_exec_policy,
+        web_ui: if args.web_ui {
+            true
+        } else if args.no_web_ui {
+            false
+        } else {
+            config.web_ui.enabled.unwrap_or(false)
+        },
+        web_ui_listen: args
+            .web_ui_listen
+            .or(config.web_ui.listen)
+            .unwrap_or_else(|| {
+                DEFAULT_WEB_UI_ADDR
+                    .parse()
+                    .expect("valid default Web UI address")
+            }),
+        web_ui_user: args
+            .web_ui_user
+            .or(config.web_ui.user)
+            .unwrap_or_else(|| "codex".to_owned()),
+        web_ui_password_file: args
+            .web_ui_password_file
+            .or(config.web_ui.password_file)
+            .map(expand_home_path),
+        web_ui_no_auth: if args.web_ui_no_auth {
+            true
+        } else if args.web_ui_auth {
+            false
+        } else {
+            config.web_ui.no_auth.unwrap_or(false)
+        },
+        web_ui_public_origin,
+        manage_app_server,
+        desktop_interposition,
+        ws_bridge_listen: config.services.ws_bridge_listen.unwrap_or_else(|| {
+            DEFAULT_WS_BRIDGE_ADDR
+                .parse()
+                .expect("valid WS bridge address")
+        }),
+        ws_bridge_bin: config.services.ws_bridge_bin.map(expand_home_path),
+        app_server_environment: config.services.app_server_environment.unwrap_or_default(),
+    })
+}
+
+#[derive(Debug)]
+struct ManagedProcessSpec {
+    name: &'static str,
+    program: PathBuf,
+    args: Vec<OsString>,
+    environment: HashMap<String, String>,
+    remove_environment: Vec<OsString>,
+    socket_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct ManagedProcessStatus {
+    running: bool,
+    restart_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+fn spawn_managed_process(
+    spec: ManagedProcessSpec,
+    shutdown: watch::Receiver<bool>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    watch::Receiver<ManagedProcessStatus>,
+) {
+    let (status_tx, status_rx) = watch::channel(ManagedProcessStatus::default());
+    let task = tokio::spawn(supervise_managed_process(spec, shutdown, status_tx));
+    (task, status_rx)
+}
+
+async fn supervise_managed_process(
+    spec: ManagedProcessSpec,
+    mut shutdown: watch::Receiver<bool>,
+    status_tx: watch::Sender<ManagedProcessStatus>,
+) {
+    let mut backoff = Duration::from_millis(500);
+    let mut restart_count = 0_u64;
+    let mut last_error = None;
+    while !*shutdown.borrow() {
+        if let Some(path) = spec.socket_path.as_deref() {
+            if let Err(error) = prepare_managed_process_socket(path).await {
+                restart_count = restart_count.saturating_add(1);
+                last_error = Some(error.to_string());
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: last_error.clone(),
+                });
+                eprintln!(
+                    "[codex-bridge] cannot prepare managed {} socket: {error:#}",
+                    spec.name
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = shutdown.changed() => return,
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(10));
+                continue;
+            }
+        }
+        eprintln!(
+            "[codex-bridge] starting managed {}: {}",
+            spec.name,
+            spec.program.display()
+        );
+        let mut command = TokioCommand::new(&spec.program);
+        command.args(&spec.args).envs(&spec.environment);
+        for name in &spec.remove_environment {
+            command.env_remove(name);
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                restart_count = restart_count.saturating_add(1);
+                last_error = Some(error.to_string());
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: last_error.clone(),
+                });
+                eprintln!(
+                    "[codex-bridge] failed to start managed {}: {error}",
+                    spec.name
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = shutdown.changed() => return,
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(10));
+                continue;
+            }
+        };
+        status_tx.send_replace(ManagedProcessStatus {
+            running: true,
+            restart_count,
+            last_error: last_error.clone(),
+        });
+        let started = Instant::now();
+        tokio::select! {
+            child_result = child.wait() => {
+                restart_count = restart_count.saturating_add(1);
+                let message = match child_result {
+                    Ok(exit_status) => format!("process exited with {exit_status}"),
+                    Err(error) => format!("failed to wait for process: {error}"),
+                };
+                last_error = Some(message.clone());
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: last_error.clone(),
+                });
+                eprintln!("[codex-bridge] managed {} {message}", spec.name);
+            }
+            _ = shutdown.changed() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error,
+                });
+                return;
+            }
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            backoff = Duration::from_millis(500);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown.changed() => return,
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+async fn prepare_managed_process_socket(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    if !metadata.file_type().is_socket() {
+        bail!("refusing to replace non-socket path {}", path.display());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "refusing to replace socket not owned by this user: {}",
+            path.display()
+        );
+    }
+    let mut connected = false;
+    for attempt in 0..3 {
+        connected = UnixStream::connect(path).await.is_ok();
+        if !connected {
+            break;
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    if connected {
+        bail!("another process is already listening on {}", path.display());
+    }
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove stale socket {}", path.display()))?;
+    Ok(())
+}
+
+fn default_ws_bridge_bin() -> Result<PathBuf> {
+    let current = env::current_exe().context("failed to resolve the codex-bridge executable")?;
+    let parent = current
+        .parent()
+        .context("codex-bridge executable has no parent directory")?;
+    Ok(parent.join("ws-unix-bridge"))
+}
+
+async fn configure_desktop_interposition(listen: SocketAddr) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let ws_url = format!("ws://{listen}/rpc");
+        let status = TokioCommand::new("launchctl")
+            .args(["setenv", "CODEX_APP_SERVER_WS_URL", &ws_url])
+            .status()
+            .await
+            .context("failed to run launchctl setenv CODEX_APP_SERVER_WS_URL")?;
+        if !status.success() {
+            bail!("launchctl setenv CODEX_APP_SERVER_WS_URL failed with {status}");
+        }
+        let status = TokioCommand::new("launchctl")
+            .args(["unsetenv", "CODEX_APP_SERVER_USE_LOCAL_DAEMON"])
+            .status()
+            .await
+            .context("failed to run launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON")?;
+        if !status.success() {
+            bail!("launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON failed with {status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = listen;
+        bail!("services.desktop_interposition is supported only on macOS")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = resolve_args(Args::parse())?;
+    println!(
+        "codex-bridge runtime mode={} config={}",
+        args.mode.as_str(),
+        args.config_path
+            .as_deref()
+            .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+    );
     let codex_home = match args.codex_home.clone() {
         Some(path) => path,
         None => default_codex_home()?,
@@ -628,22 +1168,71 @@ async fn main() -> Result<()> {
                 .map(PathBuf::from)
         })
         .unwrap_or_else(default_codex_program);
-    let app_server_socket = args.app_server_socket.clone().or_else(|| {
-        env::var_os(APP_SERVER_SOCKET_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    });
+    let app_server_socket = args.app_server_socket.clone();
     let session_store = Arc::new(SessionStore::new(codex_home));
     let write_backend = Arc::new(CodexCliBackend::new_with_thread_cache(
-        codex_program,
-        app_server_socket,
+        codex_program.clone(),
+        app_server_socket.clone(),
         args.app_server_thread_cache,
     ));
-    let host_exec_policy = args.host_exec_policy.or_else(|| {
-        env::var_os(HOST_EXEC_POLICY_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    });
+    let (managed_shutdown_tx, managed_shutdown_rx) = watch::channel(false);
+    let mut managed_tasks = Vec::new();
+    let mut managed_app_server_status = None;
+    let mut ws_bridge_status = None;
+    if args.manage_app_server {
+        let socket = app_server_socket
+            .as_deref()
+            .context("managed app-server has no configured socket")?;
+        let listen = OsString::from(format!("unix://{}", socket.display()));
+        let spec = ManagedProcessSpec {
+            name: "app-server",
+            program: codex_program.clone(),
+            args: vec![
+                OsString::from("app-server"),
+                OsString::from("--listen"),
+                listen,
+            ],
+            environment: args.app_server_environment.clone(),
+            remove_environment: vec![
+                OsString::from("CODEX_APP_SERVER_WS_URL"),
+                OsString::from("CODEX_APP_SERVER_USE_LOCAL_DAEMON"),
+            ],
+            socket_path: Some(socket.to_owned()),
+        };
+        let (task, status) = spawn_managed_process(spec, managed_shutdown_rx.clone());
+        managed_tasks.push(task);
+        managed_app_server_status = Some(status);
+    }
+    if args.desktop_interposition {
+        if !args.ws_bridge_listen.ip().is_loopback() {
+            bail!("services.ws_bridge_listen must use a loopback address");
+        }
+        let ws_bridge_bin = match args.ws_bridge_bin.clone() {
+            Some(path) => path,
+            None => default_ws_bridge_bin()?,
+        };
+        let socket = app_server_socket
+            .as_deref()
+            .context("Desktop interposition has no configured app-server socket")?;
+        let spec = ManagedProcessSpec {
+            name: "ws-unix-bridge",
+            program: ws_bridge_bin,
+            args: vec![
+                OsString::from("--listen"),
+                OsString::from(args.ws_bridge_listen.to_string()),
+                OsString::from("--upstream-socket"),
+                socket.as_os_str().to_owned(),
+            ],
+            environment: HashMap::new(),
+            remove_environment: Vec::new(),
+            socket_path: None,
+        };
+        let (task, status) = spawn_managed_process(spec, managed_shutdown_rx.clone());
+        managed_tasks.push(task);
+        ws_bridge_status = Some(status);
+        configure_desktop_interposition(args.ws_bridge_listen).await?;
+    }
+    let host_exec_policy = args.host_exec_policy;
     let host_executor = Arc::new(
         HostExecutor::load(host_exec_policy.as_deref())
             .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?,
@@ -651,10 +1240,7 @@ async fn main() -> Result<()> {
     let selected_thread = Arc::new(RwLock::new(None));
     let pending_messages = Arc::new(PendingMessages::default());
     let app_server_tools = Arc::new(AppServerToolCache::default());
-    let secure_existing_parent = args.socket.is_none()
-        && env::var_os(SOCKET_ENV)
-            .filter(|value| !value.is_empty())
-            .is_none();
+    let secure_existing_parent = args.socket_uses_default;
     let socket_path = match args.socket {
         Some(path) => path,
         None => default_socket_path()?,
@@ -686,6 +1272,13 @@ async fn main() -> Result<()> {
         selected_thread,
         pending_messages,
         app_server_tools,
+        runtime_mode: args.mode,
+        config_path: args.config_path.clone(),
+        manage_app_server: args.manage_app_server,
+        desktop_interposition: args.desktop_interposition,
+        ws_bridge_listen: args.desktop_interposition.then_some(args.ws_bridge_listen),
+        managed_app_server_status,
+        ws_bridge_status,
     };
     let hot_cache_task = spawn_hot_session_cache(
         Arc::clone(&session_store),
@@ -755,6 +1348,10 @@ async fn main() -> Result<()> {
     }
     if let Some(hot_cache_task) = hot_cache_task {
         hot_cache_task.abort();
+    }
+    managed_shutdown_tx.send_replace(true);
+    for task in managed_tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     Ok(())
@@ -1480,14 +2077,15 @@ async fn web_events(
     if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    let backend = Arc::clone(&state.bridge.write_backend);
+    let bridge = state.bridge.clone();
     upgrade
-        .on_upgrade(move |socket| web_event_socket(socket, backend))
+        .on_upgrade(move |socket| web_event_socket(socket, bridge))
         .into_response()
 }
 
-async fn web_event_socket(socket: WebSocket, backend: Arc<CodexCliBackend>) {
+async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
     let (mut sender, mut receiver) = socket.split();
+    let backend = Arc::clone(&bridge.write_backend);
     let Some(mut events) = backend.subscribe_app_server_events() else {
         let _ = sender
             .send(AxumWsMessage::Text(
@@ -1506,6 +2104,20 @@ async fn web_event_socket(socket: WebSocket, backend: Arc<CodexCliBackend>) {
             json!({"type": "bridge_event_stream", "status": "ready"})
                 .to_string()
                 .into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if sender
+        .send(AxumWsMessage::Text(
+            json!({
+                "type": "bridge_service_snapshot",
+                "managed_services": managed_services_snapshot(&bridge),
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .is_err()
@@ -1531,6 +2143,9 @@ async fn web_event_socket(socket: WebSocket, backend: Arc<CodexCliBackend>) {
             return;
         }
     }
+    let mut service_snapshot = tokio::time::interval(Duration::from_secs(3));
+    service_snapshot.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    service_snapshot.tick().await;
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -1549,6 +2164,15 @@ async fn web_event_socket(socket: WebSocket, backend: Arc<CodexCliBackend>) {
                 match message {
                     Some(Ok(AxumWsMessage::Close(_))) | None | Some(Err(_)) => break,
                     _ => {}
+                }
+            }
+            _ = service_snapshot.tick() => {
+                let event = json!({
+                    "type": "bridge_service_snapshot",
+                    "managed_services": managed_services_snapshot(&bridge),
+                });
+                if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
+                    break;
                 }
             }
         }
@@ -2288,6 +2912,32 @@ fn overlay_app_server_tools(
     replaced
 }
 
+fn managed_services_snapshot(state: &BridgeState) -> Value {
+    let disabled = ManagedProcessStatus::default();
+    let app_server = state
+        .managed_app_server_status
+        .as_ref()
+        .map(|status| status.borrow().clone())
+        .unwrap_or_else(|| disabled.clone());
+    let ws_bridge = state
+        .ws_bridge_status
+        .as_ref()
+        .map(|status| status.borrow().clone())
+        .unwrap_or(disabled);
+    json!({
+        "app_server": {
+            "enabled": state.manage_app_server,
+            "listen": state.write_backend.app_server_socket(),
+            "status": app_server,
+        },
+        "desktop_interposition": {
+            "enabled": state.desktop_interposition,
+            "listen": state.ws_bridge_listen,
+            "status": ws_bridge,
+        },
+    })
+}
+
 fn dispatch(request: Request, state: &BridgeState) -> Response {
     let socket_path = state.socket_path.as_path();
     let session_store = state.session_store.as_ref();
@@ -2324,6 +2974,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             "status": "ready",
             "protocol_version": PROTOCOL_VERSION,
             "socket": socket_path,
+            "configuration": {
+                "mode": state.runtime_mode.as_str(),
+                "path": state.config_path.as_deref(),
+                "loaded": state.config_path.is_some(),
+            },
+            "managed_services": managed_services_snapshot(state),
             "rollout_store": {
                 "available": session_store.is_available(),
                 "codex_home": session_store.home(),
@@ -3170,7 +3826,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             );
             match write_backend.steer_via_app_server(&resolved.thread.id, &turn_id, &input) {
                 Ok(backend) => {
-                    pending_messages.finish(&pending_id, "steered", None);
+                    pending_messages.finish_steer(&pending_id, &resolved.thread.id);
                     Response::success(json!({
                         "action": "steer",
                         "status": "steered",
@@ -4344,6 +5000,133 @@ mod tests {
     }
 
     #[test]
+    fn user_config_selects_runtime_mode_and_web_ui_defaults() {
+        let root = unique_test_dir("bridge-config");
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+mode = "standalone"
+app_server_thread_cache = 7
+
+[web_ui]
+enabled = true
+listen = "127.0.0.1:19091"
+user = "remote"
+no_auth = true
+public_origins = ["https://codex.example.com"]
+
+[services]
+manage_app_server = true
+
+[services.app_server_environment]
+HTTPS_PROXY = "http://127.0.0.1:7897"
+"#,
+        )
+        .unwrap();
+        let args =
+            Args::try_parse_from(["codex-bridge", "--config", config_path.to_str().unwrap()])
+                .unwrap();
+        let resolved = resolve_args(args).unwrap();
+        assert!(matches!(resolved.mode, RuntimeMode::Standalone));
+        assert_eq!(resolved.config_path.as_deref(), Some(config_path.as_path()));
+        assert_eq!(resolved.app_server_thread_cache, 7);
+        assert!(resolved.web_ui);
+        assert_eq!(resolved.web_ui_listen, "127.0.0.1:19091".parse().unwrap());
+        assert_eq!(resolved.web_ui_user, "remote");
+        assert!(resolved.web_ui_no_auth);
+        assert_eq!(resolved.web_ui_public_origin, ["https://codex.example.com"]);
+        assert!(resolved.manage_app_server);
+        assert!(!resolved.desktop_interposition);
+        assert_eq!(
+            resolved
+                .app_server_environment
+                .get("HTTPS_PROXY")
+                .map(String::as_str),
+            Some("http://127.0.0.1:7897")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn command_line_overrides_user_config() {
+        let root = unique_test_dir("bridge-config-override");
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            "mode = \"standalone\"\napp_server_thread_cache = 7\n[web_ui]\nenabled = true\nlisten = \"127.0.0.1:19091\"\nno_auth = true\n",
+        )
+        .unwrap();
+        let args = Args::try_parse_from([
+            "codex-bridge",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--mode",
+            "desktop",
+            "--app-server-thread-cache",
+            "5",
+            "--web-ui-listen",
+            "127.0.0.1:19092",
+            "--no-web-ui",
+            "--web-ui-auth",
+        ])
+        .unwrap();
+        let resolved = resolve_args(args).unwrap();
+        assert!(matches!(resolved.mode, RuntimeMode::Desktop));
+        assert_eq!(resolved.app_server_thread_cache, 5);
+        assert_eq!(resolved.web_ui_listen, "127.0.0.1:19092".parse().unwrap());
+        assert!(!resolved.web_ui);
+        assert!(!resolved.web_ui_no_auth);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_process_stops_with_the_daemon() {
+        let spec = ManagedProcessSpec {
+            name: "test-child",
+            program: PathBuf::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from("exec /bin/sleep 30")],
+            environment: HashMap::new(),
+            remove_environment: Vec::new(),
+            socket_path: None,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (task, mut status) = spawn_managed_process(spec, shutdown_rx);
+        tokio::time::timeout(Duration::from_secs(1), status.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.borrow().running);
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.borrow().running);
+    }
+
+    #[tokio::test]
+    async fn managed_socket_cleanup_rejects_live_owner_and_removes_stale_socket() {
+        let root = unique_test_dir("managed-socket");
+        fs::create_dir_all(&root).unwrap();
+        let active_socket = root.join("active.sock");
+        let active_listener = tokio::net::UnixListener::bind(&active_socket).unwrap();
+        assert!(prepare_managed_process_socket(&active_socket)
+            .await
+            .is_err());
+        drop(active_listener);
+        fs::remove_file(active_socket).unwrap();
+
+        let stale_socket = root.join("stale.sock");
+        drop(tokio::net::UnixListener::bind(&stale_socket).unwrap());
+        prepare_managed_process_socket(&stale_socket).await.unwrap();
+        assert!(!stale_socket.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn native_queue_text_summarizes_multimodal_inputs() {
         assert_eq!(
             queue_input_text(&json!([
@@ -4571,6 +5354,16 @@ mod tests {
     }
 
     #[test]
+    fn consumed_steer_is_removed_without_waiting_for_rollout_reconciliation() {
+        let pending = PendingMessages::default();
+        let id = pending.begin("thread-1", "follow-up", "steer", 12);
+
+        pending.finish_steer(&id, "thread-1");
+
+        assert!(pending.entries.read().unwrap().is_empty());
+    }
+
+    #[test]
     fn app_server_queue_reconciliation_preserves_server_id_and_removes_cancelled_entries() {
         let pending = PendingMessages::default();
         let local_id = pending.begin("thread-1", "queued text", "queue", -1);
@@ -4787,6 +5580,9 @@ mod tests {
             "role=\"status\" aria-live=\"polite\"",
             "id=\"languageBtn\"",
             "id=\"settingsPanel\"",
+            "id=\"componentStatus\"",
+            "bridge_service_snapshot",
+            "renderManagedServices",
             "github.com/hitsmaxft/codex-bridge",
             "setComposerSubmitting",
             "submit-stop",
@@ -4836,7 +5632,7 @@ mod tests {
         assert!(source.contains("background: var(--code-bg)"));
         assert_eq!(source.matches(".message.user {").count(), 1);
         assert_eq!(source.matches(".composer-shell {").count(), 2);
-        assert_eq!(source.matches(".outbox-item {").count(), 1);
+        assert_eq!(source.matches("\n.outbox-item {").count(), 1);
         assert!(!source.contains("--mobile-code"));
         assert!(!source.contains("project-path"));
         assert!(!source.contains("max-height: min(52dvh, 480px)"));

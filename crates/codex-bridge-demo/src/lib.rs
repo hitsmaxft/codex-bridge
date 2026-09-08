@@ -328,6 +328,10 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "protocol_version": 18,
+            "managed_services": {
+                "app_server": {"enabled": true, "status": {"running": true, "restart_count": 0}},
+                "desktop_interposition": {"enabled": false, "listen": null, "status": {"running": false, "restart_count": 0}}
+            },
             "rollout_store": {"available": true, "codex_home": "/demo/.codex", "read_only": true},
             "selected_thread_id": PRIMARY_THREAD,
             "write_backend": {"app_server_available": true, "app_server_mode": "demo_wasm", "standalone_fallback": false}

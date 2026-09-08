@@ -1,385 +1,220 @@
-# Installation and service setup
+# Installation and user services
 
-This guide installs `codex-bridge` as a global Cargo service with its production Web UI embedded
-in the executable. It then covers the two runtime topologies:
+`codex-bridge` can install entirely within one user account. The installer builds the embedded
+Vite frontend, installs the Rust binaries with Cargo, writes
+`~/.config/codex-bridge/config.toml`, and installs one launchd or systemd user service. It never
+requires `sudo` and does not modify the signed Codex Desktop application.
 
-| Environment                     | App-server                       | Processes to run                     | `ws-unix-bridge` |
-| ------------------------------- | -------------------------------- | ------------------------------------ | ---------------- |
-| macOS with Codex Desktop        | CLI bundled in `ChatGPT.app`     | app-server, adapter, bridge, Desktop | Required         |
-| Linux, or macOS without Desktop | Open-source standalone Codex CLI | app-server and bridge                | Not used         |
+| Platform                 | Mode         | App-server                     | User service manager | Adapter          |
+| ------------------------ | ------------ | ------------------------------ | -------------------- | ---------------- |
+| macOS with Codex Desktop | `desktop`    | Bundled in `ChatGPT.app`       | launchd user agent   | `ws-unix-bridge` |
+| Linux without Desktop    | `standalone` | Open-source `codex app-server` | systemd user service | Not needed       |
 
-The app-server supports stdio, Unix-socket, and WebSocket transports. This project uses a local
-Unix socket for bridge RPC. See the
-[official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server) for protocol
-and transport details.
+The bridge reads its runtime choices from the config file and can supervise the selected
+app-server itself. In macOS desktop mode it can also supervise `ws-unix-bridge` and publish the
+Desktop connection URL. Service definitions therefore start only
+`codex-bridge --config /absolute/path/config.toml`; process topology, Web UI, sockets, and runtime
+mode no longer need to be duplicated in launchd or systemd arguments.
 
-## 1. Build and install the global commands
+## Quick installation
 
 Requirements:
 
-- a current stable Rust toolchain with Cargo;
-- Node.js and npm, used once to build the Vite frontend;
-- a Codex runtime: `ChatGPT.app` for the macOS Desktop topology, or a recent standalone `codex`
-  executable whose `codex app-server --help` lists `unix://` transport support.
+- current stable Rust and Cargo;
+- Node.js and npm for the one-time frontend build;
+- macOS: `/Applications/ChatGPT.app` with its bundled `codex` executable;
+- Linux: a standalone `codex` on `PATH` whose `app-server --help` supports a Unix listener.
 
-Clone the repository, build the production frontend first, then install the daemon and CLI:
+Clone the repository and run the platform installer as the target user:
 
 ```sh
 git clone https://github.com/hitsmaxft/codex-bridge.git
 cd codex-bridge
 
-npm --prefix web-ui ci
-npm --prefix web-ui run build
+# macOS with Codex Desktop
+./scripts/install-macos.sh
 
-CARGO_TARGET_DIR="$PWD/target" CARGO_INCREMENTAL=0 \
-  cargo install --locked --path crates/codex-bridge
-CARGO_TARGET_DIR="$PWD/target" CARGO_INCREMENTAL=0 \
-  cargo install --locked --path crates/codexctl
+# Linux with standalone Codex
+./scripts/install-linux.sh
 ```
 
-When using Codex Desktop on macOS, also install its transport adapter:
+Pass `--web-ui` to enable a password-protected Web UI on `127.0.0.1:18791`. The installer creates
+a private password file but prints only its path. Pass `--no-start` to install files without
+loading or enabling services:
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target" CARGO_INCREMENTAL=0 \
-  cargo install --locked --path crates/codex-gui-bridge --bin ws-unix-bridge
+./scripts/install-macos.sh --web-ui
+./scripts/install-linux.sh --web-ui --no-start
 ```
 
-Reusing the checkout's `target` directory avoids separate Cargo build caches for each package.
-Cargo installs the executables into `${CARGO_HOME:-$HOME/.cargo}/bin`; put that directory on `PATH`
-for interactive use and use its absolute path in service-manager configuration.
+Both scripts:
 
-The files in `web-ui/dist` are compiled into `codex-bridge` with `include_str!`. A globally
-installed daemon therefore serves the frontend without a source checkout, Node.js, or a runtime
-assets directory. Rebuild `web-ui/dist` before `cargo install` whenever frontend source changed.
+1. run `npm ci` and build `web-ui/dist`;
+2. reuse the checkout's `target` directory with `CARGO_INCREMENTAL=0`;
+3. install `codex-bridge` and `codexctl` under `${CARGO_HOME:-$HOME/.cargo}/bin`;
+4. preserve an existing config file instead of overwriting local changes;
+5. install and optionally start user-owned services.
 
-Confirm the installed artifacts without starting a service:
+The macOS script also installs `ws-unix-bridge`. The Linux script deliberately does not install or
+start the Desktop adapter.
 
-```sh
-codex-bridge --version
-codexctl --version
+## Configuration
 
-# macOS Desktop topology only
-ws-unix-bridge --version
+The default path is `${XDG_CONFIG_HOME:-$HOME/.config}/codex-bridge/config.toml`. Start from
+[`../config.example.toml`](../config.example.toml) when configuring manually.
+
+```toml
+mode = "desktop" # auto, desktop, or standalone
+codex_bin = "/Applications/ChatGPT.app/Contents/Resources/codex"
+app_server_socket = "~/.codex-bridge/bundled-app-server.sock"
+app_server_thread_cache = 3
+
+[web_ui]
+enabled = true
+listen = "127.0.0.1:18791"
+user = "codex"
+password_file = "~/.codex-bridge/web-ui-password"
+no_auth = false
+public_origins = []
+
+[services]
+manage_app_server = true
+desktop_interposition = true
+ws_bridge_listen = "127.0.0.1:18790"
+ws_bridge_bin = "~/.cargo/bin/ws-unix-bridge"
+
+# Optional proxy or other variables for only the app-server child:
+[services.app_server_environment]
+HTTPS_PROXY = "http://127.0.0.1:7897"
+HTTP_PROXY = "http://127.0.0.1:7897"
 ```
 
-`cargo install` does not install Codex Desktop or the standalone Codex CLI. It installs only this
-repository's bridge processes.
+Paths in the TOML file may be absolute or start with `~/`. Unknown fields and invalid values stop
+startup with the config filename in the error instead of being ignored.
 
-For an update, pull the desired revision, rebuild the frontend, and repeat the applicable install
-commands with `--force`.
+Configuration precedence is:
 
-## 2. Prepare private runtime state
-
-Both topologies use a private directory for the daemon socket and app-server socket:
-
-```sh
-install -d -m 700 "$HOME/.codex-bridge"
+```text
+command-line option > environment variable > config.toml > selected-mode default
 ```
 
-The optional Web UI normally requires a regular password file owned by the current user and
-inaccessible to group and other users:
+Existing launch scripts remain compatible. Use `--config PATH` for another file, `--no-config` to
+retain legacy argument-only behavior, or `--mode auto|desktop|standalone` for a one-off mode
+override. `--web-ui`/`--no-web-ui` and `--web-ui-no-auth`/`--web-ui-auth` provide explicit boolean
+overrides.
 
-```sh
-umask 077
-printf '%s\n' 'replace-with-a-long-random-password' > \
-  "$HOME/.codex-bridge/web-ui-password"
-chmod 600 "$HOME/.codex-bridge/web-ui-password"
+Mode defaults apply only when a path was not set explicitly:
+
+- `desktop` selects the Codex executable bundled in `ChatGPT.app` and
+  `~/.codex-bridge/bundled-app-server.sock`;
+- `standalone` selects `codex` and `$XDG_RUNTIME_DIR/codex-app-server.sock` (falling back to
+  `~/.codex-bridge/codex-app-server.sock`);
+- `auto` preserves the previous behavior and does not invent an app-server endpoint.
+
+`services.manage_app_server = true` makes the bridge start, stop, and restart the selected
+`codex app-server` child. `services.desktop_interposition = true` is valid only in `desktop` mode;
+it also supervises `ws-unix-bridge` and sets `CODEX_APP_SERVER_WS_URL` in the user's launchd
+environment. Leave both false when another service manager owns those processes.
+`services.app_server_environment` is passed only to the managed app-server; the daemon removes
+Desktop interposition variables from that child to avoid a recursive connection.
+
+The Web UI status card reports each managed component's live state, restart count, listen endpoint,
+and most recent startup/exit error. The event WebSocket publishes a compact service snapshot every
+three seconds, so an open settings panel follows recovery without a page reload.
+
+### Web UI security
+
+The normal Web UI configuration requires a mode-`0600` password file. To place the loopback
+listener behind an authenticated same-host proxy, use:
+
+```toml
+[web_ui]
+enabled = true
+listen = "127.0.0.1:18791"
+no_auth = true
+public_origins = ["https://codex.example.com"]
 ```
 
-Do not enable authenticated `--web-ui` until this file exists. If a same-host reverse proxy already
-enforces authentication, `--web-ui-no-auth` may be used instead, but only with a loopback listener.
+Unauthenticated Web UI startup is rejected on non-loopback addresses. A direct LAN bind should
+retain bridge authentication, and cross-network access should use TLS or a VPN.
 
-## 3. macOS with Codex Desktop
+## macOS Desktop topology
 
-### Why Desktop needs transport interposition
+The installer creates one file, `~/Library/LaunchAgents/local.codex-bridge.daemon.plist`, which
+starts the bridge with only `--config`. The daemon owns the bundled app-server and WS adapter child
+processes and writes their diagnostics to its log under
+`${XDG_STATE_HOME:-$HOME/.local/state}/codex-bridge`. All files are owned by the current user.
 
-Desktop normally owns a private app-server connection. To let Desktop and `codex-bridge` address
-the same app-server instance, start the Codex executable bundled in `ChatGPT.app` on a Unix socket,
-forward a loopback TCP WebSocket to that socket, and launch Desktop with:
+Fully quit ChatGPT before installation or before changing this topology. After installation,
+relaunch it so the new process inherits:
 
 ```text
 CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc
 ```
 
-`CODEX_APP_SERVER_USE_LOCAL_DAEMON` must be absent. This changes only the startup environment and
-transport route; it does not modify the signed app bundle.
-
-Fully quit ChatGPT before changing this route. Closing a window is not enough because an existing
-process will retain its old environment.
-
-### Verify the topology manually
-
-Use three terminals. First start the bundled app-server, explicitly removing the variables meant
-for Desktop so the server cannot recursively connect to its own adapter:
-
-```sh
-env -u CODEX_APP_SERVER_WS_URL -u CODEX_APP_SERVER_USE_LOCAL_DAEMON \
-  /Applications/ChatGPT.app/Contents/Resources/codex app-server \
-  --listen "unix://$HOME/.codex-bridge/bundled-app-server.sock"
-```
-
-Start the transport adapter:
-
-```sh
-ws-unix-bridge \
-  --listen 127.0.0.1:18790 \
-  --upstream-socket "$HOME/.codex-bridge/bundled-app-server.sock"
-```
-
-Start the bridge daemon:
-
-```sh
-codex-bridge \
-  --codex-bin /Applications/ChatGPT.app/Contents/Resources/codex \
-  --app-server-socket "$HOME/.codex-bridge/bundled-app-server.sock" \
-  --app-server-thread-cache 3
-```
-
-Finally, start a new Desktop process with the intercepted WebSocket URL:
-
-```sh
-env -u CODEX_APP_SERVER_USE_LOCAL_DAEMON \
-  CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc \
-  /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
-```
-
-Do not use `open -a ChatGPT` for this manual test: macOS may reuse an already-running process that
-did not inherit the variable.
-
-### Keep the services running with launchd
-
-Use user LaunchAgents under `~/Library/LaunchAgents`. `launchd` does not expand `$HOME` inside
-`ProgramArguments`, so replace every example with an absolute path. Keep logs under a directory the
-user owns, such as `~/.codex`.
-
-The persistent setup contains four jobs:
-
-- `local.codex-bridge.app-server` runs a wrapper around the bundled app-server and owns
-  `/Users/YOU/.codex-bridge/bundled-app-server.sock`.
-- `local.codex-bridge.ws-adapter` runs the installed `ws-unix-bridge`, listening only on
-  `127.0.0.1:18790` and forwarding to the bundled Unix socket.
-- `local.codex-bridge.daemon` runs the installed `codex-bridge`, with both `--codex-bin` and
-  `--app-server-socket` set explicitly. This job also owns the optional Web UI.
-- `local.codex-bridge.desktop-env` runs a one-shot script that injects the WebSocket route into the
-  launchd user environment for newly launched Desktop processes.
-
-The app-server wrapper is important because user-domain launchd environment variables are
-inherited by services. Create a script such as `~/.local/bin/codex-bundled-app-server`:
-
-```sh
-#!/bin/sh
-unset CODEX_APP_SERVER_WS_URL
-unset CODEX_APP_SERVER_USE_LOCAL_DAEMON
-exec /Applications/ChatGPT.app/Contents/Resources/codex app-server \
-  --listen "unix://$HOME/.codex-bridge/bundled-app-server.sock"
-```
-
-Make both the app-server wrapper and Desktop environment script executable with `chmod 700`.
-
-The one-shot Desktop environment script should contain:
-
-```sh
-#!/bin/sh
-launchctl setenv CODEX_APP_SERVER_WS_URL "ws://127.0.0.1:18790/rpc"
-launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
-```
-
-Each long-running plist should set `RunAtLoad` and `KeepAlive` to `true`. The environment job uses
-`RunAtLoad=true` and `KeepAlive=false`. A minimal daemon plist has this shape; replace `YOU` and add
-the optional Web UI arguments described below when needed:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>local.codex-bridge.daemon</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Users/YOU/.cargo/bin/codex-bridge</string>
-    <string>--codex-bin</string>
-    <string>/Applications/ChatGPT.app/Contents/Resources/codex</string>
-    <string>--app-server-socket</string>
-    <string>/Users/YOU/.codex-bridge/bundled-app-server.sock</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key>
-  <string>/Users/YOU/.codex/codex-bridge.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/YOU/.codex/codex-bridge.log</string>
-</dict>
-</plist>
-```
-
-Use the same plist structure for the app-server wrapper and `ws-unix-bridge`, substituting the
-absolute executables and arguments from the manual startup commands. The environment job runs its
-script with `KeepAlive=false`. Validate each file before loading it:
-
-```sh
-plutil -lint "$HOME/Library/LaunchAgents/local.codex-bridge.daemon.plist"
-launchctl bootstrap gui/"$(id -u)" \
-  "$HOME/Library/LaunchAgents/local.codex-bridge.daemon.plist"
-```
-
-Bootstrap all four jobs in app-server, adapter, bridge, environment order. `bootstrap` is a
-one-time load operation and fails if the label is already loaded. Inspect or restart an installed
-job with `launchctl print`, `kickstart`, and `bootout` rather than bootstrapping duplicates.
-
-After the environment job has run, fully quit and relaunch Desktop. Confirm that the new process
-received the route:
+Verify without relying on a window being open:
 
 ```sh
 launchctl getenv CODEX_APP_SERVER_WS_URL
-launchctl getenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
 test -S "$HOME/.codex-bridge/bundled-app-server.sock"
 lsof -nP -iTCP:18790 -sTCP:LISTEN
-ps eww -p "$(pgrep -x ChatGPT | tail -1)" | tr ' ' '\n' | \
-  grep '^CODEX_APP_SERVER_'
+launchctl print "gui/$(id -u)/local.codex-bridge.daemon"
 codexctl status
 ```
 
-The URL should be present, the local-daemon flag should print nothing, the Unix socket and loopback
-listener should exist, and `codexctl status` should succeed.
-
-### Enable the Web UI in the launchd daemon
-
-Add these strings to the daemon plist's `ProgramArguments` array:
-
-```xml
-<string>--web-ui</string>
-<string>--web-ui-listen</string>
-<string>127.0.0.1:18791</string>
-<string>--web-ui-user</string>
-<string>codex</string>
-<string>--web-ui-password-file</string>
-<string>/Users/YOU/.codex-bridge/web-ui-password</string>
-```
-
-For a trusted LAN, replace the listen address with the host's LAN address or `0.0.0.0:PORT`. For an
-HTTPS reverse proxy, also repeat `--web-ui-public-origin` with each exact external origin. Public
-origins must use HTTPS and cannot contain a path, query, or fragment.
-
-When an authenticated proxy such as Cloudflare Access runs on the same host, replace the username
-and password-file arguments with `<string>--web-ui-no-auth</string>` and keep
-`--web-ui-listen` on `127.0.0.1`. The bridge rejects unauthenticated non-loopback listeners.
-
-### Disable Desktop interposition
-
-Quit Desktop, boot out the adapter and environment jobs, clear the variables, and then launch
-Desktop normally:
+To restart after editing `config.toml`:
 
 ```sh
-launchctl bootout gui/"$(id -u)" \
-  "$HOME/Library/LaunchAgents/local.codex-bridge.ws-adapter.plist"
-launchctl bootout gui/"$(id -u)" \
-  "$HOME/Library/LaunchAgents/local.codex-bridge.desktop-env.plist"
+launchctl kickstart -k "gui/$(id -u)/local.codex-bridge.daemon"
+```
+
+To disable Desktop interposition while retaining installed files, fully quit ChatGPT and run:
+
+```sh
+# Set desktop_interposition = false in config.toml, then restart the daemon.
+launchctl kickstart -k "gui/$(id -u)/local.codex-bridge.daemon"
 launchctl unsetenv CODEX_APP_SERVER_WS_URL
 launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
 ```
 
-Stopping the adapter does not imply that the app-server or bridge should be stopped; another local
-client or Web UI may still be using them.
+## Linux standalone topology
 
-## 4. Linux or macOS without Desktop
+The Linux installer creates only `~/.config/systemd/user/codex-bridge.service`. The bridge starts
+and supervises the standalone app-server selected by `mode = "standalone"`. There is no Desktop
+WebSocket interception and no `ws-unix-bridge`; both bridge and child run as the logged-in user and
+share the same Codex home directory.
 
-When Desktop is not part of the topology, run the open-source standalone app-server directly on a
-Unix socket and connect `codex-bridge` to it. There is no Desktop TCP WebSocket connection, no
-`CODEX_APP_SERVER_WS_URL`, and no reason to run `ws-unix-bridge`.
-
-Manual startup:
+Verify or inspect logs with:
 
 ```sh
-install -d -m 700 "$HOME/.codex-bridge"
-
-codex app-server \
-  --listen "unix://$HOME/.codex-bridge/app-server.sock"
-```
-
-In another terminal:
-
-```sh
-codex-bridge \
-  --codex-bin "$(command -v codex)" \
-  --app-server-socket "$HOME/.codex-bridge/app-server.sock"
-```
-
-Add the Web UI flags from the previous section to the `codex-bridge` command if required. The
-standalone app-server and bridge should use the same user and the same `CODEX_HOME` so task UUIDs,
-rollouts, queue state, and live turns refer to one account state directory.
-
-### systemd user services
-
-On Linux, `%t` is the private user runtime directory and `%h` is the home directory. First find the
-absolute standalone Codex path with `command -v codex`, then create
-`~/.config/systemd/user/codex-app-server.service`:
-
-```ini
-[Unit]
-Description=Codex standalone app-server
-
-[Service]
-ExecStart=/ABSOLUTE/PATH/TO/codex app-server --listen unix://%t/codex-app-server.sock
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-```
-
-Create `~/.config/systemd/user/codex-bridge.service`:
-
-```ini
-[Unit]
-Description=Local Codex bridge
-Requires=codex-app-server.service
-After=codex-app-server.service
-
-[Service]
-ExecStart=%h/.cargo/bin/codex-bridge \
-  --codex-bin /ABSOLUTE/PATH/TO/codex \
-  --app-server-socket %t/codex-app-server.sock
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-```
-
-To enable the Web UI, append `--web-ui`,
-`--web-ui-password-file %h/.codex-bridge/web-ui-password`, and any listen/public-origin arguments
-to the bridge's `ExecStart`.
-
-Load and validate both services:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now codex-app-server.service codex-bridge.service
-systemctl --user status codex-app-server.service codex-bridge.service
-journalctl --user -u codex-app-server.service -u codex-bridge.service -n 100
+systemctl --user status codex-bridge.service
+journalctl --user -u codex-bridge.service -n 100
 codexctl status
 ```
 
-If the bridge starts before the socket becomes available it returns explicit app-server errors for
-live RPC until the server is ready; rollout history remains readable. `Restart=on-failure` handles
-process failures, while normal app-server restarts do not require a bridge restart because each
-RPC opens a new Unix-socket connection.
+After editing `config.toml`:
 
-## 5. Network and ownership checks
+```sh
+systemctl --user restart codex-bridge.service
+```
 
-- Keep app-server and daemon Unix sockets private to the service user.
-- Keep `ws-unix-bridge` on `127.0.0.1`; it has no application-layer authentication.
-- The Web UI normally uses HTTP Basic Auth for the initial browser login, then a seven-day HttpOnly,
-  SameSite-strict session cookie backed by a private temporary token cache. `--web-ui-no-auth` is
-  limited to loopback and should only sit behind an authenticated same-host proxy. A non-loopback
-  bind exposes task history and write controls.
-- Exact HTTPS public origins are allowlisted; arbitrary forwarded `Host` and `Origin` values are
-  rejected.
-- Use one app-server instance for each live task writer boundary. Do not start a second resume
-  process against a task merely to make remote control work.
+systemd user services normally start when that user logs in. Running them before login requires
+administrator-controlled lingering policy; the installer intentionally does not change it.
 
-For deeper transport inspection, logs, protocol probes, and isolated test setup, see
-[../DEBUGGING.md](../DEBUGGING.md). For CLI usage after installation, see
-[`codexctl.md`](codexctl.md).
+## Updating
+
+Pull the desired revision and rerun the same installer. It replaces installed binaries and service
+definitions but preserves `config.toml` and an existing Web UI password. Installer flags only
+choose defaults when creating a config for the first time; edit the existing TOML to change Web UI
+or runtime settings:
+
+```sh
+git pull --ff-only
+./scripts/install-macos.sh   # or install-linux.sh
+```
+
+Confirm the effective startup selection in the service log. The bridge prints its mode and loaded
+config path before opening sockets.
+
+For command semantics see [`codexctl.md`](codexctl.md). For app-server methods, compatibility, and
+debugging boundaries see [`appserver.md`](appserver.md) and [the debugging guide](../DEBUGGING.md).

@@ -30,11 +30,80 @@ import {
 } from "./state.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
 
+function renderManagedServices() {
+  const root = $("componentStatus"),
+    services = state.managedServices;
+  if (!root) return;
+  const expanded = new Set(
+    [...root.querySelectorAll("details[open]")].map((entry) => entry.dataset.component),
+  );
+  root.textContent = "";
+  if (!services) return;
+  const heading = document.createElement("div");
+  heading.className = "component-status-title";
+  heading.textContent = tr("managedComponents");
+  root.appendChild(heading);
+  for (const [key, label, service] of [
+    ["app-server", tr("appServerComponent"), services.app_server],
+    ["ws-bridge", tr("wsBridgeComponent"), services.desktop_interposition],
+  ]) {
+    const status = service?.status || {},
+      enabled = Boolean(service?.enabled),
+      running = enabled && Boolean(status.running),
+      failed = enabled && !running && Boolean(status.last_error),
+      entry = document.createElement("details"),
+      summary = document.createElement("summary"),
+      dot = document.createElement("span"),
+      name = document.createElement("span"),
+      value = document.createElement("span"),
+      detail = document.createElement("div");
+    entry.className = `component-entry${running ? " running" : failed ? " failed" : ""}`;
+    entry.dataset.component = key;
+    entry.open = expanded.has(key);
+    dot.className = "component-dot";
+    name.className = "component-name";
+    name.textContent = label;
+    value.className = "component-state";
+    value.textContent = !enabled
+      ? tr("componentExternal")
+      : running
+        ? tr("componentRunning")
+        : tr("componentStopped");
+    detail.className = "component-detail";
+    if (enabled) {
+      const restart = document.createElement("div");
+      restart.textContent = tr("restartCount", { count: status.restart_count || 0 });
+      detail.appendChild(restart);
+    } else {
+      const ownership = document.createElement("div");
+      ownership.textContent = tr("componentExternalDetail");
+      detail.appendChild(ownership);
+    }
+    if (service?.listen) {
+      const listen = document.createElement("div");
+      listen.textContent = tr("listenAddress", { address: service.listen });
+      detail.appendChild(listen);
+    }
+    if (enabled) {
+      const error = document.createElement("div");
+      error.textContent = status.last_error
+        ? tr("lastStartupError", { error: status.last_error })
+        : tr("noStartupError");
+      detail.appendChild(error);
+    }
+    summary.append(dot, name, value);
+    entry.append(summary, detail);
+    root.appendChild(entry);
+  }
+}
+
 async function loadStatus() {
   const r = await command({ command: "status" }, false),
     backend = r.write_backend || {};
   state.directAppServer = Boolean(backend.app_server_available);
   state.appServerMode = backend.app_server_mode || null;
+  state.managedServices = r.managed_services || null;
+  renderManagedServices();
   const appServer = state.directAppServer
     ? tr("directOnline")
     : state.appServerMode === "desktop_bundled_only"
@@ -77,6 +146,7 @@ async function toggleLanguage() {
   renderProjects();
   renderPending();
   renderComposerAttachments();
+  renderManagedServices();
   showActivity();
   await loadStatus();
   if (state.current) await openThread(state.current, { quiet: true });
@@ -1568,6 +1638,11 @@ function handleBridgeEvent(event) {
     loadStatus().catch(() => {});
     return;
   }
+  if (event?.type === "bridge_service_snapshot") {
+    state.managedServices = event.managed_services || null;
+    renderManagedServices();
+    return;
+  }
   if (event?.type === "bridge_thread_activity_snapshot") {
     if (!Array.isArray(event.active_thread_ids)) return;
     state.updatingThreads.clear();
@@ -1989,11 +2064,6 @@ $("createCancelBtn").onclick = closeCreateDialog;
 $("createDialog").onclick = (event) => {
   if (event.target === $("createDialog")) closeCreateDialog();
 };
-$("selectBtn").onclick = () =>
-  run(async () => {
-    const r = await command(targetRequest("select"));
-    notify(tr("selected", { session: r.thread.title || r.thread.id }));
-  });
 function toggleSendModeAndKeepFocus() {
   setSendMode($("sendMode").value === "steer" ? "send" : "steer", false);
   $("messageText").focus({ preventScroll: true });

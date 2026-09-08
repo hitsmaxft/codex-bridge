@@ -1,6 +1,7 @@
-# Codex App Server WebUI
+# Codex App Server WebUI for Homelab and NAS
 
-Self-hosted Web UI and CLI bridge for OpenAI Codex app-server.
+Self-hosted Web UI and CLI control plane for OpenAI Codex app-server, designed for an always-on
+homelab, NAS, Mac mini, or Linux server.
 
 [Project site](https://gh.bhee.online/codex-bridge/) ·
 [Install](docs/install.md) ·
@@ -8,9 +9,11 @@ Self-hosted Web UI and CLI bridge for OpenAI Codex app-server.
 [Design](DESIGN.md) ·
 [Debugging](DEBUGGING.md)
 
-Access your Codex tasks directly from a terminal, phone, or private browser UI. Resume sessions,
-follow live runs, inspect tools and diffs, and control Codex remotely without using the ChatGPT app
-as the remote-control layer.
+Run Codex on a machine where your projects already live, then access its tasks from a terminal,
+phone, tablet, or private browser UI. Resume sessions, follow live runs, inspect tools and diffs,
+and control Codex remotely without using the ChatGPT app as the remote-control layer. A Cloudflare
+Tunnel with Cloudflare Access is a practical way to publish the loopback-only Web UI securely
+without forwarding a NAS or homelab port to the public Internet.
 
 `codex-bridge` is a local control plane around Codex app-server and its rollout store. It exposes
 task history, live tool activity, queue/steer/interrupt controls, model settings, and task metadata
@@ -18,6 +21,20 @@ through one typed local protocol. Remote-control traffic travels directly betwee
 your own bridge; it does not depend on the ChatGPT app as a remote-control relay or add another
 hosted Codex control service. Model execution still uses the account and network configured by
 Codex itself.
+
+## Built for self-hosted Codex
+
+- **Homelab and NAS:** keep Codex app-server beside your repositories on an always-on Linux host,
+  NAS, home server, or Mac mini, then continue the same task from any personal device.
+- **Remote development:** put the loopback Web UI behind Cloudflare Tunnel and Access, a private
+  VPN, or another authenticated HTTPS reverse proxy instead of exposing the bridge port directly.
+- **Away from the desktop:** review a long-running agent, inspect structured tool calls and diffs,
+  queue the next message, steer an active turn, or stop it from a phone.
+- **One local control plane:** use the responsive Web UI and `codexctl` against the same explicit
+  sessions, persistent app-server connection, and bounded history cache.
+
+Cloudflare is optional and transports browser traffic only. Codex model requests still use the
+OpenAI account and network configured by Codex app-server.
 
 ## Release highlights
 
@@ -41,6 +58,8 @@ Codex itself.
 
 ## Why use it
 
+- Turn a homelab, NAS, Mac mini, or Linux workstation into a private Codex app-server host.
+- Reach the Web UI remotely through Cloudflare Tunnel + Access without opening an inbound port.
 - Continue or steer an existing Codex task without screen-scraping the Desktop UI.
 - Read durable, paginated task history and structured app-server tool calls from another device.
 - Use the same explicit task targeting from the Web UI, `codexctl`, or another local client.
@@ -80,10 +99,11 @@ Codex Desktop ── TCP WebSocket ── ws-unix-bridge ── Unix WebSocket �
                                              Web UI / codexctl
 ```
 
-The app-server executable comes from `ChatGPT.app`. Desktop must be launched with
-`CODEX_APP_SERVER_WS_URL` pointing at the loopback adapter; `launchctl` keeps the app-server,
-adapter, and bridge alive and can enable the Web UI. This transport interposition is local and does
-not patch or re-sign the app bundle.
+The app-server executable comes from `ChatGPT.app`. In the installed desktop mode,
+`codex-bridge` supervises both that process and the loopback adapter, then publishes
+`CODEX_APP_SERVER_WS_URL` through the user's launchd environment. launchd only has to keep the one
+bridge daemon alive. This transport interposition is local and does not patch or re-sign the app
+bundle.
 
 ### Standalone Codex, including Linux
 
@@ -93,11 +113,25 @@ standalone codex app-server ── Unix WebSocket ── codex-bridge daemon ─
                                                    rollout store
 ```
 
-Run the open-source standalone app-server and point `codex-bridge` at its Unix socket. Without
-Codex Desktop there is no Desktop connection to intercept, so `ws-unix-bridge` is unnecessary.
+In the installed standalone mode, `codex-bridge` supervises the open-source app-server on its Unix
+socket. Without Codex Desktop there is no Desktop connection to intercept, so `ws-unix-bridge` is
+unnecessary.
 
 See [Installation and service setup](docs/install.md) for global Cargo installation, launchd and
 systemd examples, optional Web UI configuration, validation, and rollback.
+
+The user-level installers build the embedded frontend, install the required Cargo binaries, write
+`~/.config/codex-bridge/config.toml`, and start the appropriate user services without `sudo`:
+
+```sh
+./scripts/install-macos.sh --web-ui  # Codex Desktop + launchd
+./scripts/install-linux.sh --web-ui  # standalone app-server + systemd --user
+```
+
+The generated launchd/systemd bridge service contains only `codex-bridge --config ...`. Runtime
+mode, managed app-server/adapter lifecycle, sockets, Web UI, authentication, and cache choices live
+in the TOML file rather than being duplicated across startup scripts. Existing argument-only and
+externally managed deployments remain supported.
 
 ## Quick check
 
@@ -125,6 +159,8 @@ the installation guide before binding another interface or placing it behind an 
 - `web-ui`: Vite source and deterministic production assets embedded in `codex-bridge` at compile
   time.
 - `crates/codex-bridge-demo`: bounded Rust/WASM simulator used by GitHub Pages.
+- `scripts/install-macos.sh` and `scripts/install-linux.sh`: user-owned service installers.
+- `config.example.toml`: documented bridge runtime configuration template.
 
 The daemon control socket defaults to `~/.codex-bridge/control.sock`; override it with `--socket`
 or `CODEX_BRIDGE_SOCKET`. It creates its default directory as `0700` and socket as `0600`.

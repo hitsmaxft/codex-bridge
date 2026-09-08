@@ -50,6 +50,7 @@ export const state = {
   usageUnavailable: false,
   directAppServer: false,
   appServerMode: null,
+  managedServices: null,
   activityFileLen: null,
   activeTurnId: null,
   activityPhase: null,

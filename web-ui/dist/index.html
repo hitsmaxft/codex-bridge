@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=674a305e020d"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=2e7f801694e4">
+    <script type="module" crossorigin src="/assets/app.js?v=050c24ac5e39"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=d1e64a1f2775">
   </head>
   <body>
     <div class="app">
@@ -57,6 +57,7 @@
           <section class="settings-card">
             <h3 data-i18n="bridgeStatus">Bridge status</h3>
             <div class="settings-value" id="bridgeState" data-i18n="connecting">Connecting…</div>
+            <div class="component-status" id="componentStatus"></div>
             <button id="statusBtn" data-i18n="refreshStatus">Refresh status</button>
           </section>
           <section class="settings-card">
@@ -101,8 +102,7 @@
             </div>
           </div>
           <div class="head-actions">
-            <button id="selectBtn" data-i18n="selectDefault">Select default</button
-            ><button id="refreshBtn" data-i18n="refresh">Refresh</button
+            <button id="refreshBtn" data-i18n="refresh">Refresh</button
             ><button class="tool-toggle" data-i18n-aria-label="tools" aria-label="Tools">
               <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
                 <circle cx="5" cy="12" r="1.7" />
