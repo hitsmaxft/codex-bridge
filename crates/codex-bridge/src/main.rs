@@ -735,6 +735,12 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
         input.push(json!({"type":"text", "text":text, "text_elements":[]}));
     }
     for attachment in attachments {
+        if matches!(attachment, ComposerAttachment::Audio { .. }) {
+            return Err(Response::error(
+                "invalid_attachment",
+                "audio must be transcribed before message submission",
+            ));
+        }
         let supported_data_url = |url: &str, allowed_mime_types: &[&str]| {
             let Some((metadata, payload)) = url.split_once(',') else {
                 return false;
@@ -756,24 +762,7 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
                 url,
                 supported_data_url(url, &["image/jpeg", "image/png", "image/webp", "image/gif"]),
             ),
-            ComposerAttachment::Audio { url, .. } => (
-                "audio",
-                url,
-                supported_data_url(
-                    url,
-                    &[
-                        "audio/webm",
-                        "audio/mp4",
-                        "audio/mpeg",
-                        "audio/ogg",
-                        "audio/wav",
-                        "audio/x-wav",
-                        "audio/aac",
-                        "audio/x-m4a",
-                        "audio/3gpp",
-                    ],
-                ),
-            ),
+            ComposerAttachment::Audio { .. } => unreachable!("audio rejected above"),
         };
         if url.len() > MAX_ATTACHMENT_URL_BYTES || !valid_prefix {
             return Err(Response::error(
@@ -2171,7 +2160,7 @@ async fn web_command(
         )
             .into_response();
     }
-    if body.len() as u64 > MAX_REQUEST_BYTES {
+    if body.len() > MAX_WEB_REQUEST_BYTES {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(Response::error(
@@ -4005,6 +3994,37 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 }
             }
         }
+        Request::AudioTranscribe { thread_id, audio } => {
+            let decoded_bytes = BASE64_STANDARD.decode(&audio.data).ok();
+            let expected_bytes = usize::try_from(audio.samples_per_channel)
+                .ok()
+                .and_then(|samples| samples.checked_mul(usize::from(audio.num_channels)))
+                .and_then(|samples| samples.checked_mul(2));
+            if audio.data.is_empty()
+                || audio.data.len() > MAX_ATTACHMENT_TOTAL_BYTES
+                || audio.sample_rate < 8_000
+                || audio.sample_rate > 96_000
+                || audio.num_channels == 0
+                || audio.num_channels > 2
+                || audio.samples_per_channel == 0
+                || decoded_bytes.as_ref().map(Vec::len) != expected_bytes
+            {
+                return Response::error(
+                    "invalid_audio",
+                    "audio must be non-empty PCM16 with a valid sample rate, channel count, and sample count",
+                );
+            }
+            match write_backend.transcribe_audio(&thread_id, &audio) {
+                Ok(text) if !text.trim().is_empty() => Response::success(json!({
+                    "action": "audio_transcribe",
+                    "thread_id": thread_id,
+                    "text": text,
+                    "backend": "app_server_realtime",
+                })),
+                Ok(_) => Response::error("audio_transcription_empty", "no speech was detected"),
+                Err(error) => write_backend_error(error),
+            }
+        }
         Request::Interrupt { thread_id } => {
             let resolved = match resolve_write_target(thread_id, session_store, selected_thread) {
                 Ok(resolved) => resolved,
@@ -5303,17 +5323,16 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
-    fn composer_input_accepts_codec_qualified_audio_data_urls() {
-        let input = composer_input(
+    fn composer_input_rejects_audio_that_was_not_transcribed() {
+        let error = composer_input(
             "",
             &[ComposerAttachment::Audio {
                 url: "data:audio/webm;codecs=opus;base64,AAAA".to_owned(),
                 name: Some("voice".to_owned()),
             }],
         )
-        .unwrap();
-        assert_eq!(input[0]["type"], "audio");
-        assert_eq!(input[0]["url"], "data:audio/webm;codecs=opus;base64,AAAA");
+        .unwrap_err();
+        assert_eq!(error.error.unwrap().code, "invalid_attachment");
     }
 
     #[test]

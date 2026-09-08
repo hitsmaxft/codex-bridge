@@ -91,30 +91,15 @@ impl DemoState {
             content.push(json!({"kind": "text", "text": text}));
         }
         for attachment in attachments {
-            let attachment_type = attachment
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("attachment");
             let url = attachment
                 .get("url")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let (label, embedded) = if attachment_type == "audio" {
-                (
-                    "Demo audio attachment",
-                    json!({"type": "input_audio", "audio_url": url}),
-                )
-            } else {
-                (
-                    "Demo image attachment",
-                    json!({"type": "input_image", "image_url": url}),
-                )
-            };
             content.push(json!({
                 "kind": "context",
-                "label": label,
+                "label": "Demo image attachment",
                 "bytes": url.len(),
-                "content": embedded,
+                "content": {"type": "input_image", "image_url": url},
             }));
         }
         self.messages.push(json!({
@@ -129,10 +114,7 @@ impl DemoState {
         }));
     }
 
-    fn scenario_for(text: &str, has_audio: bool, salt: u32) -> u8 {
-        if has_audio {
-            return 3;
-        }
+    fn scenario_for(text: &str, salt: u32) -> u8 {
         let lower = text.to_ascii_lowercase();
         if lower.contains("search") || lower.contains("research") || lower.contains("查找") {
             return 1;
@@ -151,17 +133,12 @@ impl DemoState {
         match scenario {
             1 => "web_search",
             2 => "apply_patch",
-            3 => "audio_transcribe",
             _ => "exec_command",
         }
     }
 
     fn start_run(&mut self, pending: PendingMessage) {
-        let has_audio = pending
-            .attachments
-            .iter()
-            .any(|attachment| attachment["type"] == "audio");
-        let scenario = Self::scenario_for(&pending.text, has_audio, self.next_pending);
+        let scenario = Self::scenario_for(&pending.text, self.next_pending);
         self.append_user_message(pending.text.clone(), pending.attachments, "queue");
         self.active_thread = Some(pending.thread_id);
         self.active_ticks = 40;
@@ -191,10 +168,6 @@ impl DemoState {
             2 => (
                 "I found the relevant demo module and I’m preparing a small simulated patch.",
                 "Update the live demo state machine",
-            ),
-            3 => (
-                "I received the demo voice clip and I’m simulating local transcription.",
-                "Transcribe the attached demo audio",
             ),
             _ => (
                 "I’m inspecting the simulated workspace before choosing the next step.",
@@ -286,7 +259,6 @@ impl DemoState {
         let reply = match scenario {
             1 => "The simulated research pass is complete. The live demo selected a source-review template from your prompt and exercised the same progress refresh used by a real session.",
             2 => "The simulated code change is complete. The live demo selected an edit template, rendered a structured tool call, and refreshed this conclusion into the conversation.",
-            3 => "The demo audio was received and played back locally. A real Codex host would forward the audio input to app-server; this public demo keeps the clip and its simulated transcript entirely in your browser.",
             _ => "The simulated workspace check is complete. This response was selected from a local template and no message or attachment left your browser.",
         };
         self.messages.push(json!({
@@ -721,6 +693,15 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            if attachments
+                .iter()
+                .any(|attachment| attachment.get("type").and_then(Value::as_str) == Some("audio"))
+            {
+                return error(
+                    "invalid_attachment",
+                    "audio must be transcribed before demo message submission",
+                );
+            }
             if text.is_empty() && attachments.is_empty() {
                 return error(
                     "invalid_request",
@@ -736,7 +717,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             let id = format!("demo-pending-{}", state.next_pending);
             state.next_pending += 1;
             let summary = if text.is_empty() {
-                "🎙 Demo voice message".to_owned()
+                "Demo image message".to_owned()
             } else {
                 text.to_owned()
             };
@@ -783,6 +764,22 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "weekly_usage": {"remaining_percent": 63, "resets_at": 1_790_000_000_u64}
         }),
         "composer_options" => models(),
+        "audio_transcribe" => {
+            let audio = request.get("audio").and_then(Value::as_object);
+            if audio
+                .and_then(|value| value.get("data"))
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return error("invalid_audio", "the demo transcription requires PCM audio");
+            }
+            json!({
+                "action": "audio_transcribe",
+                "thread_id": thread_id,
+                "text": "Please summarize the current implementation and keep the answer concise.",
+                "backend": "demo_wasm"
+            })
+        }
         "thread_settings_update" => {
             state.model = request
                 .get("model")
@@ -1093,27 +1090,35 @@ mod tests {
     }
 
     #[test]
-    fn audio_only_submission_uses_the_local_audio_template() {
+    fn audio_transcription_returns_editable_text_without_submitting_a_message() {
         let mut state = DemoState::new();
-        result(dispatch(
+        let before = state.messages.len();
+        let transcription = result(dispatch(
+            json!({
+                "command": "audio_transcribe",
+                "thread_id": PRIMARY_THREAD,
+                "audio": {"data": "AAAAAA==", "sample_rate": 24000, "num_channels": 1, "samples_per_channel": 2}
+            }),
+            &mut state,
+        ));
+        assert_eq!(state.messages.len(), before);
+        assert_eq!(transcription["backend"], "demo_wasm");
+        assert!(transcription["text"]
+            .as_str()
+            .unwrap()
+            .contains("summarize"));
+
+        let attachment = dispatch(
             json!({
                 "command": "send",
                 "thread_id": PRIMARY_THREAD,
                 "text": "",
-                "attachments": [{"type": "audio", "url": "data:audio/wav;base64,UklGRg==", "name": "demo.wav"}]
+                "attachments": [{"type": "audio", "url": "data:audio/wav;base64,UklGRg=="}]
             }),
             &mut state,
-        ));
-        land_pending_message(&mut state);
-        assert_eq!(state.active_scenario, Some(3));
-        let user = state.messages.last().unwrap();
-        assert_eq!(user["content"][1]["content"]["type"], "input_audio");
-
-        finish_active_run(&mut state);
-        assert!(state.messages.last().unwrap()["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("audio"));
+        );
+        assert_eq!(attachment["ok"], false);
+        assert_eq!(attachment["error"]["code"], "invalid_attachment");
     }
 
     #[test]

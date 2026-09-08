@@ -12,6 +12,8 @@
   --composer-surface: #181b18;
   --user-bg: #183b52;
   --user-text: #91d1ff;
+  --steer-bg: #263d2d;
+  --steer-text: #a7d7ae;
   --active-thread: #193549;
   --control-bg: var(--panel);
   --code-bg: #202320;
@@ -1002,6 +1004,12 @@ main {
 .outbox-item .markdown {
   color: var(--user-text);
 }
+.outbox-item.steer .message-body {
+  background: var(--steer-bg);
+}
+.outbox-item.steer .markdown {
+  color: var(--steer-text);
+}
 .outbox-mode {
   margin-top: 1px;
   color: color-mix(in srgb, var(--user-text) 68%, transparent);
@@ -1558,6 +1566,13 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   color: var(--danger);
   animation: voice-pulse 1.2s ease-in-out infinite;
 }
+.composer-actions button.transcribing {
+  color: var(--accent2);
+  opacity: 1;
+}
+.composer-actions button.transcribing svg {
+  animation: voice-spin 0.9s linear infinite;
+}
 .composer-actions svg {
   width: 21px;
   height: 21px;
@@ -1570,6 +1585,11 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
 @keyframes voice-pulse {
   50% {
     box-shadow: 0 0 0 5px color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+}
+@keyframes voice-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 @keyframes edge-flow {
@@ -2291,43 +2311,11 @@ label.caption {
     max-height: none;
   }
   .composer-shell {
-    grid-template-areas: "mode actions input submit";
-    grid-template-columns: 64px 72px minmax(0, 1fr) 44px;
-    grid-template-rows: auto;
-    align-items: center;
+    grid-template-columns: 64px 72px minmax(0, 1fr) 64px;
   }
-  .composer-shell:focus-within,
-  .composer-shell.focused,
-  .composer-shell.has-text,
-  .composer-shell.submitting {
-    grid-template-areas:
-      "mode actions spacer submit"
-      "input input input input";
-    grid-template-columns: 64px 72px minmax(0, 1fr) 44px;
-    grid-template-rows: auto minmax(44px, auto);
-    align-items: start;
-  }
-  .composer-shell:focus-within #submitBtn,
-  .composer-shell.focused #submitBtn,
-  .composer-shell.has-text #submitBtn,
-  .composer-shell.submitting #submitBtn {
-    justify-self: end;
-    width: 44px;
-    height: 38px;
-    min-height: 38px;
-    border-radius: 50%;
-  }
-  .composer-shell.stop-ready #submitBtn {
-    width: 44px;
-    height: 44px;
-    min-height: 44px;
-    border-radius: 50%;
-  }
-  .composer-shell.stop-ready {
-    grid-template-areas: "mode actions input submit";
-    grid-template-columns: 64px 72px minmax(0, 1fr) 44px;
-    grid-template-rows: auto;
-    align-items: center;
+  .composer-shell #submitBtn {
+    width: 64px;
+    border-radius: 22px;
   }
   .outbox-tray {
     max-height: 26vh;
@@ -2431,6 +2419,8 @@ html[data-theme="light"] {
   --diff-delete-bg: #ffebe9;
   --user-bg: #dff1ff;
   --user-text: #0874c9;
+  --steer-bg: #deeddd;
+  --steer-text: #48734e;
   --active-thread: #edf6ff;
 }
 html[data-theme="light"] .composer-shell.submitting,

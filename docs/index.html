@@ -898,107 +898,106 @@
         <h2 class="zh">从远程控制到完整会话工作流。</h2>
         <h2 class="en">From remote control to a complete session workflow.</h2>
         <p class="section-intro zh">
-          v0.1.0 覆盖会话创建、实时交接、多会话任务总览、结构化工具展示和长会话优化，
-          并由同一套 Rust/WASM Demo 契约持续验证前端行为。
+          v0.2.0 让浏览器 Demo、语音转写和移动端远程控制更接近真实工作流，
+          并继续使用同一套 Rust/WASM 契约验证生产前端行为。
         </p>
         <p class="section-intro en">
-          v0.1.0 covers session creation, live handoff, a multi-session task
-          overview, structured tools, and large-session performance, with the
-          frontend continuously checked against the same Rust/WASM demo contract.
+          v0.2.0 makes the browser demo, voice transcription, and mobile remote
+          control behave more like the real workflow, while keeping the
+          production frontend checked against the same Rust/WASM contract.
         </p>
         <div class="release">
           <div class="release-date">
             2026-09-08
-            <span class="zh">v0.1.0 正式版</span
-            ><span class="en">v0.1.0 release</span>
+            <span class="zh">v0.2.0 正式版</span
+            ><span class="en">v0.2.0 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">创建和管理会话</span
-                ><span class="en">Create and manage sessions</span>
+                <span class="zh">动态浏览器 Demo</span
+                ><span class="en">Prompt-responsive browser demo</span>
               </h3>
               <p class="zh">
-                在当前项目目录或隔离 Git worktree 中创建会话；空会话无需等待首条
-                rollout 即可打开、输入和提交。
+                页面内 WASM
+                根据用户输入选择模拟工作流，持续刷新工具、消息和最终结果，
+                数据不会离开浏览器。
               </p>
               <p class="en">
-                Start in the current project or an isolated Git worktree. Empty
-                sessions open and accept their first message before a rollout
-                exists.
+                In-page WASM selects a simulated workflow from each prompt and
+                continuously refreshes tools, messages, and conclusions without
+                sending data off-page.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">实时控制链路</span
-                ><span class="en">Live control path</span>
+                <span class="zh">完整交接体验</span
+                ><span class="en">Complete handoff experience</span>
               </h3>
               <p class="zh">
-                持久化 app-server 连接统一承载
-                queue、跟进、停止、运行状态、模型和限额更新。
+                在 Demo 中直接体验
+                queue、跟进、撤回和取消；状态转换与生产前端使用相同组件。
               </p>
               <p class="en">
-                A persistent app-server connection carries queue, steer, stop,
-                activity, model, and rate-limit updates.
+                Try queue, steer, withdrawal, and cancellation in the demo.
+                State transitions use the same components as the production
+                frontend.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">多会话任务总览</span
-                ><span class="en">Multi-session task overview</span>
+                <span class="zh">可编辑语音转写</span
+                ><span class="en">Editable voice transcription</span>
               </h3>
               <p class="zh">
-                从会话列表同时查看运行中和最近完成的任务，包括最近输入、Agent
-                回复、工具进度和最终状态，并可直接跳回完整会话。
+                录音先在浏览器转换为 24 kHz 单声道 PCM，再由 app-server
+                转成可编辑文本；音频不会作为消息附件提交。
               </p>
               <p class="en">
-                Watch active and recently finished tasks together, including
-                the latest prompt, agent response, tool progress, final state,
-                and a direct link back to each full session.
+                Recordings become 24 kHz mono PCM in the browser, then
+                app-server returns editable text. Audio is never submitted as an
+                attachment.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">结构化、响应式界面</span
-                ><span class="en">Structured, responsive UI</span>
+                <span class="zh">移动端 Tasks 快捷入口</span
+                ><span class="en">Mobile Tasks shortcut</span>
               </h3>
               <p class="zh">
-                移动端和桌面端共享消息、输入框、工具、Diff、主题与设置组件，并支持中英文。
+                在会话中向右滑动即可打开多任务进度视图，会话列表仍通过独立按钮展开。
               </p>
               <p class="en">
-                Mobile and desktop share message, composer, tool, diff, theme,
-                and settings components, with persistent English and Chinese
-                preferences.
+                Swipe right in a conversation to open the multi-task progress
+                view; the session drawer remains on its explicit button.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">长会话低内存索引</span
-                ><span class="en">Low-memory history index</span>
+                <span class="zh">稳定的移动输入框</span
+                ><span class="en">Stable mobile composer</span>
               </h3>
               <p class="zh">
-                跳过非展示记录，工具输出按偏移按需读取；312.6 MiB 回归会话的预热
-                RSS 从约 422 MiB 降至 127 MiB。
+                文本固定在操作栏上方并向上增长，不再因聚焦重排；提交按钮与模式切换按钮等宽。
               </p>
               <p class="en">
-                Non-display records are skipped and tool outputs load by offset;
-                pinned RSS for the 312.6 MiB regression session fell from about
-                422 MiB to 127 MiB.
+                Text stays above a fixed action row and grows upward without
+                focus-driven reflow; submit and mode controls use matching
+                widths.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">实时浏览器 Demo</span
-                ><span class="en">Live browser demo</span>
+                <span class="zh">更清晰的消息类型</span
+                ><span class="en">Clearer message types</span>
               </h3>
               <p class="zh">
-                本地 WASM 根据输入选择模拟执行模板，可体验结构化工具、排队、跟进、
-                撤回、中断和可播放的伪语音；消息与附件不会离开页面。
+                Queue
+                消息保留蓝色，跟进消息改用豆绿色；浅色和深色主题都能快速区分。
               </p>
               <p class="en">
-                Local WASM selects a simulated workflow from each prompt, so
-                visitors can try structured tools, queue, steer, withdraw,
-                cancel, and playable synthetic voice without sending data off-page.
+                Queue messages remain blue while Steer messages use bean green,
+                making handoffs easy to distinguish in light and dark themes.
               </p>
             </article>
           </div>

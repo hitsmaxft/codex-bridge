@@ -117,6 +117,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<ComposerAttachment>,
     },
+    AudioTranscribe {
+        thread_id: String,
+        audio: RealtimeAudioChunk,
+    },
     Scroll {
         direction: Option<ScrollDirection>,
         pixels: Option<i64>,
@@ -166,6 +170,14 @@ pub enum ComposerAttachment {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RealtimeAudioChunk {
+    pub data: String,
+    pub sample_rate: u32,
+    pub num_channels: u16,
+    pub samples_per_channel: u32,
+}
+
 impl Request {
     pub fn name(&self) -> &'static str {
         match self {
@@ -193,6 +205,7 @@ impl Request {
             Self::Tail => "tail",
             Self::Send { .. } => "send",
             Self::Steer { .. } => "steer",
+            Self::AudioTranscribe { .. } => "audio_transcribe",
             Self::Scroll { .. } => "scroll",
             Self::Pending => "pending",
             Self::PendingMessages { .. } => "pending_messages",
@@ -429,6 +442,24 @@ mod tests {
         assert_eq!(json["command"], "send");
         assert_eq!(json["thread_id"], "thread-1");
         assert_eq!(json["text"], "continue");
+    }
+
+    #[test]
+    fn audio_transcribe_uses_pcm_metadata() {
+        let request = Request::AudioTranscribe {
+            thread_id: "thread-1".into(),
+            audio: RealtimeAudioChunk {
+                data: "AAAAAA==".into(),
+                sample_rate: 24_000,
+                num_channels: 1,
+                samples_per_channel: 2,
+            },
+        };
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["command"], "audio_transcribe");
+        assert_eq!(json["audio"]["sample_rate"], 24_000);
+        assert_eq!(json["audio"]["num_channels"], 1);
     }
 
     #[test]

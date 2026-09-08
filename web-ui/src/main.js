@@ -775,10 +775,13 @@ async function createThread(worktree) {
 }
 const MAX_COMPOSER_ATTACHMENTS = 6;
 const MAX_ATTACHMENT_DATA_URL_BYTES = 6 * 1024 * 1024;
+const TRANSCRIPTION_SAMPLE_RATE = 24_000;
+const MAX_VOICE_SECONDS = 120;
 let voiceRecorder = null;
 let voiceStream = null;
 let voiceChunks = [];
 let voiceLimitTimer = null;
+let voiceTranscribing = false;
 function blobDataUrl(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -787,34 +790,91 @@ function blobDataUrl(blob) {
     reader.readAsDataURL(blob);
   });
 }
-function demoAudioDataUrl() {
-  const sampleRate = 8000,
-    sampleCount = Math.round(sampleRate * 0.45),
-    bytes = new Uint8Array(44 + sampleCount * 2),
-    view = new DataView(bytes.buffer),
-    writeText = (offset, text) => {
-      for (let index = 0; index < text.length; index += 1)
-        bytes[offset + index] = text.charCodeAt(index);
-    };
-  writeText(0, "RIFF");
-  view.setUint32(4, 36 + sampleCount * 2, true);
-  writeText(8, "WAVEfmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeText(36, "data");
-  view.setUint32(40, sampleCount * 2, true);
-  for (let index = 0; index < sampleCount; index += 1) {
-    const fade = Math.sin((Math.PI * index) / sampleCount),
-      frequency = 420 + (index / sampleCount) * 180,
-      sample = Math.sin((2 * Math.PI * frequency * index) / sampleRate) * fade * 0.22;
-    view.setInt16(44 + index * 2, Math.round(sample * 32767), true);
+function bytesBase64(bytes) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000)
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return btoa(binary);
+}
+async function pcmAudio(blob) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) throw new Error(tr("audioDecodeUnavailable"));
+  const context = new AudioContextClass();
+  let decoded;
+  try {
+    decoded = await context.decodeAudioData(await blob.arrayBuffer());
+  } catch {
+    throw new Error(tr("audioDecodeFailed"));
+  } finally {
+    await context.close().catch(() => {});
   }
-  return `data:audio/wav;base64,${btoa(String.fromCharCode(...bytes))}`;
+  if (!decoded.length || decoded.duration > MAX_VOICE_SECONDS + 1)
+    throw new Error(tr("voiceTooLarge"));
+  const speechSamples = Math.ceil(decoded.duration * TRANSCRIPTION_SAMPLE_RATE),
+    silenceSamples = Math.round(TRANSCRIPTION_SAMPLE_RATE * 0.8),
+    samples = new Int16Array(speechSamples + silenceSamples),
+    channels = Array.from({ length: decoded.numberOfChannels }, (_, index) =>
+      decoded.getChannelData(index),
+    );
+  for (let index = 0; index < speechSamples; index += 1) {
+    const sourcePosition = (index * decoded.sampleRate) / TRANSCRIPTION_SAMPLE_RATE,
+      left = Math.min(decoded.length - 1, Math.floor(sourcePosition)),
+      right = Math.min(decoded.length - 1, left + 1),
+      mix = sourcePosition - left;
+    let sample = 0;
+    for (const channel of channels)
+      sample += channel[left] + (channel[right] - channel[left]) * mix;
+    sample = Math.max(-1, Math.min(1, sample / channels.length));
+    samples[index] = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
+  }
+  return {
+    data: bytesBase64(new Uint8Array(samples.buffer)),
+    sample_rate: TRANSCRIPTION_SAMPLE_RATE,
+    num_channels: 1,
+    samples_per_channel: samples.length,
+  };
+}
+function insertTranscription(text) {
+  const textarea = $("messageText"),
+    start = textarea.selectionStart ?? textarea.value.length,
+    end = textarea.selectionEnd ?? start,
+    before = textarea.value.slice(0, start),
+    prefix = before && !/\s$/.test(before) ? " " : "",
+    suffix = textarea.value.slice(end) && !/^\s/.test(textarea.value.slice(end)) ? " " : "",
+    insertion = `${prefix}${text.trim()}${suffix}`;
+  textarea.setRangeText(insertion, start, end, "end");
+  saveDraft(state.current?.id, textarea.value);
+  resizeComposerTextarea();
+  textarea.focus({ preventScroll: true });
+}
+async function transcribeAudio(audio) {
+  if (!state.current) throw new Error(tr("chooseSessionError"));
+  if (voiceTranscribing) return;
+  voiceTranscribing = true;
+  const button = $("voiceBtn");
+  button.disabled = true;
+  button.classList.add("transcribing");
+  button.title = tr("transcribingVoice");
+  button.setAttribute("aria-label", button.title);
+  notify(tr("transcribingVoice"));
+  try {
+    const result = await command(
+      { command: "audio_transcribe", thread_id: state.current.id, audio },
+      false,
+    );
+    insertTranscription(result.text || "");
+    notify(tr("voiceTranscribed"));
+  } catch (error) {
+    if (error.message.includes("audio_transcription_auth_required"))
+      throw new Error(tr("voiceApiKeyRequired"));
+    throw error;
+  } finally {
+    voiceTranscribing = false;
+    button.disabled = false;
+    button.classList.remove("transcribing");
+    button.title = tr("recordVoice");
+    button.setAttribute("aria-label", button.title);
+  }
 }
 async function imageAttachment(file) {
   if (file.type === "image/gif") {
@@ -882,14 +942,8 @@ async function addImages(files) {
   renderComposerAttachments();
 }
 async function addAudioFile(file) {
-  if (state.composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS)
-    throw new Error(tr("attachmentLimit"));
-  const fallbackType = /\.m4a$/i.test(file.name) ? "audio/mp4" : "audio/webm";
-  const blob = file.type ? file : file.slice(0, file.size, fallbackType);
-  const url = await blobDataUrl(blob);
-  if (url.length > MAX_ATTACHMENT_DATA_URL_BYTES) throw new Error(tr("voiceTooLarge"));
-  state.composerAttachments.push({ type: "audio", url, name: file.name || "voice" });
-  renderComposerAttachments();
+  if (file.size > MAX_ATTACHMENT_DATA_URL_BYTES) throw new Error(tr("voiceTooLarge"));
+  await transcribeAudio(await pcmAudio(file));
 }
 function resetVoiceRecorder() {
   clearTimeout(voiceLimitTimer);
@@ -907,16 +961,14 @@ async function toggleVoiceRecording() {
     voiceRecorder.stop();
     return;
   }
-  if (state.composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS)
-    throw new Error(tr("attachmentLimit"));
+  if (voiceTranscribing) return;
   if (demoMode) {
-    state.composerAttachments.push({
-      type: "audio",
-      url: demoAudioDataUrl(),
-      name: "demo-voice.wav",
+    await transcribeAudio({
+      data: "AAAAAA==",
+      sample_rate: TRANSCRIPTION_SAMPLE_RATE,
+      num_channels: 1,
+      samples_per_channel: 2,
     });
-    renderComposerAttachments();
-    notify(tr("demoVoiceAdded"));
     return;
   }
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
@@ -942,15 +994,8 @@ async function toggleVoiceRecording() {
       const mime = voiceRecorder?.mimeType || voiceChunks[0]?.type || "audio/webm";
       const blob = new Blob(voiceChunks, { type: mime });
       try {
-        const url = await blobDataUrl(blob);
-        if (url.length > MAX_ATTACHMENT_DATA_URL_BYTES) throw new Error(tr("voiceTooLarge"));
-        state.composerAttachments.push({
-          type: "audio",
-          url,
-          name: `voice-${new Date().toISOString()}`,
-        });
         resetVoiceRecorder();
-        renderComposerAttachments();
+        await transcribeAudio(await pcmAudio(blob));
       } catch (error) {
         resetVoiceRecorder();
         notify(error.message, true);
@@ -1458,7 +1503,7 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
 function pendingNode(entry) {
   const box = document.createElement("article");
   const submitting = ["queueing", "steering"].includes(entry.status);
-  box.className = `outbox-item${entry.handoff ? " handoff" : ""}${submitting ? " submitting" : ""}`;
+  box.className = `outbox-item${entry.action === "steer" ? " steer" : ""}${entry.handoff ? " handoff" : ""}${submitting ? " submitting" : ""}`;
   box.dataset.pendingId = entry.id;
   const body = document.createElement("div");
   body.className = "message-body";
@@ -2686,10 +2731,12 @@ function bindSwipe(element, direction, onSwipe, { ignoreInteractive = false } = 
   );
 }
 bindSwipe(document.querySelector("main"), 1, () => {
-  if (!$("tools").classList.contains("open")) {
-    $("sidebar").classList.add("open");
-    syncScrim();
-  }
+  if (
+    $("tasksDialog").hidden &&
+    !$("tools").classList.contains("open") &&
+    !$("sidebar").classList.contains("open")
+  )
+    openTasksDialog();
 });
 bindSwipe(
   $("sidebar"),

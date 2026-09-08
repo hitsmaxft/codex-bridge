@@ -38,28 +38,23 @@ OpenAI account and network configured by Codex app-server.
 
 ## Release highlights
 
-### v0.1.0 · 2026-09-08
+### v0.2.0 · 2026-09-08
 
-- **Create and manage sessions:** start a session in an existing project directory or an isolated
-  Git worktree, then rename, pin, archive, or stop it. A newly started empty session is immediately
-  usable while app-server is still waiting for the first message to create its rollout.
-- **Live remote control:** one persistent app-server connection carries activity events, native
-  queue and steer handoff, interruption, model settings, rate limits, and bounded subscriptions for
-  active or pinned sessions.
-- **Multi-session task overview:** watch active and recently finished tasks together from the
-  session sidebar. Each entry shows the latest prompt, agent response, tool progress, completion
-  state, and a direct link back to the full session; long responses collapse in place.
-- **Responsive Web UI:** the same mobile-first message, composer, tool, diff, theme, and settings
-  components are used on phones and desktops. English and Chinese preferences persist locally.
-- **Large-session performance:** rollout parsing skips non-display records and indexes tool-output
-  offsets for on-demand reads. In the 312.6 MiB regression session, pinned prewarming dropped from
-  about 422 MiB to 127 MiB RSS while a cached 30-message page remained below 10 ms locally.
-- **Safe local artifacts:** workspace-scoped downloads use five-minute, process-local tickets and
-  reject files outside the session directory or files at least 16 MiB.
-- **Browser demo and regression coverage:** GitHub Pages runs the production Vite frontend against
-  a finite Rust/WASM server, and the same demo contract is exercised by automated UI tests.
+- **Prompt-responsive live demo:** the GitHub Pages demo now chooses simulated workflows from each
+  prompt and continuously updates queue, steer, withdrawal, cancellation, tool, and final-response
+  states through the same Rust/WASM contract used by frontend regressions.
+- **Editable voice transcription:** recorded or selected audio is decoded in the browser, converted
+  to 24 kHz mono PCM, and transcribed through app-server realtime before the resulting text is
+  inserted into the composer. Audio is never submitted as a message attachment.
+- **Faster mobile task access:** swipe right in the conversation to open the multi-session Tasks
+  view directly, while the session drawer remains available from its explicit button.
+- **Stable mobile composer:** text remains above a fixed action row as it grows, eliminating
+  focus-driven grid reflow. Submit/stop and Queue/Steer controls now use matching widths.
+- **Clearer handoff queue:** queued work remains blue while Steer/follow-up messages use a distinct
+  bean-green palette in both light and dark themes.
 
-See the complete [v0.1.0 release notes](docs/releases/v0.1.0.md).
+See the complete [v0.2.0 release notes](docs/releases/v0.2.0.md). The original feature baseline is
+documented in the [v0.1.0 release notes](docs/releases/v0.1.0.md).
 
 ## Why use it
 
@@ -77,8 +72,8 @@ See the complete [v0.1.0 release notes](docs/releases/v0.1.0.md).
 [Try the interactive demo](https://gh.bhee.online/codex-bridge/demo/). It runs the production Vite
 frontend against a live Rust/WASM simulator entirely in the browser. Submit different prompts to
 see template-driven progress and structured tools, steer or queue another message while it runs,
-withdraw queued work, cancel the run, or add a playable synthetic voice clip. Demo submissions and
-attachments never contact Codex or leave the page.
+withdraw queued work, cancel the run, or try simulated voice-to-text. Demo submissions and images
+never contact Codex or leave the page.
 
 [<img src="docs/assets/codex-bridge-mobile.jpg" alt="Codex App Server WebUI showing a live Codex task on mobile" width="360">](docs/assets/codex-bridge-mobile.jpg)
 

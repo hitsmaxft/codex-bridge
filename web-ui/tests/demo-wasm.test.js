@@ -98,7 +98,7 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   );
 });
 
-test("live demo supports queued work, steer handoff, dynamic tools, and audio", async () => {
+test("live demo supports queued work, steer handoff, dynamic tools, and voice transcription", async () => {
   const command = await demoClient();
   result(
     command({
@@ -157,12 +157,27 @@ test("live demo supports queued work, steer handoff, dynamic tools, and audio", 
   assert.equal(withdrawn.queue_deleted, true);
   result(command({ command: "interrupt", thread_id: "demo-thread-web-ui" }));
 
+  const beforeTranscription = result(
+    command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
+  ).messages.length;
+  const transcription = result(
+    command({
+      command: "audio_transcribe",
+      thread_id: "demo-thread-web-ui",
+      audio: { data: "AAAAAA==", sample_rate: 24000, num_channels: 1, samples_per_channel: 2 },
+    }),
+  );
+  assert.match(transcription.text, /summarize/i);
+  assert.equal(
+    result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 })).messages
+      .length,
+    beforeTranscription,
+  );
   result(
     command({
       command: "send",
       thread_id: "demo-thread-web-ui",
-      text: "",
-      attachments: [{ type: "audio", name: "demo.wav", url: "data:audio/wav;base64,UklGRg==" }],
+      text: transcription.text,
     }),
   );
   for (let poll = 0; poll < 3; poll += 1) result(command({ command: "pending_messages" }));
@@ -175,11 +190,8 @@ test("live demo supports queued work, steer handoff, dynamic tools, and audio", 
   const completed = result(
     command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
   );
-  const audioMessage = completed.messages.findLast(
-    (message) => message.role === "user" && message.content.some((item) => item.content),
-  );
-  assert.equal(audioMessage.content[1].content.type, "input_audio");
-  assert.match(completed.messages.at(-1).content[0].text, /audio/i);
+  const transcribedMessage = completed.messages.findLast((message) => message.role === "user");
+  assert.match(transcribedMessage.content[0].text, /summarize/i);
 });
 
 test("session hash routes to the requested demo session", async () => {
@@ -213,10 +225,7 @@ test("file diffs define distinct light and dark theme palettes", async () => {
   assert.match(stylesheet, /html\[data-theme="light"\]\s*\{[^}]*--diff-surface:\s*#fff/s);
   assert.match(stylesheet, /\.diff-line\.add\s*\{[^}]*var\(--diff-add-bg\)/s);
   assert.match(stylesheet, /\.diff-line\.delete\s*\{[^}]*var\(--diff-delete-bg\)/s);
-  assert.match(
-    stylesheet,
-    /\.composer-shell:focus-within #submitBtn,[\s\S]*?justify-self:\s*end;[\s\S]*?width:\s*44px;/,
-  );
+  assert.match(stylesheet, /\.composer-shell\s*\{[^}]*"input input input input"/s);
 });
 
 test("session run snapshots preserve active, completed, and failed indicators", async () => {
@@ -268,16 +277,37 @@ test("mobile composer stays out of the message grid sizing flow", async () => {
   assert.doesNotMatch(mobile, /\.composer\s*\{[^}]*grid-row:\s*2;/s);
   assert.doesNotMatch(source, /textarea\.blur\(\)/);
   assert.match(source, /syncOutboxCompactLabel/);
+  assert.doesNotMatch(mobile, /\.composer-shell[^\{]*\{[^}]*grid-template-areas:/s);
   assert.match(
     mobile,
-    /\.composer-shell\.stop-ready\s*\{[^}]*grid-template-areas:\s*"mode actions input submit";[^}]*grid-template-columns:\s*64px 72px minmax\(0, 1fr\) 44px;/s,
+    /\.composer-shell\s*\{[^}]*grid-template-columns:\s*64px 72px minmax\(0, 1fr\) 64px;/s,
   );
+  assert.match(mobile, /\.composer-shell #submitBtn\s*\{[^}]*width:\s*64px;/s);
   assert.doesNotMatch(stylesheet, /\.outbox-tray\.compact \.outbox-item:not\(:last-child\)/);
   assert.match(stylesheet, /\.outbox-tray\.compact > \.outbox-item\s*\{/);
   assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-actions/);
 });
 
-test("composer exposes native image and voice attachment controls", async () => {
+test("steer messages use a distinct bean-green outbox palette", async () => {
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /entry\.action === "steer" \? " steer" : ""/);
+  assert.match(stylesheet, /--steer-bg:\s*#263d2d/);
+  assert.match(stylesheet, /html\[data-theme="light"\][\s\S]*--steer-bg:\s*#deeddd/);
+  assert.match(stylesheet, /\.outbox-item\.steer \.message-body\s*\{[^}]*var\(--steer-bg\)/s);
+});
+
+test("mobile right swipe opens Tasks without opening the session drawer", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const gesture = source.match(
+    /bindSwipe\(document\.querySelector\("main"\), 1, \(\) => \{[\s\S]*?\n\}\);/,
+  )?.[0];
+  assert.ok(gesture);
+  assert.match(gesture, /openTasksDialog\(\)/);
+  assert.doesNotMatch(gesture, /sidebar"\)\.classList\.add\("open"\)/);
+});
+
+test("composer keeps images as attachments and transcribes voice into editable text", async () => {
   const index = await readFile(indexPath, "utf8");
   const source = await readFile(mainScriptPath, "utf8");
   assert.match(
@@ -288,8 +318,10 @@ test("composer exposes native image and voice attachment controls", async () => 
   assert.match(source, /attachments = state\.composerAttachments\.map/);
   assert.match(source, /command\(\{ command: name, thread_id: threadId, text, attachments \}\)/);
   assert.match(source, /new MediaRecorder/);
-  assert.match(source, /function demoAudioDataUrl\(\)/);
-  assert.match(source, /if \(demoMode\) \{[\s\S]*?name: "demo-voice\.wav"/);
+  assert.match(source, /async function pcmAudio\(blob\)/);
+  assert.match(source, /command: "audio_transcribe"/);
+  assert.match(source, /insertTranscription\(result\.text \|\| ""\)/);
+  assert.doesNotMatch(source, /type: "audio",\s*url/);
   assert.match(source, /if \(item\.content\) \{[\s\S]*?appendContextValue/);
 });
 

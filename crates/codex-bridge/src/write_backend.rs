@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tungstenite::{Message, WebSocket};
 
+use crate::RealtimeAudioChunk;
+
 pub const CODEX_BIN_ENV: &str = "CODEX_BRIDGE_CODEX_BIN";
 pub const APP_SERVER_SOCKET_ENV: &str = "CODEX_BRIDGE_APP_SERVER_SOCKET";
 
@@ -22,6 +24,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_IDLE_POLL: Duration = Duration::from_millis(200);
 const APP_SERVER_EVENT_CAPACITY: usize = 512;
 const APP_SERVER_MAX_MESSAGE_BYTES: usize = 64 << 20;
+const REALTIME_TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct CodexCliBackend {
@@ -236,6 +239,52 @@ impl CodexCliBackend {
         app_server.call(method, params)
     }
 
+    pub fn transcribe_audio(
+        &self,
+        thread_id: &str,
+        audio: &RealtimeAudioChunk,
+    ) -> Result<String, BackendFailure> {
+        let mut events = self
+            .subscribe_app_server_events()
+            .ok_or_else(app_server_unavailable)?;
+        self.app_server_rpc(
+            "thread/realtime/start",
+            json!({
+                "threadId": thread_id,
+                "version": "v2",
+                "outputModality": "text",
+                "clientManagedHandoffs": true,
+                "includeStartupContext": false,
+                "flushTranscriptTailOnSessionEnd": false,
+            }),
+        )?;
+        if let Err(error) =
+            wait_for_realtime_event(&mut events, thread_id, "thread/realtime/started")
+        {
+            let _ = self.app_server_rpc("thread/realtime/stop", json!({"threadId": thread_id}));
+            return Err(error);
+        }
+        self.app_server_rpc(
+            "thread/realtime/appendAudio",
+            json!({
+                "threadId": thread_id,
+                "audio": {
+                    "data": audio.data,
+                    "sampleRate": audio.sample_rate,
+                    "numChannels": audio.num_channels,
+                    "samplesPerChannel": audio.samples_per_channel,
+                }
+            }),
+        )?;
+        let transcript = wait_for_realtime_transcript(&mut events, thread_id);
+        let stop = self.app_server_rpc("thread/realtime/stop", json!({"threadId": thread_id}));
+        match (transcript, stop) {
+            (Ok(text), _) => Ok(text),
+            (Err(error), Ok(_)) => Err(error),
+            (Err(_), Err(error)) => Err(error),
+        }
+    }
+
     pub fn latest_item_type(
         &self,
         thread_id: &str,
@@ -317,6 +366,106 @@ fn app_server_unavailable() -> BackendFailure {
     BackendFailure {
         code: "app_server_unavailable",
         message: "Desktop bundled app-server uses a private stdio connection; no external app-server endpoint is configured and standalone fallback is disabled".to_owned(),
+    }
+}
+
+fn app_server_event<'a>(event: &'a Value, thread_id: &str) -> Option<(&'a str, &'a Value)> {
+    let message = event.get("message")?;
+    let method = message.get("method")?.as_str()?;
+    let params = message.get("params")?;
+    (params.get("threadId")?.as_str()? == thread_id).then_some((method, params))
+}
+
+fn wait_for_realtime_event(
+    events: &mut broadcast::Receiver<Value>,
+    thread_id: &str,
+    expected_method: &str,
+) -> Result<(), BackendFailure> {
+    let deadline = Instant::now() + REALTIME_TRANSCRIPTION_TIMEOUT;
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                if let Some((method, params)) = app_server_event(&event, thread_id) {
+                    if method == expected_method {
+                        return Ok(());
+                    }
+                    if method == "thread/realtime/error" {
+                        let message = params
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("app-server realtime transcription failed");
+                        return Err(BackendFailure {
+                            code: if message.contains("requires API key auth") {
+                                "audio_transcription_auth_required"
+                            } else {
+                                "audio_transcription_failed"
+                            },
+                            message: message.to_owned(),
+                        });
+                    }
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty) => {
+                if Instant::now() >= deadline {
+                    return Err(BackendFailure {
+                        code: "audio_transcription_timeout",
+                        message: format!("timed out waiting for {expected_method}"),
+                    });
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Closed) => return Err(app_server_unavailable()),
+        }
+    }
+}
+
+fn wait_for_realtime_transcript(
+    events: &mut broadcast::Receiver<Value>,
+    thread_id: &str,
+) -> Result<String, BackendFailure> {
+    let deadline = Instant::now() + REALTIME_TRANSCRIPTION_TIMEOUT;
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                if let Some((method, params)) = app_server_event(&event, thread_id) {
+                    if method == "thread/realtime/transcript/done"
+                        && params.get("role").and_then(Value::as_str) == Some("user")
+                    {
+                        return Ok(params
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned());
+                    }
+                    if method == "thread/realtime/error" {
+                        let message = params
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("app-server realtime transcription failed");
+                        return Err(BackendFailure {
+                            code: if message.contains("requires API key auth") {
+                                "audio_transcription_auth_required"
+                            } else {
+                                "audio_transcription_failed"
+                            },
+                            message: message.to_owned(),
+                        });
+                    }
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty) => {
+                if Instant::now() >= deadline {
+                    return Err(BackendFailure {
+                        code: "audio_transcription_timeout",
+                        message: "timed out waiting for speech transcription".to_owned(),
+                    });
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Closed) => return Err(app_server_unavailable()),
+        }
     }
 }
 

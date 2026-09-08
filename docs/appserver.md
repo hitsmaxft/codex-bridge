@@ -224,9 +224,15 @@ Methods marked **experimental** only appear when the schema is generated with `-
 | `remoteControl/enable`, `remoteControl/disable`, `remoteControl/status/read` **experimental** | Enable, disable, and inspect Codex's native remote-control service. |
 | `remoteControl/pairing/start`, `remoteControl/pairing/status` **experimental** | Start and inspect device pairing. |
 | `remoteControl/client/list`, `remoteControl/client/revoke` **experimental** | List paired clients and revoke access. |
-| `thread/realtime/start`, `thread/realtime/stop` **experimental** | Start or stop a realtime session. |
-| `thread/realtime/appendText`, `thread/realtime/appendAudio`, `thread/realtime/appendSpeech` **experimental** | Stream text, audio, or captured speech into realtime. |
+| `thread/realtime/start`, `thread/realtime/stop` **experimental** | Start or stop a realtime session. The Web UI uses a text-output, client-managed session for voice transcription. |
+| `thread/realtime/appendText`, `thread/realtime/appendAudio`, `thread/realtime/appendSpeech` **experimental** | Stream text, raw PCM audio, or already-transcribed speakable text into realtime. The Web UI resamples recorded audio to 24 kHz mono PCM and consumes `thread/realtime/transcript/done`; it never submits the recording as a turn attachment. |
 | `thread/realtime/listVoices` **experimental** | List voices available for realtime output. |
+
+The current bundled schema exposes no standalone dictation RPC. Its speech-to-text result is the
+`thread/realtime/transcript/done` notification. In the bundled build tested on 2026-09-08,
+realtime v2 with text output rejects ChatGPT-subscription authentication and requires API-key
+authentication. The bridge therefore reports this capability error explicitly; it never falls back
+to sending recorded audio as an ordinary Codex message attachment.
 
 ### Diagnostics and platform support
 
@@ -353,8 +359,9 @@ sessions incomplete, so JSONL remains a fallback rather than a second live event
 - `remoteControl/*` overlaps this project's purpose and is worth evaluating, but it is
   experimental. Its pairing, network path, authentication, and Desktop dependencies must be
   tested before treating it as a bridge replacement.
-- `thread/realtime/*` could add voice control, at the cost of a much larger streaming and media
-  surface.
+- The remaining `thread/realtime/*` output-audio and conversational voice paths could add full
+  voice control. The current integration deliberately stops at speech-to-text so the user can edit
+  the transcript before submitting it to a Codex turn.
 - project/environment management could provide remote workspace creation and attachment, but the
   relevant APIs are experimental in this build.
 
