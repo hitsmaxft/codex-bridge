@@ -1,4 +1,4 @@
-# Codex Bridge Web UI
+# Codex App Server WebUI
 
 This is the mobile-friendly browser client for `codex-bridge`. It lets an authenticated user read
 Codex Desktop tasks, follow live activity, steer or queue messages, inspect tool output and diffs,
@@ -48,7 +48,9 @@ npm run build
 ```
 
 The development server proxies `/api` to the default bridge address at
-`http://127.0.0.1:18791`. The bridge still requires its configured HTTP Basic Auth credentials.
+`http://127.0.0.1:18791`. Basic Auth bootstraps a seven-day HttpOnly browser session cookie whose
+private token survives ordinary bridge restarts. An authenticated same-host reverse proxy may use
+`--web-ui-no-auth`, which is restricted to loopback listeners.
 
 `dist/` is checked in because Rust uses `include_str!` to package these deterministic asset
 names into the executable. Run `npm run build` after changing `index.html` or anything under

@@ -304,8 +304,21 @@ improve:
 
 The implementation correlates RPC responses, bounds browser event buffering, reconnects the
 browser event stream, and retains polling after an event gap. Rollout reads still finalize the
-displayed history, but their append-only parser keeps subsequent refresh work proportional to new
-content rather than total session size.
+displayed history, but the compatibility reader is deliberately isolated from the live app-server
+transport:
+
+- it reads only response-item envelopes that can affect visible messages and skips compaction,
+  reasoning, token, world-state, and event payloads without materializing their contents;
+- it keeps an append-only in-memory index of message and tool-output record offsets;
+- message pages retain lightweight tool metadata, while the full output is read from one indexed
+  JSONL record only when the user expands that tool;
+- file identity and processed length invalidate or extend the index when a rollout is replaced or
+  appended.
+
+This boundary is intentional. Once a supported app-server history API can supply complete,
+pageable messages and tool details, the rollout compatibility reader can be disabled or removed
+without changing the Web UI protocol. Until then, disabling it would make older and offline
+sessions incomplete, so JSONL remains a fallback rather than a second live event source.
 
 ### Strong user-facing candidates
 

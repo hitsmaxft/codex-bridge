@@ -5,18 +5,32 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta
       name="description"
-      content="Access the Codex running on your Mac directly from a terminal or phone, without a Codex cloud relay or a ChatGPT client remote-control layer."
+      content="A self-hosted Web UI and CLI bridge for OpenAI Codex app-server. Resume sessions, inspect tools and diffs, and control Codex remotely."
     />
+    <link rel="canonical" href="https://gh.bhee.online/codex-bridge/" />
     <meta name="theme-color" content="#f5f5f2" />
-    <meta
-      property="og:title"
-      content="codex-bridge — Direct access to your Codex"
-    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://gh.bhee.online/codex-bridge/" />
+    <meta property="og:title" content="Codex App Server WebUI" />
     <meta
       property="og:description"
-      content="A fast, direct remote-control path to the Codex already running on your Mac—without routing control through Codex cloud services or a ChatGPT client."
+      content="Fast, direct remote access to Codex app-server from a phone, terminal, or private browser UI."
     />
-    <title>codex-bridge — Direct access to your Codex</title>
+    <meta
+      property="og:image"
+      content="https://gh.bhee.online/codex-bridge/assets/codex-bridge-mobile.jpg"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Codex App Server WebUI" />
+    <meta
+      name="twitter:description"
+      content="A self-hosted Web UI and CLI bridge for OpenAI Codex app-server."
+    />
+    <meta
+      name="twitter:image"
+      content="https://gh.bhee.online/codex-bridge/assets/codex-bridge-mobile.jpg"
+    />
+    <title>Codex App Server WebUI — Fast, Direct Remote Access to Codex</title>
     <style>
       :root {
         --ink: #171714;
@@ -586,6 +600,15 @@
         .nav {
           height: 62px;
         }
+        .brand {
+          gap: 7px;
+          white-space: nowrap;
+          font-size: 13px;
+        }
+        .mark {
+          width: 27px;
+          height: 27px;
+        }
         .github {
           display: none;
         }
@@ -640,7 +663,9 @@
   </head>
   <body>
     <nav class="wrap nav">
-      <a class="brand" href="#top"><span class="mark">C›</span>codex-bridge</a>
+      <a class="brand" href="#top"
+        ><span class="mark">C›</span>Codex App Server WebUI</a
+      >
       <div class="nav-actions">
         <div class="lang" aria-label="Language">
           <button data-lang="zh">中文</button><button data-lang="en">EN</button>
@@ -655,8 +680,8 @@
       <section class="wrap hero">
         <div>
           <span class="eyebrow"
-            ><span class="zh">本机直连</span
-            ><span class="en">Direct local access</span></span
+            ><span class="zh">Codex app-server 网页客户端</span
+            ><span class="en">Codex app-server Web UI</span></span
           >
           <h1>
             <span class="zh">直接访问<br />你的 Codex。</span
@@ -732,7 +757,7 @@
             <img
               class="phone-shot"
               src="assets/codex-bridge-mobile.jpg"
-              alt="codex-bridge mobile Web UI showing a live Codex task"
+              alt="Codex App Server WebUI showing a live Codex task on mobile"
             />
           </div>
         </div>
@@ -824,11 +849,13 @@
             <h2 class="zh">仅开放在可信局域网。</h2>
             <h2 class="en">Use it on a trusted LAN.</h2>
             <p class="section-intro zh">
-              Web UI 强制 Basic Auth，并校验密码文件权限、Host 和 Origin。
+              Web UI 默认使用 Basic Auth 和七天有效的 HttpOnly 会话；受同机认证代理保护时，
+              也可在仅监听环回地址的前提下关闭应用层鉴权。
             </p>
             <p class="section-intro en">
-              The Web UI requires Basic Auth and validates password-file
-              permissions, Host, and Origin.
+              Basic Auth normally bootstraps a seven-day HttpOnly browser
+              session. Behind an authenticated same-host proxy, application
+              authentication may be disabled only on a loopback listener.
             </p>
           </div>
           <aside class="notice">
@@ -843,8 +870,11 @@
       </section>
     </main>
     <footer class="wrap footer">
-      <strong>codex-bridge</strong
-      ><span>Local CLI · Private Web UI · Codex Desktop</span>
+      <strong>Codex App Server WebUI</strong
+      ><span
+        ><code>codex-bridge</code> · Local CLI · Private Web UI · Codex
+        Desktop</span
+      >
     </footer>
     <script>
       const root = document.documentElement,

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 
 pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const GIT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -35,6 +35,33 @@ struct CachedMessages {
     messages: Arc<Vec<ThreadMessage>>,
     seen_ids: HashSet<String>,
     tool_locations: HashMap<String, (usize, usize, usize)>,
+    tool_records: HashMap<String, ToolRecordLocation>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolRecordLocation {
+    output: Option<RecordLocation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecordLocation {
+    offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRolloutRecord<'a> {
+    #[serde(rename = "type")]
+    record_type: &'a str,
+    #[serde(borrow)]
+    payload: Option<&'a RawValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPayloadHeader<'a> {
+    #[serde(rename = "type")]
+    payload_type: &'a str,
+    call_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -383,10 +410,7 @@ impl SessionStore {
         let Some(summary) = summary else {
             return Ok(None);
         };
-        let messages = self
-            .messages_for_path(&summary.rollout_path)?
-            .as_ref()
-            .clone();
+        let messages = self.hydrated_messages_for_path(&summary.rollout_path)?;
         Ok(Some(ThreadSnapshot {
             thread: summary,
             messages,
@@ -452,7 +476,31 @@ impl SessionStore {
             return Ok(None);
         };
         let messages = self.messages_for_path(&summary.rollout_path)?;
-        Ok(messages.get(message_index).cloned())
+        let Some(mut message) = messages.get(message_index).cloned() else {
+            return Ok(None);
+        };
+        self.hydrate_tool_outputs(&summary.rollout_path, &mut message)?;
+        Ok(Some(message))
+    }
+
+    pub fn message_count(&self, thread_id: &str) -> Result<Option<usize>> {
+        let Some(summary) = self.find_thread(thread_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.messages_for_path(&summary.rollout_path)?.len()))
+    }
+
+    pub fn read_recent_messages(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<ThreadMessage>>> {
+        let Some(summary) = self.find_thread(thread_id)? else {
+            return Ok(None);
+        };
+        let messages = self.messages_for_path(&summary.rollout_path)?;
+        let start = messages.len().saturating_sub(limit);
+        Ok(Some(messages[start..].to_vec()))
     }
 
     pub fn warm_thread_messages(&self, thread_id: &str) -> Result<bool> {
@@ -482,6 +530,7 @@ impl SessionStore {
                         Arc::make_mut(&mut entry.messages),
                         &mut entry.seen_ids,
                         &mut entry.tool_locations,
+                        &mut entry.tool_records,
                     )?;
                     entry.modified = modified;
                     entry.file_len = file_len;
@@ -494,8 +543,15 @@ impl SessionStore {
         let mut messages = Vec::new();
         let mut seen_ids = HashSet::new();
         let mut tool_locations = HashMap::new();
-        let processed_len =
-            read_rollout_messages_from(path, 0, &mut messages, &mut seen_ids, &mut tool_locations)?;
+        let mut tool_records = HashMap::new();
+        let processed_len = read_rollout_messages_from(
+            path,
+            0,
+            &mut messages,
+            &mut seen_ids,
+            &mut tool_locations,
+            &mut tool_records,
+        )?;
         let messages = Arc::new(messages);
         if let Ok(mut cache) = self.message_cache.lock() {
             if cache.len() >= MESSAGE_CACHE_ENTRIES && !cache.contains_key(path) {
@@ -518,10 +574,43 @@ impl SessionStore {
                     messages: messages.clone(),
                     seen_ids,
                     tool_locations,
+                    tool_records,
                 },
             );
         }
         Ok(messages)
+    }
+
+    fn hydrated_messages_for_path(&self, path: &Path) -> Result<Vec<ThreadMessage>> {
+        let messages = self.messages_for_path(path)?;
+        let mut messages = messages.as_ref().clone();
+        for message in &mut messages {
+            self.hydrate_tool_outputs(path, message)?;
+        }
+        Ok(messages)
+    }
+
+    fn hydrate_tool_outputs(&self, path: &Path, message: &mut ThreadMessage) -> Result<()> {
+        let locations = self.message_cache.lock().ok().map(|cache| {
+            message
+                .tools
+                .iter()
+                .map(|tool| {
+                    cache
+                        .get(path)
+                        .and_then(|entry| entry.tool_records.get(&tool.call_id))
+                        .and_then(|record| record.output)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (tool, location) in message.tools.iter_mut().zip(locations.unwrap_or_default()) {
+            let Some(location) = location else {
+                continue;
+            };
+            let record = read_json_record(path, location)?;
+            tool.output = record.pointer("/payload/output").cloned();
+        }
+        Ok(())
     }
 
     pub fn active_turn_id(&self, thread_id: &str) -> Result<Option<String>> {
@@ -852,6 +941,7 @@ fn read_rollout_messages_from(
     messages: &mut Vec<ThreadMessage>,
     seen_ids: &mut HashSet<String>,
     tool_locations: &mut HashMap<String, (usize, usize, usize)>,
+    tool_records: &mut HashMap<String, ToolRecordLocation>,
 ) -> Result<u64> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -867,13 +957,90 @@ fn read_rollout_messages_from(
         if bytes == 0 || !line.ends_with(b"\n") {
             break;
         }
+        let record_offset = processed_len;
         processed_len = processed_len.saturating_add(bytes as u64);
+        let Ok(envelope) = serde_json::from_slice::<RawRolloutRecord<'_>>(&line) else {
+            continue;
+        };
+        if envelope.record_type != "response_item" {
+            continue;
+        }
+        let Some(raw_payload) = envelope.payload else {
+            continue;
+        };
+        let Ok(header) = serde_json::from_str::<RawPayloadHeader<'_>>(raw_payload.get()) else {
+            continue;
+        };
+        if matches!(
+            header.payload_type,
+            "custom_tool_call_output" | "function_call_output"
+        ) {
+            let Some(call_id) = header.call_id else {
+                continue;
+            };
+            append_tool_output(
+                call_id,
+                RecordLocation {
+                    offset: record_offset,
+                    len: bytes,
+                },
+                messages,
+                tool_locations,
+                tool_records,
+            );
+            continue;
+        }
+        if !matches!(
+            header.payload_type,
+            "message" | "custom_tool_call" | "function_call"
+        ) {
+            continue;
+        }
         let Ok(record) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         append_rollout_record(record, messages, seen_ids, tool_locations);
     }
     Ok(processed_len)
+}
+
+fn append_tool_output(
+    call_id: &str,
+    location: RecordLocation,
+    messages: &mut [ThreadMessage],
+    tool_locations: &HashMap<String, (usize, usize, usize)>,
+    tool_records: &mut HashMap<String, ToolRecordLocation>,
+) {
+    let Some(&(message_index, tool_start, tool_end)) = tool_locations.get(call_id) else {
+        return;
+    };
+    for tool in &mut messages[message_index].tools[tool_start..tool_end] {
+        if tool.status == "running" {
+            tool.status = "completed".to_owned();
+        }
+    }
+    if let Some(tool) = messages[message_index]
+        .tools
+        .get_mut(tool_end.saturating_sub(1))
+    {
+        tool.output = Some(serde_json::json!({
+            "_codex_bridge_lazy": true,
+            "bytes": location.len,
+        }));
+        tool_records.entry(tool.call_id.clone()).or_default().output = Some(location);
+    }
+}
+
+fn read_json_record(path: &Path, location: RecordLocation) -> Result<Value> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    file.seek(SeekFrom::Start(location.offset))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    let mut encoded = vec![0; location.len];
+    file.read_exact(&mut encoded)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&encoded)
+        .with_context(|| format!("failed to parse indexed record in {}", path.display()))
 }
 
 fn append_rollout_record(
@@ -942,28 +1109,6 @@ fn append_rollout_record(
         }
         let tool_end = messages[message_index].tools.len();
         tool_locations.insert(call_id.to_owned(), (message_index, tool_start, tool_end));
-        return;
-    }
-    if matches!(
-        payload_type,
-        Some("custom_tool_call_output" | "function_call_output")
-    ) {
-        let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
-            return;
-        };
-        if let Some(&(message_index, tool_start, tool_end)) = tool_locations.get(call_id) {
-            for tool in &mut messages[message_index].tools[tool_start..tool_end] {
-                if tool.status == "running" {
-                    tool.status = "completed".to_owned();
-                }
-            }
-            if let Some(tool) = messages[message_index]
-                .tools
-                .get_mut(tool_end.saturating_sub(1))
-            {
-                tool.output = payload.get("output").cloned();
-            }
-        }
         return;
     }
     if payload_type != Some("message") {
@@ -1714,6 +1859,36 @@ mod tests {
                 .tools[0]
                 .call_id,
             "call-1"
+        );
+    }
+
+    #[test]
+    fn message_pages_index_tool_outputs_and_hydrate_them_on_demand() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-lazy-tools.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-lazy-tools","cwd":"/tmp/project","source":"vscode"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"Inspecting."}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-lazy","name":"exec","status":"running","input":"{\"cmd\":\"status\"}"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-lazy","output":"a deliberately large output would remain in the rollout"}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let (_, page) = store
+            .read_message_page("thread-lazy-tools", None, 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.messages[0].tools[0].status, "completed");
+        assert_eq!(
+            page.messages[0].tools[0].output.as_ref().unwrap()["_codex_bridge_lazy"],
+            true
+        );
+
+        let message = store.read_message("thread-lazy-tools", 0).unwrap().unwrap();
+        assert_eq!(
+            message.tools[0].output.as_ref().and_then(Value::as_str),
+            Some("a deliberately large output would remain in the rollout")
         );
     }
 

@@ -1,4 +1,6 @@
-# codex-bridge
+# Codex App Server WebUI
+
+Self-hosted Web UI and CLI bridge for OpenAI Codex app-server.
 
 [Project site](https://gh.bhee.online/codex-bridge/) ·
 [Install](docs/install.md) ·
@@ -6,7 +8,9 @@
 [Design](DESIGN.md) ·
 [Debugging](DEBUGGING.md)
 
-Access your Codex tasks directly from a terminal, phone, or private browser UI.
+Access your Codex tasks directly from a terminal, phone, or private browser UI. Resume sessions,
+follow live runs, inspect tools and diffs, and control Codex remotely without using the ChatGPT app
+as the remote-control layer.
 
 `codex-bridge` is a local control plane around Codex app-server and its rollout store. It exposes
 task history, live tool activity, queue/steer/interrupt controls, model settings, and task metadata
@@ -30,7 +34,7 @@ Codex itself.
 frontend against a finite Rust/WASM simulator entirely in the browser. Demo submissions never
 contact Codex.
 
-[<img src="docs/assets/codex-bridge-mobile.jpg" alt="codex-bridge mobile Web UI showing a live Codex task" width="360">](docs/assets/codex-bridge-mobile.jpg)
+[<img src="docs/assets/codex-bridge-mobile.jpg" alt="Codex App Server WebUI showing a live Codex task on mobile" width="360">](docs/assets/codex-bridge-mobile.jpg)
 
 The private UI is responsive across mobile and desktop. It includes project and task navigation,
 rendered tool calls and diffs, task pinning, renaming, and archiving, model selection, Git change summaries,
@@ -85,8 +89,11 @@ codexctl ls --limit 10
 codexctl show --last 20
 ```
 
-The optional Web UI listens on `127.0.0.1:18791` by default and requires a private password file.
-See the installation guide before binding another interface or placing it behind an HTTPS proxy.
+The optional Web UI listens on `127.0.0.1:18791` by default and normally requires a private
+password file. Successful browser Basic Auth creates a seven-day HttpOnly session cookie whose
+private token survives ordinary bridge restarts. A same-host authenticated reverse proxy may use
+`--web-ui-no-auth`; that mode is rejected unless the listener is bound to a loopback address. See
+the installation guide before binding another interface or placing it behind an HTTPS proxy.
 
 ## Components
 

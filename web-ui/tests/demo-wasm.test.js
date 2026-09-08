@@ -20,6 +20,7 @@ const wasmPath = new URL(
   import.meta.url,
 );
 const stylesheetPath = new URL("../src/styles.css", import.meta.url);
+const mainScriptPath = new URL("../src/main.js", import.meta.url);
 
 async function demoClient() {
   const { instance } = await WebAssembly.instantiate(await readFile(wasmPath), {});
@@ -128,6 +129,41 @@ test("file diffs define distinct light and dark theme palettes", async () => {
     stylesheet,
     /\.composer-shell:focus-within #submitBtn,[\s\S]*?justify-self:\s*end;[\s\S]*?width:\s*44px;/,
   );
+});
+
+test("mobile composer stays out of the message grid sizing flow", async () => {
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  const source = await readFile(mainScriptPath, "utf8");
+  const mobile = stylesheet.slice(stylesheet.indexOf("@media (max-width: 800px)"));
+  assert.match(mobile, /\.composer\s*\{[^}]*position:\s*fixed;/s);
+  assert.doesNotMatch(mobile, /#messages\s*\{[^}]*grid-row:\s*2;/s);
+  assert.doesNotMatch(mobile, /\.composer\s*\{[^}]*grid-row:\s*2;/s);
+  assert.doesNotMatch(source, /textarea\.blur\(\)/);
+  assert.match(source, /syncOutboxCompactLabel/);
+  assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-item:not\(:last-child\)/);
+  assert.match(stylesheet, /\.outbox-tray\.compact > \.outbox-item:last-child/);
+  assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-actions/);
+});
+
+test("structured command actions stay separate and preserve multiline commands", async () => {
+  const command = await demoClient();
+  const page = result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }));
+  const summary = page.messages[1].tools[0];
+  assert.equal(summary.command_action_count, 2);
+  assert.equal(summary.command_actions_parallel, false);
+  const detail = result(
+    command({
+      command: "tool_content",
+      thread_id: "demo-thread-web-ui",
+      message_index: 1,
+      tool_index: 0,
+    }),
+  );
+  assert.equal(detail.display_input.commandActions.length, 2);
+  assert.match(detail.display_input.commandActions[0].command, /\n  -p codex-bridge-demo$/);
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /function appendCommandActions/);
+  assert.match(source, /action\?\.command \|\| toolValueText\(action\)/);
 });
 
 test("local task file links resolve to workspace paths", () => {

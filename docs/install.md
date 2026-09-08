@@ -76,8 +76,8 @@ Both topologies use a private directory for the daemon socket and app-server soc
 install -d -m 700 "$HOME/.codex-bridge"
 ```
 
-The optional Web UI requires a regular password file owned by the current user and inaccessible to
-group and other users:
+The optional Web UI normally requires a regular password file owned by the current user and
+inaccessible to group and other users:
 
 ```sh
 umask 077
@@ -86,7 +86,8 @@ printf '%s\n' 'replace-with-a-long-random-password' > \
 chmod 600 "$HOME/.codex-bridge/web-ui-password"
 ```
 
-Do not enable `--web-ui` until this file exists.
+Do not enable authenticated `--web-ui` until this file exists. If a same-host reverse proxy already
+enforces authentication, `--web-ui-no-auth` may be used instead, but only with a loopback listener.
 
 ## 3. macOS with Codex Desktop
 
@@ -261,6 +262,10 @@ For a trusted LAN, replace the listen address with the host's LAN address or `0.
 HTTPS reverse proxy, also repeat `--web-ui-public-origin` with each exact external origin. Public
 origins must use HTTPS and cannot contain a path, query, or fragment.
 
+When an authenticated proxy such as Cloudflare Access runs on the same host, replace the username
+and password-file arguments with `<string>--web-ui-no-auth</string>` and keep
+`--web-ui-listen` on `127.0.0.1`. The bridge rejects unauthenticated non-loopback listeners.
+
 ### Disable Desktop interposition
 
 Quit Desktop, boot out the adapter and environment jobs, clear the variables, and then launch
@@ -366,7 +371,10 @@ RPC opens a new Unix-socket connection.
 
 - Keep app-server and daemon Unix sockets private to the service user.
 - Keep `ws-unix-bridge` on `127.0.0.1`; it has no application-layer authentication.
-- The Web UI requires HTTP Basic Auth. A non-loopback bind exposes task history and write controls.
+- The Web UI normally uses HTTP Basic Auth for the initial browser login, then a seven-day HttpOnly,
+  SameSite-strict session cookie backed by a private temporary token cache. `--web-ui-no-auth` is
+  limited to loopback and should only sit behind an authenticated same-host proxy. A non-loopback
+  bind exposes task history and write controls.
 - Exact HTTPS public origins are allowlisted; arbitrary forwarded `Host` and `Origin` values are
   rejected.
 - Use one app-server instance for each live task writer boundary. Do not start a second resume

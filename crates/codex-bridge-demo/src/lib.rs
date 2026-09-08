@@ -194,7 +194,9 @@ fn seed_messages() -> Vec<Value> {
                 "bytes": 284,
                 "additions": null,
                 "deletions": null,
-                "file_count": null
+                "file_count": null,
+                "command_action_count": 2,
+                "command_actions_parallel": false
             }],
         }),
         json!({
@@ -276,8 +278,16 @@ fn models() -> Value {
 fn tool_content(message_index: usize, tool_index: usize) -> Option<Value> {
     match (message_index, tool_index) {
         (1, 0) => Some(json!({
-            "display_input": {"type": "commandExecution", "command": "cargo build --release --target wasm32-unknown-unknown -p codex-bridge-demo", "cwd": PROJECT_PATH},
-            "tool": {"call_id": "demo-command", "name": "exec_command", "status": "completed", "input": {"type": "commandExecution", "command": "cargo build --release --target wasm32-unknown-unknown -p codex-bridge-demo", "cwd": PROJECT_PATH}, "output": {"exitCode": 0, "aggregatedOutput": "Finished release profile [optimized]"}}
+            "display_input": {
+                "type": "commandExecution",
+                "command": "cargo build --release --target wasm32-unknown-unknown -p codex-bridge-demo && npm run build",
+                "commandActions": [
+                    {"type": "build", "command": "cargo build --release --target wasm32-unknown-unknown \\\n  -p codex-bridge-demo", "path": "crates/codex-bridge-demo"},
+                    {"type": "build", "command": "npm run build", "path": "web-ui"}
+                ],
+                "cwd": PROJECT_PATH
+            },
+            "tool": {"call_id": "demo-command", "name": "exec_command", "status": "completed", "input": {"type": "commandExecution"}, "output": {"exitCode": 0, "aggregatedOutput": "Finished release profile [optimized]"}}
         })),
         (2, 0) => Some(json!({
             "display_input": {"type": "fileChange", "changes": [

@@ -586,6 +586,43 @@ function appendPatchDiff(parent, patch, label = "Diff") {
   card.append(head, content);
   parent.appendChild(card);
 }
+
+function appendCommandActions(parent, input) {
+  const actions = Array.isArray(input?.commandActions) ? input.commandActions : [];
+  if (!actions.length) return false;
+  const title = document.createElement("h5");
+  const parallel =
+    input.parallel === true ||
+    ["parallel", "concurrent"].includes(input.executionMode || input.execution_mode);
+  title.textContent = parallel
+    ? tr("parallelCommands", { count: actions.length })
+    : tr("commandActions", { count: actions.length });
+  const list = document.createElement("div");
+  list.className = `command-actions${parallel ? " parallel" : ""}`;
+  for (const [index, action] of actions.entries()) {
+    const item = document.createElement("section"),
+      head = document.createElement("div"),
+      number = document.createElement("span"),
+      kind = document.createElement("span"),
+      target = document.createElement("span"),
+      command = document.createElement("pre");
+    item.className = "command-action";
+    head.className = "command-action-head";
+    number.className = "command-action-number";
+    number.textContent = String(index + 1);
+    kind.className = "command-action-kind";
+    kind.textContent = action?.type || tr("command");
+    target.className = "command-action-target";
+    target.textContent = action?.name || action?.path || action?.query || "";
+    command.textContent = action?.command || toolValueText(action);
+    head.append(number, kind);
+    if (target.textContent) head.appendChild(target);
+    item.append(head, command);
+    list.appendChild(item);
+  }
+  parent.append(title, list);
+  return true;
+}
 const renderedMessageState = new WeakMap();
 
 function toolGroupNode(message, keepRunning = false) {
@@ -683,8 +720,15 @@ function toolGroupNode(message, keepRunning = false) {
           const inputTitle = document.createElement("h5");
           inputTitle.textContent = tr("input");
           const input = document.createElement("pre");
-          input.textContent = toolValueText(r.display_input);
-          body.append(inputTitle, input, outputTitle);
+          if (appendCommandActions(body, r.display_input)) {
+            body.appendChild(outputTitle);
+          } else {
+            input.textContent =
+              typeof r.display_input?.command === "string"
+                ? r.display_input.command
+                : toolValueText(r.display_input);
+            body.append(inputTitle, input, outputTitle);
+          }
         }
         appendToolValue(body, r.tool.output);
       });
@@ -728,6 +772,10 @@ function localizedToolPreview(tool) {
   if (tool.name === "apply_patch") {
     if (tool.file_count > 1) return tr("filesShort", { count: tool.file_count });
     return preview.replace(/^已(?:编辑|新建|删除|移动)\s+/, "");
+  }
+  if (tool.name === "exec_command" && tool.command_action_count > 1) {
+    const mode = tool.command_actions_parallel ? "parallelCommandsShort" : "commandActionsShort";
+    return `${preview} · ${tr(mode, { count: tool.command_action_count })}`;
   }
   return preview;
 }
@@ -901,6 +949,13 @@ function renderPending() {
     );
   }
   tray.hidden = !tray.childElementCount;
+  syncOutboxCompactLabel();
+}
+function syncOutboxCompactLabel() {
+  const tray = $("outboxTray"),
+    label = tr(tray.classList.contains("compact") ? "expandPending" : "collapsePending");
+  tray.title = label;
+  tray.setAttribute("aria-label", label);
 }
 async function refreshPending() {
   const r = await command(
@@ -1769,8 +1824,10 @@ $("sendModeToggle").onclick = (event) => {
   if (event.detail !== 0) return;
   toggleSendModeAndKeepFocus();
 };
-$("submitBtn").onpointerdown = () => {
-  $("submitBtn").dataset.pointerAction = $("submitBtn").dataset.action;
+$("submitBtn").onpointerdown = (event) => {
+  if (!event.isPrimary || event.button !== 0) return;
+  event.preventDefault();
+  $("submitBtn").dataset.pointerAction ||= $("submitBtn").dataset.action;
 };
 $("submitBtn").onpointercancel = () => delete $("submitBtn").dataset.pointerAction;
 $("submitBtn").onclick = () => {
@@ -2039,6 +2096,7 @@ window.addEventListener("hashchange", () => {
   run(() => openSessionById(threadId, { fromHash: Boolean(hashedId), replaceHash: !hashedId }));
 });
 const composer = document.querySelector(".composer"),
+  composerShell = document.querySelector(".composer-shell"),
   mainPanel = document.querySelector("main"),
   threadHead = document.querySelector(".thread-head"),
   syncFrameInsets = () => {
@@ -2058,6 +2116,24 @@ syncFrameInsets();
 resizeComposerTextarea();
 window.addEventListener("resize", resizeComposerTextarea, { passive: true });
 window.visualViewport?.addEventListener("resize", resizeComposerTextarea, { passive: true });
+composerShell.addEventListener(
+  "pointerdown",
+  (event) => {
+    if (
+      !usesDocumentMessageScroll() ||
+      !event.isPrimary ||
+      event.button !== 0 ||
+      event.target === $("messageText")
+    )
+      return;
+    if ($("submitBtn").contains(event.target)) {
+      $("submitBtn").dataset.pointerAction ||= $("submitBtn").dataset.action;
+    }
+    event.preventDefault();
+    $("messageText").focus({ preventScroll: true });
+  },
+  true,
+);
 document.addEventListener("click", (event) => {
   if (
     !$("modelPicker").hidden &&
@@ -2066,30 +2142,15 @@ document.addEventListener("click", (event) => {
   )
     $("modelPicker").hidden = true;
 });
-document.addEventListener(
-  "pointerdown",
-  (event) => {
-    const textarea = $("messageText"),
-      submit = $("submitBtn"),
-      mode = $("sendModeToggle"),
-      shell = document.querySelector(".composer-shell"),
-      target = event.target;
-    if (
-      target === textarea ||
-      textarea.contains(target) ||
-      submit.contains(target) ||
-      mode.contains(target)
-    )
-      return;
-    shell.classList.remove("input-focused");
-    textarea.blur();
-    syncSubmitAction();
-  },
-  true,
-);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("createDialog").hidden) closeCreateDialog();
 });
+$("outboxTray").addEventListener("click", (event) => {
+  if (event.target !== event.currentTarget) return;
+  $("outboxTray").classList.toggle("compact");
+  syncOutboxCompactLabel();
+});
+syncOutboxCompactLabel();
 $("messages").addEventListener("touchmove", () => (state.userScrolled = true), { passive: true });
 $("messages").addEventListener("wheel", () => (state.userScrolled = true), { passive: true });
 const handleMessageScroll = () => {

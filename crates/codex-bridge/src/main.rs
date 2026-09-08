@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +39,8 @@ const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const DOWNLOAD_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_DOWNLOAD_TICKETS: usize = 128;
+const WEB_SESSION_COOKIE: &str = "codex_bridge_session";
+const WEB_SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
 const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
@@ -75,7 +77,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     host_exec_policy: Option<PathBuf>,
 
-    /// Start the HTTP Web UI. HTTP Basic Auth is required.
+    /// Start the HTTP Web UI.
     #[arg(long)]
     web_ui: bool,
 
@@ -90,6 +92,10 @@ struct Args {
     /// Read the HTTP Basic Auth password from a same-user mode-0600 file.
     #[arg(long, value_name = "PATH")]
     web_ui_password_file: Option<PathBuf>,
+
+    /// Disable Web UI authentication. Only allowed with a loopback listener.
+    #[arg(long, requires = "web_ui")]
+    web_ui_no_auth: bool,
 
     /// Exact HTTPS origin allowed through a trusted reverse proxy. May be repeated.
     #[arg(long, value_name = "HTTPS_ORIGIN")]
@@ -111,7 +117,7 @@ struct BridgeState {
 struct WebState {
     bridge: BridgeState,
     port: u16,
-    auth: Arc<WebAuth>,
+    auth: Option<Arc<WebAuth>>,
     public_origins: Arc<Vec<WebOrigin>>,
     download_tickets: Arc<RwLock<HashMap<String, DownloadTicket>>>,
 }
@@ -125,6 +131,7 @@ struct WebOrigin {
 struct WebAuth {
     username: String,
     password: String,
+    session_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,10 +257,9 @@ impl PendingMessages {
                 .entry(entry.thread_id.clone())
                 .or_insert_with(|| {
                     session_store
-                        .read_thread(&entry.thread_id)
+                        .read_recent_messages(&entry.thread_id, 128)
                         .ok()
                         .flatten()
-                        .map(|snapshot| snapshot.messages)
                         .unwrap_or_default()
                 });
             let is_landed = pending_message_landed(entry, messages, &mut landed);
@@ -550,8 +556,8 @@ async fn main() -> Result<()> {
         None => default_socket_path()?,
     };
 
-    let web_auth = args
-        .web_ui
+    validate_web_ui_auth_config(args.web_ui_no_auth, args.web_ui_listen)?;
+    let web_auth = (args.web_ui && !args.web_ui_no_auth)
         .then(|| load_web_auth(&args.web_ui_user, args.web_ui_password_file.as_deref()))
         .transpose()?;
     let web_public_origins = args
@@ -596,7 +602,7 @@ async fn main() -> Result<()> {
         let web_state = WebState {
             bridge: bridge_state.clone(),
             port: web_addr.port(),
-            auth: Arc::new(web_auth.context("Web UI authentication is unavailable")?),
+            auth: web_auth.map(Arc::new),
             public_origins: Arc::new(web_public_origins),
             download_tickets: Arc::new(RwLock::new(HashMap::new())),
         };
@@ -647,6 +653,13 @@ async fn main() -> Result<()> {
         hot_cache_task.abort();
     }
 
+    Ok(())
+}
+
+fn validate_web_ui_auth_config(no_auth: bool, listen: SocketAddr) -> Result<()> {
+    if no_auth && !listen.ip().is_loopback() {
+        bail!("--web-ui-no-auth requires --web-ui-listen to use a loopback address");
+    }
     Ok(())
 }
 
@@ -845,10 +858,94 @@ fn load_web_auth(username: &str, password_file: Option<&Path>) -> Result<WebAuth
     if password.is_empty() {
         bail!("Web UI password must not be empty");
     }
+    let session_token = load_or_create_web_session_token(username, &metadata)?;
     Ok(WebAuth {
         username: username.to_owned(),
         password,
+        session_token,
     })
+}
+
+fn load_or_create_web_session_token(
+    username: &str,
+    password_metadata: &fs::Metadata,
+) -> Result<String> {
+    let uid = unsafe { libc::geteuid() };
+    let cache_dir = env::temp_dir().join(format!("codex-bridge-{uid}"));
+    match fs::symlink_metadata(&cache_dir) {
+        Ok(metadata)
+            if metadata.file_type().is_dir()
+                && metadata.uid() == uid
+                && metadata.mode() & 0o077 == 0 => {}
+        Ok(_) => bail!("Web UI session cache directory is not private"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&cache_dir)
+                .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+        }
+        Err(error) => return Err(error).context("failed to inspect Web UI session cache"),
+    }
+    let username_key = URL_SAFE_NO_PAD.encode(username.as_bytes());
+    let cache_path = cache_dir.join(format!(
+        "web-session-{}-{}-{}-{}-{}",
+        password_metadata.dev(),
+        password_metadata.ino(),
+        password_metadata.mtime(),
+        password_metadata.mtime_nsec(),
+        username_key
+    ));
+    match read_web_session_token(&cache_path, uid) {
+        Ok(Some(token)) => return Ok(token),
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).context("failed to create Web UI session token")?;
+    let token = URL_SAFE_NO_PAD.encode(random);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&cache_path)
+    {
+        Ok(mut file) => {
+            file.write_all(token.as_bytes())
+                .with_context(|| format!("failed to write {}", cache_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", cache_path.display()))?;
+            Ok(token)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            read_web_session_token(&cache_path, uid)?
+                .context("Web UI session cache appeared but could not be read")
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to create {}", cache_path.display()))
+        }
+    }
+}
+
+fn read_web_session_token(path: &Path, uid: u32) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        bail!("Web UI session cache file is not private");
+    }
+    let token =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(token.as_bytes())
+        .context("Web UI session cache contains an invalid token")?;
+    if decoded.len() != 32 {
+        bail!("Web UI session cache contains an invalid token length");
+    }
+    Ok(Some(token))
 }
 
 async fn handle_connection(stream: UnixStream, state: BridgeState) -> Result<()> {
@@ -924,7 +1021,9 @@ async fn web_app_css(State(state): State<WebState>, headers: HeaderMap) -> HttpR
 }
 
 async fn web_auth_check(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
-    if !basic_auth_allowed(&headers, &state.auth) {
+    let auth = state.auth.as_deref();
+    let basic_authenticated = auth.is_some_and(|auth| basic_auth_allowed(&headers, auth));
+    if !web_auth_allowed(&headers, auth) {
         return basic_auth_required();
     }
     if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
@@ -935,6 +1034,9 @@ async fn web_auth_check(State(state): State<WebState>, headers: HeaderMap) -> Ht
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
     );
+    if let Some(auth) = auth.filter(|_| basic_authenticated) {
+        set_web_session_cookie(&mut response, &headers, auth, &state.public_origins);
+    }
     response
 }
 
@@ -1025,7 +1127,7 @@ async fn web_file_ticket(
     headers: HeaderMap,
     body: Bytes,
 ) -> HttpResponse {
-    if !basic_auth_allowed(&headers, &state.auth) {
+    if !web_auth_allowed(&headers, state.auth.as_deref()) {
         return basic_auth_required();
     }
     if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
@@ -1176,7 +1278,9 @@ fn web_asset_response(
     body: &'static str,
     content_type: &'static str,
 ) -> HttpResponse {
-    if !basic_auth_allowed(headers, &state.auth) {
+    let auth = state.auth.as_deref();
+    let basic_authenticated = auth.is_some_and(|auth| basic_auth_allowed(headers, auth));
+    if !web_auth_allowed(headers, auth) {
         return basic_auth_required();
     }
     if !web_headers_allowed(headers, state.port, false, &state.public_origins) {
@@ -1190,6 +1294,9 @@ fn web_asset_response(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, no-cache, must-revalidate"),
     );
+    if let Some(auth) = auth.filter(|_| basic_authenticated) {
+        set_web_session_cookie(&mut response, headers, auth, &state.public_origins);
+    }
     response
 }
 
@@ -1198,7 +1305,7 @@ async fn web_command(
     headers: HeaderMap,
     body: Bytes,
 ) -> HttpResponse {
-    if !basic_auth_allowed(&headers, &state.auth) {
+    if !web_auth_allowed(&headers, state.auth.as_deref()) {
         return basic_auth_required();
     }
     if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
@@ -1286,7 +1393,7 @@ async fn web_events(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> HttpResponse {
-    if !basic_auth_allowed(&headers, &state.auth) {
+    if !web_auth_allowed(&headers, state.auth.as_deref()) {
         return basic_auth_required();
     }
     if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
@@ -1491,6 +1598,47 @@ fn basic_auth_allowed(headers: &HeaderMap, auth: &WebAuth) -> bool {
     };
     constant_time_eq(username.as_bytes(), auth.username.as_bytes())
         & constant_time_eq(password.as_bytes(), auth.password.as_bytes())
+}
+
+fn session_cookie_allowed(headers: &HeaderMap, auth: &WebAuth) -> bool {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .find(|(name, _)| *name == WEB_SESSION_COOKIE)
+        .is_some_and(|(_, token)| constant_time_eq(token.as_bytes(), auth.session_token.as_bytes()))
+}
+
+fn web_auth_allowed(headers: &HeaderMap, auth: Option<&WebAuth>) -> bool {
+    auth.is_none_or(|auth| {
+        session_cookie_allowed(headers, auth) || basic_auth_allowed(headers, auth)
+    })
+}
+
+fn set_web_session_cookie(
+    response: &mut HttpResponse,
+    headers: &HeaderMap,
+    auth: &WebAuth,
+    public_origins: &[WebOrigin],
+) {
+    let secure = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| {
+            public_origins
+                .iter()
+                .any(|origin| origin.authority.eq_ignore_ascii_case(host))
+        });
+    let value = format!(
+        "{WEB_SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={WEB_SESSION_MAX_AGE_SECONDS}{}",
+        auth.session_token,
+        if secure { "; Secure" } else { "" }
+    );
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -3031,10 +3179,10 @@ struct ResolvedThread {
 
 fn latest_message_index(session_store: &SessionStore, thread_id: &str) -> i64 {
     session_store
-        .read_thread(thread_id)
+        .message_count(thread_id)
         .ok()
         .flatten()
-        .map(|snapshot| snapshot.messages.len() as i64 - 1)
+        .map(|count| count as i64 - 1)
         .unwrap_or(-1)
 }
 
@@ -3436,6 +3584,7 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
 
 fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
     let changes = structured_file_changes(tool);
+    let command_actions = structured_command_actions(tool);
     let patch_stats = changes.map(|changes| {
         changes
             .iter()
@@ -3454,11 +3603,28 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
         "status": tool.status,
         "preview": tool_preview(tool),
         "has_output": tool.output.is_some(),
-        "bytes": serde_json::to_vec(tool).map_or(0, |encoded| encoded.len()),
+        "bytes": compact_tool_bytes(tool),
         "additions": patch_stats.map(|stats| stats.0),
         "deletions": patch_stats.map(|stats| stats.1),
         "file_count": changes.map(<[Value]>::len),
+        "command_action_count": command_actions.map(<[Value]>::len),
+        "command_actions_parallel": command_actions
+            .is_some_and(|actions| actions.len() > 1 && command_actions_are_parallel(tool)),
     })
+}
+
+fn compact_tool_bytes(tool: &ThreadToolCall) -> usize {
+    let encoded = serde_json::to_vec(tool).map_or(0, |encoded| encoded.len());
+    let lazy_output_bytes = tool
+        .output
+        .as_ref()
+        .and_then(|output| output.get("_codex_bridge_lazy"))
+        .and_then(Value::as_bool)
+        .filter(|lazy| *lazy)
+        .and_then(|_| tool.output.as_ref()?.get("bytes")?.as_u64())
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .unwrap_or(0);
+    encoded.saturating_add(lazy_output_bytes)
 }
 
 fn tool_preview(tool: &ThreadToolCall) -> String {
@@ -3466,11 +3632,13 @@ fn tool_preview(tool: &ThreadToolCall) -> String {
         return "等待输出".to_owned();
     }
     if tool.name == "exec_command" {
-        return tool
-            .input
-            .get("command")
+        let command = structured_command_actions(tool)
+            .and_then(|actions| actions.first())
+            .and_then(|action| action.get("command"))
             .and_then(Value::as_str)
-            .unwrap_or("exec_command")
+            .or_else(|| tool.input.get("command").and_then(Value::as_str))
+            .unwrap_or("exec_command");
+        return command
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -3504,6 +3672,9 @@ fn tool_preview(tool: &ThreadToolCall) -> String {
             .map(|query| format!("搜索 {query}"))
             .unwrap_or_else(|| "网页搜索".to_owned());
     }
+    if let Some(preview) = plugin_title_preview(tool) {
+        return preview;
+    }
     let preferred = tool.input.as_str().unwrap_or(&tool.name);
     let normalized = preferred.split_whitespace().collect::<Vec<_>>().join(" ");
     let preview = if normalized.is_empty() {
@@ -3512,6 +3683,45 @@ fn tool_preview(tool: &ThreadToolCall) -> String {
         normalized
     };
     preview.chars().take(140).collect()
+}
+
+fn plugin_title_preview(tool: &ThreadToolCall) -> Option<String> {
+    let plugin_id = tool.input.get("pluginId")?.as_str()?;
+    let title = tool.input.pointer("/arguments/title")?.as_str()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let plugin_name = plugin_id
+        .rsplit_once('@')
+        .filter(|(name, source)| !name.is_empty() && !source.is_empty())
+        .map_or(plugin_id, |(name, _)| name);
+    Some(
+        format!("{plugin_name} · {title}")
+            .chars()
+            .take(180)
+            .collect(),
+    )
+}
+
+fn structured_command_actions(tool: &ThreadToolCall) -> Option<&[Value]> {
+    (tool.name == "exec_command").then(|| {
+        tool.input
+            .get("commandActions")?
+            .as_array()
+            .filter(|actions| !actions.is_empty())
+            .map(Vec::as_slice)
+    })?
+}
+
+fn command_actions_are_parallel(tool: &ThreadToolCall) -> bool {
+    tool.input.get("parallel").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            tool.input
+                .get("executionMode")
+                .or_else(|| tool.input.get("execution_mode"))
+                .and_then(Value::as_str),
+            Some("parallel" | "concurrent")
+        )
 }
 
 fn structured_file_changes(tool: &ThreadToolCall) -> Option<&[Value]> {
@@ -4087,6 +4297,7 @@ mod tests {
         let auth = WebAuth {
             username: "codex".to_owned(),
             password: "test-password".to_owned(),
+            session_token: "test-session-token".to_owned(),
         };
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -4099,6 +4310,61 @@ mod tests {
             HeaderValue::from_static("Basic Y29kZXg6d3Jvbmc="),
         );
         assert!(!basic_auth_allowed(&headers, &auth));
+
+        headers.remove(header::AUTHORIZATION);
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("theme=dark; codex_bridge_session=test-session-token"),
+        );
+        assert!(session_cookie_allowed(&headers, &auth));
+        assert!(web_auth_allowed(&headers, Some(&auth)));
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("codex_bridge_session=wrong"),
+        );
+        assert!(!session_cookie_allowed(&headers, &auth));
+        assert!(!web_auth_allowed(&headers, Some(&auth)));
+        assert!(web_auth_allowed(&HeaderMap::new(), None));
+    }
+
+    #[test]
+    fn unauthenticated_web_ui_is_restricted_to_loopback() {
+        assert!(validate_web_ui_auth_config(false, "0.0.0.0:47653".parse().unwrap()).is_ok());
+        assert!(validate_web_ui_auth_config(true, "127.0.0.1:47653".parse().unwrap()).is_ok());
+        assert!(validate_web_ui_auth_config(true, "[::1]:47653".parse().unwrap()).is_ok());
+        assert!(validate_web_ui_auth_config(true, "0.0.0.0:47653".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn web_ui_session_cookie_is_http_only_and_secure_behind_public_origin() {
+        let auth = WebAuth {
+            username: "codex".to_owned(),
+            password: "test-password".to_owned(),
+            session_token: "test-session-token".to_owned(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("codex.example.com"));
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        set_web_session_cookie(
+            &mut response,
+            &headers,
+            &auth,
+            &[WebOrigin {
+                scheme: "https".to_owned(),
+                authority: "codex.example.com".to_owned(),
+            }],
+        );
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("codex_bridge_session=test-session-token;"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Max-Age=604800"));
+        assert!(cookie.ends_with("; Secure"));
     }
 
     #[test]
@@ -4437,12 +4703,15 @@ mod tests {
             "SessionMessageCache",
             "tool-summary-label",
             "appendPatchDiff",
+            "appendCommandActions",
+            "command_action_count",
             "diff-line",
             "fileChange",
             ".outbox-item.submitting .message-body",
             "outbox-mode",
             "border: 1px dashed",
             "classList.add(\"focused\", \"input-focused\")",
+            "composerShell.addEventListener",
             "border-width: 2px",
         ] {
             assert!(source.contains(marker), "missing {marker}");
@@ -4526,6 +4795,71 @@ mod tests {
         assert_eq!(tool.input["command"], "git status --short");
         assert_eq!(tool.output.as_ref().unwrap()["aggregatedOutput"], "clean");
         assert_eq!(tool_preview(&tool), "git status --short");
+    }
+
+    #[test]
+    fn command_summary_exposes_structured_actions_without_claiming_sequential_shell_is_parallel() {
+        let tool = typed_thread_tool(&json!({
+            "type":"commandExecution",
+            "id":"exec-2",
+            "command":"/bin/zsh -lc \"rg -n needle file && sed -n '1,20p' file\"",
+            "commandActions":[
+                {"type":"search","command":"rg -n needle file","query":"needle","path":"file"},
+                {"type":"read","command":"sed -n '1,20p' file","path":"file"}
+            ],
+            "cwd":"/workspace",
+            "status":"completed",
+            "aggregatedOutput":"result"
+        }))
+        .unwrap();
+        let compact = compact_tool_summary(&tool, 0);
+        assert_eq!(compact["preview"], "rg -n needle file");
+        assert_eq!(compact["command_action_count"], 2);
+        assert_eq!(compact["command_actions_parallel"], false);
+        assert_eq!(structured_command_actions(&tool).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn command_summary_preserves_explicit_parallel_metadata() {
+        let tool = typed_thread_tool(&json!({
+            "type":"commandExecution",
+            "id":"exec-3",
+            "command":"first & second & wait",
+            "executionMode":"parallel",
+            "commandActions":[
+                {"type":"unknown","command":"first"},
+                {"type":"unknown","command":"second"}
+            ],
+            "status":"inProgress"
+        }))
+        .unwrap();
+        let compact = compact_tool_summary(&tool, 0);
+        assert_eq!(compact["command_action_count"], 2);
+        assert_eq!(compact["command_actions_parallel"], true);
+    }
+
+    #[test]
+    fn plugin_tool_preview_uses_plugin_name_and_argument_title() {
+        let tool = typed_thread_tool(&json!({
+            "type":"mcpToolCall",
+            "id":"plugin-1",
+            "server":"cua_repl",
+            "tool":"js",
+            "arguments":{
+                "code":"await cua.getState();",
+                "title":"检查浏览器状态"
+            },
+            "pluginId":"unified-computer-use@openai-bundled",
+            "status":"completed",
+            "result":{"content":[]}
+        }))
+        .unwrap();
+        assert_eq!(tool.name, "cua_repl.js");
+        assert_eq!(tool_preview(&tool), "unified-computer-use · 检查浏览器状态");
+        assert_eq!(
+            compact_tool_summary(&tool, 0)["preview"],
+            "unified-computer-use · 检查浏览器状态"
+        );
     }
 
     #[test]

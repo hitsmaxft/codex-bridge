@@ -853,6 +853,39 @@ main {
 .outbox-tray[hidden] {
   display: none;
 }
+.outbox-tray.compact {
+  max-height: 34px;
+  overflow: hidden;
+  cursor: pointer;
+}
+.outbox-tray.compact .outbox-item:not(:last-child) {
+  display: none;
+}
+.outbox-tray.compact > .outbox-item:last-child {
+  grid-template-columns: minmax(0, 1fr);
+  width: min(88%, 680px);
+}
+.outbox-tray.compact .outbox-actions,
+.outbox-tray.compact .outbox-mode,
+.outbox-tray.compact .markdown > :not(:first-child),
+.outbox-tray.compact .markdown :is(img, video, audio, pre, blockquote, ul, ol, button) {
+  display: none;
+}
+.outbox-tray.compact .message-body {
+  min-width: 0;
+  max-height: 28px;
+  overflow: hidden;
+  padding-block: 4px;
+}
+.outbox-tray.compact .markdown,
+.outbox-tray.compact .markdown > :first-child {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .outbox-item {
   display: grid;
   grid-template-columns: minmax(44px, auto) minmax(0, 1fr);
@@ -1096,6 +1129,66 @@ main {
     SFMono-Regular,
     Menlo,
     monospace;
+}
+.command-actions {
+  position: relative;
+  display: grid;
+  gap: 6px;
+  margin-bottom: 7px;
+  padding-left: 13px;
+}
+.command-actions::before {
+  content: "";
+  position: absolute;
+  top: 13px;
+  bottom: 13px;
+  left: 4px;
+  border-left: 1px solid var(--line);
+}
+.command-actions.parallel::before {
+  border-left-style: dashed;
+  border-left-color: var(--accent);
+}
+.command-action {
+  min-width: 0;
+}
+.command-action-head {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 5px;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.command-action-number {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 15px;
+  height: 15px;
+  margin-left: -16px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 9px;
+}
+.command-actions.parallel .command-action-number {
+  border-color: var(--accent);
+}
+.command-action-kind {
+  flex: 0 0 auto;
+  text-transform: lowercase;
+}
+.command-action-target {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool-detail .command-action pre {
+  margin-bottom: 0;
+  padding: 7px 8px;
 }
 .tool-detail img {
   display: block;
