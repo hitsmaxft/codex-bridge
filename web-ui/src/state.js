@@ -42,6 +42,8 @@ export const state = {
   userScrolled: false,
   pending: [],
   drafts: loadDrafts(),
+  composerAttachments: [],
+  attachmentDrafts: new Map(),
   modelOptions: [],
   composerModel: null,
   composerEffort: null,

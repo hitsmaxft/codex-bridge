@@ -76,6 +76,7 @@ pub struct SessionStore {
     codex_home: PathBuf,
     git_branch_cache: GitBranchCache,
     summary_cache: Arc<Mutex<Option<SummaryCache>>>,
+    ephemeral_threads: Arc<Mutex<HashMap<String, ThreadSummary>>>,
     message_cache: Arc<Mutex<HashMap<PathBuf, CachedMessages>>>,
     activity_cache: Arc<Mutex<HashMap<PathBuf, CachedActivity>>>,
 }
@@ -195,6 +196,7 @@ impl SessionStore {
             codex_home,
             git_branch_cache: Arc::new(Mutex::new(HashMap::new())),
             summary_cache: Arc::new(Mutex::new(None)),
+            ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
             message_cache: Arc::new(Mutex::new(HashMap::new())),
             activity_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -211,6 +213,45 @@ impl SessionStore {
     pub fn invalidate_summary_cache(&self) {
         if let Ok(mut cache) = self.summary_cache.lock() {
             *cache = None;
+        }
+    }
+
+    pub fn register_ephemeral_thread(
+        &self,
+        id: String,
+        cwd: PathBuf,
+        title: Option<String>,
+        updated_at_ms: u64,
+    ) {
+        if let Ok(mut threads) = self.ephemeral_threads.lock() {
+            threads.insert(
+                id.clone(),
+                ThreadSummary {
+                    id,
+                    title,
+                    cwd,
+                    git_branch: None,
+                    created_at: None,
+                    updated_at_ms,
+                    source: Some("app_server".to_owned()),
+                    archived: false,
+                    rollout_path: PathBuf::new(),
+                },
+            );
+        }
+    }
+
+    pub fn rename_ephemeral_thread(&self, thread_id: &str, name: &str) {
+        if let Ok(mut threads) = self.ephemeral_threads.lock() {
+            if let Some(thread) = threads.get_mut(thread_id) {
+                thread.title = Some(name.to_owned());
+            }
+        }
+    }
+
+    pub fn remove_ephemeral_thread(&self, thread_id: &str) {
+        if let Ok(mut threads) = self.ephemeral_threads.lock() {
+            threads.remove(thread_id);
         }
     }
 
@@ -251,6 +292,9 @@ impl SessionStore {
         let Some(thread) = self.find_thread(thread_id)? else {
             return Ok((None, None));
         };
+        if thread.rollout_path.as_os_str().is_empty() {
+            return Ok((None, None));
+        }
         let file = File::open(&thread.rollout_path)
             .with_context(|| format!("failed to open {}", thread.rollout_path.display()))?;
         let mut model = None;
@@ -359,7 +403,10 @@ impl SessionStore {
         if let Ok(cache) = self.summary_cache.lock() {
             if let Some(cache) = cache.as_ref() {
                 if cache.refreshed_at.elapsed() <= SUMMARY_CACHE_TTL {
-                    return Ok(filter_archived(cache.threads.clone(), include_archived));
+                    return Ok(self.merge_ephemeral_threads(filter_archived(
+                        cache.threads.clone(),
+                        include_archived,
+                    )));
                 }
             }
         }
@@ -371,7 +418,29 @@ impl SessionStore {
                 threads: threads.clone(),
             });
         }
-        Ok(filter_archived(threads, include_archived))
+        Ok(self.merge_ephemeral_threads(filter_archived(threads, include_archived)))
+    }
+
+    fn merge_ephemeral_threads(&self, mut threads: Vec<ThreadSummary>) -> Vec<ThreadSummary> {
+        let existing = threads
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect::<HashSet<_>>();
+        if let Ok(ephemeral) = self.ephemeral_threads.lock() {
+            threads.extend(
+                ephemeral
+                    .values()
+                    .filter(|thread| !existing.contains(&thread.id))
+                    .cloned(),
+            );
+        }
+        threads.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        threads
     }
 
     fn scan_threads(&self) -> Result<Vec<ThreadSummary>> {
@@ -410,7 +479,11 @@ impl SessionStore {
         let Some(summary) = summary else {
             return Ok(None);
         };
-        let messages = self.hydrated_messages_for_path(&summary.rollout_path)?;
+        let messages = if summary.rollout_path.as_os_str().is_empty() {
+            Vec::new()
+        } else {
+            self.hydrated_messages_for_path(&summary.rollout_path)?
+        };
         Ok(Some(ThreadSnapshot {
             thread: summary,
             messages,
@@ -426,6 +499,18 @@ impl SessionStore {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(Some((
+                summary,
+                MessagePage {
+                    messages: Vec::new(),
+                    start: 0,
+                    end: 0,
+                    total: 0,
+                    has_more: false,
+                },
+            )));
+        }
         let messages = self.messages_for_path(&summary.rollout_path)?;
         let total = messages.len();
         let end = before.unwrap_or(total).min(total);
@@ -452,6 +537,9 @@ impl SessionStore {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
         let messages = self.messages_for_path(&summary.rollout_path)?;
         let Some(message) = messages.get(message_index) else {
             return Ok(None);
@@ -475,6 +563,9 @@ impl SessionStore {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
         let messages = self.messages_for_path(&summary.rollout_path)?;
         let Some(mut message) = messages.get(message_index).cloned() else {
             return Ok(None);
@@ -487,6 +578,9 @@ impl SessionStore {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(Some(0));
+        }
         Ok(Some(self.messages_for_path(&summary.rollout_path)?.len()))
     }
 
@@ -498,6 +592,9 @@ impl SessionStore {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(Some(Vec::new()));
+        }
         let messages = self.messages_for_path(&summary.rollout_path)?;
         let start = messages.len().saturating_sub(limit);
         Ok(Some(messages[start..].to_vec()))
@@ -507,6 +604,9 @@ impl SessionStore {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(false);
         };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(true);
+        }
         self.messages_for_path(&summary.rollout_path)?;
         Ok(true)
     }
@@ -623,6 +723,15 @@ impl SessionStore {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(Some(ThreadActivity {
+                file_len: 0,
+                updated_at_ms: summary.updated_at_ms,
+                active_turn_id: None,
+                phase: None,
+                active_tool: None,
+            }));
+        }
         read_thread_activity(&summary.rollout_path, &self.activity_cache).map(Some)
     }
 
@@ -1703,6 +1812,30 @@ mod tests {
         assert_eq!((older.start, older.end), (0, 2));
         assert!(!older.has_more);
         assert_eq!(older.messages[1].id.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn newly_started_thread_is_readable_before_its_rollout_exists() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = SessionStore::new(fixture.path.clone());
+        store.register_ephemeral_thread("thread-empty".to_owned(), workspace.clone(), None, 42);
+
+        let (thread, page) = store
+            .read_message_page("thread-empty", None, 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.id, "thread-empty");
+        assert_eq!(thread.cwd, workspace);
+        assert_eq!(page.total, 0);
+        assert!(page.messages.is_empty());
+        assert!(!page.has_more);
+        assert!(store
+            .list_projects(false)
+            .unwrap()
+            .iter()
+            .any(|project| project.path == thread.cwd));
     }
 
     #[test]

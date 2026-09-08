@@ -21,6 +21,7 @@ const wasmPath = new URL(
 );
 const stylesheetPath = new URL("../src/styles.css", import.meta.url);
 const mainScriptPath = new URL("../src/main.js", import.meta.url);
+const indexPath = new URL("../index.html", import.meta.url);
 
 async function demoClient() {
   const { instance } = await WebAssembly.instantiate(await readFile(wasmPath), {});
@@ -143,6 +144,19 @@ test("mobile composer stays out of the message grid sizing flow", async () => {
   assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-item:not\(:last-child\)/);
   assert.match(stylesheet, /\.outbox-tray\.compact > \.outbox-item:last-child/);
   assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-actions/);
+});
+
+test("composer exposes native image and voice attachment controls", async () => {
+  const index = await readFile(indexPath, "utf8");
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(
+    index,
+    /id="imageInput"[\s\S]*?accept="image\/jpeg,image\/png,image\/webp,image\/gif"/,
+  );
+  assert.match(index, /id="audioInput"[^>]*accept="audio\/\*"[^>]*capture/);
+  assert.match(source, /attachments = state\.composerAttachments\.map/);
+  assert.match(source, /command\(\{ command: name, thread_id: threadId, text, attachments \}\)/);
+  assert.match(source, /new MediaRecorder/);
 });
 
 test("structured command actions stay separate and preserve multiline commands", async () => {

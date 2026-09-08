@@ -121,18 +121,14 @@ impl CodexCliBackend {
     pub fn queue_message(
         &self,
         thread_id: &str,
-        text: &str,
+        input: &[Value],
         client_user_message_id: &str,
     ) -> Result<NativeQueueReceipt, BackendFailure> {
         let result = self.app_server_rpc(
             "thread/queue/add",
             json!({
                 "threadId": thread_id,
-                "input": [{
-                    "type": "text",
-                    "text": text,
-                    "text_elements": []
-                }],
+                "input": input,
                 "clientUserMessageId": client_user_message_id,
             }),
         )?;
@@ -213,15 +209,11 @@ impl CodexCliBackend {
         &self,
         thread_id: &str,
         turn_id: &str,
-        text: &str,
+        input: &[Value],
     ) -> Result<BackendSuccess, BackendFailure> {
         let params = json!({
             "threadId": thread_id,
-            "input": [{
-                "type": "text",
-                "text": text,
-                "text_elements": []
-            }],
+            "input": input,
             "expectedTurnId": turn_id
         });
         self.run_app_server_rpc("turn/steer", params, "codex_app_server_steer")
@@ -992,7 +984,11 @@ mod tests {
         let mut events = backend.subscribe_app_server_events().unwrap();
 
         let steer = backend
-            .steer_via_app_server("thread-1", "turn-1", "guide")
+            .steer_via_app_server(
+                "thread-1",
+                "turn-1",
+                &[json!({"type":"text", "text":"guide", "text_elements":[]})],
+            )
             .unwrap();
         assert_eq!(steer.backend, "codex_app_server_steer");
 
@@ -1182,7 +1178,11 @@ mod tests {
         });
         let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(sock_path.clone()));
         let receipt = backend
-            .queue_message("thread-1", "queued text", "browser-message-1")
+            .queue_message(
+                "thread-1",
+                &[json!({"type":"text", "text":"queued text", "text_elements":[]})],
+                "browser-message-1",
+            )
             .unwrap();
         assert_eq!(receipt.backend, "app_server_queue");
         assert_eq!(receipt.queued_submission_id, "server-queue-1");
@@ -1327,7 +1327,11 @@ mod tests {
             .steer_via_app_server(
                 &thread_id,
                 &turn_id,
-                "STEER_ACCEPTED: skip the sleep and finish the smoke test now.",
+                &[json!({
+                    "type":"text",
+                    "text":"STEER_ACCEPTED: skip the sleep and finish the smoke test now.",
+                    "text_elements":[]
+                })],
             )
             .unwrap();
         match backend.interrupt_turn(&thread_id, &turn_id) {

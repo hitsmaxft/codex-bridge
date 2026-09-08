@@ -1372,9 +1372,9 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
 .composer-shell {
   display: grid;
   grid-template-areas:
-    "input input input"
-    "mode spacer submit";
-  grid-template-columns: 64px minmax(0, 1fr) 44px;
+    "input input input input"
+    "mode actions spacer submit";
+  grid-template-columns: 64px 72px minmax(0, 1fr) 44px;
   grid-template-rows: minmax(44px, auto) auto;
   align-items: end;
   gap: 4px;
@@ -1383,6 +1383,97 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   border-radius: 30px;
   background: var(--composer-surface);
   box-shadow: 0 2px 12px #00000018;
+}
+.composer-attachments {
+  display: flex;
+  gap: 8px;
+  max-width: 100%;
+  margin: 0 5px 7px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.composer-attachments[hidden] {
+  display: none;
+}
+.composer-attachment {
+  position: relative;
+  flex: 0 0 auto;
+  width: 58px;
+  height: 58px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel2);
+}
+.composer-attachment img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.composer-attachment.audio {
+  display: grid;
+  place-items: center;
+  color: var(--accent2);
+}
+.composer-attachment.audio svg {
+  width: 23px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+}
+.attachment-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  min-height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #111c;
+  color: #fff;
+  font-size: 15px;
+  line-height: 1;
+}
+.composer-actions {
+  grid-area: actions;
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+.composer-actions button {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+}
+.composer-actions button.recording {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
+  animation: voice-pulse 1.2s ease-in-out infinite;
+}
+.composer-actions svg {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+@keyframes voice-pulse {
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--danger) 12%, transparent);
+  }
 }
 @keyframes edge-flow {
   from {
@@ -1570,6 +1661,9 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
 }
 .tool-primary .tool-row button {
   width: 100%;
+}
+.tool-primary .tool-row {
+  flex-direction: column;
 }
 .tool-other {
   min-height: 0;
@@ -1940,8 +2034,8 @@ label.caption {
     max-height: none;
   }
   .composer-shell {
-    grid-template-areas: "mode input submit";
-    grid-template-columns: 64px minmax(0, 1fr) 44px;
+    grid-template-areas: "mode actions input submit";
+    grid-template-columns: 64px 72px minmax(0, 1fr) 44px;
     grid-template-rows: auto;
     align-items: center;
   }
@@ -1950,9 +2044,9 @@ label.caption {
   .composer-shell.has-text,
   .composer-shell.submitting {
     grid-template-areas:
-      "mode submit"
-      "input input";
-    grid-template-columns: 64px minmax(0, 1fr);
+      "mode actions spacer submit"
+      "input input input input";
+    grid-template-columns: 64px 72px minmax(0, 1fr) 44px;
     grid-template-rows: auto minmax(44px, auto);
     align-items: start;
   }

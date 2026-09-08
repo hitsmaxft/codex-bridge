@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{get, post};
@@ -22,10 +22,10 @@ use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_P
 use base64::Engine as _;
 use clap::Parser;
 use codex_bridge::{
-    default_codex_home, default_socket_path, BackendFailure, CodexCliBackend, HostExecFailure,
-    HostExecutor, Request, Response, SessionStore, ThreadMessage, ThreadSummary, ThreadToolCall,
-    APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV,
-    PROTOCOL_VERSION, SOCKET_ENV,
+    default_codex_home, default_socket_path, BackendFailure, CodexCliBackend, ComposerAttachment,
+    HostExecFailure, HostExecutor, Request, Response, SessionStore, ThreadMessage, ThreadSummary,
+    ThreadToolCall, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
+    HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
@@ -36,6 +36,10 @@ use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+const MAX_WEB_REQUEST_BYTES: usize = 12 * 1024 * 1024;
+const MAX_COMPOSER_ATTACHMENTS: usize = 6;
+const MAX_ATTACHMENT_URL_BYTES: usize = 6 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const DOWNLOAD_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_DOWNLOAD_TICKETS: usize = 128;
@@ -407,17 +411,117 @@ fn read_native_queue(
 }
 
 fn queue_input_text(input: &Value) -> Option<String> {
-    let text = input
-        .as_array()?
-        .iter()
-        .filter_map(|item| {
-            (item.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| item.get("text").and_then(Value::as_str))
-                .flatten()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut parts = Vec::new();
+    for item in input.as_array()? {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_owned());
+                }
+            }
+            Some("image" | "localImage") => parts.push("[Image attachment]".to_owned()),
+            Some("audio" | "localAudio") => parts.push("[Audio attachment]".to_owned()),
+            _ => {}
+        }
+    }
+    let text = parts.join("\n");
     (!text.is_empty()).then_some(text)
+}
+
+fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<Value>, Response> {
+    if text.trim().is_empty() && attachments.is_empty() {
+        return Err(Response::error(
+            "invalid_request",
+            "message must contain text or an attachment",
+        ));
+    }
+    if attachments.len() > MAX_COMPOSER_ATTACHMENTS {
+        return Err(Response::error(
+            "invalid_request",
+            format!("at most {MAX_COMPOSER_ATTACHMENTS} attachments are allowed"),
+        ));
+    }
+    let total_bytes = attachments.iter().fold(0usize, |total, attachment| {
+        total.saturating_add(match attachment {
+            ComposerAttachment::Image { url, .. } | ComposerAttachment::Audio { url, .. } => {
+                url.len()
+            }
+        })
+    });
+    if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
+        return Err(Response::error(
+            "invalid_request",
+            "attachment data exceeds 10 MiB",
+        ));
+    }
+    let mut input = Vec::with_capacity(attachments.len() + usize::from(!text.trim().is_empty()));
+    if !text.trim().is_empty() {
+        input.push(json!({"type":"text", "text":text, "text_elements":[]}));
+    }
+    for attachment in attachments {
+        let supported_data_url = |url: &str, allowed_mime_types: &[&str]| {
+            let Some((metadata, payload)) = url.split_once(',') else {
+                return false;
+            };
+            let Some(metadata) = metadata.strip_prefix("data:") else {
+                return false;
+            };
+            let mut parts = metadata.split(';');
+            let Some(mime_type) = parts.next() else {
+                return false;
+            };
+            allowed_mime_types.contains(&mime_type)
+                && parts.any(|part| part.eq_ignore_ascii_case("base64"))
+                && !payload.is_empty()
+        };
+        let (kind, url, valid_prefix) = match attachment {
+            ComposerAttachment::Image { url, .. } => (
+                "image",
+                url,
+                supported_data_url(url, &["image/jpeg", "image/png", "image/webp", "image/gif"]),
+            ),
+            ComposerAttachment::Audio { url, .. } => (
+                "audio",
+                url,
+                supported_data_url(
+                    url,
+                    &[
+                        "audio/webm",
+                        "audio/mp4",
+                        "audio/mpeg",
+                        "audio/ogg",
+                        "audio/wav",
+                        "audio/x-wav",
+                        "audio/aac",
+                        "audio/x-m4a",
+                        "audio/3gpp",
+                    ],
+                ),
+            ),
+        };
+        if url.len() > MAX_ATTACHMENT_URL_BYTES || !valid_prefix {
+            return Err(Response::error(
+                "invalid_attachment",
+                format!("{kind} attachment has an unsupported type or exceeds 6 MiB"),
+            ));
+        }
+        input.push(json!({"type":kind, "url":url}));
+    }
+    Ok(input)
+}
+
+fn pending_input_summary(text: &str, attachments: &[ComposerAttachment]) -> String {
+    let mut parts = Vec::new();
+    if !text.trim().is_empty() {
+        parts.push(text.to_owned());
+    }
+    for attachment in attachments {
+        parts.push(match attachment {
+            ComposerAttachment::Image { .. } => "[Image attachment]".to_owned(),
+            ComposerAttachment::Audio { .. } => "[Audio attachment]".to_owned(),
+        });
+    }
+    parts.join("\n")
 }
 
 fn queued_messages_for_thread(
@@ -697,7 +801,7 @@ fn spawn_hot_session_cache(
                     refresh_count = refresh_count.wrapping_add(1);
                     let store = Arc::clone(&session_store);
                     let backend = Arc::clone(&write_backend);
-                    let refresh_pins = refresh_count == 1 || refresh_count % 3 == 0;
+                    let refresh_pins = refresh_count == 1 || refresh_count.is_multiple_of(3);
                     let _ = tokio::task::spawn_blocking(move || {
                         let Ok(loaded_result) = backend.app_server_rpc("thread/loaded/list", json!({})) else {
                             return;
@@ -963,20 +1067,9 @@ async fn handle_connection(stream: UnixStream, state: BridgeState) -> Result<()>
         Response::error("request_too_large", "request exceeds 1 MiB")
     } else {
         match serde_json::from_str::<Request>(&line) {
-            Ok(request) => tokio::task::spawn_blocking(move || {
-                dispatch(
-                    request,
-                    &state.socket_path,
-                    &state.session_store,
-                    &state.write_backend,
-                    &state.host_executor,
-                    &state.selected_thread,
-                    &state.pending_messages,
-                    &state.app_server_tools,
-                )
-            })
-            .await
-            .context("bridge worker failed")?,
+            Ok(request) => tokio::task::spawn_blocking(move || dispatch(request, &state))
+                .await
+                .context("bridge worker failed")?,
             Err(error) => Response::error("invalid_request", error.to_string()),
         }
     };
@@ -1000,6 +1093,7 @@ fn web_router(state: WebState) -> Router {
         .route("/api/file", get(web_file_download))
         .route("/api/command", post(web_command))
         .route("/api/events", get(web_events))
+        .layer(DefaultBodyLimit::max(MAX_WEB_REQUEST_BYTES))
         .with_state(state)
 }
 
@@ -1133,7 +1227,7 @@ async fn web_file_ticket(
     if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    if body.len() as u64 > MAX_REQUEST_BYTES {
+    if body.len() > MAX_WEB_REQUEST_BYTES {
         return (StatusCode::PAYLOAD_TOO_LARGE, "request is too large").into_response();
     }
     let request = match serde_json::from_slice::<FileTicketRequest>(&body) {
@@ -1323,7 +1417,7 @@ async fn web_command(
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(Response::error(
                 "request_too_large",
-                "request exceeds 1 MiB",
+                "request exceeds 12 MiB",
             )),
         )
             .into_response();
@@ -1367,20 +1461,7 @@ async fn web_command(
         }
     };
     let bridge = state.bridge;
-    match tokio::task::spawn_blocking(move || {
-        dispatch(
-            request,
-            &bridge.socket_path,
-            &bridge.session_store,
-            &bridge.write_backend,
-            &bridge.host_executor,
-            &bridge.selected_thread,
-            &bridge.pending_messages,
-            &bridge.app_server_tools,
-        )
-    })
-    .await
-    {
+    match tokio::task::spawn_blocking(move || dispatch(request, &bridge)).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => {
             Json(Response::error("bridge_worker_error", error.to_string())).into_response()
@@ -2207,16 +2288,14 @@ fn overlay_app_server_tools(
     replaced
 }
 
-fn dispatch(
-    request: Request,
-    socket_path: &Path,
-    session_store: &SessionStore,
-    write_backend: &CodexCliBackend,
-    host_executor: &HostExecutor,
-    selected_thread: &RwLock<Option<String>>,
-    pending_messages: &PendingMessages,
-    app_server_tools: &AppServerToolCache,
-) -> Response {
+fn dispatch(request: Request, state: &BridgeState) -> Response {
+    let socket_path = state.socket_path.as_path();
+    let session_store = state.session_store.as_ref();
+    let write_backend = state.write_backend.as_ref();
+    let host_executor = state.host_executor.as_ref();
+    let selected_thread = state.selected_thread.as_ref();
+    let pending_messages = state.pending_messages.as_ref();
+    let app_server_tools = state.app_server_tools.as_ref();
     match request {
         Request::Status => {
             if write_backend.app_server_socket().is_some() {
@@ -2726,6 +2805,12 @@ fn dispatch(
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
+            session_store.register_ephemeral_thread(
+                thread_id.clone(),
+                prepared.cwd.clone(),
+                fallback_thread["title"].as_str().map(str::to_owned),
+                fallback_thread["updated_at_ms"].as_u64().unwrap_or(0),
+            );
             if let Ok(mut selected) = selected_thread.write() {
                 *selected = Some(thread_id.clone());
             }
@@ -2803,6 +2888,7 @@ fn dispatch(
                 json!({"threadId": resolved.thread.id, "name": name}),
             ) {
                 Ok(_) => {
+                    session_store.rename_ephemeral_thread(&resolved.thread.id, name);
                     session_store.invalidate_summary_cache();
                     Response::success(json!({
                         "action": "thread_rename",
@@ -2825,6 +2911,7 @@ fn dispatch(
                 .app_server_rpc("thread/archive", json!({"threadId": resolved.thread.id}))
             {
                 Ok(_) => {
+                    session_store.remove_ephemeral_thread(&resolved.thread.id);
                     session_store.invalidate_summary_cache();
                     if let Ok(mut selected) = selected_thread.write() {
                         if selected.as_deref() == Some(resolved.thread.id.as_str()) {
@@ -2973,21 +3060,27 @@ fn dispatch(
                 Err(error) => backend_error(error),
             }
         }
-        Request::Send { thread_id, text } => {
-            if text.trim().is_empty() {
-                return Response::error("invalid_request", "send message must not be empty");
-            }
+        Request::Send {
+            thread_id,
+            text,
+            attachments,
+        } => {
+            let input = match composer_input(&text, &attachments) {
+                Ok(input) => input,
+                Err(response) => return response,
+            };
+            let pending_text = pending_input_summary(&text, &attachments);
             let resolved = match resolve_write_target(thread_id, session_store, selected_thread) {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
             let pending_id = pending_messages.begin(
                 &resolved.thread.id,
-                &text,
+                &pending_text,
                 "queue",
                 latest_message_index(session_store, &resolved.thread.id),
             );
-            match write_backend.queue_message(&resolved.thread.id, &text, &pending_id) {
+            match write_backend.queue_message(&resolved.thread.id, &input, &pending_id) {
                 Ok(receipt) => {
                     pending_messages
                         .finish_queue(&pending_id, receipt.queued_submission_id.clone());
@@ -3012,7 +3105,7 @@ fn dispatch(
                             && (error.message.contains("requires experimentalApi")
                                 || error.message.contains("Method not found")
                                 || error.message.contains("does not support thread/queue/add")));
-                    if compatible_fallback {
+                    if compatible_fallback && attachments.is_empty() {
                         match write_backend.queue_message_via_cli(&resolved.thread.id, &text) {
                             Ok(backend) => {
                                 pending_messages.finish(&pending_id, "queued", None);
@@ -3042,10 +3135,16 @@ fn dispatch(
                 }
             }
         }
-        Request::Steer { thread_id, text } => {
-            if text.trim().is_empty() {
-                return Response::error("invalid_request", "steer message must not be empty");
-            }
+        Request::Steer {
+            thread_id,
+            text,
+            attachments,
+        } => {
+            let input = match composer_input(&text, &attachments) {
+                Ok(input) => input,
+                Err(response) => return response,
+            };
+            let pending_text = pending_input_summary(&text, &attachments);
             let resolved = match resolve_write_target(thread_id, session_store, selected_thread) {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
@@ -3065,11 +3164,11 @@ fn dispatch(
             };
             let pending_id = pending_messages.begin(
                 &resolved.thread.id,
-                &text,
+                &pending_text,
                 "steer",
                 latest_message_index(session_store, &resolved.thread.id),
             );
-            match write_backend.steer_via_app_server(&resolved.thread.id, &turn_id, &text) {
+            match write_backend.steer_via_app_server(&resolved.thread.id, &turn_id, &input) {
                 Ok(backend) => {
                     pending_messages.finish(&pending_id, "steered", None);
                     Response::success(json!({
@@ -4245,16 +4344,31 @@ mod tests {
     }
 
     #[test]
-    fn native_queue_text_uses_only_text_inputs() {
+    fn native_queue_text_summarizes_multimodal_inputs() {
         assert_eq!(
             queue_input_text(&json!([
                 {"type":"text", "text":"first"},
                 {"type":"localImage", "path":"/tmp/image.png"},
+                {"type":"audio", "url":"data:audio/mp4;base64,AAAA"},
                 {"type":"text", "text":"second"}
             ]))
             .as_deref(),
-            Some("first\nsecond")
+            Some("first\n[Image attachment]\n[Audio attachment]\nsecond")
         );
+    }
+
+    #[test]
+    fn composer_input_accepts_codec_qualified_audio_data_urls() {
+        let input = composer_input(
+            "",
+            &[ComposerAttachment::Audio {
+                url: "data:audio/webm;codecs=opus;base64,AAAA".to_owned(),
+                name: Some("voice".to_owned()),
+            }],
+        )
+        .unwrap();
+        assert_eq!(input[0]["type"], "audio");
+        assert_eq!(input[0]["url"], "data:audio/webm;codecs=opus;base64,AAAA");
     }
 
     #[test]

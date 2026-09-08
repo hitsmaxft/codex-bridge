@@ -25,7 +25,7 @@ pub use write_backend::{
     APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,10 +108,14 @@ pub enum Request {
     Send {
         thread_id: Option<String>,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ComposerAttachment>,
     },
     Steer {
         thread_id: Option<String>,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ComposerAttachment>,
     },
     Scroll {
         direction: Option<ScrollDirection>,
@@ -144,6 +148,21 @@ pub enum Request {
     AppServerRpc {
         method: String,
         params: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ComposerAttachment {
+    Image {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    Audio {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
 }
 
@@ -403,6 +422,7 @@ mod tests {
         let request = Request::Send {
             thread_id: Some("thread-1".into()),
             text: "continue".into(),
+            attachments: Vec::new(),
         };
 
         let json = serde_json::to_value(request).unwrap();

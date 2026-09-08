@@ -76,6 +76,7 @@ async function toggleLanguage() {
   setSendMode($("sendMode").value, state.modeAutomatic);
   renderProjects();
   renderPending();
+  renderComposerAttachments();
   showActivity();
   await loadStatus();
   if (state.current) await openThread(state.current, { quiet: true });
@@ -403,6 +404,163 @@ async function createThread(worktree) {
   } finally {
     buttons.forEach((button) => (button.disabled = false));
     $("createProgress").textContent = "";
+  }
+}
+const MAX_COMPOSER_ATTACHMENTS = 6;
+const MAX_ATTACHMENT_DATA_URL_BYTES = 6 * 1024 * 1024;
+let voiceRecorder = null;
+let voiceStream = null;
+let voiceChunks = [];
+let voiceLimitTimer = null;
+function blobDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error(tr("imageReadFailed")));
+    reader.readAsDataURL(blob);
+  });
+}
+async function imageAttachment(file) {
+  if (file.type === "image/gif") {
+    const url = await blobDataUrl(file);
+    if (url.length > MAX_ATTACHMENT_DATA_URL_BYTES) throw new Error(tr("imageTooLarge"));
+    return { type: "image", url, name: file.name };
+  }
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    throw new Error(tr("imageReadFailed"));
+  }
+  const scale = Math.min(1, 2048 / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close?.();
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", 0.88));
+  if (!blob) throw new Error(tr("imageReadFailed"));
+  const url = await blobDataUrl(blob);
+  if (url.length > MAX_ATTACHMENT_DATA_URL_BYTES) throw new Error(tr("imageTooLarge"));
+  return { type: "image", url, name: file.name };
+}
+function renderComposerAttachments() {
+  const tray = $("composerAttachments");
+  tray.replaceChildren();
+  state.composerAttachments.forEach((attachment, index) => {
+    const item = document.createElement("div");
+    item.className = `composer-attachment ${attachment.type}`;
+    if (attachment.type === "image") {
+      const image = document.createElement("img");
+      image.src = attachment.url;
+      image.alt = attachment.name || tr("attachment");
+      item.appendChild(image);
+    } else {
+      item.innerHTML =
+        '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 9v6M9 6v12M13 4v16M17 7v10M21 10v4"/></svg>';
+      item.title = attachment.name || tr("recordVoice");
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "attachment-remove";
+    remove.textContent = "×";
+    remove.title = tr("removeAttachment");
+    remove.setAttribute("aria-label", remove.title);
+    remove.onclick = () => {
+      state.composerAttachments.splice(index, 1);
+      renderComposerAttachments();
+    };
+    item.appendChild(remove);
+    tray.appendChild(item);
+  });
+  tray.hidden = !state.composerAttachments.length;
+  resizeComposerTextarea();
+}
+async function addImages(files) {
+  const available = MAX_COMPOSER_ATTACHMENTS - state.composerAttachments.length;
+  if (files.length > available) throw new Error(tr("attachmentLimit"));
+  for (const file of files) state.composerAttachments.push(await imageAttachment(file));
+  renderComposerAttachments();
+}
+async function addAudioFile(file) {
+  if (state.composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS)
+    throw new Error(tr("attachmentLimit"));
+  const fallbackType = /\.m4a$/i.test(file.name) ? "audio/mp4" : "audio/webm";
+  const blob = file.type ? file : file.slice(0, file.size, fallbackType);
+  const url = await blobDataUrl(blob);
+  if (url.length > MAX_ATTACHMENT_DATA_URL_BYTES) throw new Error(tr("voiceTooLarge"));
+  state.composerAttachments.push({ type: "audio", url, name: file.name || "voice" });
+  renderComposerAttachments();
+}
+function resetVoiceRecorder() {
+  clearTimeout(voiceLimitTimer);
+  voiceLimitTimer = null;
+  voiceStream?.getTracks().forEach((track) => track.stop());
+  voiceStream = null;
+  voiceRecorder = null;
+  voiceChunks = [];
+  $("voiceBtn").classList.remove("recording");
+  $("voiceBtn").title = tr("recordVoice");
+  $("voiceBtn").setAttribute("aria-label", $("voiceBtn").title);
+}
+async function toggleVoiceRecording() {
+  if (voiceRecorder?.state === "recording") {
+    voiceRecorder.stop();
+    return;
+  }
+  if (state.composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS)
+    throw new Error(tr("attachmentLimit"));
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    $("audioInput").click();
+    return;
+  }
+  try {
+    voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const preferred = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find((type) =>
+      MediaRecorder.isTypeSupported(type),
+    );
+    voiceRecorder = preferred
+      ? new MediaRecorder(voiceStream, { mimeType: preferred })
+      : new MediaRecorder(voiceStream);
+    voiceChunks = [];
+    voiceRecorder.ondataavailable = (event) => event.data.size && voiceChunks.push(event.data);
+    voiceRecorder.onerror = () => {
+      voiceRecorder.onstop = null;
+      resetVoiceRecorder();
+      notify(tr("microphoneUnavailable"), true);
+    };
+    voiceRecorder.onstop = async () => {
+      const mime = voiceRecorder?.mimeType || voiceChunks[0]?.type || "audio/webm";
+      const blob = new Blob(voiceChunks, { type: mime });
+      try {
+        const url = await blobDataUrl(blob);
+        if (url.length > MAX_ATTACHMENT_DATA_URL_BYTES) throw new Error(tr("voiceTooLarge"));
+        state.composerAttachments.push({
+          type: "audio",
+          url,
+          name: `voice-${new Date().toISOString()}`,
+        });
+        resetVoiceRecorder();
+        renderComposerAttachments();
+      } catch (error) {
+        resetVoiceRecorder();
+        notify(error.message, true);
+      }
+    };
+    voiceRecorder.start(250);
+    $("voiceBtn").classList.add("recording");
+    $("voiceBtn").title = tr("stopRecording");
+    $("voiceBtn").setAttribute("aria-label", $("voiceBtn").title);
+    voiceLimitTimer = setTimeout(() => {
+      if (voiceRecorder?.state === "recording") voiceRecorder.stop();
+    }, 120000);
+    notify(tr("voiceRecording"));
+  } catch (error) {
+    resetVoiceRecorder();
+    throw new Error(error?.message || tr("microphoneUnavailable"));
   }
 }
 function byteText(bytes) {
@@ -1478,7 +1636,7 @@ function resizeComposerTextarea() {
     shell = document.querySelector(".composer-shell"),
     threadHead = document.querySelector(".thread-head");
   if (!textarea || !composer || !shell || !threadHead) return;
-  shell.classList.toggle("has-text", Boolean(textarea.value));
+  shell.classList.toggle("has-text", Boolean(textarea.value || state.composerAttachments.length));
   syncComposerPlaceholder();
   textarea.style.height = "44px";
   const viewportHeight = window.visualViewport?.height || window.innerHeight,
@@ -1546,10 +1704,14 @@ async function openThread(
     closePanels();
     setThreadHeaderExpanded(false);
   }
-  if (state.current) saveDraft(state.current.id, $("messageText").value, true);
+  if (state.current) {
+    saveDraft(state.current.id, $("messageText").value, true);
+    state.attachmentDrafts.set(state.current.id, state.composerAttachments);
+  }
   state.current = thread;
   $("messageText").value = state.drafts.get(thread.id) || "";
-  resizeComposerTextarea();
+  state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
+  renderComposerAttachments();
   if (changedThread) {
     state.before = null;
     state.hasMore = false;
@@ -1685,6 +1847,10 @@ function setComposerSubmitting(active) {
   shell.classList.toggle("submitting", active);
   $("messageText").disabled = active;
   $("sendModeToggle").disabled = active;
+  $("attachBtn").disabled = active;
+  $("voiceBtn").disabled = active;
+  $("imageInput").disabled = active;
+  $("audioInput").disabled = active;
   $("submitBtn").disabled = active;
   syncSubmitAction();
 }
@@ -1722,8 +1888,10 @@ async function interruptCurrentRun({ confirm = true, requireActive = false } = {
 }
 async function write(name) {
   const draft = $("messageText").value,
-    text = draft.trim();
-  if (!text) throw new Error(tr("messageRequired"));
+    text = draft.trim(),
+    attachments = state.composerAttachments.map((attachment) => ({ ...attachment }));
+  if (!text && !attachments.length) throw new Error(tr("messageRequired"));
+  if (voiceRecorder?.state === "recording") throw new Error(tr("stopRecording"));
   if (!state.current) throw new Error(tr("chooseSessionError"));
   const threadId = state.current.id;
   let acknowledged = false;
@@ -1736,7 +1904,7 @@ async function write(name) {
     started: false,
     dismissed: false,
     onScreen: false,
-    text,
+    text: text || `${attachments.length} ${tr("attachment")}`,
   });
   setComposerSubmitting(true);
   try {
@@ -1751,7 +1919,7 @@ async function write(name) {
     $("messageText").value = "";
     resizeComposerTextarea();
     saveDraft(threadId, "", true);
-    const request = command({ command: name, thread_id: threadId, text }).then(
+    const request = command({ command: name, thread_id: threadId, text, attachments }).then(
       (value) => ({ value }),
       (error) => ({ error }),
     );
@@ -1764,6 +1932,9 @@ async function write(name) {
     }
     setComposerSubmitting(false);
     acknowledged = true;
+    state.composerAttachments = [];
+    state.attachmentDrafts.delete(threadId);
+    renderComposerAttachments();
     setDeliveryState(outcome.value.status === "queued" ? "queued" : "accepted", {
       mode: name,
       pendingId: outcome.value.pending_id || null,
@@ -1802,6 +1973,18 @@ $("languageBtn").onclick = () => run(toggleLanguage);
 $("refreshBtn").onclick = () => run(refreshThread);
 $("createCurrentBtn").onclick = () => run(() => createThread(false));
 $("createWorktreeBtn").onclick = () => run(() => createThread(true));
+$("attachBtn").onclick = () => $("imageInput").click();
+$("imageInput").onchange = (event) => {
+  const files = [...event.target.files];
+  event.target.value = "";
+  run(() => addImages(files));
+};
+$("audioInput").onchange = (event) => {
+  const [file] = event.target.files;
+  event.target.value = "";
+  if (file) run(() => addAudioFile(file));
+};
+$("voiceBtn").onclick = () => run(toggleVoiceRecording);
 $("createCancelBtn").onclick = closeCreateDialog;
 $("createDialog").onclick = (event) => {
   if (event.target === $("createDialog")) closeCreateDialog();
@@ -1874,6 +2057,9 @@ $("archiveThreadBtn").onclick = () =>
     $("threadMeta").textContent = tr("archivedRemoved");
     $("messages").innerHTML = `<div class="empty">${tr("loadingAnother")}</div>`;
     $("messageText").value = "";
+    state.composerAttachments = [];
+    state.attachmentDrafts.delete(threadId);
+    renderComposerAttachments();
     resizeComposerTextarea();
     renderPending();
     closePanels();
@@ -2075,7 +2261,10 @@ bindSwipe(
   },
   { ignoreInteractive: true },
 );
-window.addEventListener("pagehide", persistDrafts);
+window.addEventListener("pagehide", () => {
+  persistDrafts();
+  voiceStream?.getTracks().forEach((track) => track.stop());
+});
 const refreshAfterResume = () => {
   if (!state.current || document.visibilityState === "hidden") return;
   state.pendingChanges = true;
@@ -2123,7 +2312,8 @@ composerShell.addEventListener(
       !usesDocumentMessageScroll() ||
       !event.isPrimary ||
       event.button !== 0 ||
-      event.target === $("messageText")
+      event.target === $("messageText") ||
+      event.target.closest(".composer-actions")
     )
       return;
     if ($("submitBtn").contains(event.target)) {
