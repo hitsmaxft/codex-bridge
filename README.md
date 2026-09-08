@@ -1,7 +1,8 @@
 # Codex App Server WebUI for Homelab and NAS
 
-Self-hosted Web UI and CLI control plane for OpenAI Codex app-server, designed for an always-on
-homelab, NAS, Mac mini, or Linux server.
+Access OpenAI Codex app-server from a responsive Web UI or CLI running on your homelab, NAS, Mac
+mini, or Linux host. Continue the same tasks from any device while Codex stays beside your
+repositories.
 
 [Project site](https://gh.bhee.online/codex-bridge/) ·
 [Install](docs/install.md) ·
@@ -9,63 +10,31 @@ homelab, NAS, Mac mini, or Linux server.
 [Design](DESIGN.md) ·
 [Debugging](DEBUGGING.md)
 
-Run Codex on a machine where your projects already live, then access its tasks from a terminal,
-phone, tablet, or private browser UI. Resume sessions, follow live runs, inspect tools and diffs,
-and control Codex remotely without using the ChatGPT app as the remote-control layer. A Cloudflare
-Tunnel with Cloudflare Access is a practical way to publish the loopback-only Web UI securely
-without forwarding a NAS or homelab port to the public Internet.
+`codex-bridge` connects directly to app-server and its rollout store. It keeps task history, live
+tools and diffs, Queue/Steer/Stop controls, models, and task metadata behind one typed local
+protocol—without using the ChatGPT app as a remote-control relay. Keep the Web UI on loopback, or
+publish it through Cloudflare Access, a VPN, or an authenticated reverse proxy. Model requests
+still use the account and network configured by Codex itself.
 
-`codex-bridge` is a local control plane around Codex app-server and its rollout store. It exposes
-task history, live tool activity, queue/steer/interrupt controls, model settings, and task metadata
-through one typed local protocol. Remote-control traffic travels directly between your clients and
-your own bridge; it does not depend on the ChatGPT app as a remote-control relay or add another
-hosted Codex control service. Model execution still uses the account and network configured by
-Codex itself.
+## What it provides
 
-## Built for self-hosted Codex
-
-- **Homelab and NAS:** keep Codex app-server beside your repositories on an always-on Linux host,
-  NAS, home server, or Mac mini, then continue the same task from any personal device.
-- **Remote development:** put the loopback Web UI behind Cloudflare Tunnel and Access, a private
-  VPN, or another authenticated HTTPS reverse proxy instead of exposing the bridge port directly.
-- **Away from the desktop:** review a long-running agent, inspect structured tool calls and diffs,
-  queue the next message, steer an active turn, or stop it from a phone.
-- **One local control plane:** use the responsive Web UI and `codexctl` against the same explicit
-  sessions, persistent app-server connection, and bounded history cache.
-
-Cloudflare is optional and transports browser traffic only. Codex model requests still use the
-OpenAI account and network configured by Codex app-server.
+- A shared task list and persistent live connection for the Web UI and `codexctl`.
+- Structured messages, tool calls, diffs, status, models, and paginated history.
+- Remote Queue, Steer, withdrawal, interruption, pinning, renaming, and archiving.
+- Bounded caches and workspace-scoped downloads for long-running, always-on hosts.
 
 ## Release highlights
 
-### v0.2.0 · 2026-09-08
+### v0.2.1 · 2026-09-09
 
-- **Prompt-responsive live demo:** the GitHub Pages demo now chooses simulated workflows from each
-  prompt and continuously updates queue, steer, withdrawal, cancellation, tool, and final-response
-  states through the same Rust/WASM contract used by frontend regressions.
-- **Editable voice transcription:** recorded or selected audio is decoded in the browser, converted
-  to 24 kHz mono PCM, and transcribed through app-server realtime before the resulting text is
-  inserted into the composer. Audio is never submitted as a message attachment.
-- **Faster mobile task access:** swipe right in the conversation to open the multi-session Tasks
-  view directly, while the session drawer remains available from its explicit button.
-- **Stable mobile composer:** text remains above a fixed action row as it grows, eliminating
-  focus-driven grid reflow. Submit/stop and Queue/Steer controls now use matching widths.
-- **Clearer handoff queue:** queued work remains blue while Steer/follow-up messages use a distinct
-  bean-green palette in both light and dark themes.
+- **Firefox iOS composer stability:** normalized the mobile textarea's WebKit font metrics and no
+  longer resize the focused control during keyboard viewport animation. This fixes the displaced
+  caret and hit targets without changing document scrolling.
+- **Leaner introduction:** the README and project page now state the product purpose once, then move
+  directly to the shared task model, structured visibility, and control workflow.
 
-See the complete [v0.2.0 release notes](docs/releases/v0.2.0.md). The original feature baseline is
-documented in the [v0.1.0 release notes](docs/releases/v0.1.0.md).
-
-## Why use it
-
-- Turn a homelab, NAS, Mac mini, or Linux workstation into a private Codex app-server host.
-- Reach the Web UI remotely through Cloudflare Tunnel + Access without opening an inbound port.
-- Continue or steer an existing Codex task without screen-scraping the Desktop UI.
-- Read durable, paginated task history and structured app-server tool calls from another device.
-- Use the same explicit task targeting from the Web UI, `codexctl`, or another local client.
-- Keep the control plane local, with a Unix socket by default and authenticated Web UI when enabled.
-- Preserve one app-server writer boundary instead of resuming the same task from a competing
-  process.
+See the complete [v0.2.1 release notes](docs/releases/v0.2.1.md), or review the larger
+[v0.2.0 feature release](docs/releases/v0.2.0.md).
 
 ## Web UI
 

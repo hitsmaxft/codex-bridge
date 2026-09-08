@@ -283,6 +283,23 @@ test("mobile composer stays out of the message grid sizing flow", async () => {
     /\.composer-shell\s*\{[^}]*grid-template-columns:\s*64px 72px minmax\(0, 1fr\) 64px;/s,
   );
   assert.match(mobile, /\.composer-shell #submitBtn\s*\{[^}]*width:\s*64px;/s);
+  assert.match(
+    mobile,
+    /\.composer-shell textarea\s*\{[^}]*-webkit-appearance:\s*none;[^}]*padding:\s*12px 5px;[^}]*font-family:\s*-apple-system,[^}]*font-size:\s*16px;[^}]*line-height:\s*20px;[^}]*zoom:\s*1;/s,
+  );
+  assert.match(
+    mobile,
+    /\.composer,[\s\S]*?\.composer-shell textarea\s*\{[^}]*transform:\s*none;[^}]*filter:\s*none;[^}]*perspective:\s*none;[^}]*will-change:\s*auto;/s,
+  );
+  assert.match(source, /function resizeComposerAfterViewportChange\(\)/);
+  assert.match(
+    source,
+    /document\.activeElement !== \$\("messageText"\)\) resizeComposerTextarea\(\)/,
+  );
+  assert.doesNotMatch(
+    source,
+    /visualViewport\?\.addEventListener\("resize", resizeComposerTextarea/,
+  );
   assert.doesNotMatch(stylesheet, /\.outbox-tray\.compact \.outbox-item:not\(:last-child\)/);
   assert.match(stylesheet, /\.outbox-tray\.compact > \.outbox-item\s*\{/);
   assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-actions/);

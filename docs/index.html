@@ -744,28 +744,26 @@
       <section class="wrap hero">
         <div>
           <span class="eyebrow"
-            ><span class="zh"
-              >适用于 Homelab 与 NAS 的 Codex app-server Web UI</span
+            ><span class="zh">直连 Codex app-server 的 Web UI 与 CLI</span
             ><span class="en"
-              >Codex app-server Web UI for homelab and NAS</span
+              >Direct Web UI and CLI for Codex app-server</span
             ></span
           >
           <h1>
-            <span class="zh">在自己的服务器上<br />运行并访问 Codex。</span
-            ><span class="en">Self-host Codex. Access it anywhere.</span>
+            <span class="zh">从任何设备<br />访问你的 Codex。</span
+            ><span class="en">Access your Codex from anywhere.</span>
           </h1>
           <p class="lede zh">
-            把 Codex app-server 部署在项目所在的 Homelab、NAS、Mac mini 或 Linux
-            主机上，再通过手机、平板和终端快速控制。配合 Cloudflare Tunnel 与
-            Access，无需开放公网端口即可安全远程访问，也不依赖 ChatGPT
-            客户端充当远程控制层。
+            让 Codex 与代码仓库常驻 Homelab、NAS、Mac mini 或 Linux 主机，
+            通过浏览器或 CLI 继续同一任务。控制链路直接连接 app-server， 不依赖
+            ChatGPT 客户端中转；需要外网访问时可接入 Cloudflare Access。
           </p>
           <p class="lede en">
-            Run Codex app-server beside your projects on a homelab, NAS, Mac
-            mini, or Linux host, then control it quickly from a phone, tablet,
-            or terminal. Add Cloudflare Tunnel and Access for secure remote
-            access without opening a public port or relying on a ChatGPT client
-            as the control layer.
+            Keep Codex beside your repositories on a homelab, NAS, Mac mini, or
+            Linux host, then continue the same task from a browser or CLI. The
+            control path connects directly to app-server instead of relaying
+            through a ChatGPT client; add Cloudflare Access when you need a
+            private remote endpoint.
           </p>
           <div class="cta">
             <a class="button primary" href="demo/"
@@ -835,56 +833,55 @@
       <section class="section white">
         <div class="wrap">
           <div class="kicker">
-            <span class="zh">使用场景</span><span class="en">Use cases</span>
+            <span class="zh">核心能力</span
+            ><span class="en">Core workflow</span>
           </div>
-          <h2 class="zh">让常驻服务器成为你的 Codex 工作站。</h2>
-          <h2 class="en">
-            Turn an always-on server into your Codex workstation.
-          </h2>
+          <h2 class="zh">围绕会话，而不是围绕某一个客户端。</h2>
+          <h2 class="en">Built around tasks, not a single client.</h2>
           <div class="grid">
             <article class="card">
               <div class="card-icon">⌂</div>
               <h3>
-                <span class="zh">Homelab 与 NAS</span
-                ><span class="en">Homelab and NAS</span>
+                <span class="zh">统一会话状态</span
+                ><span class="en">One shared task state</span>
               </h3>
               <p class="zh">
-                Codex 与代码仓库运行在同一台 Linux、NAS 或 Mac
-                主机上，浏览器关闭后任务仍可继续。
+                Web UI 与 codexctl 使用同一连接、明确的会话 ID 和有限缓存，
+                切换设备不会创建竞争写入者。
               </p>
               <p class="en">
-                Keep Codex beside your repositories on Linux, a NAS, or a Mac
-                host, with tasks continuing after the browser closes.
+                The Web UI and codexctl share one connection, explicit task IDs,
+                and bounded caches without creating competing writers.
               </p>
             </article>
             <article class="card">
-              <div class="card-icon">☁</div>
+              <div class="card-icon">⌘</div>
               <h3>
-                <span class="zh">Cloudflare 远程访问</span
-                ><span class="en">Cloudflare remote access</span>
+                <span class="zh">结构化过程</span
+                ><span class="en">Structured visibility</span>
               </h3>
               <p class="zh">
-                使用 Cloudflare Tunnel 和 Access 将环回 Web UI
-                安全带到外网，无需路由器端口转发。
+                消息、并行工具调用、命令输出、文件 Diff 和运行状态均按类型渲染，
+                无需阅读原始 rollout。
               </p>
               <p class="en">
-                Put the loopback Web UI behind Cloudflare Tunnel and Access,
-                without router port forwarding.
+                Messages, parallel tools, command output, file diffs, and run
+                state are rendered by type instead of exposing raw rollouts.
               </p>
             </article>
             <article class="card">
               <div class="card-icon">☏</div>
               <h3>
-                <span class="zh">随时接管长任务</span
-                ><span class="en">Control long-running tasks</span>
+                <span class="zh">完整控制流程</span
+                ><span class="en">Complete control flow</span>
               </h3>
               <p class="zh">
-                在手机上查看消息、工具和
-                Diff，排队后续消息、跟进运行中的任务或远程停止。
+                Queue、跟进、撤回和停止都与 app-server 状态同步，
+                多任务视图集中展示最新进展和结论。
               </p>
               <p class="en">
-                Review messages, tools, and diffs from a phone; queue the next
-                message, steer an active turn, or stop it remotely.
+                Queue, Steer, withdrawal, and Stop follow app-server state,
+                while the Tasks view collects current progress and conclusions.
               </p>
             </article>
           </div>
@@ -898,50 +895,48 @@
         <h2 class="zh">从远程控制到完整会话工作流。</h2>
         <h2 class="en">From remote control to a complete session workflow.</h2>
         <p class="section-intro zh">
-          v0.2.0 让浏览器 Demo、语音转写和移动端远程控制更接近真实工作流，
-          并继续使用同一套 Rust/WASM 契约验证生产前端行为。
+          v0.2.1 修复 Firefox iOS 的输入光标与点击位置偏移，并精简项目介绍；
+          同时保留 v0.2.0 的动态 Demo、语音转写和移动端工作流。
         </p>
         <p class="section-intro en">
-          v0.2.0 makes the browser demo, voice transcription, and mobile remote
-          control behave more like the real workflow, while keeping the
-          production frontend checked against the same Rust/WASM contract.
+          v0.2.1 fixes displaced Firefox iOS caret and hit targets and
+          streamlines the project introduction, while retaining the live demo,
+          voice transcription, and mobile workflow from v0.2.0.
         </p>
         <div class="release">
           <div class="release-date">
-            2026-09-08
-            <span class="zh">v0.2.0 正式版</span
-            ><span class="en">v0.2.0 release</span>
+            2026-09-09
+            <span class="zh">v0.2.1 正式版</span
+            ><span class="en">v0.2.1 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">动态浏览器 Demo</span
-                ><span class="en">Prompt-responsive browser demo</span>
+                <span class="zh">Firefox iOS 输入修复</span
+                ><span class="en">Firefox iOS composer fix</span>
               </h3>
               <p class="zh">
-                页面内 WASM
-                根据用户输入选择模拟工作流，持续刷新工具、消息和最终结果，
-                数据不会离开浏览器。
+                统一 WebKit
+                字体与行盒，并避免在键盘视口动画期间重算已聚焦文本框，
+                修复光标和按钮点击位置下移。
               </p>
               <p class="en">
-                In-page WASM selects a simulated workflow from each prompt and
-                continuously refreshes tools, messages, and conclusions without
-                sending data off-page.
+                Normalized WebKit font metrics and stopped resizing the focused
+                textarea during keyboard viewport animation, fixing displaced
+                caret and button hit targets.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">完整交接体验</span
-                ><span class="en">Complete handoff experience</span>
+                <span class="zh">更精简的项目介绍</span
+                ><span class="en">Leaner project introduction</span>
               </h3>
               <p class="zh">
-                在 Demo 中直接体验
-                queue、跟进、撤回和取消；状态转换与生产前端使用相同组件。
+                首屏只解释产品定位和连接方式，后续内容直接展示会话、结构化过程和控制能力。
               </p>
               <p class="en">
-                Try queue, steer, withdrawal, and cancellation in the demo.
-                State transitions use the same components as the production
-                frontend.
+                The opening states the product and connection model once, then
+                moves directly to tasks, structured visibility, and controls.
               </p>
             </article>
             <article class="release-item">

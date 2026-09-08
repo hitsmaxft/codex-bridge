@@ -2134,6 +2134,9 @@ function resizeComposerTextarea() {
   textarea.style.height = `${Math.ceil(height)}px`;
   textarea.style.overflowY = textarea.scrollHeight > height + 1 ? "auto" : "hidden";
 }
+function resizeComposerAfterViewportChange() {
+  if (document.activeElement !== $("messageText")) resizeComposerTextarea();
+}
 function syncComposerPlaceholder() {
   const textarea = $("messageText"),
     shell = document.querySelector(".composer-shell"),
@@ -2789,8 +2792,10 @@ frameResizeObserver.observe(composer);
 frameResizeObserver.observe(threadHead);
 syncFrameInsets();
 resizeComposerTextarea();
-window.addEventListener("resize", resizeComposerTextarea, { passive: true });
-window.visualViewport?.addEventListener("resize", resizeComposerTextarea, { passive: true });
+window.addEventListener("resize", resizeComposerAfterViewportChange, { passive: true });
+window.visualViewport?.addEventListener("resize", resizeComposerAfterViewportChange, {
+  passive: true,
+});
 composerShell.addEventListener(
   "pointerdown",
   (event) => {

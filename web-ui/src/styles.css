@@ -2307,8 +2307,23 @@ label.caption {
       max(14px, env(safe-area-inset-left));
     overflow: visible;
   }
+  .composer,
+  .composer-shell,
   .composer-shell textarea {
+    transform: none;
+    filter: none;
+    perspective: none;
+    will-change: auto;
+  }
+  .composer-shell textarea {
+    -webkit-appearance: none;
+    appearance: none;
+    padding: 12px 5px;
     max-height: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px;
+    line-height: 20px;
+    zoom: 1;
   }
   .composer-shell {
     grid-template-columns: 64px 72px minmax(0, 1fr) 64px;
