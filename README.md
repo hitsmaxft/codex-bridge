@@ -19,6 +19,26 @@ your own bridge; it does not depend on the ChatGPT app as a remote-control relay
 hosted Codex control service. Model execution still uses the account and network configured by
 Codex itself.
 
+## Release highlights
+
+### 2026-09-08
+
+- **Create and manage sessions:** start a session in an existing project directory or an isolated
+  Git worktree, then rename, pin, archive, or stop it. A newly started empty session is immediately
+  usable while app-server is still waiting for the first message to create its rollout.
+- **Live remote control:** one persistent app-server connection carries activity events, native
+  queue and steer handoff, interruption, model settings, rate limits, and bounded subscriptions for
+  active or pinned sessions.
+- **Responsive Web UI:** the same mobile-first message, composer, tool, diff, theme, and settings
+  components are used on phones and desktops. English and Chinese preferences persist locally.
+- **Large-session performance:** rollout parsing skips non-display records and indexes tool-output
+  offsets for on-demand reads. In the 312.6 MiB regression session, pinned prewarming dropped from
+  about 422 MiB to 127 MiB RSS while a cached 30-message page remained below 10 ms locally.
+- **Safe local artifacts:** workspace-scoped downloads use five-minute, process-local tickets and
+  reject files outside the session directory or files at least 16 MiB.
+- **Browser demo and regression coverage:** GitHub Pages runs the production Vite frontend against
+  a finite Rust/WASM server, and the same demo contract is exercised by automated UI tests.
+
 ## Why use it
 
 - Continue or steer an existing Codex task without screen-scraping the Desktop UI.
