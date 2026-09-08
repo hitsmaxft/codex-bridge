@@ -895,48 +895,75 @@
         <h2 class="zh">从远程控制到完整会话工作流。</h2>
         <h2 class="en">From remote control to a complete session workflow.</h2>
         <p class="section-intro zh">
-          v0.2.1 修复 Firefox iOS 的输入光标与点击位置偏移，并精简项目介绍；
-          同时保留 v0.2.0 的动态 Demo、语音转写和移动端工作流。
+          v0.2.2 增加服务端语音转写能力协商，并记住已展开的项目文件夹；
+          移动输入框也改用原生点击命中，空白区域归还给消息列表。
         </p>
         <p class="section-intro en">
-          v0.2.1 fixes displaced Firefox iOS caret and hit targets and
-          streamlines the project introduction, while retaining the live demo,
-          voice transcription, and mobile workflow from v0.2.0.
+          v0.2.2 adds server voice-transcription capability negotiation,
+          remembered project folders, background summary loading, and native
+          mobile composer hit targets.
         </p>
         <div class="release">
           <div class="release-date">
             2026-09-09
-            <span class="zh">v0.2.1 正式版</span
-            ><span class="en">v0.2.1 release</span>
+            <span class="zh">v0.2.2 正式版</span
+            ><span class="en">v0.2.2 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">Firefox iOS 输入修复</span
-                ><span class="en">Firefox iOS composer fix</span>
+                <span class="zh">语音能力状态推送</span
+                ><span class="en">Voice capability snapshots</span>
               </h3>
               <p class="zh">
-                统一 WebKit
-                字体与行盒，并避免在键盘视口动画期间重算已聚焦文本框，
-                修复光标和按钮点击位置下移。
+                Bridge 根据 app-server 登录模式判断语音转写能力，缓存结果并随
+                WebSocket 服务状态持续推送，不发起试探性实时会话。
               </p>
               <p class="en">
-                Normalized WebKit font metrics and stopped resizing the focused
-                textarea during keyboard viewport animation, fixing displaced
-                caret and button hit targets.
+                Bridge derives voice transcription availability from the
+                app-server auth mode and pushes the cached result with service
+                snapshots, without opening trial realtime sessions.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">更精简的项目介绍</span
-                ><span class="en">Leaner project introduction</span>
+                <span class="zh">记住会话文件夹</span
+                ><span class="en">Remembered session folders</span>
               </h3>
               <p class="zh">
-                首屏只解释产品定位和连接方式，后续内容直接展示会话、结构化过程和控制能力。
+                浏览器保存项目的展开状态；刷新后自动恢复，并以最多三个并发请求在后台加载会话摘要。
               </p>
               <p class="en">
-                The opening states the product and connection model once, then
-                moves directly to tasks, structured visibility, and controls.
+                The browser restores expanded projects and preloads their
+                session summaries with at most three concurrent requests.
+              </p>
+            </article>
+            <article class="release-item">
+              <h3>
+                <span class="zh">原生移动端点击</span
+                ><span class="en">Native mobile hit targets</span>
+              </h3>
+              <p class="zh">
+                输入框只让真实控件接收点击，底部空白归还给消息列表；提交和模式切换不再拦截原生事件。
+              </p>
+              <p class="en">
+                Only visible composer controls capture taps; unused space
+                belongs to the message view, and mode/submit actions no longer
+                suppress native clicks.
+              </p>
+            </article>
+            <article class="release-item">
+              <h3>
+                <span class="zh">录音前明确禁用</span
+                ><span class="en">Disabled before recording</span>
+              </h3>
+              <p class="zh">
+                转写不可用时，麦克风显示红色叉号且无法点击，并通过中英文提示说明原因。
+              </p>
+              <p class="en">
+                When transcription is unavailable, the microphone shows a red
+                cross, cannot be clicked, and explains the reason in English or
+                Chinese.
               </p>
             </article>
             <article class="release-item">

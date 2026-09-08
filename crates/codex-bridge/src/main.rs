@@ -230,6 +230,7 @@ struct BridgeState {
     ws_bridge_listen: Option<SocketAddr>,
     managed_app_server_status: Option<watch::Receiver<ManagedProcessStatus>>,
     ws_bridge_status: Option<watch::Receiver<ManagedProcessStatus>>,
+    server_capabilities: Arc<RwLock<Value>>,
 }
 
 #[derive(Clone)]
@@ -1410,6 +1411,13 @@ async fn main() -> Result<()> {
     let _socket_guard = SocketGuard::new(&socket_path)?;
 
     let socket_path = Arc::new(socket_path);
+    let server_capabilities = Arc::new(RwLock::new(json!({
+        "audio_transcription": {
+            "enabled": false,
+            "reason": "not_checked",
+            "auth_mode": null,
+        }
+    })));
     let bridge_state = BridgeState {
         socket_path: Arc::clone(&socket_path),
         session_store: Arc::clone(&session_store),
@@ -1426,6 +1434,7 @@ async fn main() -> Result<()> {
         ws_bridge_listen: args.desktop_interposition.then_some(args.ws_bridge_listen),
         managed_app_server_status,
         ws_bridge_status,
+        server_capabilities,
     };
     let hot_cache_task = spawn_hot_session_cache(
         Arc::clone(&session_store),
@@ -2266,6 +2275,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
             json!({
                 "type": "bridge_service_snapshot",
                 "managed_services": managed_services_snapshot(&bridge),
+                "capabilities": server_capabilities_snapshot(&bridge),
             })
             .to_string()
             .into(),
@@ -2321,6 +2331,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
                 let event = json!({
                     "type": "bridge_service_snapshot",
                     "managed_services": managed_services_snapshot(&bridge),
+                    "capabilities": server_capabilities_snapshot(&bridge),
                 });
                 if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
                     break;
@@ -3089,6 +3100,64 @@ fn managed_services_snapshot(state: &BridgeState) -> Value {
     })
 }
 
+fn audio_transcription_capability(account_response: &Value) -> Value {
+    let auth_mode = account_response
+        .pointer("/account/type")
+        .and_then(Value::as_str);
+    match auth_mode {
+        Some("apiKey") => json!({
+            "enabled": true,
+            "reason": null,
+            "auth_mode": "apiKey",
+        }),
+        Some(mode) => json!({
+            "enabled": false,
+            "reason": "api_key_auth_required",
+            "auth_mode": mode,
+        }),
+        None => json!({
+            "enabled": false,
+            "reason": "not_authenticated",
+            "auth_mode": null,
+        }),
+    }
+}
+
+fn refresh_server_capabilities(state: &BridgeState) -> Value {
+    let audio_transcription = state
+        .write_backend
+        .app_server_rpc("account/read", json!({"refreshToken": false}))
+        .map(|response| audio_transcription_capability(&response))
+        .unwrap_or_else(|_| {
+            json!({
+                "enabled": false,
+                "reason": "app_server_unavailable",
+                "auth_mode": null,
+            })
+        });
+    let capabilities = json!({"audio_transcription": audio_transcription});
+    if let Ok(mut cached) = state.server_capabilities.write() {
+        cached.clone_from(&capabilities);
+    }
+    capabilities
+}
+
+fn server_capabilities_snapshot(state: &BridgeState) -> Value {
+    state
+        .server_capabilities
+        .read()
+        .map(|cached| cached.clone())
+        .unwrap_or_else(|_| {
+            json!({
+                "audio_transcription": {
+                    "enabled": false,
+                    "reason": "state_unavailable",
+                    "auth_mode": null,
+                }
+            })
+        })
+}
+
 fn dispatch(request: Request, state: &BridgeState) -> Response {
     let socket_path = state.socket_path.as_path();
     let session_store = state.session_store.as_ref();
@@ -3120,6 +3189,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 .and_then(|info| info.user_agent.as_deref())
                 .and_then(app_server_version_from_user_agent)
                 .map(|version| format!("{version}-{runtime_kind}"));
+            let capabilities = refresh_server_capabilities(state);
             Response::success(json!({
             "service": "codex-bridge",
             "status": "ready",
@@ -3131,6 +3201,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "loaded": state.config_path.is_some(),
             },
             "managed_services": managed_services_snapshot(state),
+            "capabilities": capabilities,
             "rollout_store": {
                 "available": session_store.is_available(),
                 "codex_home": session_store.home(),
@@ -4522,18 +4593,24 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
 fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
     let changes = structured_file_changes(tool);
     let command_actions = structured_command_actions(tool);
-    let patch_stats = changes.map(|changes| {
-        changes
-            .iter()
-            .fold((0, 0), |(additions, deletions), change| {
-                let (added, deleted) = change
-                    .get("diff")
-                    .and_then(Value::as_str)
-                    .map(patch_line_stats)
-                    .unwrap_or_default();
-                (additions + added, deletions + deleted)
-            })
-    });
+    let raw_patch = apply_patch_text(tool);
+    let patch_stats = changes
+        .map(|changes| {
+            changes
+                .iter()
+                .fold((0, 0), |(additions, deletions), change| {
+                    let (added, deleted) = change
+                        .get("diff")
+                        .and_then(Value::as_str)
+                        .map(patch_line_stats)
+                        .unwrap_or_default();
+                    (additions + added, deletions + deleted)
+                })
+        })
+        .or_else(|| raw_patch.map(patch_line_stats));
+    let file_count = changes
+        .map(<[Value]>::len)
+        .or_else(|| raw_patch.map(|patch| apply_patch_paths(patch).len()));
     json!({
         "tool_index": tool_index,
         "name": tool.name,
@@ -4543,7 +4620,7 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
         "bytes": compact_tool_bytes(tool),
         "additions": patch_stats.map(|stats| stats.0),
         "deletions": patch_stats.map(|stats| stats.1),
-        "file_count": changes.map(<[Value]>::len),
+        "file_count": file_count,
         "command_action_count": command_actions.map(<[Value]>::len),
         "command_actions_parallel": command_actions
             .is_some_and(|actions| actions.len() > 1 && command_actions_are_parallel(tool)),
@@ -4598,6 +4675,19 @@ fn tool_preview(tool: &ThreadToolCall) -> String {
                     .unwrap_or("file")
             ),
             changes if !changes.is_empty() => format!("已编辑 {} 个文件", changes.len()),
+            _ => "应用文件补丁".to_owned(),
+        };
+    }
+    if let Some(patch) = apply_patch_text(tool) {
+        return match apply_patch_paths(patch).as_slice() {
+            [file] => format!(
+                "已编辑 {}",
+                Path::new(file)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("file")
+            ),
+            files if !files.is_empty() => format!("已编辑 {} 个文件", files.len()),
             _ => "应用文件补丁".to_owned(),
         };
     }
@@ -4664,6 +4754,26 @@ fn command_actions_are_parallel(tool: &ThreadToolCall) -> bool {
 fn structured_file_changes(tool: &ThreadToolCall) -> Option<&[Value]> {
     (tool.name == "apply_patch")
         .then(|| tool.input.get("changes")?.as_array().map(Vec::as_slice))?
+}
+
+fn apply_patch_text(tool: &ThreadToolCall) -> Option<&str> {
+    if tool.name != "apply_patch"
+        || tool.input.get("operation").and_then(Value::as_str) != Some("apply_patch")
+    {
+        return None;
+    }
+    tool.input.get("patch")?.as_str()
+}
+
+fn apply_patch_paths(patch: &str) -> Vec<&str> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .collect()
 }
 
 fn patch_action_label(action: &str) -> &'static str {
@@ -4903,6 +5013,31 @@ mod tests {
             "codex-bridge-{label}-{}-{sequence}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn audio_transcription_capability_requires_api_key_authentication() {
+        let api_key = audio_transcription_capability(&json!({
+            "account": {"type": "apiKey"},
+            "requiresOpenaiAuth": true
+        }));
+        assert_eq!(api_key["enabled"], true);
+        assert_eq!(api_key["auth_mode"], "apiKey");
+
+        let chatgpt = audio_transcription_capability(&json!({
+            "account": {"type": "chatgpt", "email": null, "planType": "plus"},
+            "requiresOpenaiAuth": true
+        }));
+        assert_eq!(chatgpt["enabled"], false);
+        assert_eq!(chatgpt["reason"], "api_key_auth_required");
+        assert_eq!(chatgpt["auth_mode"], "chatgpt");
+
+        let signed_out = audio_transcription_capability(&json!({
+            "account": null,
+            "requiresOpenaiAuth": true
+        }));
+        assert_eq!(signed_out["enabled"], false);
+        assert_eq!(signed_out["reason"], "not_authenticated");
     }
 
     #[test]
@@ -5739,6 +5874,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             include_str!("../../../web-ui/src/main.js"),
             include_str!("../../../web-ui/src/markdown.js"),
             include_str!("../../../web-ui/src/message-cache.js"),
+            include_str!("../../../web-ui/src/project-state.js"),
             include_str!("../../../web-ui/src/i18n.js"),
             include_str!("../../../web-ui/src/composer-state.js"),
             include_str!("../../../web-ui/src/session-route.js"),
@@ -5836,7 +5972,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "codex-bridge.language.v1",
             "id=\"sendModeToggle\"",
             "toggleSendModeAndKeepFocus",
-            "event.detail !== 0",
+            "preloadExpandedProjectThreads",
+            "codex-bridge.expanded-projects.v1",
             "messagePlaceholderCompact",
             "createFileDownloadTicket",
             "id=\"archiveThreadBtn\"",
@@ -5853,7 +5990,6 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "outbox-mode",
             "border: 1px dashed",
             "classList.add(\"focused\", \"input-focused\")",
-            "composerShell.addEventListener",
             "border-width: 2px",
         ] {
             assert!(source.contains(marker), "missing {marker}");
@@ -6024,6 +6160,25 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact["file_count"], 1);
         assert_eq!(compact["name"], "apply_patch");
         assert_eq!(tool.input["changes"][0]["path"], "/tmp/src/sessions.rs");
+    }
+
+    #[test]
+    fn raw_apply_patch_request_reports_files_and_line_counts() {
+        let tool = ThreadToolCall {
+            call_id: "patch-raw".to_owned(),
+            name: "apply_patch".to_owned(),
+            status: "completed".to_owned(),
+            input: json!({
+                "operation": "apply_patch",
+                "patch": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n+more\n*** End Patch"
+            }),
+            output: None,
+        };
+        assert_eq!(tool_preview(&tool), "已编辑 main.rs");
+        let compact = compact_tool_summary(&tool, 0);
+        assert_eq!(compact["file_count"], 1);
+        assert_eq!(compact["additions"], 2);
+        assert_eq!(compact["deletions"], 1);
     }
 
     #[test]

@@ -63,6 +63,7 @@ a completed bridge or Web UI feature.
 | `thread/items/list` | Page recent native items for structured tool rendering and active-turn state helpers. |
 | `thread/read` | Read a thread and its composer settings. |
 | `config/read` | Fallback source for composer configuration. |
+| `account/read` | Detect whether API-key authentication enables realtime voice transcription. The result is cached for Web UI status snapshots; the bridge does not probe realtime sessions. |
 | `account/rateLimits/read` | Display account usage and limits. |
 | `model/list` | Populate the model selector. |
 | `project/list` | Resolve a project when starting a new thread. |
@@ -84,6 +85,13 @@ They page the smaller native item stream only until the visible assistant messag
 preserving structured `commandExecution`, `fileChange`, and MCP tool rendering without parsing
 wrapper scripts. Large message bodies and tool details remain lazy in the browser.
 
+Current app-server schemas expose `name`, `preview`, `cwd`, timestamps, pin state, and runtime
+`status` in `thread/list`. `thread/read(includeTurns: false)` also returns summary-only metadata
+without resuming the thread. Folder expansion is a Web UI preference rather than app-server state,
+so it is stored in browser storage. On startup, the UI restores that preference and preloads the
+existing lightweight `project_threads` summaries for expanded folders with at most three concurrent
+requests; opening a folder is no longer the trigger for its first load.
+
 Some older or very long threads return `-32601` for `thread/items/list` even after a successful
 metadata-only resume. For those threads only, the rollout compatibility path recognizes the fixed
 `text(await tools.<name>(...))` envelope and splits its calls into bounded structured tool entries.
@@ -97,6 +105,12 @@ memory. Each WebSocket connection receives an immediate compact active-thread ID
 each subsequent discovery pass sends another snapshot over the existing Web UI event stream. This
 lets sidebar activity dots recover after a browser reconnect even when no new
 `thread/status/changed` transition occurs. Polling remains as a compatibility and gap-recovery path.
+
+The same WebSocket service snapshot includes `capabilities.audio_transcription` with `enabled`,
+`reason`, and `auth_mode`. The ordinary status request and `account/updated` refresh this value;
+periodic snapshots only forward the cached result. The Web UI can therefore disable the microphone
+before recording when the current app-server authentication mode cannot use realtime
+transcription, without triggering an auth refresh or opening a trial realtime session.
 
 ## Client-to-server method catalogue
 

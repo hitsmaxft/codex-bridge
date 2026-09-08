@@ -7,8 +7,8 @@
       content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
     />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=c6ce48494a60"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=89a6ba40cdab">
+    <script type="module" crossorigin src="/assets/app.js?v=f3f71b942b06"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=bb9ce3ab7875">
   </head>
   <body>
     <div class="app">
@@ -195,7 +195,9 @@
               </button>
               <button
                 id="voiceBtn"
+                class="unavailable"
                 type="button"
+                disabled
                 data-i18n-aria-label="recordVoice"
                 aria-label="Record voice"
               >
@@ -212,7 +214,7 @@
               multiple
               hidden
             />
-            <input id="audioInput" type="file" accept="audio/*" capture hidden />
+            <input id="audioInput" type="file" accept="audio/*" capture hidden disabled />
             <input id="sendMode" type="hidden" value="steer" /><textarea
               id="messageText"
               rows="1"

@@ -13,6 +13,7 @@ import {
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import { shouldOfferStop } from "./composer-state.js";
+import { persistExpandedProjects, storedExpandedProjects } from "./project-state.js";
 import { taskOverview } from "./task-overview.js";
 import {
   rememberSessionId,
@@ -30,6 +31,21 @@ import {
   watchSystemTheme,
 } from "./state.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
+const restoredExpandedProjects = storedExpandedProjects(window.localStorage);
+if (restoredExpandedProjects !== null) {
+  state.expanded = restoredExpandedProjects;
+  state.expandedPreferenceSaved = true;
+}
+
+function rememberExpandedProjects() {
+  state.expandedPreferenceSaved = true;
+  persistExpandedProjects(window.localStorage, state.expanded);
+}
+function setProjectExpanded(projectPath, expanded, persist = true) {
+  if (expanded) state.expanded.add(projectPath);
+  else state.expanded.delete(projectPath);
+  if (persist) rememberExpandedProjects();
+}
 
 function renderManagedServices() {
   const root = $("componentStatus"),
@@ -104,7 +120,9 @@ async function loadStatus() {
   state.directAppServer = Boolean(backend.app_server_available);
   state.appServerMode = backend.app_server_mode || null;
   state.managedServices = r.managed_services || null;
+  state.serverCapabilities = r.capabilities || null;
   renderManagedServices();
+  syncVoiceCapability();
   const appServer = state.directAppServer
     ? tr("directOnline")
     : state.appServerMode === "desktop_bundled_only"
@@ -147,6 +165,7 @@ async function toggleLanguage() {
   renderProjects();
   renderPending();
   renderComposerAttachments();
+  syncVoiceCapability();
   renderManagedServices();
   renderTasksButton();
   renderTaskOverviews();
@@ -161,7 +180,15 @@ async function loadProjects() {
   ]);
   state.projects = r.projects || [];
   state.projectThreads.clear();
-  state.expanded.clear();
+  state.projectLoadGeneration += 1;
+  const knownPaths = new Set(state.projects.map((project) => project.path));
+  let removedStalePath = false;
+  for (const path of state.expanded) {
+    if (knownPaths.has(path)) continue;
+    state.expanded.delete(path);
+    removedStalePath = true;
+  }
+  if (removedStalePath && state.expandedPreferenceSaved) rememberExpandedProjects();
   renderProjects();
   if (!state.current) {
     const hashedId = sessionIdFromHash(window.location.hash),
@@ -172,6 +199,7 @@ async function loadProjects() {
           fromHash: Boolean(hashedId),
           replaceHash: !hashedId,
         });
+        preloadExpandedProjectThreads();
         return;
       } catch {
         state.current = null;
@@ -179,11 +207,12 @@ async function loadProjects() {
     }
     if (state.projects.length) {
       const project = state.projects[0];
-      state.expanded.add(project.path);
+      if (!state.expandedPreferenceSaved) setProjectExpanded(project.path, true);
       const threads = await loadProjectThreads(project);
       if (threads.length) await openThread(threads[0], { replaceHash: true });
     }
   }
+  preloadExpandedProjectThreads();
 }
 async function loadPins() {
   if (!state.directAppServer) {
@@ -225,31 +254,58 @@ async function loadPins() {
   }
 }
 async function loadProjectThreads(project, offset = 0) {
-  const r = await command(
-    {
-      command: "project_threads",
-      project_path: project.path,
-      include_archived: $("archived").checked,
-      offset,
-      limit: 50,
-    },
-    false,
+  const generation = state.projectLoadGeneration,
+    includeArchived = $("archived").checked,
+    key = `${generation}:${includeArchived ? 1 : 0}:${project.path}:${offset}`;
+  if (state.projectThreadLoads.has(key)) return state.projectThreadLoads.get(key);
+  const request = (async () => {
+    const r = await command(
+      {
+        command: "project_threads",
+        project_path: project.path,
+        include_archived: includeArchived,
+        offset,
+        limit: 50,
+      },
+      false,
+    );
+    if (generation !== state.projectLoadGeneration || includeArchived !== $("archived").checked)
+      return [];
+    const prior = offset ? state.projectThreads.get(project.path)?.threads || [] : [];
+    state.projectThreads.set(project.path, {
+      threads: prior.concat(r.threads || []),
+      available: r.available || 0,
+    });
+    renderProjects();
+    return state.projectThreads.get(project.path).threads;
+  })();
+  state.projectThreadLoads.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (state.projectThreadLoads.get(key) === request) state.projectThreadLoads.delete(key);
+  }
+}
+function preloadExpandedProjectThreads() {
+  const projects = state.projects.filter(
+    (project) => state.expanded.has(project.path) && !state.projectThreads.has(project.path),
   );
-  const prior = offset ? state.projectThreads.get(project.path)?.threads || [] : [];
-  state.projectThreads.set(project.path, {
-    threads: prior.concat(r.threads || []),
-    available: r.available || 0,
-  });
-  renderProjects();
-  return state.projectThreads.get(project.path).threads;
+  let next = 0;
+  const worker = async () => {
+    while (next < projects.length) {
+      const project = projects[next++];
+      await loadProjectThreads(project).catch(() => {});
+    }
+  };
+  void Promise.allSettled(Array.from({ length: Math.min(3, projects.length) }, worker));
 }
 async function toggleProject(project, autoOpen = false) {
   if (state.expanded.has(project.path) && !autoOpen) {
-    state.expanded.delete(project.path);
+    setProjectExpanded(project.path, false);
     renderProjects();
     return;
   }
-  state.expanded.add(project.path);
+  setProjectExpanded(project.path, true);
   let threads = state.projectThreads.get(project.path)?.threads;
   if (!threads) threads = await loadProjectThreads(project);
   else renderProjects();
@@ -627,7 +683,7 @@ async function revealSessionProject(thread) {
   if (state.pinnedIds.has(thread.id)) return renderProjects();
   const project = pinnedProject(thread);
   if (!project) return renderProjects();
-  state.expanded.add(project.path);
+  setProjectExpanded(project.path, true);
   if (!state.projectThreads.has(project.path)) await loadProjectThreads(project);
   else renderProjects();
 }
@@ -711,7 +767,7 @@ function renderProjects() {
     list.hidden = !state.expanded.has(p.path);
     const data = state.projectThreads.get(p.path);
     if (!data) {
-      list.innerHTML = `<div class="empty" style="padding:8px">${tr("openToLoad")}</div>`;
+      list.innerHTML = `<div class="empty" style="padding:8px">${tr("loadingSessions")}</div>`;
     } else {
       for (const t of data.threads) {
         if (!state.pinnedIds.has(t.id)) list.appendChild(threadRow(t));
@@ -759,7 +815,7 @@ async function createThread(worktree) {
     const targetPath = r.worktree_path || r.project_path,
       target = state.projects.find((item) => item.path === targetPath);
     if (target) {
-      state.expanded.add(target.path);
+      setProjectExpanded(target.path, true);
       await loadProjectThreads(target);
     }
     const thread = target
@@ -782,6 +838,29 @@ let voiceStream = null;
 let voiceChunks = [];
 let voiceLimitTimer = null;
 let voiceTranscribing = false;
+function audioTranscriptionCapability() {
+  return state.serverCapabilities?.audio_transcription || null;
+}
+function voiceCapabilityLabel(capability = audioTranscriptionCapability()) {
+  if (!capability) return tr("voiceStatusPending");
+  if (capability.enabled) return tr("recordVoice");
+  if (capability.reason === "api_key_auth_required") return tr("voiceApiKeyRequired");
+  return tr("voiceUnavailable");
+}
+function syncVoiceCapability() {
+  const button = $("voiceBtn"),
+    capability = audioTranscriptionCapability(),
+    unavailable = !capability?.enabled,
+    submitting = document.querySelector(".composer-shell")?.classList.contains("submitting"),
+    busy = submitting || voiceTranscribing;
+  button.classList.toggle("unavailable", unavailable);
+  button.disabled = unavailable || busy;
+  $("audioInput").disabled = unavailable || busy;
+  if (!button.classList.contains("recording") && !button.classList.contains("transcribing")) {
+    button.title = voiceCapabilityLabel(capability);
+    button.setAttribute("aria-label", button.title);
+  }
+}
 function blobDataUrl(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -870,10 +949,8 @@ async function transcribeAudio(audio) {
     throw error;
   } finally {
     voiceTranscribing = false;
-    button.disabled = false;
     button.classList.remove("transcribing");
-    button.title = tr("recordVoice");
-    button.setAttribute("aria-label", button.title);
+    syncVoiceCapability();
   }
 }
 async function imageAttachment(file) {
@@ -953,8 +1030,7 @@ function resetVoiceRecorder() {
   voiceRecorder = null;
   voiceChunks = [];
   $("voiceBtn").classList.remove("recording");
-  $("voiceBtn").title = tr("recordVoice");
-  $("voiceBtn").setAttribute("aria-label", $("voiceBtn").title);
+  syncVoiceCapability();
 }
 async function toggleVoiceRecording() {
   if (voiceRecorder?.state === "recording") {
@@ -2030,7 +2106,9 @@ function handleBridgeEvent(event) {
   }
   if (event?.type === "bridge_service_snapshot") {
     state.managedServices = event.managed_services || null;
+    state.serverCapabilities = event.capabilities || state.serverCapabilities;
     renderManagedServices();
+    syncVoiceCapability();
     return;
   }
   if (event?.type === "bridge_thread_activity_snapshot") {
@@ -2066,6 +2144,10 @@ function handleBridgeEvent(event) {
     params = message.params || {},
     threadId = params.threadId || null;
   if (!method) return;
+  if (method === "account/updated") {
+    loadStatus().catch(() => {});
+    return;
+  }
   if (threadId && state.taskTrackedIds.has(threadId)) markTaskDirty(threadId);
   if (method === "thread/status/changed" && threadId) {
     updateThreadLiveFromStatus(threadId, params.status);
@@ -2334,10 +2416,9 @@ function setComposerSubmitting(active) {
   $("messageText").disabled = active;
   $("sendModeToggle").disabled = active;
   $("attachBtn").disabled = active;
-  $("voiceBtn").disabled = active;
   $("imageInput").disabled = active;
-  $("audioInput").disabled = active;
   $("submitBtn").disabled = active;
+  syncVoiceCapability();
   syncSubmitAction();
 }
 function syncSubmitAction() {
@@ -2485,18 +2566,9 @@ function toggleSendModeAndKeepFocus() {
   setSendMode($("sendMode").value === "steer" ? "send" : "steer", false);
   $("messageText").focus({ preventScroll: true });
 }
-$("sendModeToggle").onpointerdown = (event) => {
-  if (!event.isPrimary || event.button !== 0) return;
-  event.preventDefault();
-  toggleSendModeAndKeepFocus();
-};
-$("sendModeToggle").onclick = (event) => {
-  if (event.detail !== 0) return;
-  toggleSendModeAndKeepFocus();
-};
+$("sendModeToggle").onclick = toggleSendModeAndKeepFocus;
 $("submitBtn").onpointerdown = (event) => {
   if (!event.isPrimary || event.button !== 0) return;
-  event.preventDefault();
   $("submitBtn").dataset.pointerAction ||= $("submitBtn").dataset.action;
 };
 $("submitBtn").onpointercancel = () => delete $("submitBtn").dataset.pointerAction;
@@ -2774,7 +2846,6 @@ window.addEventListener("hashchange", () => {
   run(() => openSessionById(threadId, { fromHash: Boolean(hashedId), replaceHash: !hashedId }));
 });
 const composer = document.querySelector(".composer"),
-  composerShell = document.querySelector(".composer-shell"),
   mainPanel = document.querySelector("main"),
   threadHead = document.querySelector(".thread-head"),
   syncFrameInsets = () => {
@@ -2796,25 +2867,6 @@ window.addEventListener("resize", resizeComposerAfterViewportChange, { passive: 
 window.visualViewport?.addEventListener("resize", resizeComposerAfterViewportChange, {
   passive: true,
 });
-composerShell.addEventListener(
-  "pointerdown",
-  (event) => {
-    if (
-      !usesDocumentMessageScroll() ||
-      !event.isPrimary ||
-      event.button !== 0 ||
-      event.target === $("messageText") ||
-      event.target.closest(".composer-actions")
-    )
-      return;
-    if ($("submitBtn").contains(event.target)) {
-      $("submitBtn").dataset.pointerAction ||= $("submitBtn").dataset.action;
-    }
-    event.preventDefault();
-    $("messageText").focus({ preventScroll: true });
-  },
-  true,
-);
 document.addEventListener("click", (event) => {
   if (
     !$("modelPicker").hidden &&

@@ -25,15 +25,21 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.2.1 · 2026-09-09
+### v0.2.2 · 2026-09-09
 
-- **Firefox iOS composer stability:** normalized the mobile textarea's WebKit font metrics and no
-  longer resize the focused control during keyboard viewport animation. This fixes the displaced
-  caret and hit targets without changing document scrolling.
-- **Leaner introduction:** the README and project page now state the product purpose once, then move
-  directly to the shared task model, structured visibility, and control workflow.
+- **Voice capability handshake:** bridge status and WebSocket snapshots now report whether the
+  current app-server authentication mode supports realtime voice transcription.
+- **Fail-fast voice control:** the Web UI crosses out and disables the microphone before recording
+  when server transcription is unavailable, with an English or Chinese explanation on hover.
+- **Remembered sidebar:** expanded project folders persist in browser storage and preload their
+  lightweight session summaries in the background after startup.
+- **Reliable mobile hit targets:** unused composer space now belongs to the message view, while
+  Queue/Steer and Submit use native click delivery instead of intercepted pointer events.
+- **Patch fallback cleanup:** opaque `apply_patch { request: "patch" }` markers are hidden in favor
+  of app-server `fileChange`; older records carrying a real patch envelope still render as diffs.
 
-See the complete [v0.2.1 release notes](docs/releases/v0.2.1.md), or review the larger
+See the complete [v0.2.2 release notes](docs/releases/v0.2.2.md), the
+[v0.2.1 Firefox iOS fix](docs/releases/v0.2.1.md), or the larger
 [v0.2.0 feature release](docs/releases/v0.2.0.md).
 
 ## Web UI

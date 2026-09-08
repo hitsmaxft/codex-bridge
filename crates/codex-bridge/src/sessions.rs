@@ -1208,7 +1208,7 @@ fn append_rollout_record(
             .flatten();
         if let Some(tools) = parsed {
             messages[message_index].tools.extend(tools);
-        } else {
+        } else if !opaque_apply_patch_marker(&name, &input) {
             messages[message_index].tools.push(ThreadToolCall {
                 call_id: call_id.to_owned(),
                 name,
@@ -1248,7 +1248,35 @@ fn append_rollout_record(
     });
 }
 
+fn opaque_apply_patch_marker(name: &str, input: &Value) -> bool {
+    if name != "apply_patch" {
+        return false;
+    }
+    match input {
+        Value::String(marker) => marker == "patch",
+        Value::Object(fields) if fields.len() == 1 => {
+            fields.get("request").and_then(Value::as_str) == Some("patch")
+        }
+        _ => false,
+    }
+}
+
 fn normalize_tool_input(name: &str, mut input: Value) -> Value {
+    if name == "apply_patch" {
+        let patch = match &input {
+            Value::String(patch) => Some(patch.as_str()),
+            Value::Object(fields) => fields.get("request").and_then(Value::as_str),
+            _ => None,
+        };
+        if let Some(patch) = patch.filter(|patch| patch.trim_start().starts_with("*** Begin Patch"))
+        {
+            return serde_json::json!({
+                "operation": "apply_patch",
+                "patch": patch,
+            });
+        }
+        return input;
+    }
     if !matches!(name, "exec" | "exec_command") {
         return input;
     }
@@ -2066,6 +2094,39 @@ mod tests {
         assert!(tool.input.get("request").is_none());
         assert!(tool.input.get("cmd").is_none());
         assert!(tool.input.get("workdir").is_none());
+    }
+
+    #[test]
+    fn apply_patch_request_is_normalized_for_diff_rendering() {
+        let input = normalize_tool_input(
+            "apply_patch",
+            serde_json::json!({
+                "request": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
+            }),
+        );
+        assert_eq!(input["operation"], "apply_patch");
+        assert!(input["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("*** Update File: src/main.rs")));
+        assert!(input.get("request").is_none());
+    }
+
+    #[test]
+    fn opaque_apply_patch_marker_is_not_exposed_as_a_tool() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-opaque-patch.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-opaque-patch","cwd":"/workspace","source":"vscode"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"Editing."}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-opaque-patch","name":"apply_patch","status":"completed","input":{"request":"patch"}}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-opaque-patch","output":"{}"}}"#,
+            ],
+        );
+
+        let store = SessionStore::new(fixture.path.clone());
+        let snapshot = store.read_thread("thread-opaque-patch").unwrap().unwrap();
+        assert!(snapshot.messages[0].tools.is_empty());
     }
 
     #[test]

@@ -1573,6 +1573,29 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
 .composer-actions button.transcribing svg {
   animation: voice-spin 0.9s linear infinite;
 }
+.composer-actions button.unavailable:disabled {
+  position: relative;
+  opacity: 1;
+}
+.composer-actions button.unavailable svg {
+  opacity: 0.38;
+}
+.composer-actions button.unavailable::after {
+  content: "×";
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--composer-surface);
+  color: var(--danger);
+  font-size: 14px;
+  font-weight: 750;
+  line-height: 1;
+}
 .composer-actions svg {
   width: 21px;
   height: 21px;
@@ -2306,6 +2329,17 @@ label.caption {
     padding: 8px max(14px, env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom))
       max(14px, env(safe-area-inset-left));
     overflow: visible;
+    pointer-events: none;
+  }
+  .composer-status,
+  .model-picker,
+  .outbox-tray,
+  .composer-attachments,
+  .composer-shell textarea,
+  .composer-shell .send-modes,
+  .composer-shell .composer-actions,
+  .composer-shell #submitBtn {
+    pointer-events: auto;
   }
   .composer,
   .composer-shell,
@@ -2327,6 +2361,11 @@ label.caption {
   }
   .composer-shell {
     grid-template-columns: 64px 72px minmax(0, 1fr) 64px;
+    pointer-events: none;
+  }
+  .composer-shell textarea,
+  .composer-shell button {
+    touch-action: manipulation;
   }
   .composer-shell #submitBtn {
     width: 64px;

@@ -570,7 +570,14 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 18,
+            "protocol_version": 20,
+            "capabilities": {
+                "audio_transcription": {
+                    "enabled": true,
+                    "reason": null,
+                    "auth_mode": "demo"
+                }
+            },
             "managed_services": {
                 "app_server": {"enabled": true, "status": {"running": true, "restart_count": 0}},
                 "desktop_interposition": {"enabled": false, "listen": null, "status": {"running": false, "restart_count": 0}}
@@ -923,7 +930,7 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 18);
+        assert_eq!(response["result"]["protocol_version"], 20);
     }
 
     #[test]

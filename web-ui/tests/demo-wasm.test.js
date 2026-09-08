@@ -7,6 +7,11 @@ import { createAuthenticationGate } from "../src/auth-gate.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { localFilePath } from "../src/markdown.js";
 import { SessionMessageCache } from "../src/message-cache.js";
+import {
+  EXPANDED_PROJECTS_STORAGE_KEY,
+  persistExpandedProjects,
+  storedExpandedProjects,
+} from "../src/project-state.js";
 import { taskOverview } from "../src/task-overview.js";
 import {
   LAST_SESSION_STORAGE_KEY,
@@ -39,6 +44,7 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   const status = result(command({ command: "status" }));
   assert.equal(status.demo, true);
   assert.equal(status.managed_services.app_server.status.running, true);
+  assert.equal(status.capabilities.audio_transcription.enabled, true);
 
   const before = result(
     command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
@@ -219,6 +225,18 @@ test("an empty hash restores the last opened session", () => {
   assert.equal(storedSessionId(storage), "demo-thread-protocol");
 });
 
+test("expanded project folders persist as a bounded browser preference", () => {
+  const values = new Map(),
+    storage = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, value),
+    };
+  assert.equal(storedExpandedProjects(storage), null);
+  persistExpandedProjects(storage, new Set(["/workspace/one", "/workspace/two"]));
+  assert.deepEqual([...storedExpandedProjects(storage)], ["/workspace/one", "/workspace/two"]);
+  assert.equal(values.has(EXPANDED_PROJECTS_STORAGE_KEY), true);
+});
+
 test("file diffs define distinct light and dark theme palettes", async () => {
   const stylesheet = await readFile(stylesheetPath, "utf8");
   assert.match(stylesheet, /:root\s*\{[^}]*--diff-surface:\s*#191c19/s);
@@ -283,6 +301,9 @@ test("mobile composer stays out of the message grid sizing flow", async () => {
     /\.composer-shell\s*\{[^}]*grid-template-columns:\s*64px 72px minmax\(0, 1fr\) 64px;/s,
   );
   assert.match(mobile, /\.composer-shell #submitBtn\s*\{[^}]*width:\s*64px;/s);
+  assert.match(mobile, /\.composer\s*\{[^}]*pointer-events:\s*none;/s);
+  assert.match(mobile, /\.composer-shell\s*\{[^}]*pointer-events:\s*none;/s);
+  assert.match(mobile, /\.composer-shell textarea,[\s\S]*?touch-action:\s*manipulation;/s);
   assert.match(
     mobile,
     /\.composer-shell textarea\s*\{[^}]*-webkit-appearance:\s*none;[^}]*padding:\s*12px 5px;[^}]*font-family:\s*-apple-system,[^}]*font-size:\s*16px;[^}]*line-height:\s*20px;[^}]*zoom:\s*1;/s,
@@ -338,8 +359,30 @@ test("composer keeps images as attachments and transcribes voice into editable t
   assert.match(source, /async function pcmAudio\(blob\)/);
   assert.match(source, /command: "audio_transcribe"/);
   assert.match(source, /insertTranscription\(result\.text \|\| ""\)/);
+  assert.match(source, /state\.serverCapabilities = event\.capabilities/);
+  assert.match(source, /method === "account\/updated"/);
+  assert.match(source, /button\.classList\.toggle\("unavailable", unavailable\)/);
   assert.doesNotMatch(source, /type: "audio",\s*url/);
   assert.match(source, /if \(item\.content\) \{[\s\S]*?appendContextValue/);
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  assert.match(
+    stylesheet,
+    /\.composer-actions button\.unavailable::after\s*\{[^}]*content:\s*"×"/s,
+  );
+});
+
+test("expanded folders preload summaries and mobile buttons keep native click delivery", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /storedExpandedProjects\(window\.localStorage\)/);
+  assert.match(source, /preloadExpandedProjectThreads\(\)/);
+  assert.match(source, /Promise\.allSettled\(Array\.from\(\{ length: Math\.min\(3,/);
+  assert.match(source, /\$\("sendModeToggle"\)\.onclick = toggleSendModeAndKeepFocus/);
+  const pointerHandler = source.match(
+    /\$\("submitBtn"\)\.onpointerdown = \(event\) => \{[\s\S]*?\n\};/,
+  )?.[0];
+  assert.ok(pointerHandler);
+  assert.doesNotMatch(pointerHandler, /preventDefault/);
+  assert.doesNotMatch(source, /composerShell\.addEventListener\(\s*"pointerdown"/);
 });
 
 test("structured command actions stay separate and preserve multiline commands", async () => {
