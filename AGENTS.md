@@ -12,7 +12,8 @@ The demo test reads the already-built release WASM artifact directly from
 `target/wasm32-unknown-unknown/release/codex_bridge_demo.wasm`. Whenever
 `crates/codex-bridge-demo`, the Web UI status contract, or another demo-visible API changes, rebuild
 that artifact before running the JavaScript regression test. Do not run the regression once against
-a known-stale WASM file merely to discover that it is stale.
+a known-stale WASM file merely to discover that it is stale. In demo mode, Vite serves and packages
+that exact artifact through `demo-wasm-asset`; do not create or maintain a second copied WASM file.
 
 Use this order:
 

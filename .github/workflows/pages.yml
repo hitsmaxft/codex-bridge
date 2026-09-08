@@ -40,9 +40,6 @@ jobs:
           CARGO_INCREMENTAL=0 cargo test --locked -p codex-bridge-demo
           cargo build --locked --release --target wasm32-unknown-unknown -p codex-bridge-demo
           npm --prefix web-ui run test:demo-wasm
-          mkdir -p target/codex-bridge-demo-public
-          cp target/wasm32-unknown-unknown/release/codex_bridge_demo.wasm \
-            target/codex-bridge-demo-public/codex_bridge_demo.wasm
       - name: Build Pages site and interactive demo
         run: |
           mkdir -p _site

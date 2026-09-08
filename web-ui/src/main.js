@@ -787,6 +787,35 @@ function blobDataUrl(blob) {
     reader.readAsDataURL(blob);
   });
 }
+function demoAudioDataUrl() {
+  const sampleRate = 8000,
+    sampleCount = Math.round(sampleRate * 0.45),
+    bytes = new Uint8Array(44 + sampleCount * 2),
+    view = new DataView(bytes.buffer),
+    writeText = (offset, text) => {
+      for (let index = 0; index < text.length; index += 1)
+        bytes[offset + index] = text.charCodeAt(index);
+    };
+  writeText(0, "RIFF");
+  view.setUint32(4, 36 + sampleCount * 2, true);
+  writeText(8, "WAVEfmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeText(36, "data");
+  view.setUint32(40, sampleCount * 2, true);
+  for (let index = 0; index < sampleCount; index += 1) {
+    const fade = Math.sin((Math.PI * index) / sampleCount),
+      frequency = 420 + (index / sampleCount) * 180,
+      sample = Math.sin((2 * Math.PI * frequency * index) / sampleRate) * fade * 0.22;
+    view.setInt16(44 + index * 2, Math.round(sample * 32767), true);
+  }
+  return `data:audio/wav;base64,${btoa(String.fromCharCode(...bytes))}`;
+}
 async function imageAttachment(file) {
   if (file.type === "image/gif") {
     const url = await blobDataUrl(file);
@@ -880,6 +909,16 @@ async function toggleVoiceRecording() {
   }
   if (state.composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS)
     throw new Error(tr("attachmentLimit"));
+  if (demoMode) {
+    state.composerAttachments.push({
+      type: "audio",
+      url: demoAudioDataUrl(),
+      name: "demo-voice.wav",
+    });
+    renderComposerAttachments();
+    notify(tr("demoVoiceAdded"));
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
     $("audioInput").click();
     return;
@@ -988,6 +1027,10 @@ function contentNode(item) {
   details.ontoggle = () => {
     if (!details.open || details.dataset.loaded) return;
     details.dataset.loaded = "1";
+    if (item.content) {
+      appendContextValue(details, item.content, item.label);
+      return;
+    }
     if (typeof item.text === "string") {
       appendContextValue(details, { text: item.text }, item.label);
       return;

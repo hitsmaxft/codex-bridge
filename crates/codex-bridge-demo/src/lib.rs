@@ -18,13 +18,18 @@ struct PendingMessage {
     action: String,
     status: String,
     polls: u8,
+    attachments: Vec<Value>,
 }
 
 struct DemoState {
     messages: Vec<Value>,
-    pending: Option<PendingMessage>,
+    pending: Vec<PendingMessage>,
     active_thread: Option<String>,
     active_ticks: u8,
+    active_scenario: Option<u8>,
+    active_prompt: String,
+    active_steers: Vec<String>,
+    active_tool_message: Option<usize>,
     next_pending: u32,
     file_len: u64,
     model: String,
@@ -37,9 +42,13 @@ impl DemoState {
     fn new() -> Self {
         Self {
             messages: seed_messages(),
-            pending: None,
+            pending: Vec::new(),
             active_thread: None,
             active_ticks: 0,
+            active_scenario: None,
+            active_prompt: String::new(),
+            active_steers: Vec::new(),
+            active_tool_message: None,
             next_pending: 1,
             file_len: 48_320,
             model: "gpt-5.6-sol".to_owned(),
@@ -76,19 +85,210 @@ impl DemoState {
         })
     }
 
-    fn append_user_message(&mut self, text: String) {
+    fn append_user_message(&mut self, text: String, attachments: Vec<Value>, action: &str) {
+        let mut content = Vec::new();
+        if !text.trim().is_empty() {
+            content.push(json!({"kind": "text", "text": text}));
+        }
+        for attachment in attachments {
+            let attachment_type = attachment
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("attachment");
+            let url = attachment
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (label, embedded) = if attachment_type == "audio" {
+                (
+                    "Demo audio attachment",
+                    json!({"type": "input_audio", "audio_url": url}),
+                )
+            } else {
+                (
+                    "Demo image attachment",
+                    json!({"type": "input_image", "image_url": url}),
+                )
+            };
+            content.push(json!({
+                "kind": "context",
+                "label": label,
+                "bytes": url.len(),
+                "content": embedded,
+            }));
+        }
         self.messages.push(json!({
             "timestamp": "2026-09-07T07:00:00.000Z",
             "id": format!("demo-user-{}", self.messages.len()),
             "role": "user",
             "phase": null,
             "category": "user",
-            "content": [{"kind": "text", "text": text}],
+            "content": content,
             "tools": [],
+            "demo_action": action,
         }));
     }
 
+    fn scenario_for(text: &str, has_audio: bool, salt: u32) -> u8 {
+        if has_audio {
+            return 3;
+        }
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("search") || lower.contains("research") || lower.contains("查找") {
+            return 1;
+        }
+        if lower.contains("code") || lower.contains("fix") || lower.contains("代码") {
+            return 2;
+        }
+        text.bytes()
+            .fold(salt, |hash, byte| {
+                hash.wrapping_mul(33).wrapping_add(byte as u32)
+            })
+            .wrapping_rem(3) as u8
+    }
+
+    fn scenario_tool(scenario: u8) -> &'static str {
+        match scenario {
+            1 => "web_search",
+            2 => "apply_patch",
+            3 => "audio_transcribe",
+            _ => "exec_command",
+        }
+    }
+
+    fn start_run(&mut self, pending: PendingMessage) {
+        let has_audio = pending
+            .attachments
+            .iter()
+            .any(|attachment| attachment["type"] == "audio");
+        let scenario = Self::scenario_for(&pending.text, has_audio, self.next_pending);
+        self.append_user_message(pending.text.clone(), pending.attachments, "queue");
+        self.active_thread = Some(pending.thread_id);
+        self.active_ticks = 40;
+        self.active_scenario = Some(scenario);
+        self.active_prompt = pending.text;
+        self.active_steers.clear();
+        self.active_tool_message = None;
+        self.file_len += 1;
+    }
+
+    fn apply_steer(&mut self, pending: PendingMessage) {
+        self.append_user_message(pending.text.clone(), pending.attachments, "steer");
+        if !pending.text.trim().is_empty() {
+            self.active_steers.push(pending.text);
+        }
+        self.active_ticks = self.active_ticks.max(18);
+        self.file_len += 1;
+    }
+
+    fn append_progress(&mut self) {
+        let scenario = self.active_scenario.unwrap_or_default();
+        let (text, preview) = match scenario {
+            1 => (
+                "I’m checking a few simulated sources and comparing the useful details.",
+                "Search the demo knowledge index",
+            ),
+            2 => (
+                "I found the relevant demo module and I’m preparing a small simulated patch.",
+                "Update the live demo state machine",
+            ),
+            3 => (
+                "I received the demo voice clip and I’m simulating local transcription.",
+                "Transcribe the attached demo audio",
+            ),
+            _ => (
+                "I’m inspecting the simulated workspace before choosing the next step.",
+                "Inspect the demo workspace",
+            ),
+        };
+        let tool_name = Self::scenario_tool(scenario);
+        let message_index = self.messages.len();
+        self.messages.push(json!({
+            "timestamp": "2026-09-08T08:00:02.000Z",
+            "id": format!("demo-progress-{message_index}"),
+            "role": "assistant",
+            "phase": "commentary",
+            "category": "assistant",
+            "content": [{"kind": "text", "text": text}],
+            "tools": [{
+                "tool_index": 0,
+                "name": tool_name,
+                "status": "running",
+                "preview": preview,
+                "has_output": true,
+                "bytes": 184,
+                "additions": if scenario == 2 { 24 } else { 0 },
+                "deletions": if scenario == 2 { 3 } else { 0 },
+                "file_count": if scenario == 2 { 2 } else { 0 },
+                "detail": {
+                    "display_input": {"type": "demoAction", "title": preview, "prompt": self.active_prompt},
+                    "tool": {"call_id": format!("demo-live-{message_index}"), "name": tool_name, "status": "running", "input": {"prompt": self.active_prompt}, "output": null}
+                }
+            }],
+        }));
+        self.active_tool_message = Some(message_index);
+        self.file_len += 1;
+    }
+
+    fn finish_progress_tool(&mut self) {
+        let Some(message_index) = self.active_tool_message else {
+            return;
+        };
+        let Some(tool) = self.messages[message_index]["tools"]
+            .as_array_mut()
+            .and_then(|tools| tools.first_mut())
+        else {
+            return;
+        };
+        tool["status"] = json!("completed");
+        tool["detail"]["tool"]["status"] = json!("completed");
+        tool["detail"]["tool"]["output"] = json!({
+            "result": "Simulated locally by the in-browser WASM demo server."
+        });
+        self.active_tool_message = None;
+        self.file_len += 1;
+    }
+
+    fn cancel_progress_tool(&mut self) {
+        let Some(message_index) = self.active_tool_message else {
+            return;
+        };
+        let Some(tool) = self.messages[message_index]["tools"]
+            .as_array_mut()
+            .and_then(|tools| tools.first_mut())
+        else {
+            return;
+        };
+        tool["status"] = json!("cancelled");
+        tool["detail"]["tool"]["status"] = json!("cancelled");
+        tool["detail"]["tool"]["output"] = json!({
+            "result": "Cancelled by the visitor in the live demo."
+        });
+        self.active_tool_message = None;
+        self.file_len += 1;
+    }
+
     fn append_demo_reply(&mut self) {
+        let scenario = self.active_scenario.unwrap_or_default();
+        let steer_note = if self.active_steers.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " I also applied {} follow-up instruction{} while the run was active.",
+                self.active_steers.len(),
+                if self.active_steers.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        };
+        let reply = match scenario {
+            1 => "The simulated research pass is complete. The live demo selected a source-review template from your prompt and exercised the same progress refresh used by a real session.",
+            2 => "The simulated code change is complete. The live demo selected an edit template, rendered a structured tool call, and refreshed this conclusion into the conversation.",
+            3 => "The demo audio was received and played back locally. A real Codex host would forward the audio input to app-server; this public demo keeps the clip and its simulated transcript entirely in your browser.",
+            _ => "The simulated workspace check is complete. This response was selected from a local template and no message or attachment left your browser.",
+        };
         self.messages.push(json!({
             "timestamp": "2026-09-07T07:00:04.000Z",
             "id": format!("demo-assistant-{}", self.messages.len()),
@@ -97,25 +297,29 @@ impl DemoState {
             "category": "assistant",
             "content": [{
                 "kind": "text",
-                "text": "This reply was generated by the in-browser WASM demo server. No message left this page, but the queue, handoff, processing, and history-refresh flow is the same UI used by codex-bridge."
+                "text": format!("{reply}{steer_note}")
             }],
             "tools": [],
         }));
     }
 
     fn pending_messages(&mut self) -> Value {
-        let visible = self.pending.as_ref().map(|pending| {
-            json!({
-                "id": pending.id,
-                "thread_id": pending.thread_id,
-                "text": pending.text,
-                "action": pending.action,
-                "status": pending.status,
-                "source": "demo_wasm",
+        let mut visible = self
+            .pending
+            .iter()
+            .map(|pending| {
+                json!({
+                    "id": pending.id,
+                    "thread_id": pending.thread_id,
+                    "text": pending.text,
+                    "action": pending.action,
+                    "status": pending.status,
+                    "source": "demo_wasm",
+                })
             })
-        });
+            .collect::<Vec<_>>();
 
-        if let Some(pending) = self.pending.as_mut() {
+        for pending in &mut self.pending {
             pending.polls += 1;
             if pending.polls == 1 {
                 pending.status = if pending.action == "steer" {
@@ -126,29 +330,72 @@ impl DemoState {
             }
         }
 
-        let should_land = self
+        let ready_index = self
             .pending
-            .as_ref()
-            .is_some_and(|pending| pending.polls >= 3);
-        if should_land {
-            let pending = self.pending.take().expect("pending message exists");
-            self.append_user_message(pending.text);
-            self.active_thread = Some(pending.thread_id);
-            self.active_ticks = 3;
-            self.file_len += 1;
-            return json!({"messages": []});
+            .iter()
+            .position(|pending| {
+                pending.polls >= 2
+                    && pending.action == "steer"
+                    && self.active_thread.as_deref() == Some(pending.thread_id.as_str())
+            })
+            .or_else(|| {
+                if self.active_thread.is_none() {
+                    self.pending
+                        .iter()
+                        .position(|pending| pending.polls >= 3 && pending.action == "queue")
+                } else {
+                    None
+                }
+            });
+        if let Some(index) = ready_index {
+            let pending = self.pending.remove(index);
+            if pending.action == "steer" {
+                self.apply_steer(pending);
+            } else {
+                self.start_run(pending);
+            }
+            let remaining_ids = self
+                .pending
+                .iter()
+                .map(|pending| pending.id.as_str())
+                .collect::<Vec<_>>();
+            visible.retain(|entry| {
+                entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| remaining_ids.contains(&id))
+            });
         }
 
-        json!({"messages": visible.into_iter().collect::<Vec<_>>()})
+        json!({"messages": visible})
     }
 
     fn activity(&mut self, thread_id: &str) -> Value {
         let active_here = self.active_thread.as_deref() == Some(thread_id) && self.active_ticks > 0;
         if active_here {
             self.active_ticks -= 1;
+            match self.active_ticks {
+                38 => self.append_progress(),
+                24 => self.finish_progress_tool(),
+                10 => {
+                    self.messages.push(json!({
+                        "timestamp": "2026-09-08T08:00:05.000Z",
+                        "id": format!("demo-analysis-{}", self.messages.len()),
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "category": "assistant",
+                        "content": [{"kind": "text", "text": "The simulated result is ready; I’m turning it into a concise final response."}],
+                        "tools": [],
+                    }));
+                    self.file_len += 1;
+                }
+                _ => {}
+            }
             if self.active_ticks == 0 {
                 self.append_demo_reply();
                 self.active_thread = None;
+                self.active_scenario = None;
+                self.active_tool_message = None;
                 self.file_len += 1;
             }
         }
@@ -158,8 +405,8 @@ impl DemoState {
             "thread_id": thread_id,
             "activity": {
                 "active_turn_id": still_active.then_some("demo-turn-processing"),
-                "phase": still_active.then_some("model"),
-                "active_tool": Value::Null,
+                "phase": still_active.then_some(if self.active_tool_message.is_some() { "tool" } else { "model" }),
+                "active_tool": still_active.then(|| self.active_scenario.map(Self::scenario_tool)).flatten(),
                 "file_len": self.file_len,
                 "updated_at_ms": 1_788_767_541_844_u64 + self.file_len,
             }
@@ -275,7 +522,7 @@ fn models() -> Value {
     ]})
 }
 
-fn tool_content(message_index: usize, tool_index: usize) -> Option<Value> {
+fn seed_tool_content(message_index: usize, tool_index: usize) -> Option<Value> {
     match (message_index, tool_index) {
         (1, 0) => Some(json!({
             "display_input": {
@@ -305,6 +552,29 @@ fn tool_content(message_index: usize, tool_index: usize) -> Option<Value> {
     }
 }
 
+fn public_message(mut message: Value) -> Value {
+    if let Some(tools) = message.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            if let Some(fields) = tool.as_object_mut() {
+                fields.remove("detail");
+            }
+        }
+    }
+    message
+}
+
+fn live_tool_content(state: &DemoState, message_index: usize, tool_index: usize) -> Option<Value> {
+    state
+        .messages
+        .get(message_index)?
+        .get("tools")?
+        .as_array()?
+        .get(tool_index)?
+        .get("detail")
+        .cloned()
+        .or_else(|| seed_tool_content(message_index, tool_index))
+}
+
 fn success(result: Value) -> Value {
     json!({"ok": true, "result": result})
 }
@@ -327,6 +597,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "service": "codex-bridge-demo",
             "status": "ready",
             "demo": true,
+            "live_simulation": true,
             "protocol_version": 18,
             "managed_services": {
                 "app_server": {"enabled": true, "status": {"running": true, "restart_count": 0}},
@@ -386,7 +657,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .iter()
                 .enumerate()
                 .map(|(offset, message)| {
-                    let mut message = message.clone();
+                    let mut message = public_message(message.clone());
                     message["message_index"] = json!(start + offset);
                     message
                 })
@@ -408,7 +679,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .get("tool_index")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
-            let Some(mut detail) = tool_content(message_index, tool_index) else {
+            let Some(mut detail) = live_tool_content(state, message_index, tool_index) else {
                 return error(
                     "tool_content_not_found",
                     "the demo has no detail for this tool",
@@ -422,12 +693,21 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
         "thread_watch" => json!({"thread_id": thread_id, "subscribed": true}),
         "pending_messages" => state.pending_messages(),
         "pending_message_delete" => {
-            let Some(pending) = state.pending.take() else {
+            let requested_id = request
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let Some(index) = state
+                .pending
+                .iter()
+                .position(|pending| pending.id == requested_id && pending.thread_id == thread_id)
+            else {
                 return error(
                     "pending_message_not_found",
                     "the demo message already handed off",
                 );
             };
+            let pending = state.pending.remove(index);
             json!({"id": pending.id, "thread_id": pending.thread_id, "text": pending.text, "message_action": pending.action, "queue_deleted": true})
         }
         "send" | "steer" => {
@@ -436,25 +716,38 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim();
-            if text.is_empty() {
-                return error("invalid_request", "message must not be empty");
-            }
-            if state.pending.is_some() || state.active_ticks > 0 {
+            let attachments = request
+                .get("attachments")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if text.is_empty() && attachments.is_empty() {
                 return error(
-                    "demo_busy",
-                    "Wait for the current simulated response before submitting another message",
+                    "invalid_request",
+                    "message must contain text or an attachment",
                 );
+            }
+            if command == "steer"
+                && (state.active_thread.as_deref() != Some(thread_id) || state.active_ticks == 0)
+            {
+                return error("no_active_turn", "start a demo run before steering it");
             }
             let action = if command == "steer" { "steer" } else { "queue" };
             let id = format!("demo-pending-{}", state.next_pending);
             state.next_pending += 1;
-            state.pending = Some(PendingMessage {
+            let summary = if text.is_empty() {
+                "🎙 Demo voice message".to_owned()
+            } else {
+                text.to_owned()
+            };
+            state.pending.push(PendingMessage {
                 id: id.clone(),
                 thread_id: thread_id.to_owned(),
-                text: text.to_owned(),
+                text: summary,
                 action: action.to_owned(),
                 status: format!("{action}ing"),
                 polls: 0,
+                attachments,
             });
             json!({"action": command, "status": if command == "steer" { "steered" } else { "queued" }, "pending_id": id, "thread_id": thread_id, "target": "demo_wasm"})
         }
@@ -466,8 +759,20 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                     format!("thread {thread_id} has no active demo turn"),
                 );
             }
+            state.cancel_progress_tool();
             state.active_ticks = 0;
             state.active_thread = None;
+            state.active_scenario = None;
+            state.active_tool_message = None;
+            state.messages.push(json!({
+                "timestamp": "2026-09-08T08:00:06.000Z",
+                "id": format!("demo-cancelled-{}", state.messages.len()),
+                "role": "assistant",
+                "phase": "commentary",
+                "category": "assistant",
+                "content": [{"kind": "text", "text": "Demo run cancelled. Any queued message remains available to withdraw or run next."}],
+                "tools": [],
+            }));
             state.file_len += 1;
             json!({"thread_id": thread_id, "status": "interrupted", "backend": "demo_wasm"})
         }
@@ -523,7 +828,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "untracked_lines_skipped": 0
         }),
         "tail" => {
-            json!({"source": "demo_wasm", "messages": state.messages, "messages_total": state.messages.len()})
+            json!({"source": "demo_wasm", "messages": state.messages.iter().cloned().map(public_message).collect::<Vec<_>>(), "messages_total": state.messages.len()})
         }
         "pending" => json!({"requests": []}),
         "scroll" => json!({"status": "simulated", "direction": request.get("direction")}),
@@ -606,11 +911,21 @@ mod tests {
         }
     }
 
+    fn finish_active_run(state: &mut DemoState) {
+        while state.active_ticks > 0 {
+            result(dispatch(
+                json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
+                state,
+            ));
+        }
+    }
+
     #[test]
     fn status_identifies_the_wasm_demo() {
         let response: Value =
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
+        assert_eq!(response["result"]["live_simulation"], true);
         assert_eq!(response["result"]["protocol_version"], 18);
     }
 
@@ -644,7 +959,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(state.messages.len(), before + 1);
-        assert_eq!(state.active_ticks, 3);
+        assert_eq!(state.active_ticks, 40);
     }
 
     #[test]
@@ -665,10 +980,7 @@ mod tests {
         assert_eq!(active["activity"]["active_turn_id"], "demo-turn-processing");
         assert!(active["activity"]["file_len"].as_u64().unwrap() > initial_file_len);
 
-        result(dispatch(
-            json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
-            &mut state,
-        ));
+        finish_active_run(&mut state);
         let completed = result(dispatch(
             json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
             &mut state,
@@ -679,16 +991,16 @@ mod tests {
             json!({"command": "messages", "thread_id": PRIMARY_THREAD, "limit": 30}),
             &mut state,
         ));
-        assert_eq!(messages["page"]["total"], initial_messages + 2);
+        assert_eq!(messages["page"]["total"], initial_messages + 4);
         assert_eq!(
             messages["messages"][initial_messages]["content"][0]["text"],
             "Refresh me"
         );
         assert!(
-            messages["messages"][initial_messages + 1]["content"][0]["text"]
+            messages["messages"].as_array().unwrap().last().unwrap()["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("in-browser WASM demo server")
+                .contains("simulated")
         );
     }
 
@@ -700,6 +1012,14 @@ mod tests {
             &mut state,
         ));
         land_pending_message(&mut state);
+        result(dispatch(
+            json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        ));
+        result(dispatch(
+            json!({"command": "thread_activity", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        ));
         let messages_after_handoff = state.messages.len();
         let file_len_before_interrupt = state.file_len;
 
@@ -710,7 +1030,15 @@ mod tests {
         assert_eq!(interrupted["status"], "interrupted");
         assert_eq!(state.active_thread, None);
         assert_eq!(state.active_ticks, 0);
-        assert_eq!(state.messages.len(), messages_after_handoff);
+        assert_eq!(state.messages.len(), messages_after_handoff + 1);
+        assert_eq!(
+            state.messages[messages_after_handoff - 1]["tools"][0]["status"],
+            "cancelled"
+        );
+        assert!(state.messages.last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
         assert!(state.file_len > file_len_before_interrupt);
 
         let inactive = result(dispatch(
@@ -724,6 +1052,68 @@ mod tests {
         );
         assert_eq!(duplicate["ok"], false);
         assert_eq!(duplicate["error"]["code"], "no_active_turn");
+    }
+
+    #[test]
+    fn active_run_accepts_steer_and_keeps_queued_work_withdrawable() {
+        let mut state = DemoState::new();
+        result(dispatch(
+            json!({"command": "send", "thread_id": PRIMARY_THREAD, "text": "Fix the demo code"}),
+            &mut state,
+        ));
+        land_pending_message(&mut state);
+
+        let queued = result(dispatch(
+            json!({"command": "send", "thread_id": PRIMARY_THREAD, "text": "Then summarize it"}),
+            &mut state,
+        ));
+        let steer = result(dispatch(
+            json!({"command": "steer", "thread_id": PRIMARY_THREAD, "text": "Keep the answer short"}),
+            &mut state,
+        ));
+        result(dispatch(json!({"command": "pending_messages"}), &mut state));
+        let pending = result(dispatch(json!({"command": "pending_messages"}), &mut state));
+        assert_eq!(pending["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(pending["messages"][0]["action"], "queue");
+        assert_eq!(state.active_steers, vec!["Keep the answer short"]);
+
+        let withdrawn = result(dispatch(
+            json!({"command": "pending_message_delete", "thread_id": PRIMARY_THREAD, "id": queued["pending_id"]}),
+            &mut state,
+        ));
+        assert_eq!(withdrawn["queue_deleted"], true);
+        assert_eq!(withdrawn["text"], "Then summarize it");
+        assert_ne!(queued["pending_id"], steer["pending_id"]);
+
+        finish_active_run(&mut state);
+        assert!(state.messages.last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("follow-up instruction"));
+    }
+
+    #[test]
+    fn audio_only_submission_uses_the_local_audio_template() {
+        let mut state = DemoState::new();
+        result(dispatch(
+            json!({
+                "command": "send",
+                "thread_id": PRIMARY_THREAD,
+                "text": "",
+                "attachments": [{"type": "audio", "url": "data:audio/wav;base64,UklGRg==", "name": "demo.wav"}]
+            }),
+            &mut state,
+        ));
+        land_pending_message(&mut state);
+        assert_eq!(state.active_scenario, Some(3));
+        let user = state.messages.last().unwrap();
+        assert_eq!(user["content"][1]["content"]["type"], "input_audio");
+
+        finish_active_run(&mut state);
+        assert!(state.messages.last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("audio"));
     }
 
     #[test]

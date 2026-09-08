@@ -1,7 +1,48 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { defineConfig } from "vite";
 
 const demoBuild = process.env.VITE_CODEX_BRIDGE_DEMO === "1";
+const demoWasmPath = new URL(
+  "../target/wasm32-unknown-unknown/release/codex_bridge_demo.wasm",
+  import.meta.url,
+);
+
+function demoWasmBuildAsset() {
+  return {
+    name: "demo-wasm-build-asset",
+    apply: "build",
+    async buildStart() {
+      if (!demoBuild) return;
+      this.emitFile({
+        type: "asset",
+        fileName: "codex_bridge_demo.wasm",
+        source: await readFile(demoWasmPath),
+      });
+    },
+  };
+}
+
+function demoWasmDevAsset() {
+  return {
+    name: "demo-wasm-dev-asset",
+    apply: "serve",
+    configureServer(server) {
+      if (!demoBuild) return;
+      server.middlewares.use(async (request, response, next) => {
+        if (request.url?.split("?", 1)[0] !== "/codex_bridge_demo.wasm") return next();
+        try {
+          response.statusCode = 200;
+          response.setHeader("Content-Type", "application/wasm");
+          response.setHeader("Cache-Control", "no-store");
+          response.end(await readFile(demoWasmPath));
+        } catch (error) {
+          next(error);
+        }
+      });
+    },
+  };
+}
 
 function fixedAssetCacheBuster() {
   return {
@@ -25,9 +66,9 @@ function fixedAssetCacheBuster() {
 }
 
 export default defineConfig({
-  plugins: [fixedAssetCacheBuster()],
+  plugins: [demoWasmBuildAsset(), demoWasmDevAsset(), fixedAssetCacheBuster()],
   base: "/",
-  publicDir: demoBuild ? "../target/codex-bridge-demo-public" : false,
+  publicDir: false,
   server: {
     proxy: {
       "/api": "http://127.0.0.1:18791",

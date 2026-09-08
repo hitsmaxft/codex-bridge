@@ -98,6 +98,90 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   );
 });
 
+test("live demo supports queued work, steer handoff, dynamic tools, and audio", async () => {
+  const command = await demoClient();
+  result(
+    command({
+      command: "send",
+      thread_id: "demo-thread-web-ui",
+      text: "Fix the live demo code",
+    }),
+  );
+  for (let poll = 0; poll < 3; poll += 1) result(command({ command: "pending_messages" }));
+
+  const queued = result(
+    command({
+      command: "send",
+      thread_id: "demo-thread-web-ui",
+      text: "Summarize this next",
+    }),
+  );
+  result(
+    command({
+      command: "steer",
+      thread_id: "demo-thread-web-ui",
+      text: "Keep the current answer concise",
+    }),
+  );
+  result(command({ command: "pending_messages" }));
+  const pending = result(command({ command: "pending_messages" }));
+  assert.equal(pending.messages.length, 1);
+  assert.equal(pending.messages[0].action, "queue");
+
+  result(command({ command: "thread_activity", thread_id: "demo-thread-web-ui" }));
+  result(command({ command: "thread_activity", thread_id: "demo-thread-web-ui" }));
+  result(command({ command: "thread_activity", thread_id: "demo-thread-web-ui" }));
+  const progress = result(
+    command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
+  );
+  const toolMessage = progress.messages.findLast((message) => message.tools?.length);
+  assert.equal(toolMessage.tools[0].name, "apply_patch");
+  const detail = result(
+    command({
+      command: "tool_content",
+      thread_id: "demo-thread-web-ui",
+      message_index: toolMessage.message_index,
+      tool_index: 0,
+    }),
+  );
+  assert.equal(detail.tool.name, "apply_patch");
+  assert.match(detail.display_input.title, /live demo state machine/i);
+
+  const withdrawn = result(
+    command({
+      command: "pending_message_delete",
+      thread_id: "demo-thread-web-ui",
+      id: queued.pending_id,
+    }),
+  );
+  assert.equal(withdrawn.queue_deleted, true);
+  result(command({ command: "interrupt", thread_id: "demo-thread-web-ui" }));
+
+  result(
+    command({
+      command: "send",
+      thread_id: "demo-thread-web-ui",
+      text: "",
+      attachments: [{ type: "audio", name: "demo.wav", url: "data:audio/wav;base64,UklGRg==" }],
+    }),
+  );
+  for (let poll = 0; poll < 3; poll += 1) result(command({ command: "pending_messages" }));
+  for (let poll = 0; poll < 48; poll += 1) {
+    const activity = result(
+      command({ command: "thread_activity", thread_id: "demo-thread-web-ui" }),
+    );
+    if (!activity.activity.active_turn_id) break;
+  }
+  const completed = result(
+    command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
+  );
+  const audioMessage = completed.messages.findLast(
+    (message) => message.role === "user" && message.content.some((item) => item.content),
+  );
+  assert.equal(audioMessage.content[1].content.type, "input_audio");
+  assert.match(completed.messages.at(-1).content[0].text, /audio/i);
+});
+
 test("session hash routes to the requested demo session", async () => {
   const command = await demoClient();
   const hash = sessionHash("demo-thread-protocol");
@@ -204,6 +288,9 @@ test("composer exposes native image and voice attachment controls", async () => 
   assert.match(source, /attachments = state\.composerAttachments\.map/);
   assert.match(source, /command\(\{ command: name, thread_id: threadId, text, attachments \}\)/);
   assert.match(source, /new MediaRecorder/);
+  assert.match(source, /function demoAudioDataUrl\(\)/);
+  assert.match(source, /if \(demoMode\) \{[\s\S]*?name: "demo-voice\.wav"/);
+  assert.match(source, /if \(item\.content\) \{[\s\S]*?appendContextValue/);
 });
 
 test("structured command actions stay separate and preserve multiline commands", async () => {

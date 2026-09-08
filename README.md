@@ -75,8 +75,10 @@ See the complete [v0.1.0 release notes](docs/releases/v0.1.0.md).
 ## Web UI
 
 [Try the interactive demo](https://gh.bhee.online/codex-bridge/demo/). It runs the production Vite
-frontend against a finite Rust/WASM simulator entirely in the browser. Demo submissions never
-contact Codex.
+frontend against a live Rust/WASM simulator entirely in the browser. Submit different prompts to
+see template-driven progress and structured tools, steer or queue another message while it runs,
+withdraw queued work, cancel the run, or add a playable synthetic voice clip. Demo submissions and
+attachments never contact Codex or leave the page.
 
 [<img src="docs/assets/codex-bridge-mobile.jpg" alt="Codex App Server WebUI showing a live Codex task on mobile" width="360">](docs/assets/codex-bridge-mobile.jpg)
 
