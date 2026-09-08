@@ -27,3 +27,21 @@ CARGO_INCREMENTAL=0 cargo test --workspace --no-fail-fast
 Run the Vite production build before compiling or packaging `codex-bridge`, because the daemon
 embeds files from `web-ui/dist` at compile time. For a deployed release, rebuild the daemon only
 after that sequence, then restart it and verify both `codexctl status` and the HTTP endpoint.
+
+## Privacy before publication
+
+- Before every commit or push, scan tracked and staged files for real usernames, absolute home
+  paths, email addresses, device names, local hostnames, private IP addresses, internal URLs,
+  cookies, tokens, passwords, API keys, rollout data, and local configuration values.
+- Use portable placeholders in documentation and fixtures, such as `~`, `${HOME}`,
+  `/Users/yourname`, `example.com`, and the RFC 5737 documentation address ranges. Do not copy a
+  developer's actual filesystem layout or network coordinates into examples.
+- Treat screenshots and other media as data: inspect visible account/path information and remove
+  EXIF location, device, author, and creation metadata before adding them.
+- Do not print suspected secrets while auditing. Report only redacted matches and file locations.
+  Public project URLs and GitHub noreply identities may remain only when they are intentional.
+- Never add local logs, databases, session rollouts, password files, auth caches, download tickets,
+  or private service configuration to the repository.
+- If sensitive material has already been committed or pushed, stop and report its scope. Removing
+  it in a later commit does not remove it from history; coordinate credential rotation and history
+  rewriting explicitly rather than doing either silently.

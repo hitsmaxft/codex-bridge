@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
+    />
     <title>Codex App Server WebUI</title>
   </head>
   <body>
@@ -37,7 +40,16 @@
               id="search"
               data-i18n-placeholder="filter"
               placeholder="Filter projects or sessions"
-            /><button id="reloadBtn" data-i18n="reload">Reload</button
+            /><button
+              class="tasks-trigger"
+              id="tasksBtn"
+              type="button"
+              data-i18n-aria-label="tasksAria"
+              aria-label="View active tasks"
+            >
+              <span data-i18n="tasks">Tasks</span
+              ><span class="tasks-count" id="tasksCount" hidden></span></button
+            ><button id="reloadBtn" data-i18n="reload">Reload</button
             ><label class="check"
               ><input id="archived" type="checkbox" />
               <span data-i18n="includeArchived">Include archived sessions</span></label
@@ -370,6 +382,22 @@
           ><button id="createCancelBtn" data-i18n="cancel">Cancel</button>
         </div>
       </div>
+    </div>
+    <div
+      class="tasks-dialog"
+      id="tasksDialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="tasksTitle"
+      hidden
+    >
+      <section class="tasks-card">
+        <header class="tasks-head">
+          <h2 id="tasksTitle" data-i18n="activeTasks">Active tasks</h2>
+          <button id="tasksCloseBtn" type="button" data-i18n="close">Close</button>
+        </header>
+        <div class="tasks-list" id="tasksList"></div>
+      </section>
     </div>
     <div class="scrim" id="scrim"></div>
     <script>

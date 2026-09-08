@@ -71,12 +71,11 @@ installation by replacing each binary name with, for example,
 `CARGO_INCREMENTAL=0 cargo run -p codex-gui-bridge --bin codex-gui-bridge --`.
 
 `cargo install` installs only this repository's bridge/client binaries. It does
-not install Desktop. On the accepted machine,
-the launchd job deliberately runs the repository's release binary directly so
-the deployed artifact is explicit:
+not install Desktop. When developing from a checkout, a launchd job can run the
+repository's release binary directly so the deployed artifact is explicit:
 
 ```text
-/Users/bhe/projects/ai/codexapp-cli/target/release/ws-unix-bridge
+/Users/yourname/projects/codexapp-cli/target/release/ws-unix-bridge
 ```
 
 If an installed `${CARGO_HOME:-$HOME/.cargo}/bin/ws-unix-bridge` is used
@@ -142,11 +141,11 @@ loads before testing `steer` or `interrupt` on a real session.
 The accepted machine uses three user LaunchAgents. launchd does not expand
 `$HOME` inside `ProgramArguments`, so every plist contains absolute paths.
 
-| Label | Role | Important settings |
-| --- | --- | --- |
-| `com.lunghaa.codex-app-server` | Keeps the bundled app-server alive | Runs `/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen unix://.../bundled-app-server.sock` |
-| `com.lunghaa.ws-unix-bridge` | Keeps the transparent adapter alive | Forwards `127.0.0.1:18790` to the bundled socket |
-| `com.lunghaa.codex-app-server-env` | Injects the Desktop transport into the user launchd domain | Sets the WebSocket URL and unsets the local-daemon flag |
+| Label                              | Role                                                       | Important settings                                                                                               |
+| ---------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `com.lunghaa.codex-app-server`     | Keeps the bundled app-server alive                         | Runs `/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen unix://.../bundled-app-server.sock` |
+| `com.lunghaa.ws-unix-bridge`       | Keeps the transparent adapter alive                        | Forwards `127.0.0.1:18790` to the bundled socket                                                                 |
+| `com.lunghaa.codex-app-server-env` | Injects the Desktop transport into the user launchd domain | Sets the WebSocket URL and unsets the local-daemon flag                                                          |
 
 The environment script must select the bridge and explicitly disable the old
 local-daemon mode:
@@ -158,18 +157,17 @@ launchctl setenv CODEX_APP_SERVER_WS_URL \
 launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
 ```
 
-The bridge LaunchAgent on the accepted machine has these effective arguments
-and log paths:
+An equivalent bridge LaunchAgent has these arguments and log paths:
 
 ```text
 ProgramArguments:
-  /Users/bhe/projects/ai/codexapp-cli/target/release/ws-unix-bridge
+  /Users/yourname/projects/codexapp-cli/target/release/ws-unix-bridge
   --listen
   127.0.0.1:18790
   --upstream-socket
-  /Users/bhe/.codex-bridge/bundled-app-server.sock
-StandardOutPath: /Users/bhe/.codex/ws-unix-bridge.log
-StandardErrorPath: /Users/bhe/.codex/ws-unix-bridge.log
+  /Users/yourname/.codex-bridge/bundled-app-server.sock
+StandardOutPath: /Users/yourname/.codex/ws-unix-bridge.log
+StandardErrorPath: /Users/yourname/.codex/ws-unix-bridge.log
 ```
 
 After writing the plists under `~/Library/LaunchAgents`, load them once in

@@ -1196,6 +1196,7 @@ fn append_rollout_record(
             .or_else(|| payload.get("arguments"))
             .cloned()
             .unwrap_or(Value::Null);
+        let input = normalize_tool_input(&name, input);
         let status = string_field(payload, "status").unwrap_or_else(|| "running".to_owned());
         let tool_start = messages[message_index].tools.len();
         let parsed = (name == "exec")
@@ -1245,6 +1246,50 @@ fn append_rollout_record(
         content: content.clone(),
         tools: Vec::new(),
     });
+}
+
+fn normalize_tool_input(name: &str, mut input: Value) -> Value {
+    if !matches!(name, "exec" | "exec_command") {
+        return input;
+    }
+
+    // Some transports serialize exec_command's argument object into a JSON
+    // string and then wrap it in `{ "request": "..." }`. Unwrap a bounded
+    // number of layers so the UI receives the same canonical command shape as
+    // native app-server commandExecution items.
+    for _ in 0..2 {
+        let encoded = match &input {
+            Value::String(encoded) => Some(encoded.as_str()),
+            Value::Object(fields)
+                if !fields.contains_key("command") && !fields.contains_key("cmd") =>
+            {
+                fields.get("request").and_then(Value::as_str)
+            }
+            _ => None,
+        };
+        let Some(encoded) = encoded else {
+            break;
+        };
+        let Ok(parsed @ Value::Object(_)) = serde_json::from_str::<Value>(encoded) else {
+            break;
+        };
+        input = parsed;
+    }
+
+    let Value::Object(mut fields) = input else {
+        return input;
+    };
+    if !fields.contains_key("command") {
+        if let Some(command) = fields.remove("cmd") {
+            fields.insert("command".to_owned(), command);
+        }
+    }
+    if !fields.contains_key("cwd") {
+        if let Some(cwd) = fields.remove("workdir") {
+            fields.insert("cwd".to_owned(), cwd);
+        }
+    }
+    Value::Object(fields)
 }
 
 fn parse_wrapped_tool_calls(
@@ -1993,6 +2038,34 @@ mod tests {
                 .call_id,
             "call-1"
         );
+    }
+
+    #[test]
+    fn wrapped_exec_command_request_is_normalized_to_structured_input() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-wrapped-exec-command.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-wrapped-exec","cwd":"/workspace","source":"vscode"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"Inspecting."}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-wrapped-exec","name":"exec_command","status":"completed","input":{"request":"{\"cmd\":\"git status --short --branch\\ngit worktree list --porcelain\",\"workdir\":\"/workspace\",\"yield_time_ms\":30000,\"max_output_tokens\":40000}"}}}"#,
+            ],
+        );
+
+        let store = SessionStore::new(fixture.path.clone());
+        let snapshot = store.read_thread("thread-wrapped-exec").unwrap().unwrap();
+        let tool = &snapshot.messages[0].tools[0];
+        assert_eq!(tool.name, "exec_command");
+        assert_eq!(
+            tool.input["command"],
+            "git status --short --branch\ngit worktree list --porcelain"
+        );
+        assert_eq!(tool.input["cwd"], "/workspace");
+        assert_eq!(tool.input["yield_time_ms"], 30000);
+        assert_eq!(tool.input["max_output_tokens"], 40000);
+        assert!(tool.input.get("request").is_none());
+        assert!(tool.input.get("cmd").is_none());
+        assert!(tool.input.get("workdir").is_none());
     }
 
     #[test]

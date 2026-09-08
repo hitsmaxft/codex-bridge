@@ -7,6 +7,7 @@ import { createAuthenticationGate } from "../src/auth-gate.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { localFilePath } from "../src/markdown.js";
 import { SessionMessageCache } from "../src/message-cache.js";
+import { taskOverview } from "../src/task-overview.js";
 import {
   LAST_SESSION_STORAGE_KEY,
   rememberSessionId,
@@ -134,15 +135,59 @@ test("file diffs define distinct light and dark theme palettes", async () => {
   );
 });
 
+test("session run snapshots preserve active, completed, and failed indicators", async () => {
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /event\.thread_states/);
+  assert.match(source, /completedTurnRunState\(params\.turn\)/);
+  assert.match(source, /thread-run-state \$\{runState\}/);
+  assert.match(stylesheet, /\.thread-run-state\.active\s*\{/);
+  assert.match(stylesheet, /\.thread-run-state\.completed::before\s*\{[^}]*content:\s*"✓"/s);
+  assert.match(stylesheet, /\.thread-run-state\.cancelled,[\s\S]*?background:\s*var\(--danger\)/);
+});
+
+test("task overview uses the demo server's latest input, tool event, and final response", async () => {
+  const command = await demoClient();
+  const messages = result(
+    command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 20 }),
+  );
+  const activity = result(command({ command: "thread_activity", thread_id: "demo-thread-web-ui" }));
+  const overview = taskOverview(messages, activity);
+  assert.match(overview.userText, /Can visitors try submitting/);
+  assert.match(overview.assistantText, /WASM state machine/);
+  assert.equal(overview.latestTool.name, "web_search");
+  assert.equal(overview.thread.id, "demo-thread-web-ui");
+
+  const index = await readFile(indexPath, "utf8");
+  const source = await readFile(mainScriptPath, "utf8");
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  assert.match(index, /id="tasksBtn"/);
+  assert.match(index, /id="tasksDialog"[\s\S]*?id="tasksList"/);
+  assert.match(source, /limit: 20/);
+  assert.match(source, /setInterval\(\(\) => refreshTaskOverviews\(\)/);
+  assert.match(source, /message \$\{className\} task-message/);
+  assert.doesNotMatch(source, /task-message-label/);
+  assert.match(source, /text\.length > 360 \|\| text\.split\("\\n"\)\.length > 8/);
+  assert.match(stylesheet, /\.task-message\.collapsible:not\(\.expanded\) \.message-body/);
+  const taskEntryStyle = stylesheet.match(/\.task-entry\s*\{[^}]*\}/s)?.[0] || "";
+  assert.doesNotMatch(taskEntryStyle, /border|background/);
+});
+
 test("mobile composer stays out of the message grid sizing flow", async () => {
+  const index = await readFile(indexPath, "utf8");
   const stylesheet = await readFile(stylesheetPath, "utf8");
   const source = await readFile(mainScriptPath, "utf8");
   const mobile = stylesheet.slice(stylesheet.indexOf("@media (max-width: 800px)"));
+  assert.match(index, /interactive-widget=resizes-content/);
   assert.match(mobile, /\.composer\s*\{[^}]*position:\s*fixed;/s);
   assert.doesNotMatch(mobile, /#messages\s*\{[^}]*grid-row:\s*2;/s);
   assert.doesNotMatch(mobile, /\.composer\s*\{[^}]*grid-row:\s*2;/s);
   assert.doesNotMatch(source, /textarea\.blur\(\)/);
   assert.match(source, /syncOutboxCompactLabel/);
+  assert.match(
+    mobile,
+    /\.composer-shell\.stop-ready\s*\{[^}]*grid-template-areas:\s*"mode actions input submit";[^}]*grid-template-columns:\s*64px 72px minmax\(0, 1fr\) 44px;/s,
+  );
   assert.doesNotMatch(stylesheet, /\.outbox-tray\.compact \.outbox-item:not\(:last-child\)/);
   assert.match(stylesheet, /\.outbox-tray\.compact > \.outbox-item\s*\{/);
   assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-actions/);
@@ -184,12 +229,12 @@ test("structured command actions stay separate and preserve multiline commands",
 
 test("local task file links resolve to workspace paths", () => {
   assert.equal(
-    localFilePath("/Users/bhe/project/firmware image.elf"),
-    "/Users/bhe/project/firmware image.elf",
+    localFilePath("/Users/example/project/firmware image.elf"),
+    "/Users/example/project/firmware image.elf",
   );
   assert.equal(
-    localFilePath("file:///Users/bhe/project/firmware.elf"),
-    "/Users/bhe/project/firmware.elf",
+    localFilePath("file:///Users/example/project/firmware.elf"),
+    "/Users/example/project/firmware.elf",
   );
   assert.equal(localFilePath("https://example.com/firmware.elf"), null);
 });

@@ -54,6 +54,7 @@ const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
 const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
 const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
 const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
+const MAX_SESSION_RUN_STATES: usize = 256;
 static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
@@ -221,6 +222,7 @@ struct BridgeState {
     selected_thread: Arc<RwLock<Option<String>>>,
     pending_messages: Arc<PendingMessages>,
     app_server_tools: Arc<AppServerToolCache>,
+    session_run_states: Arc<SessionRunStates>,
     runtime_mode: RuntimeMode,
     config_path: Option<PathBuf>,
     manage_app_server: bool,
@@ -289,6 +291,160 @@ struct CachedAppServerTools {
     refreshed_at: Instant,
     known_message_ids: HashSet<String>,
     tools: HashMap<String, Vec<ThreadToolCall>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionRunState {
+    Active,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl SessionRunState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionRunStateEntry {
+    state: SessionRunState,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct SessionRunStates {
+    sequence: AtomicU64,
+    entries: RwLock<HashMap<String, SessionRunStateEntry>>,
+}
+
+impl SessionRunStates {
+    fn set(&self, thread_id: &str, state: SessionRunState) -> bool {
+        if thread_id.is_empty() {
+            return false;
+        }
+        let Ok(mut entries) = self.entries.write() else {
+            return false;
+        };
+        let changed = entries
+            .get(thread_id)
+            .is_none_or(|entry| entry.state != state);
+        entries.insert(
+            thread_id.to_owned(),
+            SessionRunStateEntry {
+                state,
+                sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+        while entries.len() > MAX_SESSION_RUN_STATES {
+            let evict = entries
+                .iter()
+                .filter(|(_, entry)| entry.state != SessionRunState::Active)
+                .min_by_key(|(_, entry)| entry.sequence)
+                .or_else(|| entries.iter().min_by_key(|(_, entry)| entry.sequence))
+                .map(|(thread_id, _)| thread_id.clone());
+            let Some(evict) = evict else {
+                break;
+            };
+            entries.remove(&evict);
+        }
+        changed
+    }
+
+    fn apply_event(&self, event: &Value) -> bool {
+        let Some(thread_id) = app_server_event_thread_id(event) else {
+            return false;
+        };
+        let method = event.pointer("/message/method").and_then(Value::as_str);
+        let state = match method {
+            Some("turn/started") => Some(SessionRunState::Active),
+            Some("turn/completed") => Some(turn_completed_run_state(event)),
+            Some("thread/status/changed")
+                if event
+                    .pointer("/message/params/status/type")
+                    .and_then(Value::as_str)
+                    == Some("active") =>
+            {
+                Some(SessionRunState::Active)
+            }
+            _ => None,
+        };
+        state.is_some_and(|state| self.set(&thread_id, state))
+    }
+
+    fn reconcile_active(&self, active_thread_ids: &[String]) {
+        let active = active_thread_ids.iter().collect::<HashSet<_>>();
+        let stale_active = self
+            .entries
+            .read()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(thread_id, entry)| {
+                        entry.state == SessionRunState::Active && !active.contains(thread_id)
+                    })
+                    .map(|(thread_id, _)| thread_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for thread_id in stale_active {
+            self.set(&thread_id, SessionRunState::Completed);
+        }
+        for thread_id in active_thread_ids {
+            self.set(thread_id, SessionRunState::Active);
+        }
+    }
+
+    fn snapshot(&self) -> HashMap<String, &'static str> {
+        self.entries
+            .read()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(thread_id, entry)| (thread_id.clone(), entry.state.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn turn_completed_run_state(event: &Value) -> SessionRunState {
+    match event
+        .pointer("/message/params/turn/status")
+        .and_then(Value::as_str)
+    {
+        Some("interrupted" | "cancelled" | "canceled") => SessionRunState::Cancelled,
+        Some("failed") => SessionRunState::Failed,
+        Some("inProgress" | "active") => SessionRunState::Active,
+        Some("completed") => SessionRunState::Completed,
+        _ if event
+            .pointer("/message/params/turn/error")
+            .is_some_and(|error| !error.is_null()) =>
+        {
+            SessionRunState::Failed
+        }
+        _ => SessionRunState::Completed,
+    }
+}
+
+fn thread_run_snapshot_event(run_states: &SessionRunStates) -> Value {
+    let thread_states = run_states.snapshot();
+    let active_thread_ids = thread_states
+        .iter()
+        .filter(|(_, state)| **state == "active")
+        .map(|(thread_id, _)| thread_id.clone())
+        .collect::<Vec<_>>();
+    json!({
+        "type": "bridge_thread_activity_snapshot",
+        "active_thread_ids": active_thread_ids,
+        "thread_states": thread_states,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1240,6 +1396,7 @@ async fn main() -> Result<()> {
     let selected_thread = Arc::new(RwLock::new(None));
     let pending_messages = Arc::new(PendingMessages::default());
     let app_server_tools = Arc::new(AppServerToolCache::default());
+    let session_run_states = Arc::new(SessionRunStates::default());
     let secure_existing_parent = args.socket_uses_default;
     let socket_path = match args.socket {
         Some(path) => path,
@@ -1272,6 +1429,7 @@ async fn main() -> Result<()> {
         selected_thread,
         pending_messages,
         app_server_tools,
+        session_run_states: Arc::clone(&session_run_states),
         runtime_mode: args.mode,
         config_path: args.config_path.clone(),
         manage_app_server: args.manage_app_server,
@@ -1283,6 +1441,7 @@ async fn main() -> Result<()> {
     let hot_cache_task = spawn_hot_session_cache(
         Arc::clone(&session_store),
         Arc::clone(&write_backend),
+        session_run_states,
         args.app_server_thread_cache,
     );
 
@@ -1367,6 +1526,7 @@ fn validate_web_ui_auth_config(no_auth: bool, listen: SocketAddr) -> Result<()> 
 fn spawn_hot_session_cache(
     session_store: Arc<SessionStore>,
     write_backend: Arc<CodexCliBackend>,
+    session_run_states: Arc<SessionRunStates>,
     pinned_limit: usize,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut events = write_backend.subscribe_app_server_events()?;
@@ -1383,6 +1543,9 @@ fn spawn_hot_session_cache(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
+                    if session_run_states.apply_event(&event) {
+                        write_backend.publish_bridge_event(thread_run_snapshot_event(&session_run_states));
+                    }
                     let Some(thread_id) = app_server_event_thread_id(&event) else {
                         continue;
                     };
@@ -1398,6 +1561,7 @@ fn spawn_hot_session_cache(
                     refresh_count = refresh_count.wrapping_add(1);
                     let store = Arc::clone(&session_store);
                     let backend = Arc::clone(&write_backend);
+                    let run_states = Arc::clone(&session_run_states);
                     let refresh_pins = refresh_count == 1 || refresh_count.is_multiple_of(3);
                     let _ = tokio::task::spawn_blocking(move || {
                         let Ok(loaded_result) = backend.app_server_rpc("thread/loaded/list", json!({})) else {
@@ -1424,10 +1588,8 @@ fn spawn_hot_session_cache(
                             }
                         }
                         if complete_snapshot {
-                            backend.publish_bridge_event(json!({
-                                "type": "bridge_thread_activity_snapshot",
-                                "active_thread_ids": active_thread_ids,
-                            }));
+                            run_states.reconcile_active(&active_thread_ids);
+                            backend.publish_bridge_event(thread_run_snapshot_event(&run_states));
                         }
                         if refresh_pins {
                             for thread_id in pinned_thread_ids(&backend)
@@ -2128,14 +2290,14 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
     if let Ok(Ok(active_thread_ids)) =
         tokio::task::spawn_blocking(move || active_loaded_thread_ids(&snapshot_backend)).await
     {
+        bridge
+            .session_run_states
+            .reconcile_active(&active_thread_ids);
         if sender
             .send(AxumWsMessage::Text(
-                json!({
-                    "type": "bridge_thread_activity_snapshot",
-                    "active_thread_ids": active_thread_ids,
-                })
-                .to_string()
-                .into(),
+                thread_run_snapshot_event(&bridge.session_run_states)
+                    .to_string()
+                    .into(),
             ))
             .await
             .is_err()
@@ -4981,7 +5143,7 @@ mod tests {
     #[test]
     fn web_ui_accepts_ip_authorities_only_on_its_port() {
         assert!(web_authority_allowed("127.0.0.1:47653", 47653));
-        assert!(web_authority_allowed("192.168.1.20:47653", 47653));
+        assert!(web_authority_allowed("192.0.2.20:47653", 47653));
         assert!(web_authority_allowed("[::1]:47653", 47653));
         assert!(!web_authority_allowed("127.0.0.1:9000", 47653));
         assert!(!web_authority_allowed("codex.example:47653", 47653));
@@ -5159,7 +5321,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let public = vec![parse_public_web_origin("https://codex.example.com").unwrap()];
         assert!(web_origin_allowed("http://127.0.0.1:47653", 47653, &public));
         assert!(web_origin_allowed(
-            "http://192.168.1.20:47653",
+            "http://192.0.2.20:47653",
             47653,
             &public
         ));
@@ -5471,6 +5633,57 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .as_deref(),
             Some("thread-2")
         );
+    }
+
+    #[test]
+    fn session_run_states_follow_turn_outcomes_in_memory() {
+        let states = SessionRunStates::default();
+        let event = |status: &str| {
+            json!({
+                "type": "app_server",
+                "message": {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": status, "error": null}
+                    }
+                }
+            })
+        };
+        let started = json!({
+            "type": "app_server",
+            "message": {
+                "method": "turn/started",
+                "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}
+            }
+        });
+
+        assert!(states.apply_event(&started));
+        assert_eq!(states.snapshot().get("thread-1"), Some(&"active"));
+        assert!(states.apply_event(&event("completed")));
+        assert_eq!(states.snapshot().get("thread-1"), Some(&"completed"));
+        assert!(states.apply_event(&started));
+        assert!(states.apply_event(&event("interrupted")));
+        assert_eq!(states.snapshot().get("thread-1"), Some(&"cancelled"));
+        assert!(states.apply_event(&started));
+        assert!(states.apply_event(&event("failed")));
+        assert_eq!(states.snapshot().get("thread-1"), Some(&"failed"));
+
+        let snapshot = thread_run_snapshot_event(&states);
+        assert_eq!(snapshot["thread_states"]["thread-1"], "failed");
+        assert!(snapshot["active_thread_ids"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_snapshot_closes_a_missed_completion_as_success() {
+        let states = SessionRunStates::default();
+        states.set("thread-1", SessionRunState::Active);
+        states.set("thread-2", SessionRunState::Active);
+
+        states.reconcile_active(&["thread-2".to_owned()]);
+
+        assert_eq!(states.snapshot().get("thread-1"), Some(&"completed"));
+        assert_eq!(states.snapshot().get("thread-2"), Some(&"active"));
     }
 
     #[test]

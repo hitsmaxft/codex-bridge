@@ -38,7 +38,7 @@ OpenAI account and network configured by Codex app-server.
 
 ## Release highlights
 
-### 2026-09-08
+### v0.1.0 · 2026-09-08
 
 - **Create and manage sessions:** start a session in an existing project directory or an isolated
   Git worktree, then rename, pin, archive, or stop it. A newly started empty session is immediately
@@ -46,6 +46,9 @@ OpenAI account and network configured by Codex app-server.
 - **Live remote control:** one persistent app-server connection carries activity events, native
   queue and steer handoff, interruption, model settings, rate limits, and bounded subscriptions for
   active or pinned sessions.
+- **Multi-session task overview:** watch active and recently finished tasks together from the
+  session sidebar. Each entry shows the latest prompt, agent response, tool progress, completion
+  state, and a direct link back to the full session; long responses collapse in place.
 - **Responsive Web UI:** the same mobile-first message, composer, tool, diff, theme, and settings
   components are used on phones and desktops. English and Chinese preferences persist locally.
 - **Large-session performance:** rollout parsing skips non-display records and indexes tool-output
@@ -55,6 +58,8 @@ OpenAI account and network configured by Codex app-server.
   reject files outside the session directory or files at least 16 MiB.
 - **Browser demo and regression coverage:** GitHub Pages runs the production Vite frontend against
   a finite Rust/WASM server, and the same demo contract is exercised by automated UI tests.
+
+See the complete [v0.1.0 release notes](docs/releases/v0.1.0.md).
 
 ## Why use it
 

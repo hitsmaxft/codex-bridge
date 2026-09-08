@@ -13,6 +13,7 @@ import {
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import { shouldOfferStop } from "./composer-state.js";
+import { taskOverview } from "./task-overview.js";
 import {
   rememberSessionId,
   sessionHash,
@@ -147,6 +148,8 @@ async function toggleLanguage() {
   renderPending();
   renderComposerAttachments();
   renderManagedServices();
+  renderTasksButton();
+  renderTaskOverviews();
   showActivity();
   await loadStatus();
   if (state.current) await openThread(state.current, { quiet: true });
@@ -277,6 +280,290 @@ function threadMatches(thread, query) {
     .toLowerCase()
     .includes(query);
 }
+function setThreadRunState(threadId, runState) {
+  if (!threadId || !["active", "completed", "cancelled", "failed"].includes(runState)) return;
+  state.threadRunStates.set(threadId, runState);
+  if (runState === "active") {
+    state.updatingThreads.add(threadId);
+    trackTask(threadId);
+  } else state.updatingThreads.delete(threadId);
+  if (state.taskTrackedIds.has(threadId)) markTaskDirty(threadId);
+  renderTasksButton();
+}
+function completedTurnRunState(turn) {
+  if (["interrupted", "cancelled", "canceled"].includes(turn?.status)) return "cancelled";
+  if (turn?.status === "failed" || turn?.error) return "failed";
+  if (["inProgress", "active"].includes(turn?.status)) return "active";
+  return "completed";
+}
+function knownThread(threadId) {
+  return (
+    state.pinnedThreads.find((thread) => thread.id === threadId) ||
+    [...state.projectThreads.values()]
+      .flatMap((entry) => entry.threads)
+      .find((thread) => thread.id === threadId) ||
+    (state.current?.id === threadId ? state.current : null)
+  );
+}
+function trackTask(threadId) {
+  if (!threadId) return;
+  state.taskTrackedIds.add(threadId);
+  const terminalIds = [...state.taskTrackedIds].filter(
+    (id) => state.threadRunStates.get(id) !== "active",
+  );
+  while (terminalIds.length > 8) {
+    const stale = terminalIds.shift();
+    state.taskTrackedIds.delete(stale);
+    state.taskOverviews.delete(stale);
+    state.taskDirtyIds.delete(stale);
+  }
+}
+function markTaskDirty(threadId) {
+  if (!state.taskTrackedIds.has(threadId)) return;
+  state.taskDirtyIds.add(threadId);
+  scheduleTasksRefresh();
+}
+function taskStateLabel(runState) {
+  return tr(
+    runState === "active"
+      ? "taskActive"
+      : runState === "completed"
+        ? "taskCompleted"
+        : runState === "cancelled"
+          ? "taskCancelled"
+          : "taskFailed",
+  );
+}
+function renderTasksButton() {
+  const count = [...state.threadRunStates.values()].filter((value) => value === "active").length,
+    badge = $("tasksCount"),
+    button = $("tasksBtn");
+  if (!badge || !button) return;
+  badge.textContent = String(count);
+  badge.hidden = count === 0;
+  button.classList.toggle("has-active", count > 0);
+  button.setAttribute("aria-label", tr("tasksAriaCount", { count }));
+}
+function taskMessageNode(
+  text,
+  className,
+  threadId,
+  { collapsible = false, expanded = false } = {},
+) {
+  const message = document.createElement("section"),
+    body = document.createElement("div");
+  message.className = `message ${className} task-message`;
+  body.className = "message-body";
+  body.appendChild(markdownNode(text, markdownOptions(threadId)));
+  message.appendChild(body);
+  if (collapsible && (text.length > 360 || text.split("\n").length > 8)) {
+    const toggle = document.createElement("button"),
+      sync = () => {
+        message.classList.toggle("expanded", expanded);
+        toggle.textContent = tr(expanded ? "showLess" : "showMore");
+        toggle.setAttribute("aria-expanded", String(expanded));
+      };
+    message.classList.add("collapsible");
+    toggle.className = "task-message-toggle";
+    toggle.type = "button";
+    toggle.onclick = () => {
+      expanded = !expanded;
+      sync();
+    };
+    sync();
+    message.appendChild(toggle);
+  }
+  return message;
+}
+function taskEventNode(overview, runState, threadId) {
+  const event = document.createElement("section"),
+    body = document.createElement("div");
+  event.className = "message assistant task-message task-event";
+  body.className = "message-body";
+  if (overview?.activity?.phase === "compacting") {
+    body.textContent = tr("taskCompacting");
+  } else if (overview?.activity?.active_tool || overview?.latestTool) {
+    const activeToolName = overview.activity?.active_tool,
+      tool =
+        activeToolName && overview.latestTool?.name !== activeToolName
+          ? { name: activeToolName, preview: activeToolName, status: "running" }
+          : overview.latestTool || {
+              name: activeToolName,
+              preview: activeToolName,
+              status: "running",
+            },
+      row = document.createElement("div"),
+      icon = document.createElement("span"),
+      text = document.createElement("span"),
+      running = runState === "active" && (activeToolName === tool.name || !toolFinished(tool));
+    row.className = "task-event-tool";
+    icon.className = `tool-icon ${toolIconClass(tool.name)}`;
+    text.textContent = `${toolActionText(tool.name, running)} ${toolSummaryPreview(tool)}`.trim();
+    row.append(icon, text);
+    body.appendChild(row);
+  } else if (runState === "active") {
+    body.textContent = tr("taskThinking");
+  } else {
+    body.textContent = taskStateLabel(runState);
+  }
+  event.appendChild(body);
+  return event;
+}
+function taskCardNode(threadId, overview, runState, replyExpanded = false) {
+  const card = document.createElement("article"),
+    head = document.createElement("header"),
+    title = document.createElement("h3"),
+    open = document.createElement("a"),
+    status = document.createElement("span"),
+    thread = overview?.thread || knownThread(threadId);
+  card.className = `task-entry ${runState}`;
+  card.dataset.threadId = threadId;
+  head.className = "task-entry-head";
+  title.className = "task-entry-title";
+  title.textContent = thread?.title || threadId;
+  open.className = "task-open";
+  open.href = sessionHash(threadId);
+  open.textContent = tr("openSession");
+  open.onclick = (event) => {
+    event.preventDefault();
+    closeTasksDialog();
+    run(() => openSessionById(threadId));
+  };
+  status.className = `thread-run-state ${runState} task-status`;
+  status.title = taskStateLabel(runState);
+  status.setAttribute("aria-label", status.title);
+  head.append(title, open, status);
+  card.appendChild(head);
+  if (overview?.userText) card.appendChild(taskMessageNode(overview.userText, "user", threadId));
+  if (overview?.assistantText)
+    card.appendChild(
+      taskMessageNode(overview.assistantText, "assistant", threadId, {
+        collapsible: true,
+        expanded: replyExpanded,
+      }),
+    );
+  if (overview?.error) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = tr("taskLoadFailed");
+    card.appendChild(empty);
+  } else if (overview) {
+    if (runState === "active" || !overview.assistantText)
+      card.appendChild(taskEventNode(overview, runState, threadId));
+  } else {
+    const loading = document.createElement("div");
+    loading.className = "empty";
+    loading.textContent = tr("loadingLatest");
+    card.appendChild(loading);
+  }
+  card.dataset.signature = JSON.stringify({ overview, runState, language: getLanguage() });
+  return card;
+}
+function renderTaskOverviews() {
+  const root = $("tasksList");
+  if (!root) return;
+  const existing = new Map(
+      [...root.querySelectorAll(":scope > .task-entry")].map((card) => [
+        card.dataset.threadId,
+        card,
+      ]),
+    ),
+    ids = [...state.taskTrackedIds].sort((left, right) => {
+      const leftActive = state.threadRunStates.get(left) === "active" ? 1 : 0,
+        rightActive = state.threadRunStates.get(right) === "active" ? 1 : 0;
+      return rightActive - leftActive;
+    }),
+    fragment = document.createDocumentFragment();
+  if (!ids.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = tr("noTrackedTasks");
+    root.replaceChildren(empty);
+    return;
+  }
+  for (const threadId of ids) {
+    const overview = state.taskOverviews.get(threadId),
+      runState = state.threadRunStates.get(threadId) || "active",
+      signature = JSON.stringify({ overview, runState, language: getLanguage() }),
+      previous = existing.get(threadId);
+    fragment.appendChild(
+      previous?.dataset.signature === signature
+        ? previous
+        : taskCardNode(
+            threadId,
+            overview,
+            runState,
+            Boolean(previous?.querySelector(".task-message.assistant.expanded")),
+          ),
+    );
+  }
+  root.replaceChildren(fragment);
+}
+let tasksRefreshTimer = null;
+function scheduleTasksRefresh(delay = 180) {
+  if (!state.tasksOpen || tasksRefreshTimer) return;
+  tasksRefreshTimer = setTimeout(() => {
+    tasksRefreshTimer = null;
+    refreshTaskOverviews().catch(() => {});
+  }, delay);
+}
+async function refreshTaskOverviews(force = false) {
+  if (!state.tasksOpen || state.tasksRefreshing) return;
+  const ids = [...state.taskTrackedIds].filter(
+    (threadId) =>
+      force ||
+      !state.taskOverviews.has(threadId) ||
+      state.taskDirtyIds.has(threadId) ||
+      state.threadRunStates.get(threadId) === "active",
+  );
+  if (!ids.length) return renderTaskOverviews();
+  state.tasksRefreshing = true;
+  $("tasksBtn").classList.add("refreshing");
+  for (const threadId of ids) state.taskDirtyIds.delete(threadId);
+  try {
+    await Promise.all(
+      ids.map(async (threadId) => {
+        try {
+          const [messages, activity] = await Promise.all([
+            command({ command: "messages", thread_id: threadId, before: null, limit: 20 }, false),
+            command({ command: "thread_activity", thread_id: threadId }, false),
+          ]);
+          const overview = taskOverview(messages, activity),
+            runState = state.threadRunStates.get(threadId),
+            previousAttempts = state.taskOverviews.get(threadId)?.terminalRefreshes || 0;
+          if (runState !== "active" && !overview.assistantText && previousAttempts < 4) {
+            overview.terminalRefreshes = previousAttempts + 1;
+            state.taskDirtyIds.add(threadId);
+          }
+          state.taskOverviews.set(threadId, overview);
+        } catch {
+          if (!state.taskOverviews.has(threadId))
+            state.taskOverviews.set(threadId, { error: true });
+          state.taskDirtyIds.add(threadId);
+        }
+      }),
+    );
+  } finally {
+    state.tasksRefreshing = false;
+    $("tasksBtn").classList.remove("refreshing");
+    renderTaskOverviews();
+  }
+}
+function openTasksDialog() {
+  for (const [threadId, runState] of state.threadRunStates) {
+    if (runState === "active") trackTask(threadId);
+  }
+  state.tasksOpen = true;
+  $("tasksDialog").hidden = false;
+  renderTaskOverviews();
+  refreshTaskOverviews(true).catch(() => {});
+}
+function closeTasksDialog() {
+  state.tasksOpen = false;
+  $("tasksDialog").hidden = true;
+  clearTimeout(tasksRefreshTimer);
+  tasksRefreshTimer = null;
+}
 function threadRow(thread) {
   const row = document.createElement("div");
   row.className = `thread-row${state.pinAvailable && !thread.archived ? "" : " no-pin"}`;
@@ -286,12 +573,22 @@ function threadRow(thread) {
   const name = document.createElement("span");
   name.textContent = thread.title || thread.id;
   button.children[0].appendChild(name);
-  if (state.updatingThreads.has(thread.id)) {
-    const live = document.createElement("span");
-    live.className = "thread-live";
-    live.setAttribute("aria-label", tr("modelRunning"));
-    live.title = tr("modelRunning");
-    button.children[0].appendChild(live);
+  const runState =
+    state.threadRunStates.get(thread.id) ||
+    (state.updatingThreads.has(thread.id) ? "active" : null);
+  if (runState) {
+    const indicator = document.createElement("span"),
+      label = tr(
+        runState === "active"
+          ? "modelRunning"
+          : runState === "completed"
+            ? "runCompleted"
+            : "runFailedOrCancelled",
+      );
+    indicator.className = `thread-run-state ${runState}`;
+    indicator.setAttribute("aria-label", label);
+    indicator.title = label;
+    button.children[0].appendChild(indicator);
   }
   button.children[1].textContent = `${thread.git_branch || tr("noBranch")} · ${timeText(thread.updated_at_ms, getLanguage() === "zh" ? "zh-CN" : "en")}${thread.archived ? ` · ${tr("archived")}` : ""}`;
   button.onclick = () => openThread(thread);
@@ -1572,6 +1869,9 @@ async function refreshActivity() {
   state.activeTurnId = activity.active_turn_id || null;
   state.activityPhase = activity.phase || null;
   state.activeTool = activity.active_tool || null;
+  if (state.activeTurnId) setThreadRunState(threadId, "active");
+  else if (state.threadRunStates.get(threadId) === "active")
+    setThreadRunState(threadId, "completed");
   const delivery = state.delivery?.threadId === threadId ? state.delivery : null,
     pendingDelivery = delivery?.pendingId
       ? state.pending.some((entry) => entry.id === delivery.pendingId)
@@ -1630,6 +1930,8 @@ function scheduleEventRefresh(threadId, immediate = false) {
 function handleBridgeEvent(event) {
   if (event?.type === "bridge_event_gap") {
     state.lastMessageRefresh = 0;
+    for (const threadId of state.taskTrackedIds) state.taskDirtyIds.add(threadId);
+    scheduleTasksRefresh(0);
     scheduleEventRefresh(state.current?.id, true);
     loadProjects().catch(() => {});
     return;
@@ -1646,10 +1948,28 @@ function handleBridgeEvent(event) {
   if (event?.type === "bridge_thread_activity_snapshot") {
     if (!Array.isArray(event.active_thread_ids)) return;
     state.updatingThreads.clear();
+    state.threadRunStates.clear();
+    const snapshotIds = new Set(
+      event.thread_states && typeof event.thread_states === "object"
+        ? Object.keys(event.thread_states)
+        : event.active_thread_ids,
+    );
+    for (const threadId of state.taskTrackedIds) {
+      if (snapshotIds.has(threadId)) continue;
+      state.taskTrackedIds.delete(threadId);
+      state.taskOverviews.delete(threadId);
+      state.taskDirtyIds.delete(threadId);
+    }
+    if (event.thread_states && typeof event.thread_states === "object") {
+      for (const [threadId, runState] of Object.entries(event.thread_states)) {
+        setThreadRunState(threadId, runState);
+      }
+    }
     for (const threadId of event.active_thread_ids) {
-      if (typeof threadId === "string" && threadId) state.updatingThreads.add(threadId);
+      if (typeof threadId === "string" && threadId) setThreadRunState(threadId, "active");
     }
     renderProjects();
+    renderTaskOverviews();
     return;
   }
   if (event?.type !== "app_server") return;
@@ -1658,10 +1978,11 @@ function handleBridgeEvent(event) {
     params = message.params || {},
     threadId = params.threadId || null;
   if (!method) return;
+  if (threadId && state.taskTrackedIds.has(threadId)) markTaskDirty(threadId);
   if (method === "thread/status/changed" && threadId) {
     updateThreadLiveFromStatus(threadId, params.status);
   } else if (method === "turn/started" && threadId) {
-    state.updatingThreads.add(threadId);
+    setThreadRunState(threadId, "active");
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = params.turn?.id || state.activeTurnId;
@@ -1672,7 +1993,7 @@ function handleBridgeEvent(event) {
       showActivity();
     }
   } else if (method === "turn/completed" && threadId) {
-    state.updatingThreads.delete(threadId);
+    setThreadRunState(threadId, completedTurnRunState(params.turn));
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = null;
@@ -1694,8 +2015,7 @@ function handleBridgeEvent(event) {
   }
 }
 function updateThreadLiveFromStatus(threadId, status) {
-  if (status?.type === "active") state.updatingThreads.add(threadId);
-  else if (status) state.updatingThreads.delete(threadId);
+  if (status?.type === "active") setThreadRunState(threadId, "active");
   renderProjects();
 }
 function resetHorizontalPosition() {
@@ -1953,6 +2273,7 @@ async function interruptCurrentRun({ confirm = true, requireActive = false } = {
   syncSubmitAction();
   try {
     await command(targetRequest("interrupt"));
+    if (state.current?.id) setThreadRunState(state.current.id, "cancelled");
     notify(tr("turnInterrupted"));
     await refreshActivity();
   } finally {
@@ -2043,6 +2364,11 @@ function approval(name) {
 $("search").oninput = renderProjects;
 $("archived").onchange = () => run(loadProjects);
 $("reloadBtn").onclick = () => run(loadProjects);
+$("tasksBtn").onclick = openTasksDialog;
+$("tasksCloseBtn").onclick = closeTasksDialog;
+$("tasksDialog").onclick = (event) => {
+  if (event.target === $("tasksDialog")) closeTasksDialog();
+};
 $("statusBtn").onclick = () => run(loadStatus);
 $("languageBtn").onclick = () => run(toggleLanguage);
 $("refreshBtn").onclick = () => run(refreshThread);
@@ -2403,7 +2729,9 @@ document.addEventListener("click", (event) => {
     $("modelPicker").hidden = true;
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !$("createDialog").hidden) closeCreateDialog();
+  if (event.key !== "Escape") return;
+  if (!$("tasksDialog").hidden) closeTasksDialog();
+  else if (!$("createDialog").hidden) closeCreateDialog();
 });
 $("outboxTray").addEventListener("click", (event) => {
   if (event.target !== event.currentTarget) return;
@@ -2449,6 +2777,7 @@ document.querySelectorAll(".nav-toggle").forEach(
 );
 $("scrim").onclick = closePanels;
 applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
+renderTasksButton();
 setSendMode("steer", false);
 applyTheme(storedTheme(), false);
 watchSystemTheme();
@@ -2459,4 +2788,5 @@ run(async () => {
   await loadProjects();
 });
 setInterval(() => pollActivity().catch(() => {}), 1500);
+setInterval(() => refreshTaskOverviews().catch(() => {}), 1500);
 setInterval(() => refreshComposerStatus().catch(() => {}), 60000);
