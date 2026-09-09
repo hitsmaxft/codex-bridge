@@ -4,6 +4,9 @@ Access OpenAI Codex app-server from a responsive Web UI or CLI running on your h
 mini, or Linux host. Continue the same tasks from any device while Codex stays beside your
 repositories.
 
+<img width="1319" height="1038" alt="图片" src="https://github.com/user-attachments/assets/2bb8da3b-c8d8-4f20-b758-d34e28a4950b" />
+
+
 [Project site](https://gh.bhee.online/codex-bridge/) ·
 [Install](docs/install.md) ·
 [`codexctl` reference](docs/codexctl.md) ·
