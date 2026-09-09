@@ -131,9 +131,124 @@ pub struct ThreadToolCall {
 pub struct ProjectSummary {
     pub path: PathBuf,
     pub name: String,
+    pub kind: ProjectKind,
     pub thread_count: usize,
     pub archived_count: usize,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectKind {
+    Project,
+    Chats,
+}
+
+pub const CHATS_PROJECT_PATH: &str = "codex-bridge://chats";
+
+#[derive(Debug, Clone, Default)]
+pub struct ThreadProjectIndex {
+    projects: HashMap<String, IndexedProject>,
+    thread_projects: HashMap<String, Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedProject {
+    name: String,
+    roots: Vec<PathBuf>,
+}
+
+impl ThreadProjectIndex {
+    pub fn from_app_server(projects: &Value, threads: &[Value]) -> Self {
+        let projects = projects
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|project| {
+                let id = project.get("id")?.as_str()?.to_owned();
+                let name = project
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Project")
+                    .to_owned();
+                let roots = project
+                    .get("roots")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|root| root.get("path").and_then(Value::as_str))
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                (!roots.is_empty()).then_some((id, IndexedProject { name, roots }))
+            })
+            .collect();
+        let thread_projects = threads
+            .iter()
+            .filter_map(|thread| {
+                let id = thread.get("id")?.as_str()?.to_owned();
+                if !thread.as_object()?.contains_key("projectId") {
+                    return None;
+                }
+                let project_id = thread
+                    .get("projectId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                Some((id, project_id))
+            })
+            .collect();
+        Self {
+            projects,
+            thread_projects,
+        }
+    }
+
+    fn group_for_thread(&self, thread: &ThreadSummary) -> (PathBuf, String, ProjectKind) {
+        if let Some(project_id) = self.thread_projects.get(&thread.id) {
+            if let Some(project) = project_id
+                .as_ref()
+                .and_then(|project_id| self.projects.get(project_id))
+            {
+                let path = matching_project_root(project, &thread.cwd)
+                    .or_else(|| project.roots.first().cloned())
+                    .unwrap_or_else(|| thread.cwd.clone());
+                return (path, project.name.clone(), ProjectKind::Project);
+            }
+        }
+        if let Some((project, path)) = self
+            .projects
+            .values()
+            .filter_map(|project| {
+                matching_project_root(project, &thread.cwd).map(|path| (project, path))
+            })
+            .max_by_key(|(_, path)| path.as_os_str().len())
+        {
+            return (path, project.name.clone(), ProjectKind::Project);
+        }
+        if self.thread_projects.contains_key(&thread.id) {
+            return (
+                PathBuf::from(CHATS_PROJECT_PATH),
+                "Chats".to_owned(),
+                ProjectKind::Chats,
+            );
+        }
+        let path = project_root_for_cwd(&thread.cwd);
+        let name = project_name(&path);
+        (path, name, ProjectKind::Project)
+    }
+
+    pub fn group_path_for_thread(&self, thread: &ThreadSummary) -> PathBuf {
+        self.group_for_thread(thread).0
+    }
+}
+
+fn matching_project_root(project: &IndexedProject, cwd: &Path) -> Option<PathBuf> {
+    project
+        .roots
+        .iter()
+        .filter(|root| cwd == root.as_path() || cwd.starts_with(root))
+        .max_by_key(|root| root.as_os_str().len())
+        .cloned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -326,15 +441,31 @@ impl SessionStore {
     }
 
     pub fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectSummary>> {
+        self.list_projects_with_index(include_archived, None)
+    }
+
+    pub fn list_projects_with_index(
+        &self,
+        include_archived: bool,
+        project_index: Option<&ThreadProjectIndex>,
+    ) -> Result<Vec<ProjectSummary>> {
         let threads = self.cached_threads(include_archived)?;
         let mut projects = HashMap::<PathBuf, ProjectSummary>::new();
         for thread in threads {
-            let path = project_root_for_cwd(&thread.cwd);
+            let (path, name, kind) = project_index.map_or_else(
+                || {
+                    let path = project_root_for_cwd(&thread.cwd);
+                    let name = project_name(&path);
+                    (path, name, ProjectKind::Project)
+                },
+                |index| index.group_for_thread(&thread),
+            );
             let entry = projects
                 .entry(path.clone())
                 .or_insert_with(|| ProjectSummary {
-                    name: project_name(&path),
+                    name,
                     path,
+                    kind,
                     thread_count: 0,
                     archived_count: 0,
                     updated_at_ms: 0,
@@ -361,10 +492,34 @@ impl SessionStore {
         limit: usize,
         pinned_thread_ids: &[String],
     ) -> Result<(Vec<ProjectThreadSummary>, usize)> {
+        self.list_project_threads_with_index(
+            project_path,
+            include_archived,
+            offset,
+            limit,
+            pinned_thread_ids,
+            None,
+        )
+    }
+
+    pub fn list_project_threads_with_index(
+        &self,
+        project_path: &Path,
+        include_archived: bool,
+        offset: usize,
+        limit: usize,
+        pinned_thread_ids: &[String],
+        project_index: Option<&ThreadProjectIndex>,
+    ) -> Result<(Vec<ProjectThreadSummary>, usize)> {
         let mut threads = self
             .cached_threads(include_archived)?
             .into_iter()
-            .filter(|thread| project_root_for_cwd(&thread.cwd) == project_path)
+            .filter(|thread| {
+                project_index.map_or_else(
+                    || project_root_for_cwd(&thread.cwd) == project_path,
+                    |index| index.group_for_thread(thread).0 == project_path,
+                )
+            })
             .collect::<Vec<_>>();
         let pinned_ranks = pinned_thread_ids
             .iter()
@@ -1847,6 +2002,75 @@ mod tests {
         assert_eq!(threads[0].id, "thread-one");
         assert!(threads[0].pinned);
         assert_ne!(threads[0].cwd, projects[0].path);
+    }
+
+    #[test]
+    fn app_server_project_roots_separate_project_threads_from_chats() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("workspace");
+        let chat_workspace = fixture.path.join("temporary-chat");
+        init_git_repo(&workspace, "main");
+        fs::create_dir_all(&chat_workspace).unwrap();
+        let project_thread = format!(
+            r#"{{"timestamp":"2026-09-09T01:00:00Z","type":"session_meta","payload":{{"id":"thread-project","cwd":{},"source":"vscode"}}}}"#,
+            serde_json::to_string(&workspace).unwrap()
+        );
+        let legacy_project_thread = format!(
+            r#"{{"timestamp":"2026-09-09T01:30:00Z","type":"session_meta","payload":{{"id":"thread-legacy-project","cwd":{},"source":"vscode"}}}}"#,
+            serde_json::to_string(&workspace).unwrap()
+        );
+        let chat_thread = format!(
+            r#"{{"timestamp":"2026-09-09T02:00:00Z","type":"session_meta","payload":{{"id":"thread-chat","cwd":{},"source":"vscode"}}}}"#,
+            serde_json::to_string(&chat_workspace).unwrap()
+        );
+        fixture.write_rollout("rollout-project.jsonl", &[&project_thread]);
+        fixture.write_rollout("rollout-legacy-project.jsonl", &[&legacy_project_thread]);
+        fixture.write_rollout("rollout-chat.jsonl", &[&chat_thread]);
+
+        let project_index = ThreadProjectIndex::from_app_server(
+            &serde_json::json!({
+                "data": [{
+                    "id": "project-1",
+                    "name": "Workspace",
+                    "roots": [{"path": workspace}],
+                }]
+            }),
+            &[
+                serde_json::json!({"id": "thread-project", "projectId": "project-1"}),
+                serde_json::json!({"id": "thread-legacy-project", "projectId": null}),
+                serde_json::json!({"id": "thread-chat", "projectId": null}),
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let projects = store
+            .list_projects_with_index(false, Some(&project_index))
+            .unwrap();
+        assert_eq!(projects.len(), 2);
+        let chats = projects
+            .iter()
+            .find(|project| project.kind == ProjectKind::Chats)
+            .unwrap();
+        assert_eq!(chats.path, Path::new(CHATS_PROJECT_PATH));
+        assert_eq!(chats.thread_count, 1);
+        let project = projects
+            .iter()
+            .find(|project| project.kind == ProjectKind::Project)
+            .unwrap();
+        assert_eq!(project.path, workspace);
+        assert_eq!(project.thread_count, 2);
+
+        let (threads, available) = store
+            .list_project_threads_with_index(
+                Path::new(CHATS_PROJECT_PATH),
+                false,
+                0,
+                10,
+                &[],
+                Some(&project_index),
+            )
+            .unwrap();
+        assert_eq!(available, 1);
+        assert_eq!(threads[0].id, "thread-chat");
     }
 
     #[test]

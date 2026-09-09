@@ -895,131 +895,107 @@
         <h2 class="zh">从远程控制到完整会话工作流。</h2>
         <h2 class="en">From remote control to a complete session workflow.</h2>
         <p class="section-intro zh">
-          v0.2.2 增加服务端语音转写能力协商，并记住已展开的项目文件夹；
-          移动输入框也改用原生点击命中，空白区域归还给消息列表。
+          v0.2.3 让繁忙的 Codex
+          服务更易浏览和控制：项目归类更准确，消息刷新更稳定，
+          Queue、停止、归档和文件下载也完成了可靠性修复。
         </p>
         <p class="section-intro en">
-          v0.2.2 adds server voice-transcription capability negotiation,
-          remembered project folders, background summary loading, and native
-          mobile composer hit targets.
+          v0.2.3 adds project-aware history, stable live message updates, direct
+          queue controls, and reliability fixes for Stop, archive, and
+          downloads.
         </p>
         <div class="release">
           <div class="release-date">
             2026-09-09
-            <span class="zh">v0.2.2 正式版</span
-            ><span class="en">v0.2.2 release</span>
+            <span class="zh">v0.2.3 正式版</span
+            ><span class="en">v0.2.3 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">语音能力状态推送</span
-                ><span class="en">Voice capability snapshots</span>
+                <span class="zh">项目与 Chats 准确归类</span
+                ><span class="en">Project-aware history</span>
               </h3>
               <p class="zh">
-                Bridge 根据 app-server 登录模式判断语音转写能力，缓存结果并随
-                WebSocket 服务状态持续推送，不发起试探性实时会话。
+                Bridge 使用 app-server
+                的分页项目与会话索引；仓库任务留在项目下，
+                只有无法匹配项目根目录的对话进入 Chats。
               </p>
               <p class="en">
-                Bridge derives voice transcription availability from the
-                app-server auth mode and pushes the cached result with service
-                snapshots, without opening trial realtime sessions.
+                Paginated app-server project and thread indexes keep repository
+                tasks in their projects and place only unmatched conversations
+                in Chats.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">记住会话文件夹</span
-                ><span class="en">Remembered session folders</span>
+                <span class="zh">稳定的消息局部刷新</span
+                ><span class="en">Stable message updates</span>
               </h3>
               <p class="zh">
-                浏览器保存项目的展开状态；刷新后自动恢复，并以最多三个并发请求在后台加载会话摘要。
+                未变化的消息节点不再整体重挂；工具展开状态和阅读锚点得以保留，
+                真正新增消息时才平滑跟随底部。
               </p>
               <p class="en">
-                The browser restores expanded projects and preloads their
-                session summaries with at most three concurrent requests.
+                Keyed reconciliation preserves open tools and the reading
+                anchor; only genuinely new content triggers smooth
+                bottom-following.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">原生移动端点击</span
-                ><span class="en">Native mobile hit targets</span>
+                <span class="zh">Queue / Steer 消息菜单</span
+                ><span class="en">Queue / Steer message menu</span>
               </h3>
               <p class="zh">
-                输入框只让真实控件接收点击，底部空白归还给消息列表；提交和模式切换不再拦截原生事件。
+                每条缓冲消息都可撤回；纯文本 Queue 还可直接改为跟进，
+                不生成重复消息，也不冒险丢失附件。
               </p>
               <p class="en">
-                Only visible composer controls capture taps; unused space
-                belongs to the message view, and mode/submit actions no longer
-                suppress native clicks.
+                Buffered work can be withdrawn, and safe text-only Queue entries
+                can move directly to Steer without duplication.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">录音前明确禁用</span
-                ><span class="en">Disabled before recording</span>
+                <span class="zh">可靠的停止与归档</span
+                ><span class="en">Reliable Stop and archive</span>
               </h3>
               <p class="zh">
-                转写不可用时，麦克风显示红色叉号且无法点击，并通过中英文提示说明原因。
+                Stop 使用推送中观察到的准确 turn ID；归档时立即移除持久订阅，
+                避免写盘竞态和重连阻塞。
               </p>
               <p class="en">
-                When transcription is unavailable, the microphone shows a red
-                cross, cannot be clicked, and explains the reason in English or
-                Chinese.
+                Stop targets the observed live turn, while archive immediately
+                removes stale reconnect subscriptions.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">可编辑语音转写</span
-                ><span class="en">Editable voice transcription</span>
+                <span class="zh">可点击的受限文件下载</span
+                ><span class="en">Clickable scoped downloads</span>
               </h3>
               <p class="zh">
-                录音先在浏览器转换为 24 kHz 单声道 PCM，再由 app-server
-                转成可编辑文本；音频不会作为消息附件提交。
+                Markdown 目标和编码后的绝对路径 URL 都会进入五分钟下载票据流程；
+                工作目录与 16 MiB 安全限制保持不变。
               </p>
               <p class="en">
-                Recordings become 24 kHz mono PCM in the browser, then
-                app-server returns editable text. Audio is never submitted as an
-                attachment.
+                Markdown targets and encoded absolute-path URLs share the same
+                five-minute ticket flow and unchanged workspace boundary.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">移动端 Tasks 快捷入口</span
-                ><span class="en">Mobile Tasks shortcut</span>
+                <span class="zh">更轻的对话视觉层级</span
+                ><span class="en">Calmer conversation hierarchy</span>
               </h3>
               <p class="zh">
-                在会话中向右滑动即可打开多任务进度视图，会话列表仍通过独立按钮展开。
+                中性用户气泡、轻量工具摘要和逐条复制按钮让桌面与移动消息视图更接近
+                ChatGPT。
               </p>
               <p class="en">
-                Swipe right in a conversation to open the multi-task progress
-                view; the session drawer remains on its explicit button.
-              </p>
-            </article>
-            <article class="release-item">
-              <h3>
-                <span class="zh">稳定的移动输入框</span
-                ><span class="en">Stable mobile composer</span>
-              </h3>
-              <p class="zh">
-                文本固定在操作栏上方并向上增长，不再因聚焦重排；提交按钮与模式切换按钮等宽。
-              </p>
-              <p class="en">
-                Text stays above a fixed action row and grows upward without
-                focus-driven reflow; submit and mode controls use matching
-                widths.
-              </p>
-            </article>
-            <article class="release-item">
-              <h3>
-                <span class="zh">更清晰的消息类型</span
-                ><span class="en">Clearer message types</span>
-              </h3>
-              <p class="zh">
-                Queue
-                消息保留蓝色，跟进消息改用豆绿色；浅色和深色主题都能快速区分。
-              </p>
-              <p class="en">
-                Queue messages remain blue while Steer messages use bean green,
-                making handoffs easy to distinguish in light and dark themes.
+                Neutral user bubbles, lighter tool summaries, and per-message
+                copy controls bring desktop and mobile closer to ChatGPT.
               </p>
             </article>
           </div>

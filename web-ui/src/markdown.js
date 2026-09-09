@@ -7,11 +7,34 @@ function appendPlain(parent, text) {
 
 export function localFilePath(raw) {
   if (typeof raw !== "string") return null;
-  let path = null;
-  if (raw.startsWith("/")) path = raw;
-  else if (raw.startsWith("file://")) {
+  let value = raw.trim();
+  if (/^https?:\/\//i.test(value)) {
     try {
-      path = decodeURIComponent(new URL(raw).pathname);
+      const pathname = new URL(value).pathname;
+      // Some model output uses an autolink-shaped URL whose path is an
+      // encoded Markdown destination: https://host/%3C/absolute/path%3E.
+      // Recover only the wrapped absolute path; the server still enforces the
+      // selected session workspace and file-size boundary.
+      if (/^\/%3c(?:%2f|\/).*%3e$/i.test(pathname)) value = pathname.slice(1);
+      else return null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    value = decodeURIComponent(value);
+  } catch {
+    // A literal percent sign is valid in a local filename. Keep the original
+    // value when the Markdown target is not valid percent-encoded text.
+  }
+  if (value.startsWith("<") && value.endsWith(">")) {
+    value = value.slice(1, -1).trim();
+  }
+  let path = null;
+  if (value.startsWith("/")) path = value;
+  else if (value.startsWith("file://")) {
+    try {
+      path = decodeURIComponent(new URL(value).pathname);
     } catch {
       return null;
     }
@@ -19,8 +42,47 @@ export function localFilePath(raw) {
   return path;
 }
 
+function appendLink(parent, label, target, options) {
+  const link = document.createElement("a"),
+    downloadPath = localFilePath(target);
+  link.textContent = label;
+  if (downloadPath && options.requestLocalFileDownload) {
+    link.href = "#";
+    link.download = downloadPath.split("/").at(-1) || "download";
+    link.onclick = async (event) => {
+      event.preventDefault();
+      if (link.getAttribute("aria-busy") === "true") return;
+      link.setAttribute("aria-busy", "true");
+      try {
+        const url = await options.requestLocalFileDownload(downloadPath);
+        // Location navigation is more reliable than a detached synthetic
+        // anchor in iOS browsers and still preserves the server-provided
+        // Content-Disposition filename.
+        window.location.assign(url);
+      } catch (error) {
+        options.onError?.(error);
+      } finally {
+        link.removeAttribute("aria-busy");
+      }
+    };
+  } else {
+    try {
+      const url = new URL(target, location.href);
+      if (["http:", "https:", "mailto:"].includes(url.protocol)) {
+        link.href = url.href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      }
+    } catch {
+      // Invalid links remain inert text.
+    }
+  }
+  if (link.href) parent.appendChild(link);
+  else parent.appendChild(document.createTextNode(label));
+}
+
 function appendInline(parent, text, options) {
-  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^\s)]+\))/g;
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^\s)]+\)|https?:\/\/[^\s<>()]+)/g;
   let offset = 0;
   for (const match of text.matchAll(pattern)) {
     appendPlain(parent, text.slice(offset, match.index));
@@ -33,48 +95,10 @@ function appendInline(parent, text, options) {
       const strong = document.createElement("strong");
       strong.textContent = token.slice(2, -2);
       parent.appendChild(strong);
-    } else {
+    } else if (token.startsWith("[")) {
       const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      const link = document.createElement("a");
-      link.textContent = parts[1];
-      const downloadPath = localFilePath(parts[2]);
-      if (downloadPath && options.requestLocalFileDownload) {
-        link.href = "#";
-        link.download = parts[2].split("/").at(-1) || "download";
-        link.onclick = async (event) => {
-          event.preventDefault();
-          if (link.getAttribute("aria-busy") === "true") return;
-          link.setAttribute("aria-busy", "true");
-          try {
-            const url = await options.requestLocalFileDownload(downloadPath);
-            const trigger = document.createElement("a");
-            trigger.href = url;
-            trigger.download = link.download;
-            trigger.hidden = true;
-            document.body.appendChild(trigger);
-            trigger.click();
-            trigger.remove();
-          } catch (error) {
-            options.onError?.(error);
-          } finally {
-            link.removeAttribute("aria-busy");
-          }
-        };
-      } else {
-        try {
-          const url = new URL(parts[2], location.href);
-          if (["http:", "https:", "mailto:"].includes(url.protocol)) {
-            link.href = url.href;
-            link.target = "_blank";
-            link.rel = "noopener noreferrer";
-          }
-        } catch {
-          // Invalid links remain inert text.
-        }
-      }
-      if (link.href) parent.appendChild(link);
-      else parent.appendChild(document.createTextNode(token));
-    }
+      appendLink(parent, parts[1], parts[2], options);
+    } else appendLink(parent, token, token, options);
     offset = match.index + token.length;
   }
   appendPlain(parent, text.slice(offset));

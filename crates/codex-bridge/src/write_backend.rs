@@ -52,6 +52,9 @@ enum AppServerCommand {
         thread_id: String,
         response: std_mpsc::SyncSender<Result<Value, BackendFailure>>,
     },
+    ForgetThread {
+        thread_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -188,6 +191,14 @@ impl CodexCliBackend {
             .as_ref()
             .ok_or_else(app_server_unavailable)?;
         app_server.watch_thread(thread_id)
+    }
+
+    pub fn forget_thread(&self, thread_id: &str) -> Result<(), BackendFailure> {
+        let app_server = self
+            .app_server
+            .as_ref()
+            .ok_or_else(app_server_unavailable)?;
+        app_server.forget_thread(thread_id)
     }
 
     pub fn subscribe_app_server_events(&self) -> Option<broadcast::Receiver<Value>> {
@@ -536,6 +547,17 @@ impl AppServerSession {
                 message: format!("failed waiting for app-server thread subscription: {error}"),
             })?
     }
+
+    fn forget_thread(&self, thread_id: &str) -> Result<(), BackendFailure> {
+        self.commands
+            .send(AppServerCommand::ForgetThread {
+                thread_id: thread_id.to_owned(),
+            })
+            .map_err(|_| BackendFailure {
+                code: "app_server_unavailable",
+                message: "app-server connection worker stopped".to_owned(),
+            })
+    }
 }
 
 fn app_server_worker(
@@ -550,6 +572,9 @@ fn app_server_worker(
     let mut watched_threads = VecDeque::<String>::new();
     loop {
         match commands.recv_timeout(APP_SERVER_IDLE_POLL) {
+            Ok(AppServerCommand::ForgetThread { thread_id }) => {
+                watched_threads.retain(|watched| watched != &thread_id);
+            }
             Ok(command) => {
                 if let Err(error) = ensure_app_server_connection(
                     &socket,
@@ -564,6 +589,7 @@ fn app_server_worker(
                         | AppServerCommand::WatchThread { response, .. } => {
                             let _ = response.send(Err(error));
                         }
+                        AppServerCommand::ForgetThread { .. } => unreachable!(),
                     }
                     continue;
                 }
@@ -630,6 +656,7 @@ fn app_server_worker(
                             let _ = response.send(result.clone());
                         }
                     }
+                    AppServerCommand::ForgetThread { .. } => unreachable!(),
                 }
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1224,7 +1251,7 @@ mod tests {
                 .unwrap();
             let initialized = read_json(&mut websocket);
             let mut requests = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..6 {
                 let request = read_json(&mut websocket);
                 let id = request["id"].clone();
                 let result = if request["method"] == "thread/resume" {
@@ -1249,6 +1276,8 @@ mod tests {
         for thread_id in ["thread-1", "thread-2", "thread-3", "thread-4"] {
             backend.watch_thread(thread_id).unwrap();
         }
+        backend.forget_thread("thread-2").unwrap();
+        backend.watch_thread("thread-2").unwrap();
         let (initialize, initialized, requests) = server.join().unwrap();
         assert_eq!(initialize["method"], "initialize");
         assert_eq!(initialized["method"], "initialized");
@@ -1262,10 +1291,12 @@ mod tests {
                 "thread/resume",
                 "thread/resume",
                 "thread/resume",
-                "thread/unsubscribe"
+                "thread/unsubscribe",
+                "thread/resume"
             ]
         );
         assert_eq!(requests[4]["params"]["threadId"], "thread-1");
+        assert_eq!(requests[5]["params"]["threadId"], "thread-2");
         std::fs::remove_file(&sock_path).unwrap();
         std::fs::remove_dir(&sock_dir).unwrap();
     }

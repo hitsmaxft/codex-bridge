@@ -19,10 +19,10 @@ WASM target, `npm run test:demo-wasm` exercises the same binary through the brow
 adapter. The Pages workflow runs both gates, so the published demo cannot drift onto a separate
 mock implementation.
 
-Clean Git states are hidden. Queued-message delivery uses compact, background-free status text in
-the empty lane beside the message, with its withdrawal action arranged vertically underneath.
-The lane only shows the withdrawal action while a message is buffered; transient delivery labels
-remain reserved for the handoff phase. Messages being submitted use a light dashed outline.
+Clean Git states are hidden. Each buffered message uses a compact **Queue/Steer ···** menu for
+withdrawal; text-only Queue entries can also be converted to Steer against the active turn.
+Attachment queues deliberately omit conversion so an action cannot silently discard media.
+Messages being submitted use a light dashed outline.
 
 Message text and attachments come from durable rollout pagination. Tool groups prefer app-server's
 typed `thread/turns/list` items and fall back to raw rollout calls only when app-server data is not

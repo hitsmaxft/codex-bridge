@@ -5,6 +5,7 @@ use std::collections::HashMap;
 const PRIMARY_THREAD: &str = "demo-thread-web-ui";
 const SECONDARY_THREAD: &str = "demo-thread-protocol";
 const PROJECT_PATH: &str = "/Users/demo/projects/codex-bridge";
+const CHATS_PROJECT_PATH: &str = "codex-bridge://chats";
 
 thread_local! {
     static STATE: RefCell<DemoState> = RefCell::new(DemoState::new());
@@ -570,7 +571,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 20,
+            "protocol_version": 22,
             "capabilities": {
                 "audio_transcription": {
                     "enabled": true,
@@ -589,16 +590,30 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
         "projects" => json!({
             "source": "demo_wasm",
             "include_archived": request.get("include_archived").and_then(Value::as_bool).unwrap_or(false),
-            "projects": [{"name": "codex-bridge", "path": PROJECT_PATH, "thread_count": 2, "archived_count": 0, "updated_at_ms": 1_788_767_541_844_u64}]
+            "projects": [
+                {"name": "codex-bridge", "path": PROJECT_PATH, "kind": "project", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_541_844_u64},
+                {"name": "Chats", "path": CHATS_PROJECT_PATH, "kind": "chats", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_500_000_u64}
+            ]
         }),
-        "project_threads" => json!({
-            "source": "demo_wasm",
-            "project_path": PROJECT_PATH,
-            "threads": [state.thread(PRIMARY_THREAD), state.thread(SECONDARY_THREAD)],
-            "offset": 0,
-            "returned": 2,
-            "available": 2
-        }),
+        "project_threads" => {
+            let project_path = request
+                .get("project_path")
+                .and_then(Value::as_str)
+                .unwrap_or(PROJECT_PATH);
+            let threads = if project_path == CHATS_PROJECT_PATH {
+                vec![state.thread(SECONDARY_THREAD)]
+            } else {
+                vec![state.thread(PRIMARY_THREAD)]
+            };
+            json!({
+                "source": "demo_wasm",
+                "project_path": project_path,
+                "threads": threads,
+                "offset": 0,
+                "returned": 1,
+                "available": 1
+            })
+        }
         "thread_pins" => {
             let thread_ids = state.pinned_thread.iter().collect::<Vec<_>>();
             let threads = thread_ids
@@ -930,7 +945,7 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 20);
+        assert_eq!(response["result"]["protocol_version"], 22);
     }
 
     #[test]

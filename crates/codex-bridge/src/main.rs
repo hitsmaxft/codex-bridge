@@ -24,9 +24,9 @@ use base64::Engine as _;
 use clap::{Parser, ValueEnum};
 use codex_bridge::{
     default_codex_home, default_socket_path, BackendFailure, CodexCliBackend, ComposerAttachment,
-    HostExecFailure, HostExecutor, Request, Response, SessionStore, ThreadMessage, ThreadSummary,
-    ThreadToolCall, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
-    HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
+    HostExecFailure, HostExecutor, Request, Response, SessionStore, ThreadMessage,
+    ThreadProjectIndex, ThreadSummary, ThreadToolCall, APP_SERVER_SCHEMA_VERSION,
+    APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
@@ -44,6 +44,7 @@ const MAX_ATTACHMENT_URL_BYTES: usize = 6 * 1024 * 1024;
 const MAX_ATTACHMENT_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const DOWNLOAD_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
+const PROJECT_INDEX_TTL: Duration = Duration::from_secs(10);
 const MAX_DOWNLOAD_TICKETS: usize = 128;
 const WEB_SESSION_COOKIE: &str = "codex_bridge_session";
 const WEB_SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -222,6 +223,7 @@ struct BridgeState {
     selected_thread: Arc<RwLock<Option<String>>>,
     pending_messages: Arc<PendingMessages>,
     app_server_tools: Arc<AppServerToolCache>,
+    app_server_projects: Arc<AppServerProjectCache>,
     session_run_states: Arc<SessionRunStates>,
     runtime_mode: RuntimeMode,
     config_path: Option<PathBuf>,
@@ -292,6 +294,18 @@ struct CachedAppServerTools {
     refreshed_at: Instant,
     known_message_ids: HashSet<String>,
     tools: HashMap<String, Vec<ThreadToolCall>>,
+}
+
+#[derive(Debug, Default)]
+struct AppServerProjectCache {
+    index: RwLock<Option<CachedAppServerProjectIndex>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAppServerProjectIndex {
+    refreshed_at: Instant,
+    includes_archived: bool,
+    index: ThreadProjectIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1386,6 +1400,7 @@ async fn main() -> Result<()> {
     let selected_thread = Arc::new(RwLock::new(None));
     let pending_messages = Arc::new(PendingMessages::default());
     let app_server_tools = Arc::new(AppServerToolCache::default());
+    let app_server_projects = Arc::new(AppServerProjectCache::default());
     let session_run_states = Arc::new(SessionRunStates::default());
     let secure_existing_parent = args.socket_uses_default;
     let socket_path = match args.socket {
@@ -1426,6 +1441,7 @@ async fn main() -> Result<()> {
         selected_thread,
         pending_messages,
         app_server_tools,
+        app_server_projects,
         session_run_states: Arc::clone(&session_run_states),
         runtime_mode: args.mode,
         config_path: args.config_path.clone(),
@@ -3158,6 +3174,107 @@ fn server_capabilities_snapshot(state: &BridgeState) -> Value {
         })
 }
 
+fn app_server_list_all(
+    write_backend: &CodexCliBackend,
+    method: &str,
+    mut params: Value,
+) -> Result<Vec<Value>, BackendFailure> {
+    let mut data = Vec::new();
+    let mut cursor = None::<String>;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        params["cursor"] = cursor.clone().map_or(Value::Null, Value::String);
+        let result = write_backend.app_server_rpc(method, params.clone())?;
+        let page = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| BackendFailure {
+                code: "app_server_protocol_error",
+                message: format!("{method} returned no data array"),
+            })?;
+        data.extend(page.iter().cloned());
+        let next = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(next) = next else { break };
+        if !seen_cursors.insert(next.clone()) {
+            return Err(BackendFailure {
+                code: "app_server_protocol_error",
+                message: format!("{method} repeated a pagination cursor"),
+            });
+        }
+        cursor = Some(next);
+    }
+    Ok(data)
+}
+
+fn fetch_app_server_project_index(
+    write_backend: &CodexCliBackend,
+    include_archived: bool,
+) -> Result<ThreadProjectIndex, BackendFailure> {
+    let projects = app_server_list_all(
+        write_backend,
+        "project/list",
+        json!({
+            "limit": 100,
+            "sortKey": "recencyAt",
+            "sortDirection": "desc",
+        }),
+    )?;
+    let source_kinds = json!(["cli", "vscode", "exec", "appServer", "unknown"]);
+    let mut threads = app_server_list_all(
+        write_backend,
+        "thread/list",
+        json!({
+            "limit": 100,
+            "sourceKinds": source_kinds,
+            "archived": false,
+            "useStateDbOnly": true,
+        }),
+    )?;
+    if include_archived {
+        threads.extend(app_server_list_all(
+            write_backend,
+            "thread/list",
+            json!({
+                "limit": 100,
+                "sourceKinds": source_kinds,
+                "archived": true,
+                "useStateDbOnly": true,
+            }),
+        )?);
+    }
+    Ok(ThreadProjectIndex::from_app_server(
+        &json!({"data": projects}),
+        &threads,
+    ))
+}
+
+fn app_server_project_index(
+    write_backend: &CodexCliBackend,
+    cache: &AppServerProjectCache,
+    include_archived: bool,
+) -> Option<ThreadProjectIndex> {
+    if let Ok(cached) = cache.index.read() {
+        if let Some(cached) = cached.as_ref().filter(|cached| {
+            cached.refreshed_at.elapsed() <= PROJECT_INDEX_TTL
+                && (cached.includes_archived || !include_archived)
+        }) {
+            return Some(cached.index.clone());
+        }
+    }
+    let index = fetch_app_server_project_index(write_backend, include_archived).ok()?;
+    if let Ok(mut cached) = cache.index.write() {
+        *cached = Some(CachedAppServerProjectIndex {
+            refreshed_at: Instant::now(),
+            includes_archived: include_archived,
+            index: index.clone(),
+        });
+    }
+    Some(index)
+}
+
 fn dispatch(request: Request, state: &BridgeState) -> Response {
     let socket_path = state.socket_path.as_path();
     let session_store = state.session_store.as_ref();
@@ -3166,6 +3283,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
     let selected_thread = state.selected_thread.as_ref();
     let pending_messages = state.pending_messages.as_ref();
     let app_server_tools = state.app_server_tools.as_ref();
+    let app_server_projects = state.app_server_projects.as_ref();
     match request {
         Request::Status => {
             if write_backend.app_server_socket().is_some() {
@@ -3304,9 +3422,15 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             }
         }
         Request::Projects { include_archived } => {
-            match session_store.list_projects(include_archived) {
+            let project_index =
+                app_server_project_index(write_backend, app_server_projects, include_archived);
+            match session_store.list_projects_with_index(include_archived, project_index.as_ref()) {
                 Ok(projects) => Response::success(json!({
-                    "source": "rollout_jsonl",
+                    "source": if project_index.is_some() {
+                        "app_server_projects_and_rollout_jsonl"
+                    } else {
+                        "rollout_jsonl"
+                    },
                     "projects": projects,
                     "include_archived": include_archived,
                 })),
@@ -3332,12 +3456,15 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             } else {
                 Vec::new()
             };
-            match session_store.list_project_threads(
+            let project_index =
+                app_server_project_index(write_backend, app_server_projects, include_archived);
+            match session_store.list_project_threads_with_index(
                 &project_path,
                 include_archived,
                 offset as usize,
                 limit as usize,
                 &pinned,
+                project_index.as_ref(),
             ) {
                 Ok((threads, available)) => {
                     let returned = threads.len();
@@ -3614,11 +3741,24 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     )
                 }
             };
-            let known_project = match session_store.list_projects(true) {
-                Ok(projects) => projects.into_iter().any(|project| {
-                    fs::canonicalize(project.path).is_ok_and(|path| path == canonical_project)
-                }),
-                Err(error) => return backend_error(error),
+            let app_server_project_list = write_backend
+                .app_server_rpc(
+                    "project/list",
+                    json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+                )
+                .ok();
+            let project_id = app_server_project_list
+                .as_ref()
+                .and_then(|projects| project_id_for_path(projects, &canonical_project));
+            let known_project = if project_id.is_some() {
+                true
+            } else {
+                match session_store.list_projects(true) {
+                    Ok(projects) => projects.into_iter().any(|project| {
+                        fs::canonicalize(project.path).is_ok_and(|path| path == canonical_project)
+                    }),
+                    Err(error) => return backend_error(error),
+                }
             };
             if !known_project {
                 return Response::error(
@@ -3636,13 +3776,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             if let Some(model) = model {
                 params["model"] = Value::String(model);
             }
-            if let Ok(projects) = write_backend.app_server_rpc(
-                "project/list",
-                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
-            ) {
-                if let Some(project_id) = project_id_for_path(&projects, &canonical_project) {
-                    params["projectId"] = Value::String(project_id);
-                }
+            if let Some(project_id) = project_id {
+                params["projectId"] = Value::String(project_id);
             }
             let result = match write_backend.app_server_rpc("thread/start", params) {
                 Ok(result) => result,
@@ -3789,6 +3924,10 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 .app_server_rpc("thread/archive", json!({"threadId": resolved.thread.id}))
             {
                 Ok(_) => {
+                    // Archived threads can no longer be resumed. Remove the
+                    // persistent-session subscription before a reconnect tries
+                    // to restore it and blocks every subsequent app-server RPC.
+                    let _ = write_backend.forget_thread(&resolved.thread.id);
                     session_store.remove_ephemeral_thread(&resolved.thread.id);
                     session_store.invalidate_summary_cache();
                     if let Ok(mut selected) = selected_thread.write() {
@@ -3808,9 +3947,14 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
         }
         Request::ThreadPins => match pinned_thread_ids(write_backend) {
             Ok(thread_ids) => {
+                let project_index =
+                    app_server_project_index(write_backend, app_server_projects, false);
                 let mut threads = Vec::new();
                 for thread_id in &thread_ids {
                     if let Ok(Some(thread)) = session_store.find_thread(thread_id) {
+                        let project_path = project_index
+                            .as_ref()
+                            .map(|index| index.group_path_for_thread(&thread));
                         threads.push(json!({
                             "id": thread.id,
                             "title": thread.title,
@@ -3821,6 +3965,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                             "source": thread.source,
                             "archived": thread.archived,
                             "pinned": true,
+                            "project_path": project_path,
                         }));
                     }
                 }
@@ -4096,23 +4241,29 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Err(error) => write_backend_error(error),
             }
         }
-        Request::Interrupt { thread_id } => {
+        Request::Interrupt { thread_id, turn_id } => {
             let resolved = match resolve_write_target(thread_id, session_store, selected_thread) {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
-            let turn_id = match session_store.active_turn_id(&resolved.thread.id) {
-                Ok(Some(turn_id)) => turn_id,
-                Ok(None) => {
-                    return Response::error(
-                        "no_active_turn",
-                        format!(
-                            "thread {} has no active turn in its rollout",
-                            resolved.thread.id
-                        ),
-                    );
-                }
-                Err(error) => return backend_error(error),
+            // App-server notifications can reach the Web UI before the matching
+            // rollout line is flushed. Prefer the turn observed by the client,
+            // while retaining rollout lookup for CLI and older clients.
+            let turn_id = match turn_id.filter(|turn_id| !turn_id.is_empty()) {
+                Some(turn_id) => turn_id,
+                None => match session_store.active_turn_id(&resolved.thread.id) {
+                    Ok(Some(turn_id)) => turn_id,
+                    Ok(None) => {
+                        return Response::error(
+                            "no_active_turn",
+                            format!(
+                                "thread {} has no active turn in its rollout",
+                                resolved.thread.id
+                            ),
+                        );
+                    }
+                    Err(error) => return backend_error(error),
+                },
             };
             match write_backend.interrupt_turn(&resolved.thread.id, &turn_id) {
                 Ok(backend) => Response::success(json!({

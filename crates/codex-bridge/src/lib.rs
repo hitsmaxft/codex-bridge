@@ -17,15 +17,16 @@ pub use host_executor::{
     MAX_HOST_EXEC_TIMEOUT_SECONDS,
 };
 pub use sessions::{
-    default_codex_home, MessagePage, ProjectSummary, ProjectThreadSummary, SessionStore,
-    ThreadActivity, ThreadMessage, ThreadSnapshot, ThreadSummary, ThreadToolCall, CODEX_HOME_ENV,
+    default_codex_home, MessagePage, ProjectKind, ProjectSummary, ProjectThreadSummary,
+    SessionStore, ThreadActivity, ThreadMessage, ThreadProjectIndex, ThreadSnapshot, ThreadSummary,
+    ThreadToolCall, CHATS_PROJECT_PATH, CODEX_HOME_ENV,
 };
 pub use write_backend::{
     AppServerRuntimeInfo, BackendFailure, BackendSuccess, CodexCliBackend, NativeQueueReceipt,
     APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 22;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +144,8 @@ pub enum Request {
     },
     Interrupt {
         thread_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     HostExec {
         thread_id: Option<String>,
@@ -289,6 +292,36 @@ mod tests {
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["command"], "scroll");
         assert_eq!(json["direction"], "down");
+    }
+
+    #[test]
+    fn interrupt_accepts_an_observed_turn_but_remains_backward_compatible() {
+        let observed = serde_json::from_value::<Request>(serde_json::json!({
+            "command": "interrupt",
+            "thread_id": "thread-1",
+            "turn_id": "turn-live"
+        }))
+        .unwrap();
+        assert_eq!(
+            observed,
+            Request::Interrupt {
+                thread_id: Some("thread-1".into()),
+                turn_id: Some("turn-live".into()),
+            }
+        );
+
+        let legacy = serde_json::from_value::<Request>(serde_json::json!({
+            "command": "interrupt",
+            "thread_id": "thread-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy,
+            Request::Interrupt {
+                thread_id: Some("thread-1".into()),
+                turn_id: None,
+            }
+        );
     }
 
     #[test]

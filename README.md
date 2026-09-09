@@ -25,20 +25,21 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.2.2 · 2026-09-09
+### v0.2.3 · 2026-09-09
 
-- **Voice capability handshake:** bridge status and WebSocket snapshots now report whether the
-  current app-server authentication mode supports realtime voice transcription.
-- **Fail-fast voice control:** the Web UI crosses out and disables the microphone before recording
-  when server transcription is unavailable, with an English or Chinese explanation on hover.
-- **Remembered sidebar:** expanded project folders persist in browser storage and preload their
-  lightweight session summaries in the background after startup.
-- **Reliable mobile hit targets:** unused composer space now belongs to the message view, while
-  Queue/Steer and Submit use native click delivery instead of intercepted pointer events.
-- **Patch fallback cleanup:** opaque `apply_patch { request: "patch" }` markers are hidden in favor
-  of app-server `fileChange`; older records carrying a real patch envelope still render as diffs.
+- **Project-aware history:** paginated app-server project and thread indexes keep repository tasks
+  in their projects and collect only unmatched conversations under **Chats**.
+- **Stable conversation timeline:** keyed message updates preserve open tools and the reading
+  anchor, while the visual hierarchy, user bubbles, copy controls, and live scrolling are lighter.
+- **Queue controls:** each buffered message has a compact menu to withdraw it or convert a safe
+  text-only Queue entry into Steer without duplicating the message.
+- **Reliable lifecycle controls:** Stop targets the exact live turn observed over WebSocket, and
+  archiving removes stale reconnect subscriptions immediately.
+- **Working local-file links:** direct encoded file URLs and Markdown targets enter the same
+  five-minute, workspace-scoped download-ticket flow.
 
-See the complete [v0.2.2 release notes](docs/releases/v0.2.2.md), the
+See the complete [v0.2.3 release notes](docs/releases/v0.2.3.md), the
+[v0.2.2 voice and sidebar release](docs/releases/v0.2.2.md), the
 [v0.2.1 Firefox iOS fix](docs/releases/v0.2.1.md), or the larger
 [v0.2.0 feature release](docs/releases/v0.2.0.md).
 

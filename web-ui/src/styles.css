@@ -10,8 +10,10 @@
   --accent2: #69adff;
   --danger: #ff8d82;
   --composer-surface: #181b18;
-  --user-bg: #183b52;
-  --user-text: #91d1ff;
+  --user-bg: #2f312f;
+  --user-text: #f3f5f1;
+  --queue-bg: #183b52;
+  --queue-text: #91d1ff;
   --steer-bg: #263d2d;
   --steer-text: #a7d7ae;
   --active-thread: #193549;
@@ -643,7 +645,7 @@ main {
   max-inline-size: 100%;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 18px max(20px, calc((100% - 820px) / 2)) calc(var(--composer-height, 92px) + 18px);
+  padding: 22px max(24px, calc((100% - 760px) / 2)) calc(var(--composer-height, 92px) + 24px);
   scroll-padding-bottom: calc(var(--composer-height, 92px) + 18px);
   overscroll-behavior: contain;
   overflow-anchor: none;
@@ -664,19 +666,20 @@ main {
   max-width: 100%;
 }
 .message {
-  margin: 0 0 5px;
+  position: relative;
+  margin: 0 0 24px;
   border: 0;
   border-radius: 0;
-  overflow: hidden;
+  overflow: visible;
   background: transparent;
 }
 .message.user {
   width: fit-content;
-  max-width: 88%;
+  max-width: 82%;
   margin-right: 0;
   margin-left: auto;
-  padding: 11px 15px;
-  border-radius: 22px;
+  padding: 10px 16px;
+  border-radius: 21px;
   background: var(--user-bg);
   color: var(--user-text);
 }
@@ -691,7 +694,7 @@ main {
 .message-body {
   padding: 0;
   font-size: 16px;
-  line-height: 1.65;
+  line-height: 1.6;
   overflow-wrap: anywhere;
   word-break: break-word;
 }
@@ -703,16 +706,20 @@ main {
   line-height: 1.5;
 }
 .message-copy {
+  position: absolute;
+  right: 0;
+  bottom: -20px;
   display: grid;
   place-items: center;
   width: 24px;
   min-height: 20px;
-  margin: 2px 2px 0 auto;
+  margin: 0;
   padding: 0;
   border: 0;
   background: transparent;
   color: var(--muted);
-  opacity: 0.58;
+  opacity: 0;
+  transition: opacity 0.15s ease;
 }
 .message-copy svg {
   width: 15px;
@@ -724,11 +731,13 @@ main {
   stroke-linejoin: round;
 }
 .message-copy:hover,
-.message-copy:focus-visible {
+.message-copy:focus-visible,
+.message:hover .message-copy,
+.message:focus-within .message-copy {
   opacity: 1;
 }
 .message.user .message-copy {
-  margin-right: 8px;
+  right: 9px;
   color: currentColor;
 }
 .message.context {
@@ -746,16 +755,7 @@ main {
   font-size: 12px;
 }
 .message.assistant .message-head {
-  height: 10px;
-  min-height: 0;
-  justify-content: flex-end;
-  padding: 0 2px;
-  background: transparent;
-  font-size: 9px;
-  line-height: 10px;
-  text-transform: none;
-  letter-spacing: 0;
-  opacity: 0.68;
+  display: none;
 }
 .markdown > *:first-child {
   margin-top: 0;
@@ -764,7 +764,7 @@ main {
   margin-bottom: 0;
 }
 .markdown p {
-  margin: 0.55em 0;
+  margin: 0.68em 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -957,6 +957,9 @@ main {
 .outbox-tray[hidden] {
   display: none;
 }
+.outbox-tray:has(.outbox-menu[open]) {
+  overflow: visible;
+}
 .outbox-tray.compact {
   cursor: pointer;
 }
@@ -965,6 +968,7 @@ main {
   width: min(88%, 680px);
 }
 .outbox-tray.compact .outbox-actions,
+.outbox-tray.compact .outbox-meta,
 .outbox-tray.compact .outbox-mode,
 .outbox-tray.compact .markdown > :not(:first-child),
 .outbox-tray.compact .markdown :is(img, video, audio, pre, blockquote, ul, ol, button) {
@@ -987,9 +991,9 @@ main {
 }
 .outbox-item {
   display: grid;
-  grid-template-columns: minmax(44px, auto) minmax(0, 1fr);
-  align-items: end;
-  gap: 6px;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: end;
+  gap: 2px;
   width: fit-content;
   max-width: min(88%, 680px);
   padding: 0;
@@ -999,10 +1003,10 @@ main {
 .outbox-item .message-body {
   padding: 5px 9px;
   border-radius: 18px;
-  background: var(--user-bg);
+  background: var(--queue-bg);
 }
 .outbox-item .markdown {
-  color: var(--user-text);
+  color: var(--queue-text);
 }
 .outbox-item.steer .message-body {
   background: var(--steer-bg);
@@ -1011,12 +1015,9 @@ main {
   color: var(--steer-text);
 }
 .outbox-mode {
-  margin-top: 1px;
-  color: color-mix(in srgb, var(--user-text) 68%, transparent);
-  font-size: 9px;
-  line-height: 11px;
-  text-align: right;
-  text-transform: lowercase;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 18px;
 }
 .outbox-item.handoff {
   border: 0;
@@ -1029,16 +1030,17 @@ main {
 .outbox-item.submitting .message-body {
   border: 1px dashed color-mix(in srgb, var(--accent) 58%, var(--line));
 }
-.outbox-actions {
+.outbox-meta {
+  position: relative;
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
+  align-items: center;
   justify-content: flex-end;
-  gap: 0;
+  gap: 5px;
   min-width: 0;
-  padding-bottom: 2px;
+  padding-right: 7px;
+  color: var(--muted);
 }
-.outbox-actions .outbox-status {
+.outbox-meta .outbox-status {
   max-width: 86px;
   margin-top: 0;
   overflow: hidden;
@@ -1048,22 +1050,55 @@ main {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.outbox-delete {
+.outbox-menu {
+  position: relative;
+  z-index: 3;
+}
+.outbox-menu > summary {
+  min-width: 24px;
   min-height: 18px;
-  padding: 0 4px;
-  border-color: transparent;
-  background: transparent;
+  padding: 0 2px;
+  cursor: pointer;
+  list-style: none;
   color: var(--muted);
-  font-size: 10px;
-  line-height: 16px;
+  font-size: 12px;
+  line-height: 18px;
+  letter-spacing: -1px;
+}
+.outbox-menu > summary::-webkit-details-marker {
+  display: none;
+}
+.outbox-menu-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 3px);
+  display: grid;
+  width: max-content;
+  min-width: 118px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel2);
+  box-shadow: 0 8px 24px #0003;
+}
+.outbox-menu-popover button {
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font-size: 12px;
+}
+.outbox-delete {
+  color: var(--muted);
 }
 .outbox-delete:hover {
   color: var(--danger);
 }
 .tool-group {
-  margin: 6px 0 1px;
+  margin: 12px 0 1px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 14px;
 }
 .tool-group > summary {
   display: inline-flex;
@@ -2097,7 +2132,7 @@ label.caption {
   }
   .message-body,
   .message.user .message-body {
-    font-size: 14px;
+    font-size: 15px;
   }
   .composer-shell textarea {
     font-size: 14px;
@@ -2317,7 +2352,7 @@ label.caption {
   }
   #messages {
     min-height: calc(100dvh - 42px);
-    padding: 14px max(20px, env(safe-area-inset-right)) calc(var(--composer-height, 92px) + 12px)
+    padding: 18px max(20px, env(safe-area-inset-right)) calc(var(--composer-height, 92px) + 18px)
       max(20px, env(safe-area-inset-left));
     overflow: visible;
     overscroll-behavior: auto;
@@ -2375,6 +2410,9 @@ label.caption {
     max-height: 26vh;
     padding: 4px max(20px, env(safe-area-inset-right)) 2px max(20px, env(safe-area-inset-left));
     background: linear-gradient(var(--panel) 74%, transparent);
+  }
+  .message-copy {
+    opacity: 0.5;
   }
   .model-picker {
     right: 14px;
@@ -2471,8 +2509,10 @@ html[data-theme="light"] {
   --diff-add-bg: #dafbe1;
   --diff-delete-text: #cf222e;
   --diff-delete-bg: #ffebe9;
-  --user-bg: #dff1ff;
-  --user-text: #0874c9;
+  --user-bg: #ececea;
+  --user-text: #20201f;
+  --queue-bg: #dff1ff;
+  --queue-text: #0874c9;
   --steer-bg: #deeddd;
   --steer-text: #48734e;
   --active-thread: #edf6ff;

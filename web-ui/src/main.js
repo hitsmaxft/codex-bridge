@@ -273,7 +273,9 @@ async function loadProjectThreads(project, offset = 0) {
       return [];
     const prior = offset ? state.projectThreads.get(project.path)?.threads || [] : [];
     state.projectThreads.set(project.path, {
-      threads: prior.concat(r.threads || []),
+      threads: prior.concat(
+        (r.threads || []).map((thread) => ({ ...thread, project_path: project.path })),
+      ),
       available: r.available || 0,
     });
     renderProjects();
@@ -666,6 +668,14 @@ function threadRow(thread) {
   return row;
 }
 function pinnedProject(thread) {
+  if (thread.project_path) {
+    const assigned = state.projects.find((project) => project.path === thread.project_path);
+    if (assigned) return assigned;
+  }
+  for (const [projectPath, data] of state.projectThreads) {
+    if (data.threads.some((candidate) => candidate.id === thread.id))
+      return state.projects.find((project) => project.path === projectPath);
+  }
   const cwd = String(thread.cwd || "").replace(/\/+$/, "");
   return state.projects
     .filter((project) => {
@@ -715,7 +725,9 @@ function renderProjects() {
   const pinned = state.pinnedThreads.filter((thread) => threadMatches(thread, q));
   const projects = state.projects.filter(
     (p) =>
-      `${p.name} ${p.path}`.toLowerCase().includes(q) ||
+      `${p.kind === "chats" ? tr("chats") : p.name} ${p.kind === "chats" ? "" : p.path}`
+        .toLowerCase()
+        .includes(q) ||
       state.projectThreads
         .get(p.path)
         ?.threads.some((t) => !state.pinnedIds.has(t.id) && threadMatches(t, q)),
@@ -748,19 +760,22 @@ function renderProjects() {
     button.innerHTML =
       '<span class="chevron"></span><span class="project-name"></span><span class="project-count"></span>';
     button.children[0].textContent = state.expanded.has(p.path) ? "▾" : "▸";
-    button.children[1].textContent = p.name;
+    button.children[1].textContent = p.kind === "chats" ? tr("chats") : p.name;
     const pinnedCount = state.pinnedThreads.filter(
       (thread) => pinnedProject(thread)?.path === p.path,
     ).length;
     button.children[2].textContent = `${Math.max(0, p.thread_count - pinnedCount)}`;
     button.onclick = () => run(() => toggleProject(p));
-    const add = document.createElement("button");
-    add.className = "project-add";
-    add.textContent = "+";
-    add.title = tr("createInProject", { project: p.name });
-    add.setAttribute("aria-label", add.title);
-    add.onclick = () => showCreateDialog(p);
-    head.append(button, add);
+    head.appendChild(button);
+    if (p.kind !== "chats") {
+      const add = document.createElement("button");
+      add.className = "project-add";
+      add.textContent = "+";
+      add.title = tr("createInProject", { project: p.name });
+      add.setAttribute("aria-label", add.title);
+      add.onclick = () => showCreateDialog(p);
+      head.appendChild(add);
+    }
     wrap.appendChild(head);
     const list = document.createElement("div");
     list.className = "project-threads";
@@ -1548,8 +1563,8 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
         message,
       ]),
     ),
-    fragment = document.createDocumentFragment();
-  if (response.page.has_more) fragment.appendChild(olderButton());
+    nodes = [];
+  if (response.page.has_more) nodes.push(root.querySelector(":scope > .older") || olderButton());
   for (const message of response.messages) {
     const key = String(message.message_index),
       previous = existing.get(key),
@@ -1561,20 +1576,31 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
       previousState?.signature === signature &&
       previousState.keepToolsRunning === keepToolsRunning
     ) {
-      fragment.appendChild(previous);
+      nodes.push(previous);
       continue;
     }
     const next = messageNode(message, keepToolsRunning);
     if (previous) preserveLoadedToolDetails(previous, next);
-    fragment.appendChild(next);
+    nodes.push(next);
   }
   if (!response.messages.length) {
-    const empty = document.createElement("div");
+    const empty = root.querySelector(":scope > .empty") || document.createElement("div");
     empty.className = "empty";
     empty.textContent = tr("noMessages");
-    fragment.appendChild(empty);
+    nodes.push(empty);
   }
-  root.replaceChildren(fragment);
+  // Move only nodes whose order changed. Re-appending every existing message to
+  // a fragment briefly detaches the whole timeline and produces a visible jump.
+  let cursor = root.firstChild;
+  for (const node of nodes) {
+    if (node === cursor) cursor = cursor.nextSibling;
+    else root.insertBefore(node, cursor);
+  }
+  while (cursor) {
+    const next = cursor.nextSibling;
+    cursor.remove();
+    cursor = next;
+  }
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
@@ -1584,22 +1610,27 @@ function pendingNode(entry) {
   const body = document.createElement("div");
   body.className = "message-body";
   body.appendChild(markdownNode(entry.text, markdownOptions(entry.thread_id || state.current?.id)));
-  if (!entry.handoff && ["queue", "steer"].includes(entry.action)) {
-    const mode = document.createElement("div");
-    mode.className = "outbox-mode";
-    mode.textContent = tr(entry.action === "steer" ? "followUp" : "queue");
-    body.appendChild(mode);
-  }
-  const actions = document.createElement("div"),
+  const meta = document.createElement("div"),
     busy = ["queueing", "steering"].includes(entry.status);
-  actions.className = "outbox-actions";
+  meta.className = "outbox-meta";
   if (entry.handoff) {
     const status = document.createElement("div");
     status.className = "outbox-status";
     status.textContent = tr(entry.status === "processing" ? "processingShort" : "acceptedShort");
     status.title = tr(entry.status === "processing" ? "handoffProcessing" : "serverAccepted");
-    actions.appendChild(status);
+    meta.appendChild(status);
   } else {
+    const mode = document.createElement("span"),
+      menu = document.createElement("details"),
+      summary = document.createElement("summary"),
+      popover = document.createElement("div");
+    mode.className = "outbox-mode";
+    mode.textContent = tr(entry.action === "steer" ? "followUp" : "queue");
+    menu.className = "outbox-menu";
+    summary.textContent = "•••";
+    summary.title = tr("pendingMenu");
+    summary.setAttribute("aria-label", summary.title);
+    popover.className = "outbox-menu-popover";
     const remove = document.createElement("button");
     remove.className = "outbox-delete";
     remove.type = "button";
@@ -1607,17 +1638,48 @@ function pendingNode(entry) {
     remove.disabled = busy;
     remove.title = busy ? tr("deleteBusy") : tr("deleteRestore");
     remove.setAttribute("aria-label", remove.title);
-    remove.onclick = () => run(() => deletePending(entry, remove));
-    actions.appendChild(remove);
+    remove.onclick = (event) => {
+      event.stopPropagation();
+      menu.open = false;
+      run(() => deletePending(entry, remove));
+    };
+    popover.appendChild(remove);
+    const hasAttachmentSummary = entry.text
+      .split("\n")
+      .some((line) => ["[Image attachment]", "[Audio attachment]"].includes(line.trim()));
+    const nativeQueue = ["app_server_queue", "demo_wasm"].includes(entry.source);
+    if (entry.action === "queue" && nativeQueue && !hasAttachmentSummary) {
+      const convert = document.createElement("button");
+      convert.type = "button";
+      convert.textContent = tr("convertToSteer");
+      convert.disabled = busy;
+      convert.onclick = (event) => {
+        event.stopPropagation();
+        menu.open = false;
+        run(() => convertPendingToSteer(entry, convert));
+      };
+      popover.prepend(convert);
+    }
+    menu.append(summary, popover);
+    meta.append(mode, menu);
   }
-  box.append(actions, body);
+  box.append(meta, body);
   return box;
 }
 function renderPending() {
   const tray = $("outboxTray"),
-    entries = state.pending.filter((entry) => entry.thread_id === state.current?.id);
+    entries = state.pending.filter((entry) => entry.thread_id === state.current?.id),
+    openMenus = new Set(
+      [...tray.querySelectorAll(".outbox-item .outbox-menu[open]")]
+        .map((menu) => menu.closest(".outbox-item")?.dataset.pendingId)
+        .filter(Boolean),
+    );
   tray.textContent = "";
-  for (const entry of entries) tray.appendChild(pendingNode(entry));
+  for (const entry of entries) {
+    const node = pendingNode(entry);
+    if (openMenus.has(entry.id)) node.querySelector(".outbox-menu").open = true;
+    tray.appendChild(node);
+  }
   const delivery = state.delivery?.threadId === state.current?.id ? state.delivery : null,
     pendingStillVisible = delivery?.pendingId
       ? entries.some((entry) => entry.id === delivery.pendingId)
@@ -1683,6 +1745,56 @@ async function deletePending(entry, button) {
     $("messageText").focus();
     $("messageText").setSelectionRange(text.length, text.length);
     notify(r.queue_deleted ? tr("queueDeletedRestore") : tr("deletedRestore"));
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
+async function convertPendingToSteer(entry, button) {
+  if (state.current?.id !== entry.thread_id) throw new Error(tr("pendingWrongSession"));
+  button.disabled = true;
+  const activity = await refreshActivity();
+  if (!activity?.activity.active_turn_id) {
+    button.disabled = false;
+    throw new Error(tr("convertRequiresActive"));
+  }
+  const initialTurnId = activity.activity.active_turn_id,
+    initialMessageIndex = state.lastMessageIndex;
+  const withdrawn = await command(
+    { command: "pending_message_delete", id: entry.id, thread_id: entry.thread_id },
+    false,
+  );
+  state.pending = state.pending.filter(
+    (item) => item.id !== entry.id || item.thread_id !== entry.thread_id,
+  );
+  if (state.delivery?.pendingId === entry.id) setDeliveryState(null);
+  renderPending();
+  try {
+    const steered = await command(
+      { command: "steer", thread_id: entry.thread_id, text: withdrawn.text, attachments: [] },
+      false,
+    );
+    setDeliveryState("accepted", {
+      threadId: entry.thread_id,
+      mode: "steer",
+      pendingId: steered.pending_id || null,
+      initialTurnId,
+      initialMessageIndex,
+      started: true,
+      dismissed: false,
+      onScreen: false,
+      text: withdrawn.text,
+    });
+    if (state.current?.id === entry.thread_id)
+      await openThread(state.current, { quiet: true, preserveView: true });
+    notify(tr("queueConverted"));
+  } catch (error) {
+    if (state.current?.id === entry.thread_id) {
+      $("messageText").value = withdrawn.text;
+      saveDraft(entry.thread_id, withdrawn.text, true);
+      setSendMode("steer", false);
+      resizeComposerTextarea();
+    }
+    throw new Error(`${tr("convertFailedRestored")} ${error.message || error}`);
   } finally {
     if (button.isConnected) button.disabled = false;
   }
@@ -1789,9 +1901,16 @@ function messageScrollMetrics() {
   }
   return { top: root.scrollTop, height: root.scrollHeight, client: root.clientHeight };
 }
-function scrollMessagesToBottom() {
-  if (usesDocumentMessageScroll()) window.scrollTo(0, document.documentElement.scrollHeight);
-  else $("messages").scrollTop = $("messages").scrollHeight;
+function setMessageScrollTop(top, behavior = "auto") {
+  if (usesDocumentMessageScroll()) window.scrollTo({ top, behavior });
+  else $("messages").scrollTo({ top, behavior });
+}
+function scrollMessagesToBottom(behavior = "auto") {
+  setMessageScrollTop(messageScrollMetrics().height, behavior);
+}
+function messageViewportTop() {
+  if (!usesDocumentMessageScroll()) return $("messages").getBoundingClientRect().top;
+  return Math.max(0, document.querySelector(".thread-head")?.getBoundingClientRect().bottom || 0);
 }
 function renderTransientStatus(active) {
   const root = $("messages"),
@@ -2237,10 +2356,16 @@ function settleHorizontalPosition() {
 }
 function captureMessageView() {
   const root = $("messages"),
-    metrics = messageScrollMetrics();
+    metrics = messageScrollMetrics(),
+    viewportTop = messageViewportTop(),
+    anchor = [...root.querySelectorAll(":scope > .message[data-message-index]")].find(
+      (message) => message.getBoundingClientRect().bottom > viewportTop + 1,
+    );
   return {
     atBottom: metrics.height - metrics.top - metrics.client < 100,
     top: metrics.top,
+    anchorMessageIndex: anchor?.dataset.messageIndex || null,
+    anchorOffset: anchor ? anchor.getBoundingClientRect().top - viewportTop : null,
     openDetails: [...root.querySelectorAll(".message details[open]")].map((detail) => {
       const message = detail.closest(".message");
       return `${message?.dataset.messageIndex || ""}:${[
@@ -2249,7 +2374,7 @@ function captureMessageView() {
     }),
   };
 }
-function restoreMessageView(view) {
+function restoreMessageView(view, { smoothBottom = false } = {}) {
   if (!view) return scrollMessagesToBottom();
   const openDetails = new Set(view.openDetails);
   for (const message of $("messages").querySelectorAll(".message")) {
@@ -2257,9 +2382,20 @@ function restoreMessageView(view) {
       detail.open = openDetails.has(`${message.dataset.messageIndex || ""}:${index}`);
     });
   }
-  if (view.atBottom) scrollMessagesToBottom();
-  else if (usesDocumentMessageScroll()) window.scrollTo(0, view.top);
-  else $("messages").scrollTop = view.top;
+  if (view.atBottom) {
+    const smooth = smoothBottom && !matchMedia("(prefers-reduced-motion: reduce)").matches;
+    scrollMessagesToBottom(smooth ? "smooth" : "auto");
+    return;
+  }
+  const anchor = view.anchorMessageIndex
+    ? [...$("messages").querySelectorAll(":scope > .message[data-message-index]")].find(
+        (message) => message.dataset.messageIndex === view.anchorMessageIndex,
+      )
+    : null;
+  if (anchor && view.anchorOffset !== null) {
+    const delta = anchor.getBoundingClientRect().top - messageViewportTop() - view.anchorOffset;
+    setMessageScrollTop(messageScrollMetrics().top + delta);
+  } else setMessageScrollTop(view.top);
 }
 async function openThread(
   thread,
@@ -2267,7 +2403,8 @@ async function openThread(
 ) {
   const token = ++state.openToken,
     changedThread = state.current?.id !== thread.id,
-    messageView = quiet && preserveView && !changedThread ? captureMessageView() : null;
+    messageView = quiet && preserveView && !changedThread ? captureMessageView() : null,
+    previousHistoryTotal = state.historyTotal;
   if (!quiet) {
     closePanels();
     setThreadHeaderExpanded(false);
@@ -2355,7 +2492,12 @@ async function openThread(
   reconcileMessageNodes(root, r, activeToolMessage);
   applyMessagePageState(r);
   renderPending();
-  restoreMessageView(messageView);
+  restoreMessageView(messageView, {
+    smoothBottom:
+      Boolean(messageView?.atBottom) &&
+      previousHistoryTotal !== null &&
+      r.page.total > previousHistoryTotal,
+  });
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
   await refreshPending();
@@ -2444,7 +2586,7 @@ async function interruptCurrentRun({ confirm = true, requireActive = false } = {
   $("submitBtn").disabled = true;
   syncSubmitAction();
   try {
-    await command(targetRequest("interrupt"));
+    await command(targetRequest("interrupt", { turn_id: state.activeTurnId }));
     if (state.current?.id) setThreadRunState(state.current.id, "cancelled");
     notify(tr("turnInterrupted"));
     await refreshActivity();
@@ -2874,6 +3016,9 @@ document.addEventListener("click", (event) => {
     !$("modelPickerBtn").contains(event.target)
   )
     $("modelPicker").hidden = true;
+  for (const menu of document.querySelectorAll(".outbox-menu[open]")) {
+    if (!menu.contains(event.target)) menu.open = false;
+  }
 });
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;

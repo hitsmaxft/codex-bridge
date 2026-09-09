@@ -92,6 +92,17 @@ so it is stored in browser storage. On startup, the UI restores that preference 
 existing lightweight `project_threads` summaries for expanded folders with at most three concurrent
 requests; opening a folder is no longer the trigger for its first load.
 
+Project grouping uses both app-server's explicit assignment and its project-root catalogue.
+`thread.projectId` is the canonical persisted assignment when populated, while `project/list`
+resolves project names and roots. Current app-server versions can still return `projectId: null` for
+older project conversations, so the bridge next matches `thread.cwd` against the longest known
+project root. Only a thread known to app-server that has neither a valid assignment nor a matching
+root is shown in the virtual **Chats** group. `ephemeral` is not used because it only means that the
+thread is not materialized on disk. If an older or currently starting rollout is missing from
+`thread/list`, the bridge temporarily falls back to its existing cwd/Git-root grouping. The project
+index is paged and cached for ten seconds so expanding several folders does not repeat the same
+metadata scan.
+
 Some older or very long threads return `-32601` for `thread/items/list` even after a successful
 metadata-only resume. For those threads only, the rollout compatibility path recognizes the fixed
 `text(await tools.<name>(...))` envelope and splits its calls into bounded structured tool entries.

@@ -372,6 +372,21 @@ test("composer keeps images as attachments and transcribes voice into editable t
 });
 
 test("expanded folders preload summaries and mobile buttons keep native click delivery", async () => {
+  const command = await demoClient();
+  const projects = result(command({ command: "projects", include_archived: false })).projects;
+  const chats = projects.find((project) => project.kind === "chats");
+  assert.ok(chats);
+  assert.equal(chats.path, "codex-bridge://chats");
+  assert.equal(
+    result(
+      command({
+        command: "project_threads",
+        project_path: chats.path,
+        include_archived: false,
+      }),
+    ).threads[0].id,
+    "demo-thread-protocol",
+  );
   const source = await readFile(mainScriptPath, "utf8");
   assert.match(source, /storedExpandedProjects\(window\.localStorage\)/);
   assert.match(source, /preloadExpandedProjectThreads\(\)/);
@@ -383,6 +398,8 @@ test("expanded folders preload summaries and mobile buttons keep native click de
   assert.ok(pointerHandler);
   assert.doesNotMatch(pointerHandler, /preventDefault/);
   assert.doesNotMatch(source, /composerShell\.addEventListener\(\s*"pointerdown"/);
+  assert.match(source, /p\.kind === "chats" \? tr\("chats"\) : p\.name/);
+  assert.match(source, /if \(p\.kind !== "chats"\)/);
 });
 
 test("structured command actions stay separate and preserve multiline commands", async () => {
@@ -415,7 +432,54 @@ test("local task file links resolve to workspace paths", () => {
     localFilePath("file:///Users/example/project/firmware.elf"),
     "/Users/example/project/firmware.elf",
   );
+  assert.equal(
+    localFilePath("</Users/example/project/release.zip>"),
+    "/Users/example/project/release.zip",
+  );
+  assert.equal(
+    localFilePath("%3C%2FUsers%2Fexample%2Fproject%2Frelease.zip%3E"),
+    "/Users/example/project/release.zip",
+  );
+  assert.equal(
+    localFilePath("<file:///Users/example/project/release%20build.zip>"),
+    "/Users/example/project/release build.zip",
+  );
+  assert.equal(
+    localFilePath("https://bridge.example/%3C%2FUsers%2Fexample%2Fproject%2Frelease.zip%3E"),
+    "/Users/example/project/release.zip",
+  );
+  assert.equal(
+    localFilePath("https://bridge.example/%3C/Users/example/project/release.zip%3E"),
+    "/Users/example/project/release.zip",
+  );
+  assert.equal(localFilePath("/Users/example/project/100%.zip"), "/Users/example/project/100%.zip");
   assert.equal(localFilePath("https://example.com/firmware.elf"), null);
+});
+
+test("interrupt requests carry the app-server turn observed by the UI", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /targetRequest\("interrupt", \{ turn_id: state\.activeTurnId \}\)/);
+});
+
+test("message refresh preserves stable nodes and viewport anchors", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /root\.insertBefore\(node, cursor\)/);
+  assert.match(source, /anchorMessageIndex/);
+  assert.match(source, /smoothBottom/);
+  const reconcile = source.slice(
+    source.indexOf("function reconcileMessageNodes"),
+    source.indexOf("function pendingNode"),
+  );
+  assert.doesNotMatch(reconcile, /replaceChildren/);
+});
+
+test("queued messages expose withdraw and convert-to-steer actions", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /function convertPendingToSteer/);
+  assert.match(source, /command: "pending_message_delete"/);
+  assert.match(source, /command: "steer"/);
+  assert.match(source, /className = "outbox-menu"/);
+  assert.match(source, /openMenus/);
 });
 
 test("authentication gate serializes concurrent startup requests", async () => {

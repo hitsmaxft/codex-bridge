@@ -275,6 +275,7 @@ impl Command {
             Self::Interrupt { json } => Ok((
                 Request::Interrupt {
                     thread_id: target_thread,
+                    turn_id: None,
                 },
                 json,
                 OutputKind::Write,
@@ -666,7 +667,8 @@ mod tests {
         assert_eq!(
             request,
             Request::Interrupt {
-                thread_id: Some("thread-2".into())
+                thread_id: Some("thread-2".into()),
+                turn_id: None,
             }
         );
     }
