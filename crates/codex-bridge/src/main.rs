@@ -1187,6 +1187,22 @@ struct ManagedProcessSpec {
     preserve_on_shutdown: bool,
 }
 
+const DESKTOP_MCP_BASE_CONFIG: &str = r#"mcp_servers.codex_app={command="",enabled=false}"#;
+
+fn managed_app_server_args(socket: &Path, desktop_interposition: bool) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(if desktop_interposition { 5 } else { 3 });
+    if desktop_interposition {
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(DESKTOP_MCP_BASE_CONFIG));
+    }
+    args.extend([
+        OsString::from("app-server"),
+        OsString::from("--listen"),
+        OsString::from(format!("unix://{}", socket.display())),
+    ]);
+    args
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedSocketState {
     Vacant,
@@ -1616,15 +1632,10 @@ async fn main() -> Result<()> {
         let socket = app_server_socket
             .as_deref()
             .context("managed app-server has no configured socket")?;
-        let listen = OsString::from(format!("unix://{}", socket.display()));
         let spec = ManagedProcessSpec {
             name: "app-server",
             program: codex_program.clone(),
-            args: vec![
-                OsString::from("app-server"),
-                OsString::from("--listen"),
-                listen,
-            ],
+            args: managed_app_server_args(socket, args.desktop_interposition),
             environment: args.app_server_environment.clone(),
             remove_environment: vec![
                 OsString::from("CODEX_APP_SERVER_WS_URL"),
@@ -5698,6 +5709,30 @@ mod tests {
             "codex-bridge-{label}-{}-{sequence}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn managed_app_server_args_seed_desktop_mcp_transport_only_for_interposition() {
+        let socket = Path::new("/tmp/codex-app-server.sock");
+
+        assert_eq!(
+            managed_app_server_args(socket, true),
+            vec![
+                OsString::from("-c"),
+                OsString::from(r#"mcp_servers.codex_app={command="",enabled=false}"#),
+                OsString::from("app-server"),
+                OsString::from("--listen"),
+                OsString::from("unix:///tmp/codex-app-server.sock"),
+            ]
+        );
+        assert_eq!(
+            managed_app_server_args(socket, false),
+            vec![
+                OsString::from("app-server"),
+                OsString::from("--listen"),
+                OsString::from("unix:///tmp/codex-app-server.sock"),
+            ]
+        );
     }
 
     #[test]

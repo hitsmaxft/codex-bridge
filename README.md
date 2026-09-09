@@ -88,7 +88,9 @@ The app-server executable comes from `ChatGPT.app`. In the installed desktop mod
 `CODEX_APP_SERVER_WS_URL` through the user's launchd environment. launchd only has to keep the one
 bridge daemon alive. This transport interposition is local and does not patch or re-sign the app
 bundle. Bridge-only upgrades preserve the healthy app-server process and adopt its Unix socket on
-restart, so active turns do not move to a new app-server PID.
+restart, so active turns do not move to a new app-server PID. The managed Desktop app-server also
+starts with a disabled `mcp_servers.codex_app` base entry; Desktop can then send its incremental
+`enabled_tools` configuration and resume an existing thread directly, without a Web UI preload.
 
 ### Standalone Codex, including Linux
 

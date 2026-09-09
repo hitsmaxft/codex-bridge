@@ -23,6 +23,9 @@ public_origins = []
 # The app-server stays alive while codex-bridge itself is upgraded or restarted.
 manage_app_server = false
 # Desktop mode can also supervise ws-unix-bridge and publish the launchd URL.
+# With both options enabled, the managed app-server receives a disabled
+# `mcp_servers.codex_app` base entry so Desktop can send its incremental tool list.
+# An external process manager must pass the same `-c` override documented in docs/install.md.
 desktop_interposition = false
 ws_bridge_listen = "127.0.0.1:18790"
 # ws_bridge_bin = "~/.cargo/bin/ws-unix-bridge"

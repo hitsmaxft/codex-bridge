@@ -355,6 +355,14 @@ pageable messages and tool details, the rollout compatibility reader can be disa
 without changing the Web UI protocol. Until then, disabling it would make older and offline
 sessions incomplete, so JSONL remains a fallback rather than a second live event source.
 
+In the shared Desktop topology, Desktop sends an incremental `mcp_servers.codex_app.enabled_tools`
+configuration when it connects. It does not resend the MCP server command or transport. The
+app-server must therefore start with the disabled base entry
+`mcp_servers.codex_app={command="",enabled=false}` before either client connects. Bridge injects
+that entry only when Desktop interposition is enabled; standalone app-server startup remains
+unchanged. Verify this contract by resuming an existing thread directly in Desktop without first
+opening it in the Web UI.
+
 ### Strong user-facing candidates
 
 1. **Native queue editor** — add editing and drag ordering through `thread/queue/update` and
@@ -398,6 +406,8 @@ sessions incomplete, so JSONL remains a fallback rather than a second live event
 
 - Generate schemas from the exact app-server binary deployed with the bridge; do not assume a
   schema from another Desktop or CLI version is compatible.
+- Treat process-level base configuration and per-client incremental configuration as one
+  compatibility contract; a healthy socket alone does not validate configuration merging.
 - Feature-detect methods during initialization and hide unsupported controls.
 - Keep experimental methods behind a capability flag and provide a fallback where the feature is
   essential.

@@ -119,7 +119,16 @@ rather than an interruption of active Codex turns. Explicitly disabling manageme
 an app-server preserved by the previous bridge; stop that process separately when retirement is
 intentional. `services.desktop_interposition = true` is valid only in `desktop` mode;
 it also supervises `ws-unix-bridge` and sets `CODEX_APP_SERVER_WS_URL` in the user's launchd
-environment. Leave both false when another service manager owns those processes.
+environment. In this topology the bridge starts the app-server with:
+
+```sh
+codex -c 'mcp_servers.codex_app={command="",enabled=false}' app-server --listen unix://SOCKET
+```
+
+Desktop supplies only an incremental `enabled_tools` value for `mcp_servers.codex_app`; the
+disabled base entry keeps that partial configuration structurally valid. If another service
+manager owns the shared app-server, it must use the same `-c` override. Leave both service options
+false when another manager owns the processes and supplies the required arguments itself.
 `services.app_server_environment` is passed only to the managed app-server; the daemon removes
 Desktop interposition variables from that child to avoid a recursive connection.
 
@@ -201,6 +210,16 @@ To restart after editing `config.toml`:
 ```sh
 launchctl kickstart -k "gui/$(id -u)/local.codex-bridge.daemon"
 ```
+
+When upgrading from v0.2.4 or earlier, the bridge can adopt the already-running app-server but
+cannot retrofit its process arguments. Fully quit ChatGPT, identify the process that owns
+`~/.codex-bridge/bundled-app-server.sock`, stop that exact process once, and restart the daemon.
+This one-time app-server restart applies the Desktop MCP base configuration; later bridge-only
+upgrades can preserve and adopt the corrected process normally.
+
+After relaunching ChatGPT, open an existing thread directly in Desktop before opening it in the Web
+UI. A successful direct resume is the acceptance check for the incremental MCP configuration;
+`codexctl status` and socket ownership alone verify transport health, not this configuration path.
 
 To disable Desktop interposition while retaining installed files, fully quit ChatGPT and run:
 
