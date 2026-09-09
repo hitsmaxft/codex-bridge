@@ -920,7 +920,7 @@ async function createThread(worktree) {
     $("createDialog").hidden = true;
     state.creatingProject = null;
     await loadProjects();
-    const targetPath = r.worktree_path || r.project_path,
+    const targetPath = r.project_path,
       target = state.projects.find((item) => item.path === targetPath);
     if (target) {
       setProjectExpanded(target.path, true);

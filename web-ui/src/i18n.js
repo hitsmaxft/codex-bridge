@@ -177,7 +177,7 @@ const messages = {
       "Start in the existing directory and include current uncommitted changes.",
     newWorktree: "New worktree",
     newWorktreeHelp:
-      "Create an isolated detached worktree from HEAD; uncommitted changes are not copied.",
+      "Create a Codex-compatible isolated worktree from HEAD; uncommitted changes are not copied.",
     cancel: "Cancel",
     languageSwitch: "Switch to Chinese",
     directOnline: "direct app-server online",
@@ -485,7 +485,8 @@ const messages = {
     currentDirectory: "当前目录",
     currentDirectoryHelp: "在现有目录启动，可直接看到当前未提交修改。",
     newWorktree: "新 Worktree",
-    newWorktreeHelp: "从当前 HEAD 创建隔离的 detached worktree；未提交修改不会复制过去。",
+    newWorktreeHelp:
+      "从当前 HEAD 创建与 Codex/Desktop 兼容的隔离 worktree；未提交修改不会复制过去。",
     cancel: "取消",
     languageSwitch: "Switch to English",
     directOnline: "直连 app-server 在线",

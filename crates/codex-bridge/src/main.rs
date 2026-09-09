@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
@@ -60,6 +60,7 @@ const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
 const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
 const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
+#[cfg(test)]
 static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
@@ -3018,7 +3019,7 @@ struct ThreadCreateFailure {
 fn prepare_thread_cwd(
     project_path: &Path,
     worktree: bool,
-    bridge_home: &Path,
+    codex_home: &Path,
 ) -> Result<PreparedThreadCwd, ThreadCreateFailure> {
     if !project_path.is_absolute() {
         return Err(ThreadCreateFailure {
@@ -3058,12 +3059,33 @@ fn prepare_thread_cwd(
             code: "worktree_create_failed",
             message: "cannot derive a worktree name from the repository root".to_owned(),
         })?;
-    let sequence = NEXT_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let worktrees_dir = bridge_home.join("worktrees");
+    let mut allocation_id = [0_u8; 16];
+    getrandom::fill(&mut allocation_id).map_err(|error| ThreadCreateFailure {
+        code: "worktree_create_failed",
+        message: format!("cannot allocate a Codex-compatible worktree ID: {error}"),
+    })?;
+    allocation_id[6] = (allocation_id[6] & 0x0f) | 0x40;
+    allocation_id[8] = (allocation_id[8] & 0x3f) | 0x80;
+    let allocation_id = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        allocation_id[0],
+        allocation_id[1],
+        allocation_id[2],
+        allocation_id[3],
+        allocation_id[4],
+        allocation_id[5],
+        allocation_id[6],
+        allocation_id[7],
+        allocation_id[8],
+        allocation_id[9],
+        allocation_id[10],
+        allocation_id[11],
+        allocation_id[12],
+        allocation_id[13],
+        allocation_id[14],
+        allocation_id[15],
+    );
+    let worktrees_dir = codex_home.join("worktrees");
     fs::create_dir_all(&worktrees_dir).map_err(|error| ThreadCreateFailure {
         code: "worktree_create_failed",
         message: format!(
@@ -3071,8 +3093,7 @@ fn prepare_thread_cwd(
             worktrees_dir.display()
         ),
     })?;
-    let allocation_dir =
-        worktrees_dir.join(format!("{timestamp:x}-{}-{sequence}", std::process::id()));
+    let allocation_dir = worktrees_dir.join(allocation_id);
     let root = allocation_dir.join(project_name);
     fs::create_dir(&allocation_dir).map_err(|error| ThreadCreateFailure {
         code: "worktree_create_failed",
@@ -4267,11 +4288,11 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 );
             }
 
-            let bridge_home = socket_path.parent().unwrap_or_else(|| session_store.home());
-            let prepared = match prepare_thread_cwd(&canonical_project, worktree, bridge_home) {
-                Ok(prepared) => prepared,
-                Err(error) => return Response::error(error.code, error.message),
-            };
+            let prepared =
+                match prepare_thread_cwd(&canonical_project, worktree, session_store.home()) {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Response::error(error.code, error.message),
+                };
             let mut params = json!({"cwd": prepared.cwd});
             if let Some(model) = model {
                 params["model"] = Value::String(model);
@@ -5943,7 +5964,7 @@ mod tests {
     fn thread_cwd_can_create_and_remove_an_isolated_git_worktree() {
         let root = unique_test_dir("worktree");
         let repository = root.join("source");
-        let bridge_home = root.join("bridge");
+        let codex_home = root.join("codex-home");
         fs::create_dir_all(&repository).unwrap();
         assert!(Command::new("git")
             .args(["init", "--quiet"])
@@ -5975,9 +5996,19 @@ mod tests {
             .unwrap()
             .success());
 
-        let prepared = prepare_thread_cwd(&repository, true, &bridge_home).unwrap();
+        let prepared = prepare_thread_cwd(&repository, true, &codex_home).unwrap();
         let worktree = prepared.worktree.as_ref().unwrap();
-        assert!(prepared.cwd.starts_with(bridge_home.join("worktrees")));
+        assert!(prepared.cwd.starts_with(codex_home.join("worktrees")));
+        let allocation_name = prepared
+            .cwd
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(allocation_name.len(), 36);
+        assert_eq!(allocation_name.matches('-').count(), 4);
         assert_eq!(
             fs::read_to_string(prepared.cwd.join("README.md")).unwrap(),
             "fixture\n"
@@ -6836,6 +6867,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         ] {
             assert!(source.contains(command), "missing {command}");
         }
+        assert!(source.contains("const targetPath = r.project_path"));
+        assert!(!source.contains("r.worktree_path || r.project_path"));
         for marker in [
             "id=\"rawRequest\"",
             "Any codex-bridge Request JSON",
