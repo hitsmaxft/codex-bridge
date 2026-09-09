@@ -118,10 +118,12 @@ lets sidebar activity dots recover after a browser reconnect even when no new
 `thread/status/changed` transition occurs. Polling remains as a compatibility and gap-recovery path.
 
 The same WebSocket service snapshot includes `capabilities.audio_transcription` with `enabled`,
-`reason`, and `auth_mode`. The ordinary status request and `account/updated` refresh this value;
-periodic snapshots only forward the cached result. The Web UI can therefore disable the microphone
-before recording when the current app-server authentication mode cannot use realtime
-transcription, without triggering an auth refresh or opening a trial realtime session.
+`reason`, `auth_mode`, and the selected backend. A background connection monitor refreshes this
+value when app-server connects or disconnects without repeatedly reading account state. When the
+optional `whisper` feature and `[services.whisper]` configuration are enabled, the bridge starts its loopback-only
+`whisper-server` child only while app-server realtime transcription is unavailable. The Web UI can
+therefore disable the microphone while neither backend is ready and automatically recover when one
+becomes available.
 
 ## Client-to-server method catalogue
 
@@ -257,7 +259,9 @@ The current bundled schema exposes no standalone dictation RPC. Its speech-to-te
 `thread/realtime/transcript/done` notification. In the bundled build tested on 2026-09-08,
 realtime v2 with text output rejects ChatGPT-subscription authentication and requires API-key
 authentication. The bridge therefore reports this capability error explicitly; it never falls back
-to sending recorded audio as an ordinary Codex message attachment.
+to sending recorded audio as an ordinary Codex message attachment. A build with the optional
+`whisper` feature may instead convert the PCM recording into a local 16 kHz mono WAV and return the
+managed whisper.cpp server's transcript to the editable composer.
 
 ### Diagnostics and platform support
 

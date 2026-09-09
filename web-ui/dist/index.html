@@ -7,8 +7,8 @@
       content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
     />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=e8fdb88bea37"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=42064340e91f">
+    <script type="module" crossorigin src="/assets/app.js?v=e018e055a437"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=d6ff7dd55f4d">
   </head>
   <body>
     <div class="app">
@@ -69,6 +69,7 @@
           <section class="settings-card">
             <h3 data-i18n="bridgeStatus">Bridge status</h3>
             <div class="settings-value" id="bridgeState" data-i18n="connecting">Connecting…</div>
+            <div class="runtime-architecture" id="runtimeArchitecture"></div>
             <div class="component-status" id="componentStatus"></div>
             <button id="statusBtn" data-i18n="refreshStatus">Refresh status</button>
           </section>
@@ -81,6 +82,11 @@
               <option value="light" data-i18n="light">Light</option>
               <option value="system" data-i18n="followSystem">Follow system</option>
             </select>
+            <label for="notificationBtn" data-i18n="browserNotifications"
+              >Browser notifications</label
+            >
+            <div class="settings-help" id="notificationHelp"></div>
+            <button id="notificationBtn" type="button">Enable notifications</button>
           </section>
         </div>
       </aside>

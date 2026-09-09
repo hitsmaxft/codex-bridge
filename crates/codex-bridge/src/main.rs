@@ -37,6 +37,9 @@ use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 
+#[cfg(feature = "whisper")]
+mod whisper;
+
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_WEB_REQUEST_BYTES: usize = 12 * 1024 * 1024;
 const MAX_COMPOSER_ATTACHMENTS: usize = 6;
@@ -50,6 +53,7 @@ const WEB_SESSION_COOKIE: &str = "codex_bridge_session";
 const WEB_SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
 const DEFAULT_WS_BRIDGE_ADDR: &str = "127.0.0.1:18790";
+const DEFAULT_WHISPER_ADDR: &str = "127.0.0.1:18792";
 const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
 const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
@@ -188,6 +192,19 @@ struct ServiceFileConfig {
     ws_bridge_listen: Option<SocketAddr>,
     ws_bridge_bin: Option<PathBuf>,
     app_server_environment: Option<HashMap<String, String>>,
+    #[serde(default)]
+    whisper: WhisperFileConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WhisperFileConfig {
+    enabled: Option<bool>,
+    bin: Option<PathBuf>,
+    model: Option<PathBuf>,
+    listen: Option<SocketAddr>,
+    language: Option<String>,
+    threads: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -212,6 +229,16 @@ struct RuntimeArgs {
     ws_bridge_listen: SocketAddr,
     ws_bridge_bin: Option<PathBuf>,
     app_server_environment: HashMap<String, String>,
+    whisper: Option<WhisperRuntimeConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct WhisperRuntimeConfig {
+    bin: PathBuf,
+    model: PathBuf,
+    listen: SocketAddr,
+    language: String,
+    threads: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -232,6 +259,9 @@ struct BridgeState {
     ws_bridge_listen: Option<SocketAddr>,
     managed_app_server_status: Option<watch::Receiver<ManagedProcessStatus>>,
     ws_bridge_status: Option<watch::Receiver<ManagedProcessStatus>>,
+    whisper: Option<WhisperRuntimeConfig>,
+    whisper_needed: Option<watch::Sender<bool>>,
+    whisper_status: Option<watch::Receiver<ManagedProcessStatus>>,
     server_capabilities: Arc<RwLock<Value>>,
 }
 
@@ -1038,6 +1068,59 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
             "services.manage_app_server requires an app-server socket or a concrete runtime mode"
         );
     }
+    let whisper = if config.services.whisper.enabled.unwrap_or(false) {
+        if !cfg!(feature = "whisper") {
+            bail!(
+                "services.whisper.enabled requires codex-bridge to be built with --features whisper"
+            );
+        }
+        let bin = config
+            .services
+            .whisper
+            .bin
+            .map(expand_home_path)
+            .unwrap_or_else(|| PathBuf::from("whisper-server"));
+        let model = config
+            .services
+            .whisper
+            .model
+            .map(expand_home_path)
+            .context("services.whisper.model is required when the Whisper fallback is enabled")?;
+        let listen = config.services.whisper.listen.unwrap_or_else(|| {
+            DEFAULT_WHISPER_ADDR
+                .parse()
+                .expect("valid default Whisper address")
+        });
+        if !listen.ip().is_loopback() {
+            bail!("services.whisper.listen must use a loopback address");
+        }
+        let language = config
+            .services
+            .whisper
+            .language
+            .unwrap_or_else(|| "auto".to_owned());
+        if language.is_empty()
+            || language.len() > 32
+            || !language
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("services.whisper.language must be a short language code or auto");
+        }
+        let threads = config.services.whisper.threads;
+        if threads.is_some_and(|threads| threads == 0 || threads > 256) {
+            bail!("services.whisper.threads must be between 1 and 256");
+        }
+        Some(WhisperRuntimeConfig {
+            bin,
+            model,
+            listen,
+            language,
+            threads,
+        })
+    } else {
+        None
+    };
 
     Ok(RuntimeArgs {
         mode,
@@ -1089,6 +1172,7 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         }),
         ws_bridge_bin: config.services.ws_bridge_bin.map(expand_home_path),
         app_server_environment: config.services.app_server_environment.unwrap_or_default(),
+        whisper,
     })
 }
 
@@ -1100,6 +1184,13 @@ struct ManagedProcessSpec {
     environment: HashMap<String, String>,
     remove_environment: Vec<OsString>,
     socket_path: Option<PathBuf>,
+    preserve_on_shutdown: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedSocketState {
+    Vacant,
+    Active,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1122,6 +1213,137 @@ fn spawn_managed_process(
     (task, status_rx)
 }
 
+fn spawn_conditional_managed_process(
+    spec: ManagedProcessSpec,
+    shutdown: watch::Receiver<bool>,
+    desired: watch::Receiver<bool>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    watch::Receiver<ManagedProcessStatus>,
+) {
+    let (status_tx, status_rx) = watch::channel(ManagedProcessStatus::default());
+    let task = tokio::spawn(supervise_conditional_managed_process(
+        spec, shutdown, desired, status_tx,
+    ));
+    (task, status_rx)
+}
+
+async fn supervise_conditional_managed_process(
+    spec: ManagedProcessSpec,
+    mut shutdown: watch::Receiver<bool>,
+    mut desired: watch::Receiver<bool>,
+    status_tx: watch::Sender<ManagedProcessStatus>,
+) {
+    let mut restart_count = 0_u64;
+    let mut last_error = None;
+    let mut backoff = Duration::from_millis(500);
+    while !*shutdown.borrow() {
+        while !*desired.borrow() && !*shutdown.borrow() {
+            tokio::select! {
+                changed = desired.changed() => if changed.is_err() { return; },
+                changed = shutdown.changed() => if changed.is_err() { return; },
+            }
+        }
+        if *shutdown.borrow() {
+            break;
+        }
+        // Mark the value that admitted this run as observed. Otherwise a
+        // pre-start false -> true transition can wake the in-process selector
+        // immediately and hide the later true -> false stop transition.
+        desired.borrow_and_update();
+        eprintln!(
+            "[codex-bridge] starting managed {} fallback: {}",
+            spec.name,
+            spec.program.display()
+        );
+        let mut command = TokioCommand::new(&spec.program);
+        command.args(&spec.args).envs(&spec.environment);
+        for name in &spec.remove_environment {
+            command.env_remove(name);
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                restart_count = restart_count.saturating_add(1);
+                last_error = Some(error.to_string());
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: last_error.clone(),
+                });
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {},
+                    _ = desired.changed() => {},
+                    _ = shutdown.changed() => return,
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(10));
+                continue;
+            }
+        };
+        status_tx.send_replace(ManagedProcessStatus {
+            running: true,
+            restart_count,
+            last_error: last_error.clone(),
+        });
+        let started = Instant::now();
+        tokio::select! {
+            child_result = child.wait() => {
+                restart_count = restart_count.saturating_add(1);
+                let message = match child_result {
+                    Ok(exit_status) => format!("process exited with {exit_status}"),
+                    Err(error) => format!("failed to wait for process: {error}"),
+                };
+                last_error = Some(message.clone());
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: last_error.clone(),
+                });
+                eprintln!("[codex-bridge] managed {} {message}", spec.name);
+            }
+            changed = desired.changed() => {
+                if changed.is_err() || !*desired.borrow() {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    last_error = None;
+                    status_tx.send_replace(ManagedProcessStatus {
+                        running: false,
+                        restart_count,
+                        last_error: None,
+                    });
+                    backoff = Duration::from_millis(500);
+                    continue;
+                }
+            }
+            _ = shutdown.changed() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error,
+                });
+                return;
+            }
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            backoff = Duration::from_millis(500);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {},
+            _ = desired.changed() => {},
+            _ = shutdown.changed() => return,
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
 async fn supervise_managed_process(
     spec: ManagedProcessSpec,
     mut shutdown: watch::Receiver<bool>,
@@ -1132,24 +1354,61 @@ async fn supervise_managed_process(
     let mut last_error = None;
     while !*shutdown.borrow() {
         if let Some(path) = spec.socket_path.as_deref() {
-            if let Err(error) = prepare_managed_process_socket(path).await {
-                restart_count = restart_count.saturating_add(1);
-                last_error = Some(error.to_string());
-                status_tx.send_replace(ManagedProcessStatus {
-                    running: false,
-                    restart_count,
-                    last_error: last_error.clone(),
-                });
-                eprintln!(
-                    "[codex-bridge] cannot prepare managed {} socket: {error:#}",
-                    spec.name
-                );
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {}
-                    _ = shutdown.changed() => return,
+            match prepare_managed_process_socket(path).await {
+                Ok(ManagedSocketState::Active) => {
+                    last_error = None;
+                    status_tx.send_replace(ManagedProcessStatus {
+                        running: true,
+                        restart_count,
+                        last_error: None,
+                    });
+                    eprintln!(
+                        "[codex-bridge] adopted managed {} already listening on {}",
+                        spec.name,
+                        path.display()
+                    );
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                                match prepare_managed_process_socket(path).await {
+                                    Ok(ManagedSocketState::Active) => continue,
+                                    Ok(ManagedSocketState::Vacant) => break,
+                                    Err(error) => {
+                                        last_error = Some(error.to_string());
+                                        status_tx.send_replace(ManagedProcessStatus {
+                                            running: false,
+                                            restart_count,
+                                            last_error: last_error.clone(),
+                                        });
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = shutdown.changed() => return,
+                        }
+                    }
+                    continue;
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(10));
-                continue;
+                Ok(ManagedSocketState::Vacant) => {}
+                Err(error) => {
+                    restart_count = restart_count.saturating_add(1);
+                    last_error = Some(error.to_string());
+                    status_tx.send_replace(ManagedProcessStatus {
+                        running: false,
+                        restart_count,
+                        last_error: last_error.clone(),
+                    });
+                    eprintln!(
+                        "[codex-bridge] cannot prepare managed {} socket: {error:#}",
+                        spec.name
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = shutdown.changed() => return,
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                    continue;
+                }
             }
         }
         eprintln!(
@@ -1166,7 +1425,7 @@ async fn supervise_managed_process(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(!spec.preserve_on_shutdown)
             .spawn();
         let mut child = match child {
             Ok(child) => child,
@@ -1212,6 +1471,13 @@ async fn supervise_managed_process(
                 eprintln!("[codex-bridge] managed {} {message}", spec.name);
             }
             _ = shutdown.changed() => {
+                if spec.preserve_on_shutdown {
+                    eprintln!(
+                        "[codex-bridge] leaving managed {} running across daemon restart",
+                        spec.name
+                    );
+                    return;
+                }
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 status_tx.send_replace(ManagedProcessStatus {
@@ -1233,10 +1499,10 @@ async fn supervise_managed_process(
     }
 }
 
-async fn prepare_managed_process_socket(path: &Path) -> Result<()> {
+async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketState> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(ManagedSocketState::Vacant),
         Err(error) => {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
@@ -1250,22 +1516,27 @@ async fn prepare_managed_process_socket(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    let mut connected = false;
+    let mut connected = 0;
+    let mut refused = 0;
     for attempt in 0..3 {
-        connected = UnixStream::connect(path).await.is_ok();
-        if !connected {
-            break;
+        if UnixStream::connect(path).await.is_ok() {
+            connected += 1;
+            if connected == 2 {
+                return Ok(ManagedSocketState::Active);
+            }
+        } else {
+            refused += 1;
+            if refused == 2 {
+                break;
+            }
         }
         if attempt < 2 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
-    if connected {
-        bail!("another process is already listening on {}", path.display());
-    }
     fs::remove_file(path)
         .with_context(|| format!("failed to remove stale socket {}", path.display()))?;
-    Ok(())
+    Ok(ManagedSocketState::Vacant)
 }
 
 fn default_ws_bridge_bin() -> Result<PathBuf> {
@@ -1339,6 +1610,8 @@ async fn main() -> Result<()> {
     let mut managed_tasks = Vec::new();
     let mut managed_app_server_status = None;
     let mut ws_bridge_status = None;
+    let mut whisper_needed = None;
+    let mut whisper_status = None;
     if args.manage_app_server {
         let socket = app_server_socket
             .as_deref()
@@ -1358,6 +1631,7 @@ async fn main() -> Result<()> {
                 OsString::from("CODEX_APP_SERVER_USE_LOCAL_DAEMON"),
             ],
             socket_path: Some(socket.to_owned()),
+            preserve_on_shutdown: true,
         };
         let (task, status) = spawn_managed_process(spec, managed_shutdown_rx.clone());
         managed_tasks.push(task);
@@ -1386,11 +1660,48 @@ async fn main() -> Result<()> {
             environment: HashMap::new(),
             remove_environment: Vec::new(),
             socket_path: None,
+            preserve_on_shutdown: false,
         };
         let (task, status) = spawn_managed_process(spec, managed_shutdown_rx.clone());
         managed_tasks.push(task);
         ws_bridge_status = Some(status);
         configure_desktop_interposition(args.ws_bridge_listen).await?;
+    }
+    if let Some(whisper) = args.whisper.as_ref() {
+        let mut whisper_args = vec![
+            OsString::from("--host"),
+            OsString::from(whisper.listen.ip().to_string()),
+            OsString::from("--port"),
+            OsString::from(whisper.listen.port().to_string()),
+            OsString::from("--model"),
+            whisper.model.as_os_str().to_owned(),
+            OsString::from("--language"),
+            OsString::from(&whisper.language),
+            OsString::from("--max-context"),
+            OsString::from("0"),
+            OsString::from("--no-timestamps"),
+        ];
+        if let Some(threads) = whisper.threads {
+            whisper_args.extend([
+                OsString::from("--threads"),
+                OsString::from(threads.to_string()),
+            ]);
+        }
+        let spec = ManagedProcessSpec {
+            name: "whisper.cpp",
+            program: whisper.bin.clone(),
+            args: whisper_args,
+            environment: HashMap::new(),
+            remove_environment: Vec::new(),
+            socket_path: None,
+            preserve_on_shutdown: false,
+        };
+        let (needed_tx, needed_rx) = watch::channel(false);
+        let (task, status) =
+            spawn_conditional_managed_process(spec, managed_shutdown_rx.clone(), needed_rx);
+        managed_tasks.push(task);
+        whisper_needed = Some(needed_tx);
+        whisper_status = Some(status);
     }
     let host_exec_policy = args.host_exec_policy;
     let host_executor = Arc::new(
@@ -1450,8 +1761,12 @@ async fn main() -> Result<()> {
         ws_bridge_listen: args.desktop_interposition.then_some(args.ws_bridge_listen),
         managed_app_server_status,
         ws_bridge_status,
+        whisper: args.whisper.clone(),
+        whisper_needed,
+        whisper_status,
         server_capabilities,
     };
+    let capability_monitor = spawn_capability_monitor(bridge_state.clone());
     let hot_cache_task = spawn_hot_session_cache(
         Arc::clone(&session_store),
         Arc::clone(&write_backend),
@@ -1489,7 +1804,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let shutdown = tokio::signal::ctrl_c();
+    let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
@@ -1522,12 +1837,30 @@ async fn main() -> Result<()> {
     if let Some(hot_cache_task) = hot_cache_task {
         hot_cache_task.abort();
     }
+    capability_monitor.abort();
     managed_shutdown_tx.send_replace(true);
     for task in managed_tasks {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to listen for SIGTERM")?;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => signal.context("failed to listen for Ctrl-C"),
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for shutdown signal")
 }
 
 fn validate_web_ui_auth_config(no_auth: bool, listen: SocketAddr) -> Result<()> {
@@ -2113,7 +2446,10 @@ fn resolve_workspace_download(
         workspace.join(requested)
     };
     let candidate = fs::canonicalize(candidate).map_err(|_| FileDownloadFailure::FileNotFound)?;
-    if !candidate.starts_with(&workspace) {
+    if !download_roots(&workspace)
+        .iter()
+        .any(|root| candidate.starts_with(root))
+    {
         return Err(FileDownloadFailure::OutsideWorkspace);
     }
     let metadata = fs::metadata(&candidate).map_err(|_| FileDownloadFailure::FileNotFound)?;
@@ -2137,6 +2473,33 @@ fn resolve_workspace_download(
         })
         .collect::<String>();
     Ok((candidate, filename, metadata.len()))
+}
+
+fn download_roots(workspace: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![workspace.to_path_buf()];
+    let Ok(output) = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(workspace)
+        .env("GIT_EXTERNAL_DIFF", "")
+        .output()
+    else {
+        return roots;
+    };
+    if !output.status.success() {
+        return roots;
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(path) = line.strip_prefix("worktree ") else {
+            continue;
+        };
+        let Ok(path) = fs::canonicalize(path) else {
+            continue;
+        };
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    roots
 }
 
 fn web_asset_response(
@@ -3101,6 +3464,11 @@ fn managed_services_snapshot(state: &BridgeState) -> Value {
         .ws_bridge_status
         .as_ref()
         .map(|status| status.borrow().clone())
+        .unwrap_or_else(|| disabled.clone());
+    let whisper = state
+        .whisper_status
+        .as_ref()
+        .map(|status| status.borrow().clone())
         .unwrap_or(disabled);
     json!({
         "app_server": {
@@ -3112,6 +3480,13 @@ fn managed_services_snapshot(state: &BridgeState) -> Value {
             "enabled": state.desktop_interposition,
             "listen": state.ws_bridge_listen,
             "status": ws_bridge,
+        },
+        "whisper": {
+            "enabled": state.whisper.is_some(),
+            "fallback": true,
+            "needed": state.whisper_needed.as_ref().is_some_and(|needed| *needed.borrow()),
+            "listen": state.whisper.as_ref().map(|config| config.listen),
+            "status": whisper,
         },
     })
 }
@@ -3139,8 +3514,8 @@ fn audio_transcription_capability(account_response: &Value) -> Value {
     }
 }
 
-fn refresh_server_capabilities(state: &BridgeState) -> Value {
-    let audio_transcription = state
+fn app_server_audio_transcription_capability(state: &BridgeState) -> Value {
+    state
         .write_backend
         .app_server_rpc("account/read", json!({"refreshToken": false}))
         .map(|response| audio_transcription_capability(&response))
@@ -3150,12 +3525,113 @@ fn refresh_server_capabilities(state: &BridgeState) -> Value {
                 "reason": "app_server_unavailable",
                 "auth_mode": null,
             })
-        });
+        })
+}
+
+#[cfg(feature = "whisper")]
+fn whisper_is_ready(config: &WhisperRuntimeConfig) -> bool {
+    whisper::is_ready(config.listen)
+}
+
+#[cfg(not(feature = "whisper"))]
+fn whisper_is_ready(_config: &WhisperRuntimeConfig) -> bool {
+    false
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_with_whisper(
+    config: &WhisperRuntimeConfig,
+    audio: &codex_bridge::RealtimeAudioChunk,
+) -> std::result::Result<String, BackendFailure> {
+    whisper::transcribe(config.listen, audio)
+}
+
+#[cfg(not(feature = "whisper"))]
+fn transcribe_with_whisper(
+    _config: &WhisperRuntimeConfig,
+    _audio: &codex_bridge::RealtimeAudioChunk,
+) -> std::result::Result<String, BackendFailure> {
+    Err(BackendFailure {
+        code: "audio_transcription_unavailable",
+        message: "codex-bridge was built without the whisper feature".to_owned(),
+    })
+}
+
+fn refresh_server_capabilities(state: &BridgeState) -> Value {
+    let native = app_server_audio_transcription_capability(state);
+    apply_audio_transcription_capability(state, native)
+}
+
+fn apply_audio_transcription_capability(state: &BridgeState, native: Value) -> Value {
+    let native_enabled = native
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(needed) = state.whisper_needed.as_ref() {
+        needed.send_replace(!native_enabled);
+    }
+    let audio_transcription = if native_enabled {
+        let mut native = native;
+        native["backend"] = json!("app_server_realtime");
+        native
+    } else if let Some(config) = state.whisper.as_ref() {
+        let process_running = state
+            .whisper_status
+            .as_ref()
+            .is_some_and(|status| status.borrow().running);
+        let ready = process_running && whisper_is_ready(config);
+        json!({
+            "enabled": ready,
+            "reason": if ready { Value::Null } else { json!("whisper_starting") },
+            "auth_mode": native.get("auth_mode").cloned().unwrap_or(Value::Null),
+            "backend": "whisper_cpp",
+            "app_server_reason": native.get("reason").cloned().unwrap_or(Value::Null),
+        })
+    } else {
+        native
+    };
     let capabilities = json!({"audio_transcription": audio_transcription});
     if let Ok(mut cached) = state.server_capabilities.write() {
         cached.clone_from(&capabilities);
     }
     capabilities
+}
+
+fn spawn_capability_monitor(state: BridgeState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_connected = None;
+        loop {
+            interval.tick().await;
+            let connected = state
+                .write_backend
+                .app_server_runtime_info()
+                .is_some_and(|runtime| runtime.connected);
+            if last_connected == Some(connected) {
+                continue;
+            }
+            last_connected = Some(connected);
+            if connected {
+                let state = state.clone();
+                if tokio::task::spawn_blocking(move || refresh_server_capabilities(&state))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            } else {
+                apply_audio_transcription_capability(
+                    &state,
+                    json!({
+                        "enabled": false,
+                        "reason": "app_server_unavailable",
+                        "auth_mode": null,
+                    }),
+                );
+            }
+        }
+    })
 }
 
 fn server_capabilities_snapshot(state: &BridgeState) -> Value {
@@ -3636,14 +4112,27 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             Err(error) => backend_error(error),
         },
         Request::ThreadWatch { thread_id } => match write_backend.watch_thread(&thread_id) {
-            Ok(result) => Response::success(json!({
-                "thread_id": thread_id,
-                "subscribed": true,
-                "thread": {
-                    "id": result.pointer("/thread/id").and_then(Value::as_str),
-                    "status": result.pointer("/thread/status").cloned(),
-                },
-            })),
+            Ok(subscription) => {
+                let thread = if subscription.pointer("/thread/status").is_some() {
+                    Ok(subscription)
+                } else {
+                    write_backend.app_server_rpc(
+                        "thread/read",
+                        json!({"threadId": thread_id, "includeTurns": false}),
+                    )
+                };
+                match thread {
+                    Ok(thread) => Response::success(json!({
+                        "thread_id": thread_id,
+                        "subscribed": true,
+                        "thread": {
+                            "id": thread.pointer("/thread/id").and_then(Value::as_str),
+                            "status": thread.pointer("/thread/status").cloned(),
+                        },
+                    })),
+                    Err(error) => write_backend_error(error),
+                }
+            }
             Err(error) => write_backend_error(error),
         },
         Request::ComposerStatus { thread_id } => {
@@ -4230,15 +4719,60 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "audio must be non-empty PCM16 with a valid sample rate, channel count, and sample count",
                 );
             }
-            match write_backend.transcribe_audio(&thread_id, &audio) {
-                Ok(text) if !text.trim().is_empty() => Response::success(json!({
-                    "action": "audio_transcribe",
-                    "thread_id": thread_id,
-                    "text": text,
-                    "backend": "app_server_realtime",
-                })),
-                Ok(_) => Response::error("audio_transcription_empty", "no speech was detected"),
-                Err(error) => write_backend_error(error),
+            let native = app_server_audio_transcription_capability(state);
+            let native_enabled = native
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut native_error = None;
+            if native_enabled {
+                match write_backend.transcribe_audio(&thread_id, &audio) {
+                    Ok(text) if !text.trim().is_empty() => {
+                        return Response::success(json!({
+                            "action": "audio_transcribe",
+                            "thread_id": thread_id,
+                            "text": text,
+                            "backend": "app_server_realtime",
+                        }));
+                    }
+                    Ok(_) => {
+                        return Response::error(
+                            "audio_transcription_empty",
+                            "no speech was detected",
+                        );
+                    }
+                    Err(error) => native_error = Some(error),
+                }
+            }
+            if let Some(config) = state.whisper.as_ref() {
+                if !whisper_is_ready(config) {
+                    return Response::error(
+                        "audio_transcription_unavailable",
+                        "the managed whisper.cpp fallback is still starting",
+                    );
+                }
+                return match transcribe_with_whisper(config, &audio) {
+                    Ok(text) => Response::success(json!({
+                        "action": "audio_transcribe",
+                        "thread_id": thread_id,
+                        "text": text,
+                        "backend": "whisper_cpp",
+                    })),
+                    Err(error) => write_backend_error(error),
+                };
+            }
+            match native_error {
+                Some(error) => write_backend_error(error),
+                None => match write_backend.transcribe_audio(&thread_id, &audio) {
+                    Ok(text) if !text.trim().is_empty() => Response::success(json!({
+                        "action": "audio_transcribe",
+                        "thread_id": thread_id,
+                        "text": text,
+                        "backend": "app_server_realtime",
+                    })),
+                    Ok(_) => Response::error("audio_transcription_empty", "no speech was detected"),
+                    Err(error) => write_backend_error(error),
+                },
             }
         }
         Request::Interrupt { thread_id, turn_id } => {
@@ -5251,6 +5785,68 @@ mod tests {
     }
 
     #[test]
+    fn workspace_download_accepts_registered_worktrees_from_the_same_repository() {
+        let root = unique_test_dir("workspace-download-worktree");
+        let workspace = root.join("source");
+        let sibling = root.join("sibling");
+        fs::create_dir_all(&workspace).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(workspace.join("README.md"), "fixture\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Codex Bridge Test",
+                "-c",
+                "user.email=codex-bridge@example.invalid",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["worktree", "add", "--quiet", "-b", "download-sibling"])
+            .arg(&sibling)
+            .current_dir(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        let artifact = sibling.join("artifact.zip");
+        fs::write(&artifact, b"complete artifact").unwrap();
+
+        assert_eq!(
+            read_workspace_download(&workspace, artifact.to_str().unwrap())
+                .unwrap()
+                .0,
+            b"complete artifact"
+        );
+
+        assert!(Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&sibling)
+            .current_dir(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn download_tickets_are_short_lived_and_retryable() {
         assert_eq!(DOWNLOAD_TICKET_TTL, Duration::from_secs(300));
         let tickets = RwLock::new(HashMap::from([
@@ -5559,6 +6155,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             environment: HashMap::new(),
             remove_environment: Vec::new(),
             socket_path: None,
+            preserve_on_shutdown: false,
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (task, mut status) = spawn_managed_process(spec, shutdown_rx);
@@ -5576,21 +6173,154 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[tokio::test]
-    async fn managed_socket_cleanup_rejects_live_owner_and_removes_stale_socket() {
+    async fn conditional_managed_process_runs_only_while_needed() {
+        let spec = ManagedProcessSpec {
+            name: "test-fallback",
+            program: PathBuf::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from("exec /bin/sleep 30")],
+            environment: HashMap::new(),
+            remove_environment: Vec::new(),
+            socket_path: None,
+            preserve_on_shutdown: false,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (desired_tx, desired_rx) = watch::channel(false);
+        let (task, mut status) = spawn_conditional_managed_process(spec, shutdown_rx, desired_rx);
+        assert!(!status.borrow().running);
+
+        desired_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), status.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.borrow().running);
+
+        desired_tx.send_replace(false);
+        tokio::time::timeout(Duration::from_secs(1), status.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.borrow().running);
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn user_config_enables_whisper_fallback_when_feature_is_built() {
+        let root = unique_test_dir("bridge-whisper-config");
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            "[services.whisper]\nenabled = true\nmodel = \"~/models/ggml-base.bin\"\nlisten = \"127.0.0.1:19092\"\nlanguage = \"auto\"\nthreads = 4\n",
+        )
+        .unwrap();
+        let args =
+            Args::try_parse_from(["codex-bridge", "--config", config_path.to_str().unwrap()])
+                .unwrap();
+        let resolved = resolve_args(args).unwrap();
+        let whisper = resolved.whisper.unwrap();
+        assert_eq!(whisper.listen, "127.0.0.1:19092".parse().unwrap());
+        assert_eq!(whisper.language, "auto");
+        assert_eq!(whisper.threads, Some(4));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(feature = "whisper"))]
+    #[test]
+    fn user_config_rejects_whisper_without_feature() {
+        let root = unique_test_dir("bridge-whisper-config-disabled");
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            "[services.whisper]\nenabled = true\nmodel = \"/tmp/ggml-base.bin\"\n",
+        )
+        .unwrap();
+        let args =
+            Args::try_parse_from(["codex-bridge", "--config", config_path.to_str().unwrap()])
+                .unwrap();
+        let error = resolve_args(args).unwrap_err().to_string();
+        assert!(error.contains("--features whisper"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_socket_cleanup_adopts_live_owner_and_removes_stale_socket() {
         let root = unique_test_dir("managed-socket");
         fs::create_dir_all(&root).unwrap();
         let active_socket = root.join("active.sock");
         let active_listener = tokio::net::UnixListener::bind(&active_socket).unwrap();
-        assert!(prepare_managed_process_socket(&active_socket)
-            .await
-            .is_err());
+        assert_eq!(
+            prepare_managed_process_socket(&active_socket)
+                .await
+                .unwrap(),
+            ManagedSocketState::Active
+        );
         drop(active_listener);
         fs::remove_file(active_socket).unwrap();
 
         let stale_socket = root.join("stale.sock");
         drop(tokio::net::UnixListener::bind(&stale_socket).unwrap());
-        prepare_managed_process_socket(&stale_socket).await.unwrap();
+        assert_eq!(
+            prepare_managed_process_socket(&stale_socket).await.unwrap(),
+            ManagedSocketState::Vacant
+        );
         assert!(!stale_socket.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserved_managed_process_survives_supervisor_shutdown() {
+        let root = unique_test_dir("preserved-managed-process");
+        fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("child.pid");
+        let spec = ManagedProcessSpec {
+            name: "preserved-child",
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("echo $$ > \"$BRIDGE_TEST_PID\"; exec /bin/sleep 30"),
+            ],
+            environment: HashMap::from([(
+                "BRIDGE_TEST_PID".to_owned(),
+                pid_file.display().to_string(),
+            )]),
+            remove_environment: Vec::new(),
+            socket_path: None,
+            preserve_on_shutdown: true,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (task, mut status) = spawn_managed_process(spec, shutdown_rx);
+        tokio::time::timeout(Duration::from_secs(1), status.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.borrow().running);
+        for _ in 0..50 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6022,10 +6752,12 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             include_str!("../../../web-ui/index.html"),
             include_str!("../../../web-ui/src/api.js"),
             include_str!("../../../web-ui/src/auth-gate.js"),
+            include_str!("../../../web-ui/src/browser-notifications.js"),
             include_str!("../../../web-ui/src/main.js"),
             include_str!("../../../web-ui/src/markdown.js"),
             include_str!("../../../web-ui/src/message-cache.js"),
             include_str!("../../../web-ui/src/project-state.js"),
+            include_str!("../../../web-ui/src/runtime-architecture.js"),
             include_str!("../../../web-ui/src/i18n.js"),
             include_str!("../../../web-ui/src/composer-state.js"),
             include_str!("../../../web-ui/src/session-route.js"),
@@ -6100,6 +6832,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "id=\"languageBtn\"",
             "id=\"settingsPanel\"",
             "id=\"componentStatus\"",
+            "id=\"runtimeArchitecture\"",
+            "runtimeArchitectureModel",
             "bridge_service_snapshot",
             "renderManagedServices",
             "github.com/hitsmaxft/codex-bridge",
@@ -6125,6 +6859,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "toggleSendModeAndKeepFocus",
             "preloadExpandedProjectThreads",
             "codex-bridge.expanded-projects.v1",
+            "codex-bridge.browser-notifications.v1",
             "messagePlaceholderCompact",
             "createFileDownloadTicket",
             "id=\"archiveThreadBtn\"",

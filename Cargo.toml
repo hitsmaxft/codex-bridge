@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 
@@ -27,3 +27,4 @@ tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom = "0.3"
 toml = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart"] }

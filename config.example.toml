@@ -19,7 +19,8 @@ no_auth = false
 public_origins = []
 
 [services]
-# When enabled, codex-bridge starts and restarts `codex app-server` itself.
+# When enabled, codex-bridge starts or adopts and restarts `codex app-server`.
+# The app-server stays alive while codex-bridge itself is upgraded or restarted.
 manage_app_server = false
 # Desktop mode can also supervise ws-unix-bridge and publish the launchd URL.
 desktop_interposition = false
@@ -29,3 +30,14 @@ ws_bridge_listen = "127.0.0.1:18790"
 # [services.app_server_environment]
 # HTTPS_PROXY = "http://127.0.0.1:7897"
 # HTTP_PROXY = "http://127.0.0.1:7897"
+
+# Optional local speech-to-text fallback. This requires a codex-bridge binary
+# built with `--features whisper`. The daemon starts whisper-server only while
+# app-server realtime transcription is unavailable.
+[services.whisper]
+enabled = false
+bin = "whisper-server"
+# model = "~/.local/share/whisper.cpp/ggml-base.bin"
+listen = "127.0.0.1:18792"
+language = "auto"
+# threads = 4

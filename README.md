@@ -24,24 +24,25 @@ still use the account and network configured by Codex itself.
 - A shared task list and persistent live connection for the Web UI and `codexctl`.
 - Structured messages, tool calls, diffs, status, models, and paginated history.
 - Remote Queue, Steer, withdrawal, interruption, pinning, renaming, and archiving.
+- Editable voice transcription through app-server, with an optional managed local whisper.cpp
+  fallback for private Mac, Linux, homelab, and NAS deployments.
 - Bounded caches and workspace-scoped downloads for long-running, always-on hosts.
 
 ## Release highlights
 
-### v0.2.3 · 2026-09-09
+### v0.2.4 · 2026-09-09
 
-- **Project-aware history:** paginated app-server project and thread indexes keep repository tasks
-  in their projects and collect only unmatched conversations under **Chats**.
-- **Stable conversation timeline:** keyed message updates preserve open tools and the reading
-  anchor, while the visual hierarchy, user bubbles, copy controls, and live scrolling are lighter.
-- **Queue controls:** each buffered message has a compact menu to withdraw it or convert a safe
-  text-only Queue entry into Steer without duplicating the message.
-- **Reliable lifecycle controls:** Stop targets the exact live turn observed over WebSocket, and
-  archiving removes stale reconnect subscriptions immediately.
-- **Working local-file links:** direct encoded file URLs and Markdown targets enter the same
-  five-minute, workspace-scoped download-ticket flow.
+- **Managed runtime:** Bridge supervises app-server, the Desktop WebSocket adapter, and an optional
+  local Whisper fallback while preserving a healthy app-server across Bridge-only upgrades.
+- **Live architecture:** the settings panel diagrams the active control, Desktop, and voice paths
+  with component state, ownership, endpoints, and restart counts.
+- **Background awareness:** opt-in browser notifications report completed, failed, or cancelled
+  runs and open the corresponding session when clicked.
+- **Reliable editing:** authoritative app-server state clears stale Stop controls, and same-thread
+  incremental refreshes no longer rewrite the composer or move its insertion caret.
 
-See the complete [v0.2.3 release notes](docs/releases/v0.2.3.md), the
+See the complete [v0.2.4 release notes](docs/releases/v0.2.4.md), the
+[v0.2.3 project history and lifecycle release](docs/releases/v0.2.3.md), the
 [v0.2.2 voice and sidebar release](docs/releases/v0.2.2.md), the
 [v0.2.1 Firefox iOS fix](docs/releases/v0.2.1.md), or the larger
 [v0.2.0 feature release](docs/releases/v0.2.0.md).
@@ -58,7 +59,9 @@ never contact Codex or leave the page.
 
 The private UI is responsive across mobile and desktop. It includes project and task navigation,
 rendered tool calls and diffs, task pinning, renaming, and archiving, model selection, Git change summaries,
-English and Chinese text, and queue/steer message handoff. Local file links can download regular
+English and Chinese text, queue/steer message handoff, and opt-in browser notifications when a run
+finishes while the page is in the background. Notifications require site permission and an open Web UI
+page; clicking one focuses the page and opens that session. Local file links can download regular
 files smaller than 16 MiB; the server resolves each link against that task's workspace and rejects
 paths or symlinks that escape it. Authenticated clients receive a random download ticket that
 expires after five minutes and tolerates browser or proxy retries. Tickets live only in bridge
@@ -84,7 +87,8 @@ The app-server executable comes from `ChatGPT.app`. In the installed desktop mod
 `codex-bridge` supervises both that process and the loopback adapter, then publishes
 `CODEX_APP_SERVER_WS_URL` through the user's launchd environment. launchd only has to keep the one
 bridge daemon alive. This transport interposition is local and does not patch or re-sign the app
-bundle.
+bundle. Bridge-only upgrades preserve the healthy app-server process and adopt its Unix socket on
+restart, so active turns do not move to a new app-server PID.
 
 ### Standalone Codex, including Linux
 

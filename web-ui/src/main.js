@@ -12,8 +12,16 @@ import {
 } from "./api.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
-import { shouldOfferStop } from "./composer-state.js";
+import {
+  browserNotificationState,
+  disableBrowserNotifications,
+  enableBrowserNotifications,
+  shouldShowBrowserNotification,
+  showBrowserNotification,
+} from "./browser-notifications.js";
+import { effectiveActiveTurnId, restoreComposerDraft, shouldOfferStop } from "./composer-state.js";
 import { persistExpandedProjects, storedExpandedProjects } from "./project-state.js";
+import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
 import {
   rememberSessionId,
@@ -51,6 +59,15 @@ function renderManagedServices() {
   const root = $("componentStatus"),
     services = state.managedServices;
   if (!root) return;
+  renderRuntimeArchitecture(
+    $("runtimeArchitecture"),
+    {
+      managedServices: state.managedServices,
+      directAppServer: state.directAppServer,
+      serverCapabilities: state.serverCapabilities,
+    },
+    tr,
+  );
   const expanded = new Set(
     [...root.querySelectorAll("details[open]")].map((entry) => entry.dataset.component),
   );
@@ -63,6 +80,7 @@ function renderManagedServices() {
   for (const [key, label, service] of [
     ["app-server", tr("appServerComponent"), services.app_server],
     ["ws-bridge", tr("wsBridgeComponent"), services.desktop_interposition],
+    ["whisper", tr("whisperComponent"), services.whisper],
   ]) {
     const status = service?.status || {},
       enabled = Boolean(service?.enabled),
@@ -83,9 +101,11 @@ function renderManagedServices() {
     value.className = "component-state";
     value.textContent = !enabled
       ? tr("componentExternal")
-      : running
-        ? tr("componentRunning")
-        : tr("componentStopped");
+      : service?.fallback && !service?.needed
+        ? tr("componentStandby")
+        : running
+          ? tr("componentRunning")
+          : tr("componentStopped");
     detail.className = "component-detail";
     if (enabled) {
       const restart = document.createElement("div");
@@ -169,6 +189,7 @@ async function toggleLanguage() {
   renderManagedServices();
   renderTasksButton();
   renderTaskOverviews();
+  renderBrowserNotifications();
   showActivity();
   await loadStatus();
   if (state.current) await openThread(state.current, { quiet: true });
@@ -362,6 +383,78 @@ function knownThread(threadId) {
       .find((thread) => thread.id === threadId) ||
     (state.current?.id === threadId ? state.current : null)
   );
+}
+function renderBrowserNotifications() {
+  const status = browserNotificationState(globalThis.Notification, window.localStorage),
+    button = $("notificationBtn"),
+    help = $("notificationHelp");
+  if (!button || !help) return;
+  button.disabled = !status.supported || status.permission === "denied";
+  button.dataset.enabled = String(status.enabled);
+  button.textContent = tr(
+    !status.supported
+      ? "notificationsUnsupported"
+      : status.permission === "denied"
+        ? "notificationsBlocked"
+        : status.enabled
+          ? "disableNotifications"
+          : "enableNotifications",
+  );
+  help.textContent = tr(
+    !status.supported
+      ? "notificationsUnsupportedHelp"
+      : status.permission === "denied"
+        ? "notificationsBlockedHelp"
+        : status.enabled
+          ? "notificationsEnabledHelp"
+          : "notificationsDisabledHelp",
+  );
+}
+async function toggleBrowserNotifications() {
+  const status = browserNotificationState(globalThis.Notification, window.localStorage),
+    next = status.enabled
+      ? disableBrowserNotifications(globalThis.Notification, window.localStorage)
+      : await enableBrowserNotifications(globalThis.Notification, window.localStorage);
+  renderBrowserNotifications();
+  if (next.permission === "granted") {
+    notify(tr(next.enabled ? "notificationsEnabled" : "notificationsDisabled"));
+  }
+}
+function notifyTurnFinished(threadId, runState, turnId) {
+  if (turnId) {
+    if (state.notifiedTurnIds.has(turnId)) return;
+    state.notifiedTurnIds.add(turnId);
+    while (state.notifiedTurnIds.size > 100) {
+      state.notifiedTurnIds.delete(state.notifiedTurnIds.values().next().value);
+    }
+  }
+  if (
+    !shouldShowBrowserNotification({
+      NotificationApi: globalThis.Notification,
+      storage: window.localStorage,
+      documentHidden: document.hidden,
+      windowFocused: document.hasFocus(),
+    })
+  )
+    return;
+  const thread = knownThread(threadId),
+    title = thread?.title || tr("session"),
+    body = tr(
+      runState === "failed"
+        ? "notificationRunFailed"
+        : runState === "cancelled"
+          ? "notificationRunCancelled"
+          : "notificationRunCompleted",
+    );
+  showBrowserNotification(globalThis.Notification, {
+    title,
+    body,
+    tag: `codex-bridge:${threadId}`,
+    onClick: () => {
+      window.focus();
+      window.location.hash = sessionHash(threadId);
+    },
+  });
 }
 function trackTask(threadId) {
   if (!threadId) return;
@@ -2149,7 +2242,10 @@ async function refreshActivity() {
   const activity = r.activity,
     previous = state.activityFileLen;
   state.activityFileLen = activity.file_len;
-  state.activeTurnId = activity.active_turn_id || null;
+  state.activeTurnId = effectiveActiveTurnId(
+    activity.active_turn_id,
+    state.authoritativeThreadActive.get(threadId),
+  );
   state.activityPhase = activity.phase || null;
   state.activeTool = activity.active_tool || null;
   if (state.activeTurnId) setThreadRunState(threadId, "active");
@@ -2247,6 +2343,7 @@ function handleBridgeEvent(event) {
     }
     if (event.thread_states && typeof event.thread_states === "object") {
       for (const [threadId, runState] of Object.entries(event.thread_states)) {
+        state.authoritativeThreadActive.set(threadId, runState === "active");
         setThreadRunState(threadId, runState);
       }
     }
@@ -2271,6 +2368,7 @@ function handleBridgeEvent(event) {
   if (method === "thread/status/changed" && threadId) {
     updateThreadLiveFromStatus(threadId, params.status);
   } else if (method === "turn/started" && threadId) {
+    state.authoritativeThreadActive.set(threadId, true);
     setThreadRunState(threadId, "active");
     renderProjects();
     if (threadId === state.current?.id) {
@@ -2282,7 +2380,10 @@ function handleBridgeEvent(event) {
       showActivity();
     }
   } else if (method === "turn/completed" && threadId) {
-    setThreadRunState(threadId, completedTurnRunState(params.turn));
+    state.authoritativeThreadActive.set(threadId, false);
+    const runState = completedTurnRunState(params.turn);
+    setThreadRunState(threadId, runState);
+    notifyTurnFinished(threadId, runState, params.turn?.id);
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = null;
@@ -2304,7 +2405,23 @@ function handleBridgeEvent(event) {
   }
 }
 function updateThreadLiveFromStatus(threadId, status) {
-  if (status?.type === "active") setThreadRunState(threadId, "active");
+  const statusType = typeof status === "string" ? status : status?.type;
+  if (!statusType) return;
+  const active = statusType === "active";
+  state.authoritativeThreadActive.set(threadId, active);
+  if (active) setThreadRunState(threadId, "active");
+  else {
+    if (state.threadRunStates.get(threadId) === "active") {
+      setThreadRunState(threadId, "completed");
+    }
+    if (threadId === state.current?.id) {
+      state.activeTurnId = null;
+      state.activityPhase = null;
+      state.activeTool = null;
+      if ($("sendMode").value === "steer") setSendMode("send", true);
+      showActivity();
+    }
+  }
   renderProjects();
 }
 function resetHorizontalPosition() {
@@ -2409,15 +2526,15 @@ async function openThread(
     closePanels();
     setThreadHeaderExpanded(false);
   }
-  if (state.current) {
+  if (changedThread && state.current) {
     saveDraft(state.current.id, $("messageText").value, true);
     state.attachmentDrafts.set(state.current.id, state.composerAttachments);
   }
   state.current = thread;
-  $("messageText").value = state.drafts.get(thread.id) || "";
-  state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
-  renderComposerAttachments();
   if (changedThread) {
+    restoreComposerDraft($("messageText"), state.drafts.get(thread.id), true);
+    state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
+    renderComposerAttachments();
     state.before = null;
     state.hasMore = false;
     state.activityFileLen = null;
@@ -2684,6 +2801,7 @@ $("tasksDialog").onclick = (event) => {
   if (event.target === $("tasksDialog")) closeTasksDialog();
 };
 $("statusBtn").onclick = () => run(loadStatus);
+$("notificationBtn").onclick = () => run(toggleBrowserNotifications);
 $("languageBtn").onclick = () => run(toggleLanguage);
 $("refreshBtn").onclick = () => run(refreshThread);
 $("createCurrentBtn").onclick = () => run(() => createThread(false));
@@ -3069,6 +3187,8 @@ document.querySelectorAll(".nav-toggle").forEach(
 );
 $("scrim").onclick = closePanels;
 applyLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || "en", false);
+renderBrowserNotifications();
+document.addEventListener("visibilitychange", renderBrowserNotifications);
 renderTasksButton();
 setSendMode("steer", false);
 applyTheme(storedTheme(), false);

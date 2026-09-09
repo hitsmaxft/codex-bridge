@@ -576,12 +576,14 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 "audio_transcription": {
                     "enabled": true,
                     "reason": null,
-                    "auth_mode": "demo"
+                    "auth_mode": "demo",
+                    "backend": "demo_wasm"
                 }
             },
             "managed_services": {
                 "app_server": {"enabled": true, "status": {"running": true, "restart_count": 0}},
-                "desktop_interposition": {"enabled": false, "listen": null, "status": {"running": false, "restart_count": 0}}
+                "desktop_interposition": {"enabled": false, "listen": null, "status": {"running": false, "restart_count": 0}},
+                "whisper": {"enabled": false, "fallback": true, "needed": false, "listen": null, "status": {"running": false, "restart_count": 0}}
             },
             "rollout_store": {"available": true, "codex_home": "/demo/.codex", "read_only": true},
             "selected_thread_id": PRIMARY_THREAD,

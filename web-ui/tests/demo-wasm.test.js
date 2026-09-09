@@ -2,11 +2,24 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { shouldOfferStop } from "../src/composer-state.js";
+import {
+  effectiveActiveTurnId,
+  restoreComposerDraft,
+  shouldOfferStop,
+} from "../src/composer-state.js";
+import {
+  BROWSER_NOTIFICATIONS_STORAGE_KEY,
+  browserNotificationState,
+  disableBrowserNotifications,
+  enableBrowserNotifications,
+  shouldShowBrowserNotification,
+  showBrowserNotification,
+} from "../src/browser-notifications.js";
 import { createAuthenticationGate } from "../src/auth-gate.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { localFilePath } from "../src/markdown.js";
 import { SessionMessageCache } from "../src/message-cache.js";
+import { runtimeArchitectureModel } from "../src/runtime-architecture.js";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   persistExpandedProjects,
@@ -39,12 +52,125 @@ function result(response) {
   return response.result;
 }
 
+test("runtime architecture follows managed and selected voice backends", () => {
+  const native = runtimeArchitectureModel({
+    managedServices: {
+      app_server: { enabled: true, status: { running: true } },
+      desktop_interposition: { enabled: false, status: { running: false } },
+      whisper: { enabled: true, fallback: true, needed: false, status: { running: false } },
+    },
+    directAppServer: true,
+    audioTranscription: { enabled: true, backend: "app_server_realtime" },
+  });
+  assert.equal(native.appServer.phase, "running");
+  assert.equal(native.whisper.phase, "standby");
+  assert.equal(native.voice.nameKey, "appServerRealtime");
+
+  const fallback = runtimeArchitectureModel({
+    managedServices: {
+      app_server: { enabled: false, status: { running: false } },
+      whisper: { enabled: true, fallback: true, needed: true, status: { running: true } },
+    },
+    directAppServer: true,
+    audioTranscription: { enabled: true, backend: "whisper_cpp" },
+  });
+  assert.equal(fallback.appServer.phase, "running");
+  assert.equal(fallback.appServer.labelKey, "componentExternal");
+  assert.equal(fallback.voice.phase, "running");
+  assert.equal(fallback.voice.nameKey, "whisperBackend");
+});
+
+test("authoritative idle suppresses a stale rollout turn", () => {
+  assert.equal(effectiveActiveTurnId("stale-rollout-turn", false), null);
+  assert.equal(effectiveActiveTurnId("live-turn", true), "live-turn");
+  assert.equal(effectiveActiveTurnId("compatibility-turn", undefined), "compatibility-turn");
+});
+
+test("same-thread refresh does not rewrite the composer or move its caret", () => {
+  let value = "alpha beta",
+    writes = 0;
+  const textarea = {
+    selectionStart: 5,
+    get value() {
+      return value;
+    },
+    set value(next) {
+      writes += 1;
+      value = next;
+      this.selectionStart = next.length;
+    },
+  };
+  assert.equal(restoreComposerDraft(textarea, "alpha beta", false), false);
+  assert.equal(writes, 0);
+  assert.equal(textarea.selectionStart, 5);
+  assert.equal(restoreComposerDraft(textarea, "next thread", true), true);
+  assert.equal(writes, 1);
+  assert.equal(value, "next thread");
+});
+
+test("browser notifications require permission, preference, and a background page", async () => {
+  const values = new Map(),
+    storage = {
+      getItem: (key) => values.get(key) || null,
+      setItem: (key, value) => values.set(key, value),
+      removeItem: (key) => values.delete(key),
+    },
+    notifications = [];
+  class FakeNotification {
+    static permission = "default";
+    static async requestPermission() {
+      FakeNotification.permission = "granted";
+      return "granted";
+    }
+    constructor(title, options) {
+      notifications.push({ title, options, instance: this });
+    }
+    close() {}
+  }
+  assert.equal(browserNotificationState(FakeNotification, storage).enabled, false);
+  assert.equal((await enableBrowserNotifications(FakeNotification, storage)).enabled, true);
+  assert.equal(values.get(BROWSER_NOTIFICATIONS_STORAGE_KEY), "enabled");
+  assert.equal(
+    shouldShowBrowserNotification({
+      NotificationApi: FakeNotification,
+      storage,
+      documentHidden: false,
+      windowFocused: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldShowBrowserNotification({
+      NotificationApi: FakeNotification,
+      storage,
+      documentHidden: true,
+      windowFocused: false,
+    }),
+    true,
+  );
+  let clicked = false;
+  assert.equal(
+    showBrowserNotification(FakeNotification, {
+      title: "Session title",
+      body: "Run completed",
+      tag: "codex-bridge:thread-1",
+      onClick: () => (clicked = true),
+    }),
+    true,
+  );
+  notifications[0].instance.onclick();
+  assert.equal(clicked, true);
+  assert.equal(disableBrowserNotifications(FakeNotification, storage).enabled, false);
+});
+
 test("compiled demo WASM supports refresh and active-run interruption", async () => {
   const command = await demoClient();
   const status = result(command({ command: "status" }));
   assert.equal(status.demo, true);
   assert.equal(status.managed_services.app_server.status.running, true);
+  assert.equal(status.managed_services.whisper.fallback, true);
   assert.equal(status.capabilities.audio_transcription.enabled, true);
+  assert.equal(status.capabilities.audio_transcription.backend, "demo_wasm");
 
   const before = result(
     command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),

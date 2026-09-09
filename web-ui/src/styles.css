@@ -287,6 +287,113 @@ aside {
 .settings-value.version-mismatch {
   color: var(--danger);
 }
+.settings-help {
+  margin: -5px 0 8px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+#notificationBtn[data-enabled="true"] {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
+  color: var(--accent);
+}
+.runtime-architecture {
+  margin: 0 0 12px;
+}
+.runtime-architecture:empty {
+  display: none;
+}
+.runtime-architecture-figure {
+  margin: 0;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel2) 52%, transparent);
+}
+.runtime-architecture-figure figcaption {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.runtime-architecture-figure figcaption strong {
+  font-size: 10px;
+  font-weight: 650;
+}
+.runtime-architecture-figure figcaption span {
+  color: var(--muted);
+  font-size: 9px;
+  text-align: right;
+}
+.architecture-lane + .architecture-lane {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 68%, transparent);
+}
+.architecture-lane-title {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+}
+.architecture-lane-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 13px minmax(0, 1fr) 13px minmax(0, 1fr);
+  align-items: stretch;
+}
+.architecture-node {
+  position: relative;
+  min-width: 0;
+  min-height: 43px;
+  padding: 6px 5px 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.architecture-node::before {
+  position: absolute;
+  top: 8px;
+  left: 4px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--muted);
+  content: "";
+}
+.architecture-node.running::before {
+  background: var(--accent);
+}
+.architecture-node.failed::before,
+.architecture-node.stopped::before {
+  background: var(--danger);
+}
+.architecture-node.standby::before {
+  background: color-mix(in srgb, var(--accent) 42%, var(--muted));
+}
+.architecture-node-name,
+.architecture-node-state {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.architecture-node-name {
+  font-size: 9px;
+  font-weight: 620;
+  line-height: 1.2;
+}
+.architecture-node-state {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.15;
+}
+.architecture-arrow {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 11px;
+}
 .component-status {
   display: grid;
   gap: 5px;

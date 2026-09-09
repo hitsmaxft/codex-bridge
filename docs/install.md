@@ -111,8 +111,13 @@ Mode defaults apply only when a path was not set explicitly:
   `~/.codex-bridge/codex-app-server.sock`);
 - `auto` preserves the previous behavior and does not invent an app-server endpoint.
 
-`services.manage_app_server = true` makes the bridge start, stop, and restart the selected
-`codex app-server` child. `services.desktop_interposition = true` is valid only in `desktop` mode;
+`services.manage_app_server = true` makes the bridge start or adopt and restart the selected
+`codex app-server` process. A healthy app-server stays alive across a bridge shutdown or upgrade;
+the replacement bridge adopts its existing Unix socket and resumes supervision without changing
+the app-server PID. This makes Web UI and bridge-only releases a control-plane hot deployment
+rather than an interruption of active Codex turns. Explicitly disabling management does not stop
+an app-server preserved by the previous bridge; stop that process separately when retirement is
+intentional. `services.desktop_interposition = true` is valid only in `desktop` mode;
 it also supervises `ws-unix-bridge` and sets `CODEX_APP_SERVER_WS_URL` in the user's launchd
 environment. Leave both false when another service manager owns those processes.
 `services.app_server_environment` is passed only to the managed app-server; the daemon removes
@@ -121,6 +126,35 @@ Desktop interposition variables from that child to avoid a recursive connection.
 The Web UI status card reports each managed component's live state, restart count, listen endpoint,
 and most recent startup/exit error. The event WebSocket publishes a compact service snapshot every
 three seconds, so an open settings panel follows recovery without a page reload.
+
+### Optional local Whisper transcription
+
+Build `codex-bridge` with the `whisper` feature and provide a `whisper-server` binary plus a
+multilingual whisper.cpp model:
+
+```sh
+CARGO_INCREMENTAL=0 cargo install --locked --force \
+  --features whisper --path crates/codex-bridge
+```
+
+For example, the whisper.cpp `base` model occupies about 142 MiB on disk and is a practical default
+for editable Chinese and English dictation. Configure the fallback separately from app-server:
+
+```toml
+[services.whisper]
+enabled = true
+bin = "/absolute/path/to/whisper-server"
+model = "~/.local/share/whisper.cpp/ggml-base.bin"
+listen = "127.0.0.1:18792"
+language = "auto"
+# threads = 4
+```
+
+This does not create a second always-running user service. `codex-bridge` remains the
+launchd/systemd daemon; it supervises `whisper-server` as a loopback-only child while app-server
+realtime transcription is unavailable, and stops it when native transcription recovers. Recorded
+PCM stays on the host for this fallback. Enabling Whisper with a bridge binary built without the
+feature is a startup error rather than a silently unavailable backend.
 
 ### Web UI security
 

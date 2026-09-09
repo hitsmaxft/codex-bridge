@@ -67,6 +67,8 @@ export const state = {
   pendingChanges: false,
   updatingThreads: new Set(),
   threadRunStates: new Map(),
+  authoritativeThreadActive: new Map(),
+  notifiedTurnIds: new Set(),
   taskTrackedIds: new Set(),
   taskOverviews: new Map(),
   tasksOpen: false,
