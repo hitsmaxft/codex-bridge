@@ -41,6 +41,12 @@ pub struct NativeQueueReceipt {
     pub started_turn_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StartedTurnReceipt {
+    pub backend: String,
+    pub turn_id: String,
+}
+
 #[derive(Debug)]
 enum AppServerCommand {
     Rpc {
@@ -183,6 +189,34 @@ impl CodexCliBackend {
         text: &str,
     ) -> Result<BackendSuccess, BackendFailure> {
         self.run(queue_invocation(thread_id, text))
+    }
+
+    pub fn start_turn(
+        &self,
+        thread_id: &str,
+        input: &[Value],
+        client_user_message_id: &str,
+    ) -> Result<StartedTurnReceipt, BackendFailure> {
+        let result = self.app_server_rpc(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": input,
+                "clientUserMessageId": client_user_message_id,
+            }),
+        )?;
+        let turn_id = result
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| BackendFailure {
+                code: "app_server_protocol_error",
+                message: "turn/start response has no turn.id".to_owned(),
+            })?;
+        Ok(StartedTurnReceipt {
+            backend: "app_server_turn_start".to_owned(),
+            turn_id: turn_id.to_owned(),
+        })
     }
 
     pub fn watch_thread(&self, thread_id: &str) -> Result<Value, BackendFailure> {
@@ -1392,6 +1426,60 @@ mod tests {
         assert!(!app_server_thread_is_active(
             &json!({"thread": {"status": {"type": "idle"}}})
         ));
+    }
+
+    #[test]
+    fn empty_thread_starts_directly_with_client_message_identity() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "codex-empty-thread-test-{}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {"userAgent": "fake/0.1"}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let _initialized = read_json(&mut websocket);
+            let request = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": request["id"], "result": {"turn": {"id": "turn-first"}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            request
+        });
+        let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(sock_path.clone()));
+        let receipt = backend
+            .start_turn(
+                "thread-empty",
+                &[json!({"type":"text", "text":"first message", "text_elements":[]})],
+                "browser-message-first",
+            )
+            .unwrap();
+        assert_eq!(receipt.backend, "app_server_turn_start");
+        assert_eq!(receipt.turn_id, "turn-first");
+        let request = server.join().unwrap();
+        assert_eq!(request["method"], "turn/start");
+        assert_eq!(request["params"]["threadId"], "thread-empty");
+        assert_eq!(
+            request["params"]["clientUserMessageId"],
+            "browser-message-first"
+        );
+        assert_eq!(request["params"]["input"][0]["text"], "first message");
+        std::fs::remove_file(&sock_path).unwrap();
+        std::fs::remove_dir(&sock_dir).unwrap();
     }
 
     fn read_json(websocket: &mut WebSocket<UnixStream>) -> Value {

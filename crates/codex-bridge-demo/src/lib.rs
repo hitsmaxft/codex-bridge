@@ -106,6 +106,7 @@ impl DemoState {
         self.messages.push(json!({
             "timestamp": "2026-09-07T07:00:00.000Z",
             "id": format!("demo-user-{}", self.messages.len()),
+            "turn_id": "demo-turn-processing",
             "role": "user",
             "phase": null,
             "category": "user",
@@ -180,6 +181,7 @@ impl DemoState {
         self.messages.push(json!({
             "timestamp": "2026-09-08T08:00:02.000Z",
             "id": format!("demo-progress-{message_index}"),
+            "turn_id": "demo-turn-processing",
             "role": "assistant",
             "phase": "commentary",
             "category": "assistant",
@@ -265,12 +267,23 @@ impl DemoState {
         self.messages.push(json!({
             "timestamp": "2026-09-07T07:00:04.000Z",
             "id": format!("demo-assistant-{}", self.messages.len()),
+            "turn_id": "demo-turn-processing",
             "role": "assistant",
             "phase": "final_answer",
             "category": "assistant",
             "content": [{
                 "kind": "text",
                 "text": format!("{reply}{steer_note}")
+            }, {
+                "kind": "memory_citation",
+                "source": "MEMORY.md:47-70",
+                "note": "demo workflow"
+            }, {
+                "kind": "turn_usage",
+                "total_tokens": 18420,
+                "input_tokens": 17680,
+                "cached_input_tokens": 14336,
+                "output_tokens": 740
             }],
             "tools": [],
         }));
@@ -354,6 +367,7 @@ impl DemoState {
                     self.messages.push(json!({
                         "timestamp": "2026-09-08T08:00:05.000Z",
                         "id": format!("demo-analysis-{}", self.messages.len()),
+                        "turn_id": "demo-turn-processing",
                         "role": "assistant",
                         "phase": "commentary",
                         "category": "assistant",
@@ -392,6 +406,7 @@ fn seed_messages() -> Vec<Value> {
         json!({
             "timestamp": "2026-09-07T06:30:15.726Z",
             "id": "demo-user-0",
+            "turn_id": "demo-turn-seed-1",
             "role": "user",
             "phase": null,
             "category": "user",
@@ -401,6 +416,7 @@ fn seed_messages() -> Vec<Value> {
         json!({
             "timestamp": "2026-09-07T06:30:21.000Z",
             "id": "demo-assistant-1",
+            "turn_id": "demo-turn-seed-1",
             "role": "assistant",
             "phase": "commentary",
             "category": "assistant",
@@ -422,6 +438,7 @@ fn seed_messages() -> Vec<Value> {
         json!({
             "timestamp": "2026-09-07T06:31:04.000Z",
             "id": "demo-assistant-2",
+            "turn_id": "demo-turn-seed-1",
             "role": "assistant",
             "phase": "commentary",
             "category": "assistant",
@@ -441,6 +458,7 @@ fn seed_messages() -> Vec<Value> {
         json!({
             "timestamp": "2026-09-07T06:31:40.000Z",
             "id": "demo-user-3",
+            "turn_id": "demo-turn-seed-2",
             "role": "user",
             "phase": null,
             "category": "user",
@@ -450,10 +468,11 @@ fn seed_messages() -> Vec<Value> {
         json!({
             "timestamp": "2026-09-07T06:31:46.000Z",
             "id": "demo-assistant-4",
+            "turn_id": "demo-turn-seed-2",
             "role": "assistant",
             "phase": "final_answer",
             "category": "assistant",
-            "content": [{"kind": "text", "text": "Yes. Try the composer below: the WASM state machine demonstrates submission, queue handoff, processing, and a simulated response entirely inside your browser."}],
+            "content": [{"kind": "text", "text": "Yes. Try the composer below: the WASM state machine demonstrates submission, queue handoff, processing, and a simulated response entirely inside your browser."}, {"kind": "memory_citation", "source": "MEMORY.md:47-70", "note": "demo and deployment workflow"}, {"kind": "turn_usage", "total_tokens": 12480, "input_tokens": 11840, "cached_input_tokens": 9216, "output_tokens": 640}],
             "tools": [{
                 "tool_index": 0,
                 "name": "web_search",
@@ -571,7 +590,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 22,
+            "protocol_version": 23,
             "capabilities": {
                 "audio_transcription": {
                     "enabled": true,
@@ -772,8 +791,9 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             state.messages.push(json!({
                 "timestamp": "2026-09-08T08:00:06.000Z",
                 "id": format!("demo-cancelled-{}", state.messages.len()),
+                "turn_id": "demo-turn-processing",
                 "role": "assistant",
-                "phase": "commentary",
+                "phase": "final_answer",
                 "category": "assistant",
                 "content": [{"kind": "text", "text": "Demo run cancelled. Any queued message remains available to withdraw or run next."}],
                 "tools": [],
@@ -947,7 +967,7 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 22);
+        assert_eq!(response["result"]["protocol_version"], 23);
     }
 
     #[test]

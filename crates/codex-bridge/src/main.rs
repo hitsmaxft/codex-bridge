@@ -4618,6 +4618,17 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
+            if resolved.thread.rollout_path.as_os_str().is_empty() {
+                return start_empty_thread_turn(
+                    session_store,
+                    write_backend,
+                    pending_messages,
+                    &resolved,
+                    &input,
+                    &pending_text,
+                    EmptyThreadAction::Queue,
+                );
+            }
             let pending_id = pending_messages.begin(
                 &resolved.thread.id,
                 &pending_text,
@@ -4693,6 +4704,17 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
+            if resolved.thread.rollout_path.as_os_str().is_empty() {
+                return start_empty_thread_turn(
+                    session_store,
+                    write_backend,
+                    pending_messages,
+                    &resolved,
+                    &input,
+                    &pending_text,
+                    EmptyThreadAction::Steer,
+                );
+            }
             let turn_id = match session_store.active_turn_id(&resolved.thread.id) {
                 Ok(Some(turn_id)) => turn_id,
                 Ok(None) => {
@@ -4902,6 +4924,28 @@ struct ResolvedThread {
     authoritative: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum EmptyThreadAction {
+    Queue,
+    Steer,
+}
+
+impl EmptyThreadAction {
+    fn pending(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Steer => "steer",
+        }
+    }
+
+    fn response(self) -> &'static str {
+        match self {
+            Self::Queue => "send",
+            Self::Steer => "steer",
+        }
+    }
+}
+
 fn latest_message_index(session_store: &SessionStore, thread_id: &str) -> i64 {
     session_store
         .message_count(thread_id)
@@ -4909,6 +4953,42 @@ fn latest_message_index(session_store: &SessionStore, thread_id: &str) -> i64 {
         .flatten()
         .map(|count| count as i64 - 1)
         .unwrap_or(-1)
+}
+
+fn start_empty_thread_turn(
+    session_store: &SessionStore,
+    write_backend: &CodexCliBackend,
+    pending_messages: &PendingMessages,
+    resolved: &ResolvedThread,
+    input: &[Value],
+    pending_text: &str,
+    action: EmptyThreadAction,
+) -> Response {
+    let pending_id = pending_messages.begin(
+        &resolved.thread.id,
+        pending_text,
+        action.pending(),
+        latest_message_index(session_store, &resolved.thread.id),
+    );
+    match write_backend.start_turn(&resolved.thread.id, input, &pending_id) {
+        Ok(receipt) => {
+            pending_messages.finish(&pending_id, "accepted", None);
+            session_store.invalidate_summary_cache();
+            Response::success(json!({
+                "action": action.response(),
+                "status": "accepted",
+                "pending_id": pending_id,
+                "thread_id": resolved.thread.id,
+                "target": resolved.method,
+                "semantics": "empty_thread_turn_start",
+                "backend": receipt,
+            }))
+        }
+        Err(error) => {
+            pending_messages.finish(&pending_id, "failed", Some(error.message.clone()));
+            write_backend_error(error)
+        }
+    }
 }
 
 fn workspace_diff_summary(thread_id: &str, cwd: &Path) -> Result<Value, Response> {
@@ -5197,6 +5277,18 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
             .or_else(|| item.get("output_text"))
             .and_then(Value::as_str);
 
+        if item_type == "codex_bridge_turn_usage" {
+            content.push(json!({
+                "kind": "turn_usage",
+                "total_tokens": item.get("total_tokens"),
+                "input_tokens": item.get("input_tokens"),
+                "cached_input_tokens": item.get("cached_input_tokens"),
+                "output_tokens": item.get("output_tokens"),
+            }));
+            content_index += 1;
+            continue;
+        }
+
         if let Some(text) = text {
             if let Some(objective) = goal_objective(text) {
                 if !objective.trim().is_empty() {
@@ -5248,12 +5340,23 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
                     content.push(json!({"kind": "text", "text": before.trim()}));
                     has_visible_text = true;
                 }
-                content.push(json!({
-                    "kind": "context",
-                    "label": "Memory citations",
-                    "bytes": citation.len(),
-                    "text": citation,
-                }));
+                let entries = memory_citation_entries(citation);
+                if entries.is_empty() {
+                    content.push(json!({
+                        "kind": "context",
+                        "label": "Memory citations",
+                        "bytes": citation.len(),
+                        "text": citation,
+                    }));
+                } else {
+                    content.extend(entries.into_iter().map(|(source, note)| {
+                        json!({
+                            "kind": "memory_citation",
+                            "source": source,
+                            "note": note,
+                        })
+                    }));
+                }
                 if !after.trim().is_empty() {
                     content.push(json!({"kind": "text", "text": after.trim()}));
                     has_visible_text = true;
@@ -5293,6 +5396,7 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
     json!({
         "timestamp": message.timestamp,
         "id": message.id,
+        "turn_id": message.turn_id,
         "role": message.role,
         "phase": message.phase,
         "category": category,
@@ -5615,6 +5719,34 @@ fn memory_citation_parts(text: &str) -> Option<(&str, &str, &str)> {
     let relative_end = text[start..].find(END)?;
     let end = start + relative_end + END.len();
     Some((&text[..start], &text[start..end], &text[end..]))
+}
+
+fn memory_citation_entries(block: &str) -> Vec<(String, Option<String>)> {
+    const START: &str = "<citation_entries>";
+    const END: &str = "</citation_entries>";
+    let Some(start) = block.find(START).map(|offset| offset + START.len()) else {
+        return Vec::new();
+    };
+    let Some(end) = block[start..].find(END).map(|offset| start + offset) else {
+        return Vec::new();
+    };
+    block[start..end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (source, note) = line
+                .split_once("|note=[")
+                .map_or((line, None), |(source, note)| {
+                    (source, Some(note.strip_suffix(']').unwrap_or(note)))
+                });
+            (
+                source.trim().to_owned(),
+                note.map(|note| note.trim().to_owned()),
+            )
+        })
+        .filter(|(source, _)| !source.is_empty())
+        .collect()
 }
 
 fn goal_objective(text: &str) -> Option<&str> {
@@ -6538,6 +6670,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let message = |role: &str, text: &str| ThreadMessage {
             timestamp: None,
             id: None,
+            turn_id: None,
             role: role.to_owned(),
             phase: None,
             content: vec![json!({"type":"input_text","text":text})],
@@ -6966,6 +7099,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let message = ThreadMessage {
             timestamp: None,
             id: Some("m1".into()),
+            turn_id: Some("turn-1".into()),
             role: "user".into(),
             phase: None,
             content: vec![
@@ -6976,6 +7110,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         };
         let compact = compact_web_message(&message, 7);
         let encoded = serde_json::to_string(&compact).unwrap();
+        assert_eq!(compact["turn_id"], "turn-1");
         assert_eq!(compact["category"], "context");
         assert_eq!(compact["content"][0]["label"], "Transcript delta");
         assert_eq!(compact["content"][1]["label"], "Image attachment");
@@ -6989,6 +7124,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let message = ThreadMessage {
             timestamp: None,
             id: Some("m1".into()),
+            turn_id: Some("turn-1".into()),
             role: "assistant".into(),
             phase: Some("commentary".into()),
             content: vec![json!({"type":"output_text","text":"Checking."})],
@@ -7140,6 +7276,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let message = ThreadMessage {
             timestamp: None,
             id: None,
+            turn_id: None,
             role: "user".into(),
             phase: None,
             content: vec![json!({
@@ -7159,6 +7296,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let message = ThreadMessage {
             timestamp: None,
             id: None,
+            turn_id: None,
             role: "user".into(),
             phase: None,
             content: vec![
@@ -7185,19 +7323,26 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let message = ThreadMessage {
             timestamp: None,
             id: None,
+            turn_id: None,
             role: "assistant".into(),
             phase: None,
             content: vec![json!({
                 "type":"output_text",
-                "text":"## 完成\n\n正文\n<oai-mem-citation>private</oai-mem-citation>\n后续"
+                "text":"## 完成\n\n正文\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:47-70|note=[deployment workflow]\nskills/example/SKILL.md:1-3|note=[format rules]\n</citation_entries>\n<rollout_ids>\n01a00000-0000-7000-8000-000000000000\n</rollout_ids>\n</oai-mem-citation>\n后续"
             })],
             tools: Vec::new(),
         };
         let compact = compact_web_message(&message, 0);
-        assert_eq!(compact["content"].as_array().unwrap().len(), 3);
+        assert_eq!(compact["content"].as_array().unwrap().len(), 4);
         assert_eq!(compact["content"][0]["text"], "## 完成\n\n正文");
-        assert_eq!(compact["content"][1]["label"], "Memory citations");
-        assert_eq!(compact["content"][2]["text"], "后续");
+        assert_eq!(compact["content"][1]["kind"], "memory_citation");
+        assert_eq!(compact["content"][1]["source"], "MEMORY.md:47-70");
+        assert_eq!(compact["content"][1]["note"], "deployment workflow");
+        assert_eq!(
+            compact["content"][2]["source"],
+            "skills/example/SKILL.md:1-3"
+        );
+        assert_eq!(compact["content"][3]["text"], "后续");
     }
 
     #[test]
@@ -7205,6 +7350,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let message = ThreadMessage {
             timestamp: None,
             id: None,
+            turn_id: None,
             role: "user".into(),
             phase: None,
             content: vec![json!({

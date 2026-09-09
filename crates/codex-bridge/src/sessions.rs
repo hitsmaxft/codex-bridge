@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{value::RawValue, Value};
+use serde_json::{json, value::RawValue, Value};
 
 pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const GIT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -36,6 +36,14 @@ struct CachedMessages {
     seen_ids: HashSet<String>,
     tool_locations: HashMap<String, (usize, usize, usize)>,
     tool_records: HashMap<String, ToolRecordLocation>,
+    pending_turn: PendingTurnMetadata,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingTurnMetadata {
+    message_start: usize,
+    turn_id: Option<String>,
+    usage: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -109,6 +117,8 @@ pub struct ThreadMessage {
     pub timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
@@ -786,6 +796,7 @@ impl SessionStore {
                         &mut entry.seen_ids,
                         &mut entry.tool_locations,
                         &mut entry.tool_records,
+                        &mut entry.pending_turn,
                     )?;
                     entry.modified = modified;
                     entry.file_len = file_len;
@@ -799,6 +810,7 @@ impl SessionStore {
         let mut seen_ids = HashSet::new();
         let mut tool_locations = HashMap::new();
         let mut tool_records = HashMap::new();
+        let mut pending_turn = PendingTurnMetadata::default();
         let processed_len = read_rollout_messages_from(
             path,
             0,
@@ -806,6 +818,7 @@ impl SessionStore {
             &mut seen_ids,
             &mut tool_locations,
             &mut tool_records,
+            &mut pending_turn,
         )?;
         let messages = Arc::new(messages);
         if let Ok(mut cache) = self.message_cache.lock() {
@@ -830,6 +843,7 @@ impl SessionStore {
                     seen_ids,
                     tool_locations,
                     tool_records,
+                    pending_turn,
                 },
             );
         }
@@ -1206,6 +1220,7 @@ fn read_rollout_messages_from(
     seen_ids: &mut HashSet<String>,
     tool_locations: &mut HashMap<String, (usize, usize, usize)>,
     tool_records: &mut HashMap<String, ToolRecordLocation>,
+    pending_turn: &mut PendingTurnMetadata,
 ) -> Result<u64> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -1226,6 +1241,12 @@ fn read_rollout_messages_from(
         let Ok(envelope) = serde_json::from_slice::<RawRolloutRecord<'_>>(&line) else {
             continue;
         };
+        if envelope.record_type == "event_msg" {
+            if let Ok(record) = serde_json::from_slice::<Value>(&line) {
+                update_turn_metadata(&record, messages, pending_turn);
+            }
+            continue;
+        }
         if envelope.record_type != "response_item" {
             continue;
         }
@@ -1266,6 +1287,59 @@ fn read_rollout_messages_from(
         append_rollout_record(record, messages, seen_ids, tool_locations);
     }
     Ok(processed_len)
+}
+
+fn update_turn_metadata(
+    record: &Value,
+    messages: &mut Vec<ThreadMessage>,
+    pending: &mut PendingTurnMetadata,
+) {
+    let payload = &record["payload"];
+    match payload.get("type").and_then(Value::as_str) {
+        Some("task_started") => {
+            pending.message_start = messages.len();
+            pending.turn_id = string_field(payload, "turn_id");
+            pending.usage = None;
+        }
+        Some("token_count") => {
+            if let Some(usage) = payload.pointer("/info/total_token_usage") {
+                pending.usage = Some(usage.clone());
+            }
+        }
+        Some("task_complete" | "turn_aborted") => {
+            let Some(usage) = pending.usage.take() else {
+                return;
+            };
+            let marker = json!({
+                "type": "codex_bridge_turn_usage",
+                "total_tokens": usage.get("total_tokens").and_then(Value::as_u64),
+                "input_tokens": usage.get("input_tokens").and_then(Value::as_u64),
+                "cached_input_tokens": usage
+                    .get("cached_input_tokens")
+                    .and_then(Value::as_u64),
+                "output_tokens": usage.get("output_tokens").and_then(Value::as_u64),
+            });
+            let message_start = pending.message_start.min(messages.len());
+            if let Some(message) = messages[message_start..]
+                .iter_mut()
+                .rev()
+                .find(|message| message.role == "assistant")
+            {
+                message.content.push(marker);
+            } else {
+                messages.push(ThreadMessage {
+                    timestamp: string_field(record, "timestamp"),
+                    id: None,
+                    turn_id: pending.turn_id.clone(),
+                    role: "assistant".to_owned(),
+                    phase: Some("turn_metadata".to_owned()),
+                    content: vec![marker],
+                    tools: Vec::new(),
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 fn append_tool_output(
@@ -1331,6 +1405,7 @@ fn append_rollout_record(
                 messages.push(ThreadMessage {
                     timestamp: string_field(&record, "timestamp"),
                     id: None,
+                    turn_id: rollout_turn_id(&record),
                     role: "assistant".to_owned(),
                     phase: Some("tool".to_owned()),
                     content: Vec::new(),
@@ -1396,11 +1471,25 @@ fn append_rollout_record(
     messages.push(ThreadMessage {
         timestamp: string_field(&record, "timestamp"),
         id,
+        turn_id: rollout_turn_id(&record),
         role: role.to_owned(),
         phase: string_field(payload, "phase"),
         content: content.clone(),
         tools: Vec::new(),
     });
+}
+
+fn rollout_turn_id(record: &Value) -> Option<String> {
+    record
+        .pointer("/payload/internal_chat_message_metadata_passthrough/turn_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            record
+                .pointer("/internal_chat_message_metadata_passthrough/turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 fn opaque_apply_patch_marker(name: &str, input: &Value) -> bool {
@@ -1856,6 +1945,48 @@ mod tests {
 
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn completed_turn_attaches_its_final_total_token_usage() {
+        let mut messages = Vec::new();
+        let mut pending = PendingTurnMetadata::default();
+        update_turn_metadata(
+            &json!({"payload":{"type":"task_started", "turn_id":"turn-1"}}),
+            &mut messages,
+            &mut pending,
+        );
+        messages.push(ThreadMessage {
+            timestamp: None,
+            id: Some("answer".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+            role: "assistant".to_owned(),
+            phase: Some("final_answer".to_owned()),
+            content: vec![json!({"type":"output_text", "text":"done"})],
+            tools: Vec::new(),
+        });
+        update_turn_metadata(
+            &json!({"payload":{"type":"token_count", "info":{"total_token_usage":{
+                "input_tokens":1200,
+                "cached_input_tokens":900,
+                "output_tokens":80,
+                "reasoning_output_tokens":20,
+                "total_tokens":1280
+            }}}}),
+            &mut messages,
+            &mut pending,
+        );
+        update_turn_metadata(
+            &json!({"timestamp":"2026-09-09T00:00:00Z", "payload":{"type":"task_complete", "turn_id":"turn-1"}}),
+            &mut messages,
+            &mut pending,
+        );
+
+        let usage = messages[0].content.last().unwrap();
+        assert_eq!(usage["type"], "codex_bridge_turn_usage");
+        assert_eq!(usage["total_tokens"], 1280);
+        assert_eq!(usage["cached_input_tokens"], 900);
+        assert!(pending.usage.is_none());
+    }
+
     struct Fixture {
         path: PathBuf,
     }
@@ -1914,8 +2045,8 @@ mod tests {
             &[
                 r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-1","timestamp":"2026-08-30T01:00:00Z","cwd":"/tmp/project","source":"vscode"}}"#,
                 r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"developer-1","role":"developer","content":[{"type":"input_text","text":"internal"}]}}"#,
-                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","id":"user-1","role":"user","content":[{"type":"input_text","text":"hello world"}]}}"#,
-                r#"{"timestamp":"2026-08-30T01:00:03Z","type":"response_item","payload":{"type":"message","id":"assistant-1","role":"assistant","phase":"final","content":[{"type":"output_text","text":"done"}]}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","id":"user-1","role":"user","content":[{"type":"input_text","text":"hello world"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:03Z","type":"response_item","payload":{"type":"message","id":"assistant-1","role":"assistant","phase":"final","content":[{"type":"output_text","text":"done"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}"#,
                 "{incomplete",
             ],
         );
@@ -1944,6 +2075,8 @@ mod tests {
         assert_eq!(snapshot.messages.len(), 2);
         assert_eq!(snapshot.messages[0].role, "user");
         assert_eq!(snapshot.messages[1].role, "assistant");
+        assert_eq!(snapshot.messages[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(snapshot.messages[1].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(snapshot.thread.cwd, Path::new("/tmp/project"));
         assert_eq!(snapshot.thread.git_branch, None);
     }

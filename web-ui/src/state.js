@@ -40,6 +40,8 @@ export const state = {
   hasMore: false,
   loadingHistory: false,
   messageCache: new SessionMessageCache(3),
+  visibleMessages: [],
+  expandedTurnIds: new Set(),
   openToken: 0,
   pageSize: 30,
   userScrolled: false,

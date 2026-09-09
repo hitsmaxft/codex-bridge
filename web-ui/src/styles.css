@@ -762,6 +762,7 @@ main {
   background: var(--panel);
 }
 #messages > *,
+.turn-group,
 .message,
 .message-body,
 .markdown,
@@ -771,6 +772,61 @@ main {
 .tool-list {
   min-width: 0;
   max-width: 100%;
+}
+.turn-group {
+  position: relative;
+}
+.turn-group > .message[hidden] {
+  display: none;
+}
+.turn-fold {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 24px;
+  margin: 0 0 8px;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  line-height: 18px;
+  text-align: left;
+}
+.turn-fold::after {
+  content: "";
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin: 0 0 3px 7px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform 0.15s;
+}
+.turn-group.expanded > .turn-fold::after {
+  margin-bottom: -3px;
+  transform: rotate(225deg);
+}
+.turn-fold .tool-icon {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  margin-right: 5px;
+}
+.turn-divider {
+  width: 100%;
+  margin: 0 0 18px;
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+}
+.turn-group.collapsed > article[class~="user"] {
+  margin-bottom: 8px;
+}
+.turn-group.collapsed > .message.assistant .tool-group {
+  display: none;
 }
 .message {
   position: relative;
@@ -863,6 +919,19 @@ main {
 }
 .message.assistant .message-head {
   display: none;
+}
+.turn-meta-line {
+  min-width: 0;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turn-meta-line + .turn-meta-line {
+  margin-top: 0;
 }
 .markdown > *:first-child {
   margin-top: 0;

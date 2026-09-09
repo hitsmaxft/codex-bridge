@@ -175,6 +175,12 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   const before = result(
     command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
   );
+  const completedTurn = before.messages.find((message) => message.id === "demo-assistant-4");
+  assert.deepEqual(
+    completedTurn.content.slice(-2).map((item) => item.kind),
+    ["memory_citation", "turn_usage"],
+  );
+  assert.equal(completedTurn.content.at(-1).total_tokens, 12480);
   assert.equal(
     result(
       command({
@@ -597,6 +603,24 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
     source.indexOf("function pendingNode"),
   );
   assert.doesNotMatch(reconcile, /replaceChildren/);
+});
+
+test("completed turns collapse by server turn id and preserve the full expansion", async () => {
+  const command = await demoClient();
+  const page = result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }));
+  assert.equal(page.messages[0].turn_id, "demo-turn-seed-1");
+  assert.equal(page.messages[1].turn_id, "demo-turn-seed-1");
+  assert.equal(page.messages.at(-1).turn_id, "demo-turn-seed-2");
+
+  const source = await readFile(mainScriptPath, "utf8");
+  const layout = source.slice(
+    source.indexOf("function groupedTurns"),
+    source.indexOf("function messageNode"),
+  );
+  assert.match(layout, /message\.turn_id/);
+  assert.match(layout, /state\.expandedTurnIds/);
+  assert.match(layout, /\.\.\.leading,[\s\S]*fold,[\s\S]*divider,[\s\S]*finalNode/);
+  assert.match(layout, /turnSummaryText\(group\)/);
 });
 
 test("queued messages expose withdraw and convert-to-steer actions", async () => {

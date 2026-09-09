@@ -1203,6 +1203,27 @@ function byteText(bytes) {
   if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1048576).toFixed(1)} MB`;
 }
+function tokenCountText(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count)) return "0";
+  return new Intl.NumberFormat(getLanguage() === "zh" ? "zh-CN" : "en", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(count);
+}
+function turnMetaNode(text, title = text) {
+  const line = document.createElement("div");
+  line.className = "turn-meta-line";
+  line.textContent = text;
+  line.title = title;
+  return line;
+}
+function memoryCitationSource(source) {
+  return String(source || "MEMORY.md")
+    .split("/")
+    .at(-1)
+    .replace(/:\d+(?:-\d+)?$/, "");
+}
 function appendContextValue(details, value, label) {
   const values = Array.isArray(value) ? value : [value];
   let rendered = false;
@@ -1244,6 +1265,23 @@ function appendContextValue(details, value, label) {
 }
 function contentNode(item) {
   if (item.kind === "text") return markdownNode(item.text, markdownOptions(state.current?.id));
+  if (item.kind === "turn_usage") {
+    const values = {
+      total: tokenCountText(item.total_tokens),
+      input: tokenCountText(item.input_tokens),
+      cached: tokenCountText(item.cached_input_tokens),
+      output: tokenCountText(item.output_tokens),
+    };
+    return turnMetaNode(tr("turnTokenUsage", values));
+  }
+  if (item.kind === "memory_citation") {
+    const source = memoryCitationSource(item.source),
+      note = item.note ? ` · ${item.note}` : "";
+    return turnMetaNode(
+      tr("memoryCitation", { source, note }),
+      [item.source, item.note].filter(Boolean).join(" · "),
+    );
+  }
   const details = document.createElement("details");
   details.className = "context-block";
   const summary = document.createElement("summary");
@@ -1576,6 +1614,127 @@ function localizedToolPreview(tool) {
   }
   return preview;
 }
+
+function groupedTurns(messages) {
+  const groups = [];
+  let legacyTurn = 0;
+  for (const message of messages) {
+    let key = message.turn_id ? `turn:${message.turn_id}` : null;
+    const previous = groups.at(-1);
+    if (!key) {
+      if (!previous || (message.role === "user" && previous.hasUser)) legacyTurn += 1;
+      key = `legacy:${legacyTurn}`;
+    }
+    let group = groups.at(-1);
+    if (!group || group.key !== key) {
+      group = { key, turnId: message.turn_id || null, messages: [], hasUser: false };
+      groups.push(group);
+    }
+    group.messages.push(message);
+    if (message.role === "user" && message.category === "user") group.hasUser = true;
+  }
+  return groups;
+}
+
+function turnHasUsage(message) {
+  return message.content?.some((item) => item.kind === "turn_usage");
+}
+
+function turnDuration(group) {
+  const times = group.messages
+    .map((message) => Date.parse(message.timestamp))
+    .filter(Number.isFinite);
+  const seconds =
+    times.length > 1
+      ? Math.max(0, Math.round((Math.max(...times) - Math.min(...times)) / 1000))
+      : 0;
+  return seconds >= 60
+    ? tr("turnDurationMinutes", { minutes: Math.floor(seconds / 60), seconds: seconds % 60 })
+    : tr("turnDurationSeconds", { seconds });
+}
+
+function turnSummaryText(group) {
+  const tools = group.messages.flatMap((message) => message.tools || []),
+    files = tools.reduce((total, tool) => total + (tool.file_count || 0), 0);
+  return tr("turnSummary", {
+    duration: turnDuration(group),
+    tools: tools.length,
+    files: files ? tr("turnEditedFiles", { count: files }) : "",
+  });
+}
+
+function reconcileChildren(parent, nodes) {
+  let cursor = parent.firstChild;
+  for (const node of nodes) {
+    if (node === cursor) cursor = cursor.nextSibling;
+    else parent.insertBefore(node, cursor);
+  }
+  while (cursor) {
+    const next = cursor.nextSibling;
+    cursor.remove();
+    cursor = next;
+  }
+}
+
+function layoutTurnGroup(section, group, messageNodes, completed) {
+  const finalPosition = group.messages.findLastIndex(
+      (message) => message.role === "assistant" && message.phase === "final_answer",
+    ),
+    fallbackFinalPosition = group.messages.findLastIndex((message) => message.role === "assistant"),
+    finalIndex = finalPosition >= 0 ? finalPosition : fallbackFinalPosition,
+    finalNode = finalIndex >= 0 ? messageNodes[finalIndex] : null,
+    userNodes = messageNodes.filter(
+      (node, index) =>
+        group.messages[index].role === "user" && group.messages[index].category === "user",
+    ),
+    hiddenNodes = messageNodes.filter((node) => node !== finalNode && !userNodes.includes(node)),
+    hasFinalTools = Boolean(finalIndex >= 0 && group.messages[finalIndex].tools?.length),
+    foldable = completed && Boolean(finalNode) && (hiddenNodes.length > 0 || hasFinalTools);
+
+  section.className = "turn-group";
+  section.dataset.turnKey = group.key;
+  if (!foldable) {
+    for (const node of messageNodes) node.hidden = false;
+    reconcileChildren(section, messageNodes);
+    return;
+  }
+
+  const expansionKey = `${state.current?.id || ""}:${group.key}`,
+    expanded = state.expandedTurnIds.has(expansionKey),
+    fold = section.querySelector(":scope > .turn-fold") || document.createElement("button"),
+    divider = section.querySelector(":scope > .turn-divider") || document.createElement("hr"),
+    latestTool = group.messages.flatMap((message) => message.tools || []).at(-1);
+  fold.type = "button";
+  fold.className = "turn-fold tool-group-summary";
+  fold.title = tr(expanded ? "collapseTurn" : "expandTurn");
+  fold.setAttribute("aria-label", fold.title);
+  fold.setAttribute("aria-expanded", String(expanded));
+  fold.replaceChildren();
+  const icon = document.createElement("span"),
+    label = document.createElement("span");
+  icon.className = `tool-icon ${toolIconClass(latestTool?.name || "other")}`;
+  label.className = "tool-summary-label";
+  label.textContent = turnSummaryText(group);
+  fold.append(icon, label);
+  fold.onclick = () => {
+    if (state.expandedTurnIds.has(expansionKey)) state.expandedTurnIds.delete(expansionKey);
+    else state.expandedTurnIds.add(expansionKey);
+    layoutTurnGroup(section, group, messageNodes, completed);
+  };
+  divider.className = "turn-divider";
+  section.classList.toggle("collapsed", !expanded);
+  section.classList.toggle("expanded", expanded);
+  for (const node of messageNodes) node.hidden = !expanded && hiddenNodes.includes(node);
+  const leading = expanded ? messageNodes.filter((node) => node !== finalNode) : userNodes;
+  reconcileChildren(section, [
+    ...leading,
+    fold,
+    divider,
+    finalNode,
+    ...hiddenNodes.filter((node) => !leading.includes(node)),
+  ]);
+}
+
 function messageNode(m, keepToolsRunning = false) {
   const box = document.createElement("article");
   box.className = `message ${m.category || m.role || ""}`;
@@ -1651,12 +1810,19 @@ function preserveLoadedToolDetails(previous, next) {
 
 function reconcileMessageNodes(root, response, activeToolMessage) {
   const existing = new Map(
-      [...root.querySelectorAll(":scope > .message[data-message-index]")].map((message) => [
+      [...root.querySelectorAll(".message[data-message-index]")].map((message) => [
         message.dataset.messageIndex,
         message,
       ]),
     ),
-    nodes = [];
+    messageNodes = new Map(),
+    nodes = [],
+    turnSections = new Map(
+      [...root.querySelectorAll(":scope > .turn-group")].map((section) => [
+        section.dataset.turnKey,
+        section,
+      ]),
+    );
   if (response.page.has_more) nodes.push(root.querySelector(":scope > .older") || olderButton());
   for (const message of response.messages) {
     const key = String(message.message_index),
@@ -1669,12 +1835,25 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
       previousState?.signature === signature &&
       previousState.keepToolsRunning === keepToolsRunning
     ) {
-      nodes.push(previous);
+      messageNodes.set(key, previous);
       continue;
     }
     const next = messageNode(message, keepToolsRunning);
     if (previous) preserveLoadedToolDetails(previous, next);
-    nodes.push(next);
+    messageNodes.set(key, next);
+  }
+  const turns = groupedTurns(response.messages);
+  for (const [turnIndex, turn] of turns.entries()) {
+    const section = turnSections.get(turn.key) || document.createElement("section"),
+      members = turn.messages.map((message) => messageNodes.get(String(message.message_index))),
+      completed =
+        turn.turnId !== state.activeTurnId &&
+        (turn.messages.some(
+          (message) => message.phase === "final_answer" || turnHasUsage(message),
+        ) ||
+          turnIndex < turns.length - 1);
+    layoutTurnGroup(section, turn, members, completed);
+    nodes.push(section);
   }
   if (!response.messages.length) {
     const empty = root.querySelector(":scope > .empty") || document.createElement("div");
@@ -2475,7 +2654,7 @@ function captureMessageView() {
   const root = $("messages"),
     metrics = messageScrollMetrics(),
     viewportTop = messageViewportTop(),
-    anchor = [...root.querySelectorAll(":scope > .message[data-message-index]")].find(
+    anchor = [...root.querySelectorAll(".message[data-message-index]")].find(
       (message) => message.getBoundingClientRect().bottom > viewportTop + 1,
     );
   return {
@@ -2505,7 +2684,7 @@ function restoreMessageView(view, { smoothBottom = false } = {}) {
     return;
   }
   const anchor = view.anchorMessageIndex
-    ? [...$("messages").querySelectorAll(":scope > .message[data-message-index]")].find(
+    ? [...$("messages").querySelectorAll(".message[data-message-index]")].find(
         (message) => message.dataset.messageIndex === view.anchorMessageIndex,
       )
     : null;
@@ -2543,6 +2722,7 @@ async function openThread(
     state.activeTool = null;
     state.pendingChanges = false;
     state.lastMessageIndex = null;
+    state.visibleMessages = [];
     state.historyStart = null;
     state.historyEnd = null;
     state.historyTotal = null;
@@ -2567,6 +2747,7 @@ async function openThread(
   if (!quiet) {
     if (cached && isValidMessagePage(cached, { latest: true })) {
       root.replaceChildren();
+      state.visibleMessages = cached.messages;
       reconcileMessageNodes(root, cached, null);
       applyMessagePageState(cached);
       requestAnimationFrame(scrollMessagesToBottom);
@@ -2606,8 +2787,23 @@ async function openThread(
   const activeToolMessage = state.activeTurnId
     ? r.messages.findLast((message) => message.tools?.length)
     : null;
-  reconcileMessageNodes(root, r, activeToolMessage);
+  const preservedHasMore = state.hasMore,
+    olderMessages = changedThread
+      ? []
+      : state.visibleMessages.filter((message) => message.message_index < r.page.start),
+    visibleResponse = {
+      ...r,
+      messages: [...olderMessages, ...r.messages],
+      page: { ...r.page, has_more: olderMessages.length ? preservedHasMore : r.page.has_more },
+    };
+  state.visibleMessages = visibleResponse.messages;
+  reconcileMessageNodes(root, visibleResponse, activeToolMessage);
   applyMessagePageState(r);
+  if (olderMessages.length) {
+    state.historyStart = olderMessages[0].message_index;
+    state.before = state.historyStart;
+    state.hasMore = preservedHasMore;
+  }
   renderPending();
   restoreMessageView(messageView, {
     smoothBottom:
@@ -2656,11 +2852,19 @@ async function loadOlder() {
   state.hasMore = r.page.has_more;
   state.historyStart = r.page.start;
   state.historyTotal = Math.max(state.historyTotal ?? 0, r.page.total);
-  root.querySelector(".older")?.remove();
-  const fragment = document.createDocumentFragment();
-  if (state.hasMore) fragment.appendChild(olderButton());
-  for (const m of r.messages) fragment.appendChild(messageNode(m));
-  root.prepend(fragment);
+  state.visibleMessages = [...r.messages, ...state.visibleMessages];
+  const activeToolMessage = state.activeTurnId
+    ? state.visibleMessages.findLast((message) => message.tools?.length)
+    : null;
+  reconcileMessageNodes(
+    root,
+    {
+      ...r,
+      messages: state.visibleMessages,
+      page: { ...r.page, start: state.historyStart, end: state.historyEnd },
+    },
+    activeToolMessage,
+  );
   const newHeight = messageScrollMetrics().height;
   if (usesDocumentMessageScroll()) window.scrollTo(0, oldTop + (newHeight - oldHeight));
   else root.scrollTop = oldTop + (newHeight - oldHeight);

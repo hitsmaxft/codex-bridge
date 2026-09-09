@@ -23,10 +23,10 @@ pub use sessions::{
 };
 pub use write_backend::{
     AppServerRuntimeInfo, BackendFailure, BackendSuccess, CodexCliBackend, NativeQueueReceipt,
-    APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
+    StartedTurnReceipt, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
