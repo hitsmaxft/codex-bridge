@@ -30,6 +30,23 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
+### v0.2.6 · 2026-09-10
+
+- **Compact completed turns:** completed runs collapse intermediate assistant progress and tools
+  while keeping the prompt and final response visible, with an expandable full transcript.
+- **Useful completion metadata:** turn summaries expose duration, the final cumulative token-usage
+  snapshot, and structured memory-citation sources without leaking internal markup into the chat.
+- **Reliable first messages and refresh:** a newly created empty thread starts its first native
+  app-server turn directly, while paginated history stays visible during live updates.
+
+See the complete [v0.2.6 release notes](docs/releases/v0.2.6.md), the
+[v0.2.5 Desktop interoperability release](docs/releases/v0.2.5.md), the
+[v0.2.4 managed-runtime release](docs/releases/v0.2.4.md), the
+[v0.2.3 project history and lifecycle release](docs/releases/v0.2.3.md), the
+[v0.2.2 voice and sidebar release](docs/releases/v0.2.2.md), the
+[v0.2.1 Firefox iOS fix](docs/releases/v0.2.1.md), or the larger
+[v0.2.0 feature release](docs/releases/v0.2.0.md).
+
 ### v0.2.5 · 2026-09-09
 
 - **Desktop direct resume:** managed Desktop app-server startup now seeds the disabled MCP transport
@@ -38,13 +55,6 @@ still use the account and network configured by Codex itself.
   assigned to their original project in both the Web UI and Desktop.
 - **Hot-deployment boundary:** Bridge-only upgrades still preserve app-server; applying the new
   process-level MCP base to an app-server started by v0.2.4 requires one intentional restart.
-
-See the complete [v0.2.5 release notes](docs/releases/v0.2.5.md), the
-[v0.2.4 managed-runtime release](docs/releases/v0.2.4.md), the
-[v0.2.3 project history and lifecycle release](docs/releases/v0.2.3.md), the
-[v0.2.2 voice and sidebar release](docs/releases/v0.2.2.md), the
-[v0.2.1 Firefox iOS fix](docs/releases/v0.2.1.md), or the larger
-[v0.2.0 feature release](docs/releases/v0.2.0.md).
 
 ## Web UI
 
