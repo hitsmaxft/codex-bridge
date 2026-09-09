@@ -30,18 +30,17 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.2.4 · 2026-09-09
+### v0.2.5 · 2026-09-09
 
-- **Managed runtime:** Bridge supervises app-server, the Desktop WebSocket adapter, and an optional
-  local Whisper fallback while preserving a healthy app-server across Bridge-only upgrades.
-- **Live architecture:** the settings panel diagrams the active control, Desktop, and voice paths
-  with component state, ownership, endpoints, and restart counts.
-- **Background awareness:** opt-in browser notifications report completed, failed, or cancelled
-  runs and open the corresponding session when clicked.
-- **Reliable editing:** authoritative app-server state clears stale Stop controls, and same-thread
-  incremental refreshes no longer rewrite the composer or move its insertion caret.
+- **Desktop direct resume:** managed Desktop app-server startup now seeds the disabled MCP transport
+  base required when Desktop sends only its incremental `enabled_tools` configuration.
+- **Compatible worktrees:** new isolated sessions use `CODEX_HOME/worktrees/<UUID>/<repo>` and stay
+  assigned to their original project in both the Web UI and Desktop.
+- **Hot-deployment boundary:** Bridge-only upgrades still preserve app-server; applying the new
+  process-level MCP base to an app-server started by v0.2.4 requires one intentional restart.
 
-See the complete [v0.2.4 release notes](docs/releases/v0.2.4.md), the
+See the complete [v0.2.5 release notes](docs/releases/v0.2.5.md), the
+[v0.2.4 managed-runtime release](docs/releases/v0.2.4.md), the
 [v0.2.3 project history and lifecycle release](docs/releases/v0.2.3.md), the
 [v0.2.2 voice and sidebar release](docs/releases/v0.2.2.md), the
 [v0.2.1 Firefox iOS fix](docs/releases/v0.2.1.md), or the larger
