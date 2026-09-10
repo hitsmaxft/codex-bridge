@@ -117,13 +117,39 @@ plutil -lint "$daemon_plist"
 
 if [ "$start_services" = true ]; then
   domain=gui/$(id -u)
+  daemon_service=$domain/local.codex-bridge.daemon
   if [ "$managed_by_bridge" = true ]; then
     for label in desktop-env ws-adapter app-server; do
       launchctl bootout "$domain/local.codex-bridge.$label" >/dev/null 2>&1 || true
     done
   fi
-  launchctl bootout "$domain/local.codex-bridge.daemon" >/dev/null 2>&1 || true
-  launchctl bootstrap "$domain" "$daemon_plist"
+  launchctl bootout "$daemon_service" >/dev/null 2>&1 || true
+  if ! launchctl bootstrap "$domain" "$daemon_plist"; then
+    echo "Initial LaunchAgent bootstrap failed; enabling the user service and retrying." >&2
+    launchctl enable "$daemon_service"
+    if ! launchctl print "$daemon_service" >/dev/null 2>&1; then
+      launchctl bootstrap "$domain" "$daemon_plist"
+    fi
+  fi
+  if ! launchctl print "$daemon_service" >/dev/null 2>&1; then
+    echo "LaunchAgent is unavailable after bootstrap: $daemon_service" >&2
+    exit 1
+  fi
+  daemon_ready=false
+  daemon_attempt=0
+  while [ "$daemon_attempt" -lt 15 ]; do
+    if "$cargo_bin_dir/codexctl" status >/dev/null 2>&1; then
+      daemon_ready=true
+      break
+    fi
+    daemon_attempt=$((daemon_attempt + 1))
+    sleep 1
+  done
+  if [ "$daemon_ready" != true ]; then
+    echo "LaunchAgent loaded, but the codex-bridge control socket did not become ready." >&2
+    echo "Inspect: $state_dir/bridge.log" >&2
+    exit 1
+  fi
 fi
 
 echo "Installed user configuration: $config_path"

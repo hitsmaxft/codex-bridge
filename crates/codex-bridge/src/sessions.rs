@@ -805,6 +805,46 @@ impl SessionStore {
         Ok(true)
     }
 
+    pub fn cache_stats(&self) -> Value {
+        let (message_entries, messages, rollout_bytes, tool_records) = self
+            .message_cache
+            .lock()
+            .map(|cache| {
+                cache.values().fold(
+                    (cache.len(), 0_usize, 0_u64, 0_usize),
+                    |(entries, messages, bytes, tools), entry| {
+                        (
+                            entries,
+                            messages.saturating_add(entry.messages.len()),
+                            bytes.saturating_add(entry.file_len),
+                            tools.saturating_add(entry.tool_records.len()),
+                        )
+                    },
+                )
+            })
+            .unwrap_or_default();
+        let summary_threads = self
+            .summary_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|entry| entry.threads.len()))
+            .unwrap_or_default();
+        let activity_entries = self
+            .activity_cache
+            .lock()
+            .map(|cache| cache.len())
+            .unwrap_or_default();
+        json!({
+            "message_entries": message_entries,
+            "message_capacity": MESSAGE_CACHE_ENTRIES,
+            "messages": messages,
+            "rollout_bytes": rollout_bytes,
+            "tool_records": tool_records,
+            "summary_threads": summary_threads,
+            "activity_entries": activity_entries,
+        })
+    }
+
     fn messages_for_path(&self, path: &Path) -> Result<Arc<Vec<ThreadMessage>>> {
         let metadata =
             fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
@@ -2371,6 +2411,140 @@ mod tests {
         assert_eq!((older.start, older.end), (0, 2));
         assert!(!older.has_more);
         assert_eq!(older.messages[1].id.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn large_session_first_message_page_stays_within_the_cold_load_baseline() {
+        const TURNS: usize = 512;
+        const TOOL_OUTPUT_BYTES: usize = 40 * 1024;
+        const COLD_BASELINE: Duration = Duration::from_millis(2_500);
+        const WARM_BASELINE: Duration = Duration::from_millis(150);
+
+        let fixture = Fixture::new();
+        let path = fixture
+            .path
+            .join("sessions/2026/08/30/rollout-large-session.jsonl");
+        let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{{"id":"thread-large-session","cwd":"/tmp/project"}}}}"#
+        )
+        .unwrap();
+        let large_output = "x".repeat(TOOL_OUTPUT_BYTES);
+        for turn in 0..TURNS {
+            let turn_id = format!("turn-{turn}");
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "timestamp": "2026-08-30T01:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn_id},
+                })
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "timestamp": "2026-08-30T01:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": format!("user-{turn}"),
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": format!("request {turn}")}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                    },
+                })
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "timestamp": "2026-08-30T01:00:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": format!("call-{turn}"),
+                        "arguments": format!(r#"{{"cmd":"large fixture {turn}"}}"#),
+                    },
+                })
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "timestamp": "2026-08-30T01:00:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": format!("call-{turn}"),
+                        "output": large_output.as_str(),
+                    },
+                })
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "timestamp": "2026-08-30T01:00:05Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": format!("answer-{turn}"),
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": format!("done {turn}")}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                    },
+                })
+            )
+            .unwrap();
+        }
+        file.flush().unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+
+        let store = SessionStore::new(fixture.path.clone());
+        let cold_started = Instant::now();
+        let (_, cold_page) = store
+            .read_message_page("thread-large-session", None, 30)
+            .unwrap()
+            .unwrap();
+        let cold_elapsed = cold_started.elapsed();
+        assert_eq!(cold_page.messages.len(), 30);
+        assert_eq!(cold_page.end, cold_page.total);
+        assert!(cold_page.has_more);
+        let page_bytes = serde_json::to_vec(&cold_page).unwrap().len();
+        assert!(
+            page_bytes <= 256 * 1024,
+            "large-session first-page payload is {page_bytes} bytes"
+        );
+        assert!(
+            cold_elapsed <= COLD_BASELINE,
+            "large-session cold first page took {cold_elapsed:?}, baseline is {COLD_BASELINE:?}"
+        );
+
+        let warm_started = Instant::now();
+        let (_, warm_page) = store
+            .read_message_page("thread-large-session", None, 30)
+            .unwrap()
+            .unwrap();
+        let warm_elapsed = warm_started.elapsed();
+        assert_eq!(warm_page.total, cold_page.total);
+        eprintln!(
+            "large-session baseline: bytes={}, messages={}, page_bytes={page_bytes}, cold={cold_elapsed:?}, warm={warm_elapsed:?}",
+            fs::metadata(&path).unwrap().len(),
+            cold_page.total,
+        );
+        assert!(
+            warm_elapsed <= WARM_BASELINE,
+            "large-session cached first page took {warm_elapsed:?}, baseline is {WARM_BASELINE:?}"
+        );
     }
 
     #[test]

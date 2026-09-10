@@ -67,8 +67,12 @@
           <section class="settings-card">
             <h3 data-i18n="bridgeStatus">Bridge status</h3>
             <div class="settings-value" id="bridgeState" data-i18n="connecting">Connecting…</div>
-            <div class="runtime-architecture" id="runtimeArchitecture"></div>
+            <details class="runtime-architecture-disclosure">
+              <summary data-i18n="runtimeArchitecture">Runtime architecture</summary>
+              <div class="runtime-architecture" id="runtimeArchitecture"></div>
+            </details>
             <div class="component-status" id="componentStatus"></div>
+            <div class="resource-status" id="resourceStatus"></div>
             <button id="statusBtn" data-i18n="refreshStatus">Refresh status</button>
           </section>
           <section class="settings-card">

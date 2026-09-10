@@ -895,13 +895,81 @@
         <h2 class="zh">从远程控制到完整会话工作流。</h2>
         <h2 class="en">From remote control to a complete session workflow.</h2>
         <p class="section-intro zh">
-          v0.2.7 让远程 Queue、跟进与长会话刷新形成可靠闭环：状态由 app-server
-          事件驱动，并在断流时自动恢复。
+          v0.2.8 让超大会话保持快速，并把消息交接、运行状态与 Desktop
+          兼容链路变成可验证的完整流程。
         </p>
         <p class="section-intro en">
-          v0.2.7 closes the loop for remote Queue, Steer, and long-session
-          refreshes with app-server-driven events and automatic recovery.
+          v0.2.8 keeps very large sessions responsive and makes message handoff,
+          runtime health, and Desktop compatibility observable.
         </p>
+        <div class="release">
+          <div class="release-date">
+            2026-09-10
+            <span class="zh">v0.2.8 正式版</span
+            ><span class="en">v0.2.8 release</span>
+          </div>
+          <div class="release-list">
+            <article class="release-item">
+              <h3>
+                <span class="zh">按视口加载超大会话</span
+                ><span class="en">Viewport-driven large sessions</span>
+              </h3>
+              <p class="zh">
+                首屏只加载即将可见的已完成
+                turn，统一观察器、单请求并发和频率限制
+                避免滚动时集中请求；新增超过 20 MiB 的性能基线。
+              </p>
+              <p class="en">
+                Completed turns hydrate only near the viewport, with one
+                observer, bounded concurrency, and a regression baseline above
+                20 MiB.
+              </p>
+            </article>
+            <article class="release-item">
+              <h3>
+                <span class="zh">原子化消息交接</span
+                ><span class="en">Atomic message handoff</span>
+              </h3>
+              <p class="zh">
+                Queue 与跟进会保留稳定提交 ID；只有 app-server
+                历史中的对应用户消息 真正渲染后，视觉缓冲区才会清除。
+              </p>
+              <p class="en">
+                Queue and Steer retain stable submission identities and leave
+                the outbox only after authoritative history is rendered.
+              </p>
+            </article>
+            <article class="release-item">
+              <h3>
+                <span class="zh">运行与缓存状态</span
+                ><span class="en">Runtime and cache health</span>
+              </h3>
+              <p class="zh">
+                紧凑架构面板区分浏览器录音能力和服务端转写状态，并展示进程内存、
+                会话 LRU 与工具/项目缓存；完成 turn 同行展示 token 用量。
+              </p>
+              <p class="en">
+                The compact architecture panel separates browser recording
+                capability from transcription readiness and reports memory,
+                session LRU, and cache usage.
+              </p>
+            </article>
+            <article class="release-item">
+              <h3>
+                <span class="zh">大响应 Desktop 兼容链路</span
+                ><span class="en">Large Desktop compatibility responses</span>
+              </h3>
+              <p class="zh">
+                双向 WebSocket 帧与消息上限提升到 64 MiB，并加入超过 16 MiB
+                的回归测试；该链路仍明确定位为会话恢复兼容层。
+              </p>
+              <p class="en">
+                Both WebSocket legs now accept 64 MiB frames and messages,
+                backed by bidirectional regression coverage above 16 MiB.
+              </p>
+            </article>
+          </div>
+        </div>
         <div class="release">
           <div class="release-date">
             2026-09-10

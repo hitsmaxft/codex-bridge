@@ -729,8 +729,14 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             },
             "managed_services": {
                 "app_server": {"enabled": true, "status": {"running": true, "restart_count": 0}},
-                "desktop_interposition": {"enabled": false, "listen": null, "status": {"running": false, "restart_count": 0}},
+                "desktop_interposition": {"enabled": false, "listen": null, "capability": null, "max_frame_bytes": 67_108_864, "max_message_bytes": 67_108_864, "status": {"running": false, "restart_count": 0}},
                 "whisper": {"enabled": false, "fallback": true, "needed": false, "listen": null, "status": {"running": false, "restart_count": 0}}
+            },
+            "runtime_resources": {
+                "memory": {"peak_rss_bytes": 12_582_912},
+                "session_cache": {"message_entries": 1, "message_capacity": 10, "messages": 42, "rollout_bytes": 48_320, "tool_records": 2, "summary_threads": 2, "activity_entries": 1},
+                "tool_cache": {"threads": 1, "messages": 12, "tool_calls": 2},
+                "project_cache": {"indexed": true}
             },
             "rollout_store": {"available": true, "codex_home": "/demo/.codex", "read_only": true},
             "selected_thread_id": PRIMARY_THREAD,

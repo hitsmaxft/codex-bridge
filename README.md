@@ -29,6 +29,21 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
+### v0.2.8 · 2026-09-10
+
+- **Faster large sessions:** viewport-driven hydration keeps first paint bounded and loads completed
+  turn details only as they approach the screen.
+- **Atomic message handoff:** Queue and Steer entries remain visible until the matching authoritative
+  user message is rendered from app-server history.
+- **Observable runtime health:** the compact architecture panel now reports browser audio support,
+  managed voice readiness, process memory, and bounded session/cache usage.
+- **Large Desktop responses:** the compatibility WebSocket accepts up to 64 MiB frames and messages
+  on both legs, with regression coverage above the previous 16 MiB ceiling.
+
+See the complete [v0.2.8 release notes](docs/releases/v0.2.8.md), the
+[v0.2.7 Queue and Steer release](docs/releases/v0.2.7.md), or the
+[complete release history](docs/releases/).
+
 ### v0.2.7 · 2026-09-10
 
 - **Eventually consistent Queue and Steer:** stable submission identities connect optimistic UI,
@@ -39,11 +54,6 @@ still use the account and network configured by Codex itself.
 - **Stable long-session navigation:** recent-message reconciliation keeps global cursor identity,
   viewport anchoring avoids large jumps, and linked Codex worktrees stay grouped with their
   repository project without changing their execution directory.
-
-See the complete [v0.2.7 release notes](docs/releases/v0.2.7.md), the
-[v0.2.6 completed-turn release](docs/releases/v0.2.6.md), the
-[v0.2.5 Desktop interoperability release](docs/releases/v0.2.5.md), or the
-[complete release history](docs/releases/).
 
 ### v0.2.6 · 2026-09-10
 

@@ -9,18 +9,29 @@ function servicePhase(service, externallyAvailable = false) {
   if (service.fallback && !service.needed) {
     return { phase: "standby", labelKey: "componentStandby" };
   }
+  if (status.running && service.capability === "resume_compatibility_only") {
+    return { phase: "standby", labelKey: "componentLimited" };
+  }
   if (status.running) return { phase: "running", labelKey: "componentRunning" };
   if (status.last_error) return { phase: "failed", labelKey: "componentStopped" };
   return { phase: "stopped", labelKey: "componentStopped" };
 }
 
-export function runtimeArchitectureModel({ managedServices, directAppServer, audioTranscription }) {
+export function runtimeArchitectureModel({
+  managedServices,
+  directAppServer,
+  audioTranscription,
+  browserMicrophoneAvailable = true,
+}) {
   const services = managedServices || {},
     appServer = servicePhase(services.app_server, directAppServer),
     wsBridge = servicePhase(services.desktop_interposition),
     whisper = servicePhase(services.whisper),
     voiceBackend = audioTranscription?.backend,
-    voiceEnabled = Boolean(audioTranscription?.enabled);
+    voiceEnabled = Boolean(audioTranscription?.enabled),
+    microphone = browserMicrophoneAvailable
+      ? { phase: "running", labelKey: "browserInput" }
+      : { phase: "failed", labelKey: "browserAudioLimited" };
   let voice = {
     phase: "stopped",
     labelKey: "voiceBackendUnavailable",
@@ -33,9 +44,14 @@ export function runtimeArchitectureModel({ managedServices, directAppServer, aud
       nameKey: "appServerRealtime",
     };
   } else if (voiceBackend === "whisper_cpp") {
+    const starting = audioTranscription?.reason === "whisper_starting";
     voice = {
-      phase: voiceEnabled ? "running" : whisper.phase,
-      labelKey: voiceEnabled ? "componentRunning" : whisper.labelKey,
+      phase: voiceEnabled ? "running" : starting ? "standby" : "stopped",
+      labelKey: voiceEnabled
+        ? "componentRunning"
+        : starting
+          ? "componentStandby"
+          : "componentStopped",
       nameKey: "whisperBackend",
     };
   } else if (voiceBackend === "demo_wasm") {
@@ -45,7 +61,7 @@ export function runtimeArchitectureModel({ managedServices, directAppServer, aud
       nameKey: "demoVoiceBackend",
     };
   }
-  return { appServer, wsBridge, whisper, voice };
+  return { appServer, wsBridge, whisper, voice, microphone };
 }
 
 function architectureNode(name, status, translate, fixedPhase = null, fixedLabelKey = null) {
@@ -104,6 +120,7 @@ export function renderRuntimeArchitecture(root, snapshot, translate) {
       managedServices: snapshot.managedServices,
       directAppServer: snapshot.directAppServer,
       audioTranscription: snapshot.serverCapabilities?.audio_transcription,
+      browserMicrophoneAvailable: snapshot.browserMicrophoneAvailable,
     }),
     figure = document.createElement("figure"),
     caption = document.createElement("figcaption"),
@@ -148,9 +165,7 @@ export function renderRuntimeArchitecture(root, snapshot, translate) {
       [
         {
           nameKey: "microphone",
-          status: {},
-          fixed: "external",
-          fixedLabelKey: "browserInput",
+          status: model.microphone,
         },
         { nameKey: model.voice.nameKey, status: model.voice, routeKey: "pcmAudioRoute" },
         {

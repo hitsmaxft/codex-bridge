@@ -55,27 +55,27 @@ On macOS, replace `codex` with
 `app_server_rpc` debugging command can technically forward any method, but that does not count as
 a completed bridge or Web UI feature.
 
-| Interface | Current use |
-| --- | --- |
-| `initialize` | One handshake for the persistent app-server connection. |
-| `thread/list` | Fetch app-server thread metadata used by the session list and pin state. |
-| `thread/turns/list` | Compatibility inventory only; ordinary message refreshes no longer download full turns. |
-| `thread/items/list` | Page recent native items for structured tool rendering and active-turn state helpers. |
-| `thread/read` | Read a thread and its composer settings. |
-| `config/read` | Fallback source for composer configuration. |
-| `account/read` | Detect whether API-key authentication enables realtime voice transcription. The result is cached for Web UI status snapshots; the bridge does not probe realtime sessions. |
-| `account/rateLimits/read` | Display account usage and limits. |
-| `model/list` | Populate the model selector. |
-| `project/list` | Resolve a project when starting a new thread. |
-| `thread/start` | Create a new session. |
-| `thread/settings/update` | Change the selected model and related thread settings. |
-| `thread/archive` | Archive a session. |
-| `thread/section/move` | Move a pinned session into or out of the pinned section. |
+| Interface                                                                            | Current use                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `initialize`                                                                         | One handshake for the persistent app-server connection.                                                                                                                           |
+| `thread/list`                                                                        | Fetch app-server thread metadata used by the session list and pin state.                                                                                                          |
+| `thread/turns/list`                                                                  | Compatibility inventory only; ordinary message refreshes no longer download full turns.                                                                                           |
+| `thread/items/list`                                                                  | Page recent native items for structured tool rendering and active-turn state helpers.                                                                                             |
+| `thread/read`                                                                        | Read a thread and its composer settings.                                                                                                                                          |
+| `config/read`                                                                        | Fallback source for composer configuration.                                                                                                                                       |
+| `account/read`                                                                       | Detect whether API-key authentication enables realtime voice transcription. The result is cached for Web UI status snapshots; the bridge does not probe realtime sessions.        |
+| `account/rateLimits/read`                                                            | Display account usage and limits.                                                                                                                                                 |
+| `model/list`                                                                         | Populate the model selector.                                                                                                                                                      |
+| `project/list`                                                                       | Resolve a project when starting a new thread.                                                                                                                                     |
+| `thread/start`                                                                       | Create a new session.                                                                                                                                                             |
+| `thread/settings/update`                                                             | Change the selected model and related thread settings.                                                                                                                            |
+| `thread/archive`                                                                     | Archive a session.                                                                                                                                                                |
+| `thread/section/move`                                                                | Move a pinned session into or out of the pinned section.                                                                                                                          |
 | `thread/queue/add`, `thread/queue/list`, `thread/queue/delete`, `thread/queue/start` | Native queue submission, reconciliation, withdrawal, and idle-thread startup. The bridge starts a newly queued submission explicitly when the authoritative thread state is idle. |
-| `turn/steer` | Follow up on an active turn. |
-| `turn/interrupt` | Stop an active turn. |
-| `thread/resume`, `thread/unsubscribe` | Keep a bounded LRU set of recently viewed threads subscribed to events. |
-| `turn/start` | Started by app-server's native queue processing after `thread/queue/add`. |
+| `turn/steer`                                                                         | Follow up on an active turn.                                                                                                                                                      |
+| `turn/interrupt`                                                                     | Stop an active turn.                                                                                                                                                              |
+| `thread/resume`, `thread/unsubscribe`                                                | Keep a bounded LRU set of recently viewed threads subscribed to events.                                                                                                           |
+| `turn/start`                                                                         | Started by app-server's native queue processing after `thread/queue/add`.                                                                                                         |
 
 Rollout JSONL files remain the authoritative recovery source for paginated history. The bridge
 parses append-only updates from its last complete-line offset instead of reparsing a growing file
@@ -131,129 +131,129 @@ Methods marked **experimental** only appear when the schema is generated with `-
 
 ### Session, turn, and history
 
-| Interface | Purpose |
-| --- | --- |
-| `thread/start` | Create a thread with workspace, model, sandbox, approval, and initial settings. |
-| `thread/resume` | Load an existing thread into the current app-server process. |
-| `thread/read` | Read one thread; may include its turns. |
-| `thread/list` | List threads with pagination and filters. |
-| `thread/loaded/list` | List threads currently loaded by this server process. |
-| `thread/search` **experimental** | Full-text or substring search across thread metadata/history, with paging and sorting. |
-| `thread/searchOccurrences` **experimental** | Find matching occurrences inside threads for search-result previews and navigation. |
-| `thread/turns/list` | Page through a thread's structured turns. |
-| `thread/items/list` | Page through structured items independently of full turns. |
-| `thread/timeline/list` **experimental** | Read a chronological timeline of thread activity. |
-| `thread/name/set` | Rename a thread. |
-| `thread/metadata/update` | Change project assignment or stored Git metadata. |
-| `thread/settings/update` **experimental** | Update persistent thread execution/model settings. |
-| `thread/section/move` | Move a thread between UI sections, including the pinned section. |
-| `threadSection/list`, `threadSection/create`, `threadSection/update`, `threadSection/delete` | Manage the independently persisted sections used to organize threads. |
-| `thread/archive`, `thread/unarchive` | Archive or restore a thread. |
-| `thread/delete` | Permanently remove a thread. |
-| `thread/fork` | Create a new thread from existing history. |
-| `thread/revert` | Replace durable history with the prefix before a selected turn; it does not revert files. |
-| `thread/rollback` | Deprecated turn-count form of history rollback; it also does not revert files. |
-| `thread/compact/start` | Start context compaction for a long thread. |
-| `thread/inject_items` | Append raw Responses API items to model-visible history. This is a low-level integration hook. |
-| `thread/unsubscribe` | Stop receiving events for a subscribed thread. |
-| `thread/increment_elicitation`, `thread/decrement_elicitation` **experimental** | Track active elicitation/user-input state. |
-| `thread/memoryMode/set` **experimental** | Select the thread memory mode. |
-| `thread/shellCommand` | Run a shell command in thread context and record it as thread activity. |
-| `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, `thread/backgroundTerminals/clean` **experimental** | Inspect, stop, and clean up background terminals associated with a thread. |
-| `turn/start` | Submit user input and start a new agent turn. |
-| `turn/steer` | Add input to the active turn. |
-| `turn/interrupt` | Interrupt the active turn. |
-| `turn/settings/update` **experimental** | Change settings for the active turn. |
-| `review/start` | Start a code review against a review target. |
-| `getConversationSummary` | Compatibility endpoint for a compact conversation summary. |
+| Interface                                                                                                                      | Purpose                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `thread/start`                                                                                                                 | Create a thread with workspace, model, sandbox, approval, and initial settings.                |
+| `thread/resume`                                                                                                                | Load an existing thread into the current app-server process.                                   |
+| `thread/read`                                                                                                                  | Read one thread; may include its turns.                                                        |
+| `thread/list`                                                                                                                  | List threads with pagination and filters.                                                      |
+| `thread/loaded/list`                                                                                                           | List threads currently loaded by this server process.                                          |
+| `thread/search` **experimental**                                                                                               | Full-text or substring search across thread metadata/history, with paging and sorting.         |
+| `thread/searchOccurrences` **experimental**                                                                                    | Find matching occurrences inside threads for search-result previews and navigation.            |
+| `thread/turns/list`                                                                                                            | Page through a thread's structured turns.                                                      |
+| `thread/items/list`                                                                                                            | Page through structured items independently of full turns.                                     |
+| `thread/timeline/list` **experimental**                                                                                        | Read a chronological timeline of thread activity.                                              |
+| `thread/name/set`                                                                                                              | Rename a thread.                                                                               |
+| `thread/metadata/update`                                                                                                       | Change project assignment or stored Git metadata.                                              |
+| `thread/settings/update` **experimental**                                                                                      | Update persistent thread execution/model settings.                                             |
+| `thread/section/move`                                                                                                          | Move a thread between UI sections, including the pinned section.                               |
+| `threadSection/list`, `threadSection/create`, `threadSection/update`, `threadSection/delete`                                   | Manage the independently persisted sections used to organize threads.                          |
+| `thread/archive`, `thread/unarchive`                                                                                           | Archive or restore a thread.                                                                   |
+| `thread/delete`                                                                                                                | Permanently remove a thread.                                                                   |
+| `thread/fork`                                                                                                                  | Create a new thread from existing history.                                                     |
+| `thread/revert`                                                                                                                | Replace durable history with the prefix before a selected turn; it does not revert files.      |
+| `thread/rollback`                                                                                                              | Deprecated turn-count form of history rollback; it also does not revert files.                 |
+| `thread/compact/start`                                                                                                         | Start context compaction for a long thread.                                                    |
+| `thread/inject_items`                                                                                                          | Append raw Responses API items to model-visible history. This is a low-level integration hook. |
+| `thread/unsubscribe`                                                                                                           | Stop receiving events for a subscribed thread.                                                 |
+| `thread/increment_elicitation`, `thread/decrement_elicitation` **experimental**                                                | Track active elicitation/user-input state.                                                     |
+| `thread/memoryMode/set` **experimental**                                                                                       | Select the thread memory mode.                                                                 |
+| `thread/shellCommand`                                                                                                          | Run a shell command in thread context and record it as thread activity.                        |
+| `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, `thread/backgroundTerminals/clean` **experimental** | Inspect, stop, and clean up background terminals associated with a thread.                     |
+| `turn/start`                                                                                                                   | Submit user input and start a new agent turn.                                                  |
+| `turn/steer`                                                                                                                   | Add input to the active turn.                                                                  |
+| `turn/interrupt`                                                                                                               | Interrupt the active turn.                                                                     |
+| `turn/settings/update` **experimental**                                                                                        | Change settings for the active turn.                                                           |
+| `review/start`                                                                                                                 | Start a code review against a review target.                                                   |
+| `getConversationSummary`                                                                                                       | Compatibility endpoint for a compact conversation summary.                                     |
 
 ### Native queue and goals
 
-| Interface | Purpose |
-| --- | --- |
-| `thread/queue/add` **experimental** | Add a queued user submission with a client message ID. |
-| `thread/queue/list` **experimental** | List queued submissions for a thread. |
-| `thread/queue/update` **experimental** | Edit an existing queued submission. |
-| `thread/queue/reorder` **experimental** | Change queued-submission order. |
-| `thread/queue/delete` **experimental** | Withdraw a queued submission. |
-| `thread/queue/start` **experimental** | Start one queued submission, or the next available submission. |
+| Interface                                                 | Purpose                                                         |
+| --------------------------------------------------------- | --------------------------------------------------------------- |
+| `thread/queue/add` **experimental**                       | Add a queued user submission with a client message ID.          |
+| `thread/queue/list` **experimental**                      | List queued submissions for a thread.                           |
+| `thread/queue/update` **experimental**                    | Edit an existing queued submission.                             |
+| `thread/queue/reorder` **experimental**                   | Change queued-submission order.                                 |
+| `thread/queue/delete` **experimental**                    | Withdraw a queued submission.                                   |
+| `thread/queue/start` **experimental**                     | Start one queued submission, or the next available submission.  |
 | `thread/goal/set`, `thread/goal/get`, `thread/goal/clear` | Manage the thread objective, status, and optional token budget. |
-| `thread/approveGuardianDeniedAction` | Explicitly approve an action previously denied by Guardian. |
+| `thread/approveGuardianDeniedAction`                      | Explicitly approve an action previously denied by Guardian.     |
 
 ### Models, account, configuration, and permissions
 
-| Interface | Purpose |
-| --- | --- |
-| `model/list` | List selectable models and presentation metadata. |
-| `modelProvider/capabilities/read` | Read provider capabilities. |
-| `collaborationMode/list` **experimental** | List supported collaboration modes and their settings. |
-| `account/read`, `getAuthStatus` | Read account and legacy authentication state. |
-| `account/login/start`, `account/login/cancel`, `account/logout` | Manage login lifecycle. |
-| `account/rateLimits/read`, `account/usage/read` | Read rate-limit windows, credits, and usage information. |
-| `account/rateLimitResetCredit/consume` | Consume a rate-limit reset credit. |
-| `account/sendAddCreditsNudgeEmail` | Request an add-credits reminder email. |
-| `account/workspaceMessages/read` | Read account/workspace notices. |
+| Interface                                                            | Purpose                                                           |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `model/list`                                                         | List selectable models and presentation metadata.                 |
+| `modelProvider/capabilities/read`                                    | Read provider capabilities.                                       |
+| `collaborationMode/list` **experimental**                            | List supported collaboration modes and their settings.            |
+| `account/read`, `getAuthStatus`                                      | Read account and legacy authentication state.                     |
+| `account/login/start`, `account/login/cancel`, `account/logout`      | Manage login lifecycle.                                           |
+| `account/rateLimits/read`, `account/usage/read`                      | Read rate-limit windows, credits, and usage information.          |
+| `account/rateLimitResetCredit/consume`                               | Consume a rate-limit reset credit.                                |
+| `account/sendAddCreditsNudgeEmail`                                   | Request an add-credits reminder email.                            |
+| `account/workspaceMessages/read`                                     | Read account/workspace notices.                                   |
 | `account/bedrock/discover`, `account/bedrock/setup` **experimental** | Discover and configure an Amazon Bedrock-backed account/provider. |
-| `config/read` | Read effective configuration and origins. |
-| `config/value/write`, `config/batchWrite` | Persist one or several configuration values. |
-| `config/mcpServer/reload` | Reload MCP server configuration. |
-| `configRequirements/read` | Read enforced configuration requirements. |
-| `permissionProfile/list` | List reusable permission profiles. |
-| `experimentalFeature/list`, `experimentalFeature/enablement/set` | Discover feature flags and change their enablement. |
-| `skills/list`, `skills/config/write`, `skills/extraRoots/set` | Discover skills and manage skill configuration/search roots. |
-| `hooks/list` | List configured hooks. |
+| `config/read`                                                        | Read effective configuration and origins.                         |
+| `config/value/write`, `config/batchWrite`                            | Persist one or several configuration values.                      |
+| `config/mcpServer/reload`                                            | Reload MCP server configuration.                                  |
+| `configRequirements/read`                                            | Read enforced configuration requirements.                         |
+| `permissionProfile/list`                                             | List reusable permission profiles.                                |
+| `experimentalFeature/list`, `experimentalFeature/enablement/set`     | Discover feature flags and change their enablement.               |
+| `skills/list`, `skills/config/write`, `skills/extraRoots/set`        | Discover skills and manage skill configuration/search roots.      |
+| `hooks/list`                                                         | List configured hooks.                                            |
 
 ### Apps, plugins, marketplaces, and MCP
 
-| Interface | Purpose |
-| --- | --- |
-| `app/list`, `app/read`, `app/installed` | Discover apps/connectors and inspect installation state. |
-| `plugin/list`, `plugin/read`, `plugin/installed` | Discover plugins and inspect installed state. |
-| `plugin/search` **experimental** | Search available plugins. |
-| `plugin/install`, `plugin/uninstall` | Install or remove a plugin. |
-| `plugin/skill/read` | Read a skill supplied by a plugin. |
-| `plugin/share/list`, `plugin/share/save`, `plugin/share/checkout`, `plugin/share/delete`, `plugin/share/updateTargets` | Manage shared plugin-development records and targets. |
-| `marketplace/add`, `marketplace/remove`, `marketplace/upgrade` | Manage plugin marketplace sources. |
-| `mcpServerStatus/list` | Read configured MCP server startup and tool/resource status. |
-| `mcpServer/oauth/login` | Begin OAuth for an MCP server. |
-| `mcpServer/tool/call` | Invoke an MCP tool through app-server. |
-| `mcpServer/resource/read` | Read an MCP resource through app-server. |
-| `mcpServer/event/stream/start`, `mcpServer/event/stream/stop` **experimental** | Subscribe to or stop a streamed MCP event source. |
+| Interface                                                                                                              | Purpose                                                      |
+| ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `app/list`, `app/read`, `app/installed`                                                                                | Discover apps/connectors and inspect installation state.     |
+| `plugin/list`, `plugin/read`, `plugin/installed`                                                                       | Discover plugins and inspect installed state.                |
+| `plugin/search` **experimental**                                                                                       | Search available plugins.                                    |
+| `plugin/install`, `plugin/uninstall`                                                                                   | Install or remove a plugin.                                  |
+| `plugin/skill/read`                                                                                                    | Read a skill supplied by a plugin.                           |
+| `plugin/share/list`, `plugin/share/save`, `plugin/share/checkout`, `plugin/share/delete`, `plugin/share/updateTargets` | Manage shared plugin-development records and targets.        |
+| `marketplace/add`, `marketplace/remove`, `marketplace/upgrade`                                                         | Manage plugin marketplace sources.                           |
+| `mcpServerStatus/list`                                                                                                 | Read configured MCP server startup and tool/resource status. |
+| `mcpServer/oauth/login`                                                                                                | Begin OAuth for an MCP server.                               |
+| `mcpServer/tool/call`                                                                                                  | Invoke an MCP tool through app-server.                       |
+| `mcpServer/resource/read`                                                                                              | Read an MCP resource through app-server.                     |
+| `mcpServer/event/stream/start`, `mcpServer/event/stream/stop` **experimental**                                         | Subscribe to or stop a streamed MCP event source.            |
 
 ### Projects, environments, and imported agents
 
-| Interface | Purpose |
-| --- | --- |
-| `project/list`, `project/read` **experimental** | List and inspect projects/workspaces. (`project/list` is present in the experimental generated set for this build.) |
-| `project/create`, `project/update`, `project/move`, `project/delete`, `project/import` **experimental** | Manage project records, roots, names, ordering, and imported workspaces. |
-| `environment/add`, `environment/info`, `environment/status` **experimental** | Register and inspect remote execution environments. |
-| `externalAgentConfig/detect` | Detect configuration from another supported agent. |
-| `externalAgentConfig/import`, `externalAgentConfig/import/readHistories`, `externalAgentConfig/import/recordHistory` | Import external-agent configuration and track import history. |
+| Interface                                                                                                            | Purpose                                                                                                             |
+| -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `project/list`, `project/read` **experimental**                                                                      | List and inspect projects/workspaces. (`project/list` is present in the experimental generated set for this build.) |
+| `project/create`, `project/update`, `project/move`, `project/delete`, `project/import` **experimental**              | Manage project records, roots, names, ordering, and imported workspaces.                                            |
+| `environment/add`, `environment/info`, `environment/status` **experimental**                                         | Register and inspect remote execution environments.                                                                 |
+| `externalAgentConfig/detect`                                                                                         | Detect configuration from another supported agent.                                                                  |
+| `externalAgentConfig/import`, `externalAgentConfig/import/readHistories`, `externalAgentConfig/import/recordHistory` | Import external-agent configuration and track import history.                                                       |
 
 ### Commands, host processes, and files
 
-| Interface | Purpose |
-| --- | --- |
-| `command/exec` | Run an argv-based command in the Codex sandbox, optionally with PTY and streamed output. |
-| `command/exec/write`, `command/exec/resize`, `command/exec/terminate` | Control a streamed `command/exec` process. |
-| `process/spawn`, `process/writeStdin`, `process/resizePty`, `process/kill` **experimental** | Run and control an unsandboxed host process. This is more privileged than `command/exec`. |
-| `fs/readFile`, `fs/readDirectory`, `fs/getMetadata` | Read files, directories, and metadata. |
-| `fs/writeFile`, `fs/createDirectory`, `fs/copy`, `fs/remove` | Modify the filesystem. |
-| `fs/watch`, `fs/unwatch` | Subscribe to filesystem changes. |
-| `fuzzyFileSearch` | Run a one-shot fuzzy workspace file search. |
-| `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, `fuzzyFileSearch/sessionStop` **experimental** | Maintain an incremental fuzzy-search session. |
-| `gitDiffToRemote` | Compatibility endpoint for a Git diff against the configured remote/base. |
+| Interface                                                                                                       | Purpose                                                                                   |
+| --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `command/exec`                                                                                                  | Run an argv-based command in the Codex sandbox, optionally with PTY and streamed output.  |
+| `command/exec/write`, `command/exec/resize`, `command/exec/terminate`                                           | Control a streamed `command/exec` process.                                                |
+| `process/spawn`, `process/writeStdin`, `process/resizePty`, `process/kill` **experimental**                     | Run and control an unsandboxed host process. This is more privileged than `command/exec`. |
+| `fs/readFile`, `fs/readDirectory`, `fs/getMetadata`                                                             | Read files, directories, and metadata.                                                    |
+| `fs/writeFile`, `fs/createDirectory`, `fs/copy`, `fs/remove`                                                    | Modify the filesystem.                                                                    |
+| `fs/watch`, `fs/unwatch`                                                                                        | Subscribe to filesystem changes.                                                          |
+| `fuzzyFileSearch`                                                                                               | Run a one-shot fuzzy workspace file search.                                               |
+| `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, `fuzzyFileSearch/sessionStop` **experimental** | Maintain an incremental fuzzy-search session.                                             |
+| `gitDiffToRemote`                                                                                               | Compatibility endpoint for a Git diff against the configured remote/base.                 |
 
 ### Remote control and realtime
 
-| Interface | Purpose |
-| --- | --- |
-| `remoteControl/enable`, `remoteControl/disable`, `remoteControl/status/read` **experimental** | Enable, disable, and inspect Codex's native remote-control service. |
-| `remoteControl/pairing/start`, `remoteControl/pairing/status` **experimental** | Start and inspect device pairing. |
-| `remoteControl/client/list`, `remoteControl/client/revoke` **experimental** | List paired clients and revoke access. |
-| `thread/realtime/start`, `thread/realtime/stop` **experimental** | Start or stop a realtime session. The Web UI uses a text-output, client-managed session for voice transcription. |
+| Interface                                                                                                    | Purpose                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `remoteControl/enable`, `remoteControl/disable`, `remoteControl/status/read` **experimental**                | Enable, disable, and inspect Codex's native remote-control service.                                                                                                                                                                          |
+| `remoteControl/pairing/start`, `remoteControl/pairing/status` **experimental**                               | Start and inspect device pairing.                                                                                                                                                                                                            |
+| `remoteControl/client/list`, `remoteControl/client/revoke` **experimental**                                  | List paired clients and revoke access.                                                                                                                                                                                                       |
+| `thread/realtime/start`, `thread/realtime/stop` **experimental**                                             | Start or stop a realtime session. The Web UI uses a text-output, client-managed session for voice transcription.                                                                                                                             |
 | `thread/realtime/appendText`, `thread/realtime/appendAudio`, `thread/realtime/appendSpeech` **experimental** | Stream text, raw PCM audio, or already-transcribed speakable text into realtime. The Web UI resamples recorded audio to 24 kHz mono PCM and consumes `thread/realtime/transcript/done`; it never submits the recording as a turn attachment. |
-| `thread/realtime/listVoices` **experimental** | List voices available for realtime output. |
+| `thread/realtime/listVoices` **experimental**                                                                | List voices available for realtime output.                                                                                                                                                                                                   |
 
 The current bundled schema exposes no standalone dictation RPC. Its speech-to-text result is the
 `thread/realtime/transcript/done` notification. In the bundled build tested on 2026-09-08,
@@ -265,13 +265,13 @@ managed whisper.cpp server's transcript to the editable composer.
 
 ### Diagnostics and platform support
 
-| Interface | Purpose |
-| --- | --- |
-| `server/diagnostics` **experimental** | Read app-server diagnostics useful for a health/debug panel. |
-| `feedback/upload` | Upload user feedback and associated diagnostics. |
-| `windowsSandbox/readiness`, `windowsSandbox/setupStart` | Inspect and initialize Windows sandbox support. |
-| `memory/reset` **experimental** | Reset app-server memory state; destructive and unsuitable for a routine UI action. |
-| `mock/experimentalMethod` **experimental** | Protocol test fixture, not a product feature. |
+| Interface                                               | Purpose                                                                            |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `server/diagnostics` **experimental**                   | Read app-server diagnostics useful for a health/debug panel.                       |
+| `feedback/upload`                                       | Upload user feedback and associated diagnostics.                                   |
+| `windowsSandbox/readiness`, `windowsSandbox/setupStart` | Inspect and initialize Windows sandbox support.                                    |
+| `memory/reset` **experimental**                         | Reset app-server memory state; destructive and unsuitable for a routine UI action. |
+| `mock/experimentalMethod` **experimental**              | Protocol test fixture, not a product feature.                                      |
 
 ## Server-to-client requests
 
@@ -279,19 +279,19 @@ These are not notifications: app-server waits for the connected client to send a
 UI must authenticate the user, present the decision or question, and correlate the reply with the
 request ID.
 
-| Interface | Client responsibility |
-| --- | --- |
-| `item/commandExecution/requestApproval` | Approve or reject a command. |
-| `item/fileChange/requestApproval` | Approve or reject a file modification. |
-| `item/permissions/requestApproval` | Approve or reject a requested permission change. |
-| `item/tool/requestUserInput` | Present structured questions and return the user's answers. |
-| `mcpServer/elicitation/request` | Present an MCP elicitation request and return a response. |
-| `item/tool/call` | Execute a client-provided dynamic tool and return its result. |
-| `account/chatgptAuthTokens/refresh` | Refresh ChatGPT authentication tokens for the server. |
-| `attestation/generate` | Produce the requested client attestation. |
-| `currentTime/read` | Return the client's current time context. |
-| `applyPatchApproval` | Legacy file-patch approval request. |
-| `execCommandApproval` | Legacy command approval request. |
+| Interface                               | Client responsibility                                         |
+| --------------------------------------- | ------------------------------------------------------------- |
+| `item/commandExecution/requestApproval` | Approve or reject a command.                                  |
+| `item/fileChange/requestApproval`       | Approve or reject a file modification.                        |
+| `item/permissions/requestApproval`      | Approve or reject a requested permission change.              |
+| `item/tool/requestUserInput`            | Present structured questions and return the user's answers.   |
+| `mcpServer/elicitation/request`         | Present an MCP elicitation request and return a response.     |
+| `item/tool/call`                        | Execute a client-provided dynamic tool and return its result. |
+| `account/chatgptAuthTokens/refresh`     | Refresh ChatGPT authentication tokens for the server.         |
+| `attestation/generate`                  | Produce the requested client attestation.                     |
+| `currentTime/read`                      | Return the client's current time context.                     |
+| `applyPatchApproval`                    | Legacy file-patch approval request.                           |
+| `execCommandApproval`                   | Legacy command approval request.                              |
 
 None of these 11 request types currently has an end-to-end approval/input flow in the Web UI.
 The protocol placeholders exposed by `codexctl pending`, `approve`, and `decline` remain
@@ -302,23 +302,23 @@ The protocol placeholders exposed by `codexctl pending`, `approve`, and `decline
 The 83 notification methods are grouped below. A persistent initialized connection is required to
 use them reliably.
 
-| Group | Notifications | Typical UI use |
-| --- | --- | --- |
-| Thread lifecycle | `thread/started`, `thread/status/changed`, `thread/archived`, `thread/unarchived`, `thread/deleted`, `thread/closed`, `thread/reverted`, `thread/compacted` | Update the session list and active/running state without polling. |
-| Thread metadata | `thread/name/updated`, `thread/project/updated`, `thread/settings/updated`, `thread/tokenUsage/updated`, `thread/goal/updated`, `thread/goal/cleared`, `thread/queue/changed` | Keep title, project, model, usage, goal, and queue views synchronized. |
-| Environment/project | `project/changed`, `thread/environment/connected`, `thread/environment/disconnected` | Refresh workspace and remote-environment indicators. |
-| Turn lifecycle | `turn/started`, `turn/completed`, `turn/diff/updated`, `turn/plan/updated`, `turn/moderationMetadata` | Drive processing state, diff counters, plans, and completion handoff. |
-| Item lifecycle | `item/started`, `item/completed`, `rawResponseItem/completed`, `rawResponse/completed` | Add and finalize structured message/tool items. |
-| Streaming content | `item/agentMessage/delta`, `item/plan/delta`, `item/reasoning/summaryTextDelta`, `item/reasoning/summaryPartAdded`, `item/reasoning/textDelta` | Stream assistant text, plans, and reasoning summaries. |
-| Commands and files | `command/exec/outputDelta`, `process/outputDelta`, `process/exited`, `item/commandExecution/outputDelta`, `item/commandExecution/terminalInteraction`, `item/fileChange/outputDelta`, `item/fileChange/patchUpdated`, `fs/changed` | Live terminal output, tool progress, patches, and file refresh. |
-| Approvals and safety | `serverRequest/resolved`, `item/autoApprovalReview/started`, `item/autoApprovalReview/completed`, `autoApprovalReview/strictReviewRequired`, `guardianWarning` | Resolve approval cards and show safety review state. |
-| MCP, skills, apps | `item/mcpToolCall/progress`, `mcpServer/oauthLogin/completed`, `mcpServer/startupStatus/updated`, `mcpServer/event/stream/notification`, `skills/changed`, `app/list/updated` | Live tool progress and integration/configuration refresh. |
-| Account and model | `account/login/completed`, `account/updated`, `account/rateLimits/updated`, `model/rerouted`, `model/verification`, `model/safetyBuffering/updated`, `modelProvider/authRecoveryStarted`, `modelProvider/authRecoveryCompleted` | Refresh login, quota, effective model, verification, and auth recovery. |
-| Hooks and imports | `hook/started`, `hook/completed`, `externalAgentConfig/import/progress`, `externalAgentConfig/import/completed` | Show hook and import progress. |
-| Fuzzy search | `fuzzyFileSearch/sessionUpdated`, `fuzzyFileSearch/sessionCompleted` | Render incremental file-search results. |
-| Remote control | `remoteControl/status/changed` | Refresh pairing and connection state. |
-| Realtime | `thread/realtime/started`, `thread/realtime/itemAdded`, `thread/realtime/item/started`, `thread/realtime/item/transcript/delta`, `thread/realtime/item/completed`, `thread/realtime/transcript/delta`, `thread/realtime/transcript/done`, `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`, `thread/realtime/error`, `thread/realtime/closed` | Implement realtime voice/text transport. |
-| Warnings and diagnostics | `error`, `warning`, `deprecationNotice`, `configWarning`, `windows/worldWritableWarning`, `windowsSandbox/setupCompleted` | Surface actionable failures and compatibility warnings. |
+| Group                    | Notifications                                                                                                                                                                                                                                                                                                                                           | Typical UI use                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Thread lifecycle         | `thread/started`, `thread/status/changed`, `thread/archived`, `thread/unarchived`, `thread/deleted`, `thread/closed`, `thread/reverted`, `thread/compacted`                                                                                                                                                                                             | Update the session list and active/running state without polling.       |
+| Thread metadata          | `thread/name/updated`, `thread/project/updated`, `thread/settings/updated`, `thread/tokenUsage/updated`, `thread/goal/updated`, `thread/goal/cleared`, `thread/queue/changed`                                                                                                                                                                           | Keep title, project, model, usage, goal, and queue views synchronized.  |
+| Environment/project      | `project/changed`, `thread/environment/connected`, `thread/environment/disconnected`                                                                                                                                                                                                                                                                    | Refresh workspace and remote-environment indicators.                    |
+| Turn lifecycle           | `turn/started`, `turn/completed`, `turn/diff/updated`, `turn/plan/updated`, `turn/moderationMetadata`                                                                                                                                                                                                                                                   | Drive processing state, diff counters, plans, and completion handoff.   |
+| Item lifecycle           | `item/started`, `item/completed`, `rawResponseItem/completed`, `rawResponse/completed`                                                                                                                                                                                                                                                                  | Add and finalize structured message/tool items.                         |
+| Streaming content        | `item/agentMessage/delta`, `item/plan/delta`, `item/reasoning/summaryTextDelta`, `item/reasoning/summaryPartAdded`, `item/reasoning/textDelta`                                                                                                                                                                                                          | Stream assistant text, plans, and reasoning summaries.                  |
+| Commands and files       | `command/exec/outputDelta`, `process/outputDelta`, `process/exited`, `item/commandExecution/outputDelta`, `item/commandExecution/terminalInteraction`, `item/fileChange/outputDelta`, `item/fileChange/patchUpdated`, `fs/changed`                                                                                                                      | Live terminal output, tool progress, patches, and file refresh.         |
+| Approvals and safety     | `serverRequest/resolved`, `item/autoApprovalReview/started`, `item/autoApprovalReview/completed`, `autoApprovalReview/strictReviewRequired`, `guardianWarning`                                                                                                                                                                                          | Resolve approval cards and show safety review state.                    |
+| MCP, skills, apps        | `item/mcpToolCall/progress`, `mcpServer/oauthLogin/completed`, `mcpServer/startupStatus/updated`, `mcpServer/event/stream/notification`, `skills/changed`, `app/list/updated`                                                                                                                                                                           | Live tool progress and integration/configuration refresh.               |
+| Account and model        | `account/login/completed`, `account/updated`, `account/rateLimits/updated`, `model/rerouted`, `model/verification`, `model/safetyBuffering/updated`, `modelProvider/authRecoveryStarted`, `modelProvider/authRecoveryCompleted`                                                                                                                         | Refresh login, quota, effective model, verification, and auth recovery. |
+| Hooks and imports        | `hook/started`, `hook/completed`, `externalAgentConfig/import/progress`, `externalAgentConfig/import/completed`                                                                                                                                                                                                                                         | Show hook and import progress.                                          |
+| Fuzzy search             | `fuzzyFileSearch/sessionUpdated`, `fuzzyFileSearch/sessionCompleted`                                                                                                                                                                                                                                                                                    | Render incremental file-search results.                                 |
+| Remote control           | `remoteControl/status/changed`                                                                                                                                                                                                                                                                                                                          | Refresh pairing and connection state.                                   |
+| Realtime                 | `thread/realtime/started`, `thread/realtime/itemAdded`, `thread/realtime/item/started`, `thread/realtime/item/transcript/delta`, `thread/realtime/item/completed`, `thread/realtime/transcript/delta`, `thread/realtime/transcript/done`, `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`, `thread/realtime/error`, `thread/realtime/closed` | Implement realtime voice/text transport.                                |
+| Warnings and diagnostics | `error`, `warning`, `deprecationNotice`, `configWarning`, `windows/worldWritableWarning`, `windowsSandbox/setupCompleted`                                                                                                                                                                                                                               | Surface actionable failures and compatibility warnings.                 |
 
 ## Useful features not yet integrated
 
@@ -362,6 +362,13 @@ app-server must therefore start with the disabled base entry
 that entry only when Desktop interposition is enabled; standalone app-server startup remains
 unchanged. Verify this contract by resuming an existing thread directly in Desktop without first
 opening it in the Web UI.
+
+This only satisfies direct-resume parsing. In current Desktop builds, the request interceptor
+replaces `codex_app` with a disabled configuration whenever app-server is not local stdio. The
+external-WebSocket path neither creates nor exports `CODEX_APP_TOOLS_PIPE_PATH`, which the bundled
+`codex-app-tools` server requires to reach Desktop host capabilities. A transparent bridge cannot
+reconstruct that private channel; full MCP acceptance remains blocked until Desktop or app-server
+provides a supported transport handoff.
 
 ### Strong user-facing candidates
 

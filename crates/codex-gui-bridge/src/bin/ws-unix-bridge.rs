@@ -5,11 +5,20 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_async, client_async, WebSocketStream};
+use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:18790";
 const UPSTREAM_WEBSOCKET_URI: &str = "ws://localhost/rpc";
+const MAX_WEBSOCKET_BYTES: usize = 64 << 20;
+const LARGE_FRAME_LOG_BYTES: usize = 16 << 20;
+
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WEBSOCKET_BYTES))
+        .max_frame_size(Some(MAX_WEBSOCKET_BYTES))
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,9 +47,10 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind TCP listener on {}", args.listen))?;
 
     eprintln!(
-        "ws-unix-bridge: listening on ws://{}/rpc and forwarding to {}",
+        "ws-unix-bridge: listening on ws://{}/rpc and forwarding to {} (frame/message limit: {} MiB)",
         listener.local_addr()?,
-        upstream_socket.display()
+        upstream_socket.display(),
+        MAX_WEBSOCKET_BYTES >> 20,
     );
 
     tokio::select! {
@@ -77,7 +87,7 @@ async fn serve(listener: TcpListener, upstream_socket: PathBuf) -> Result<()> {
 
 async fn bridge_connection(desktop_tcp: TcpStream, upstream_socket: &Path) -> Result<()> {
     let desktop_peer = desktop_tcp.peer_addr().ok();
-    let desktop = accept_async(desktop_tcp)
+    let desktop = accept_async_with_config(desktop_tcp, Some(websocket_config()))
         .await
         .with_context(|| match desktop_peer {
             Some(peer) => format!("failed WebSocket handshake with Desktop at {peer}"),
@@ -87,14 +97,18 @@ async fn bridge_connection(desktop_tcp: TcpStream, upstream_socket: &Path) -> Re
     let upstream_unix = UnixStream::connect(upstream_socket)
         .await
         .with_context(|| format!("failed to connect to {}", upstream_socket.display()))?;
-    let (upstream, _) = client_async(UPSTREAM_WEBSOCKET_URI, upstream_unix)
-        .await
-        .with_context(|| {
-            format!(
-                "failed WebSocket handshake over {}",
-                upstream_socket.display()
-            )
-        })?;
+    let (upstream, _) = client_async_with_config(
+        UPSTREAM_WEBSOCKET_URI,
+        upstream_unix,
+        Some(websocket_config()),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed WebSocket handshake over {}",
+            upstream_socket.display()
+        )
+    })?;
 
     relay(desktop, upstream).await
 }
@@ -113,6 +127,12 @@ async fn relay(
                         return Ok(());
                     }
                     Some(Ok(message)) => {
+                        if message.len() > LARGE_FRAME_LOG_BYTES {
+                            eprintln!(
+                                "ws-unix-bridge: forwarding large Desktop frame ({} bytes)",
+                                message.len()
+                            );
+                        }
                         if let Err(error) = upstream.send(message).await {
                             let _ = desktop.close(None).await;
                             return Err(error).context("failed to forward Desktop frame to app-server");
@@ -136,6 +156,12 @@ async fn relay(
                         return Ok(());
                     }
                     Some(Ok(message)) => {
+                        if message.len() > LARGE_FRAME_LOG_BYTES {
+                            eprintln!(
+                                "ws-unix-bridge: forwarding large app-server frame ({} bytes)",
+                                message.len()
+                            );
+                        }
                         if let Err(error) = desktop.send(message).await {
                             let _ = upstream.close(None).await;
                             return Err(error).context("failed to forward app-server frame to Desktop");
@@ -163,7 +189,7 @@ mod tests {
     use anyhow::{bail, Result};
     use tokio::net::UnixListener;
     use tokio::time::timeout;
-    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
 
     use super::*;
 
@@ -189,18 +215,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn forwards_text_frames_in_both_directions() -> Result<()> {
-        const REQUEST: &str = r#"{"id":7,"method":"thread/list","params":{"limit":1}}"#;
-        const RESPONSE: &str = r#"{"id":7,"result":{"echo":"thread/list"}}"#;
+    async fn forwards_large_text_frames_in_both_directions() -> Result<()> {
+        const LARGE_PAYLOAD_BYTES: usize = (16 << 20) + 1024;
+        let request = format!(
+            r#"{{"id":7,"method":"thread/read","params":{{"padding":"{}"}}}}"#,
+            "r".repeat(LARGE_PAYLOAD_BYTES)
+        );
+        let response = format!(
+            r#"{{"id":7,"result":{{"padding":"{}"}}}}"#,
+            "s".repeat(LARGE_PAYLOAD_BYTES)
+        );
 
         let socket_path = TestSocketPath::new();
         let fake_app_server = UnixListener::bind(&socket_path.0)?;
         let bridge_listener = TcpListener::bind("127.0.0.1:0").await?;
         let bridge_addr = bridge_listener.local_addr()?;
 
+        let expected_response_len = response.len();
         let app_server_task = tokio::spawn(async move {
             let (stream, _) = fake_app_server.accept().await?;
-            let mut websocket = accept_async(stream).await?;
+            let mut websocket = accept_async_with_config(stream, Some(websocket_config())).await?;
 
             let received = match websocket.next().await {
                 Some(Ok(Message::Text(text))) => text.to_string(),
@@ -210,7 +244,7 @@ mod tests {
                 Some(Err(error)) => return Err(error.into()),
                 None => bail!("bridge disconnected before forwarding Desktop request"),
             };
-            websocket.send(Message::text(RESPONSE)).await?;
+            websocket.send(Message::text(response)).await?;
 
             match websocket.next().await {
                 Some(Ok(Message::Close(_))) | None => {}
@@ -228,13 +262,21 @@ mod tests {
             bridge_connection(stream, &bridge_socket).await
         });
 
-        let (mut desktop, _) = connect_async(format!("ws://{bridge_addr}/rpc")).await?;
-        desktop.send(Message::text(REQUEST)).await?;
+        let client_config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_WEBSOCKET_BYTES))
+            .max_frame_size(Some(MAX_WEBSOCKET_BYTES));
+        let (mut desktop, _) = connect_async_with_config(
+            format!("ws://{bridge_addr}/rpc"),
+            Some(client_config),
+            false,
+        )
+        .await?;
+        desktop.send(Message::text(request.clone())).await?;
         let response = timeout(TEST_TIMEOUT, desktop.next())
             .await
             .context("timed out waiting for fake app-server response")?;
         match response {
-            Some(Ok(Message::Text(text))) => assert_eq!(text, RESPONSE),
+            Some(Ok(Message::Text(text))) => assert_eq!(text.len(), expected_response_len),
             Some(Ok(message)) => bail!("fake Desktop received unexpected frame: {message:?}"),
             Some(Err(error)) => return Err(error.into()),
             None => bail!("bridge disconnected before returning app-server response"),
@@ -244,7 +286,7 @@ mod tests {
         let forwarded_request = timeout(TEST_TIMEOUT, app_server_task)
             .await
             .context("fake app-server task timed out")???;
-        assert_eq!(forwarded_request, REQUEST);
+        assert_eq!(forwarded_request, request);
         timeout(TEST_TIMEOUT, bridge_task)
             .await
             .context("bridge task timed out")???;

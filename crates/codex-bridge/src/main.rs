@@ -46,6 +46,7 @@ const MAX_COMPOSER_ATTACHMENTS: usize = 6;
 const MAX_ATTACHMENT_URL_BYTES: usize = 6 * 1024 * 1024;
 const MAX_ATTACHMENT_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
+const DESKTOP_WS_MAX_BYTES: usize = 64 << 20;
 const DOWNLOAD_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 const PROJECT_INDEX_TTL: Duration = Duration::from_secs(10);
 const MAX_DOWNLOAD_TICKETS: usize = 128;
@@ -505,7 +506,6 @@ struct PendingMessage {
     queued_submission_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_id: Option<String>,
-    #[serde(skip)]
     after_message_index: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -2782,6 +2782,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
                 "type": "bridge_service_snapshot",
                 "managed_services": managed_services_snapshot(&bridge),
                 "capabilities": server_capabilities_snapshot(&bridge),
+                "runtime_resources": runtime_resources_snapshot(&bridge),
             })
             .to_string()
             .into(),
@@ -2838,6 +2839,7 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
                     "type": "bridge_service_snapshot",
                     "managed_services": managed_services_snapshot(&bridge),
                     "capabilities": server_capabilities_snapshot(&bridge),
+                    "runtime_resources": runtime_resources_snapshot(&bridge),
                 });
                 if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
                     break;
@@ -3627,6 +3629,9 @@ fn managed_services_snapshot(state: &BridgeState) -> Value {
             "enabled": state.desktop_interposition,
             "listen": state.ws_bridge_listen,
             "status": ws_bridge,
+            "capability": state.desktop_interposition.then_some("resume_compatibility_only"),
+            "max_frame_bytes": DESKTOP_WS_MAX_BYTES,
+            "max_message_bytes": DESKTOP_WS_MAX_BYTES,
         },
         "whisper": {
             "enabled": state.whisper.is_some(),
@@ -3635,6 +3640,58 @@ fn managed_services_snapshot(state: &BridgeState) -> Value {
             "listen": state.whisper.as_ref().map(|config| config.listen),
             "status": whisper,
         },
+    })
+}
+
+fn process_peak_rss_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage initializes the provided rusage structure on success.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful call above initialized the structure.
+    let peak = unsafe { usage.assume_init() }.ru_maxrss;
+    u64::try_from(peak).ok().map(|bytes| {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            bytes.saturating_mul(1024)
+        } else {
+            bytes
+        }
+    })
+}
+
+fn runtime_resources_snapshot(state: &BridgeState) -> Value {
+    let (tool_threads, tool_messages, tool_calls) = state
+        .app_server_tools
+        .threads
+        .read()
+        .map(|cache| {
+            cache.values().fold(
+                (cache.len(), 0_usize, 0_usize),
+                |(threads, messages, calls), entry| {
+                    (
+                        threads,
+                        messages.saturating_add(entry.known_message_ids.len()),
+                        calls.saturating_add(entry.tools.values().map(Vec::len).sum::<usize>()),
+                    )
+                },
+            )
+        })
+        .unwrap_or_default();
+    let project_index_cached = state
+        .app_server_projects
+        .index
+        .read()
+        .is_ok_and(|cache| cache.is_some());
+    json!({
+        "memory": {"peak_rss_bytes": process_peak_rss_bytes()},
+        "session_cache": state.session_store.cache_stats(),
+        "tool_cache": {
+            "threads": tool_threads,
+            "messages": tool_messages,
+            "tool_calls": tool_calls,
+        },
+        "project_cache": {"indexed": project_index_cached},
     })
 }
 
@@ -3755,7 +3812,18 @@ fn spawn_capability_monitor(state: BridgeState) -> tokio::task::JoinHandle<()> {
                 .write_backend
                 .app_server_runtime_info()
                 .is_some_and(|runtime| runtime.connected);
-            if last_connected == Some(connected) {
+            let whisper_starting = state
+                .server_capabilities
+                .read()
+                .ok()
+                .and_then(|capabilities| {
+                    capabilities
+                        .pointer("/audio_transcription/reason")
+                        .and_then(Value::as_str)
+                        .map(|reason| reason == "whisper_starting")
+                })
+                .unwrap_or(false);
+            if last_connected == Some(connected) && !whisper_starting {
                 continue;
             }
             last_connected = Some(connected);
@@ -3942,6 +4010,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "loaded": state.config_path.is_some(),
             },
             "managed_services": managed_services_snapshot(state),
+            "runtime_resources": runtime_resources_snapshot(state),
             "capabilities": capabilities,
             "rollout_store": {
                 "available": session_store.is_available(),
@@ -7389,6 +7458,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "id=\"settingsPanel\"",
             "id=\"componentStatus\"",
             "id=\"runtimeArchitecture\"",
+            "id=\"resourceStatus\"",
+            "runtime-architecture-disclosure",
             "runtimeArchitectureModel",
             "bridge_service_snapshot",
             "renderManagedServices",

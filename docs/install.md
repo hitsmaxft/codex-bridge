@@ -132,9 +132,20 @@ false when another manager owns the processes and supplies the required argument
 `services.app_server_environment` is passed only to the managed app-server; the daemon removes
 Desktop interposition variables from that child to avoid a recursive connection.
 
+This is a direct-resume compatibility path, not a complete private-MCP handoff. Current Desktop
+builds deliberately replace `codex_app` with a disabled entry when app-server uses an external
+WebSocket: they do not create or export the native host pipe required by the bundled
+`codex-app-tools` process. Bridge therefore cannot make those private tools ready without a future
+Desktop/app-server capability handoff. The status panel reports this topology as connected but
+limited instead of treating it as a startup failure.
+
 The Web UI status card reports each managed component's live state, restart count, listen endpoint,
 and most recent startup/exit error. The event WebSocket publishes a compact service snapshot every
 three seconds, so an open settings panel follows recovery without a page reload.
+
+The macOS installer also verifies both the LaunchAgent label and the control socket. If launchd
+returns error 5 immediately after unloading an older service, the installer enables the per-user
+label, retries bootstrap when necessary, and waits for `codexctl status` before reporting success.
 
 ### Optional local Whisper transcription
 

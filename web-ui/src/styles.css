@@ -297,8 +297,19 @@ aside {
   border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
   color: var(--accent);
 }
+.runtime-architecture-disclosure {
+  margin: 0 0 8px;
+  border-top: 1px solid var(--line);
+}
+.runtime-architecture-disclosure > summary {
+  padding: 8px 1px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+}
 .runtime-architecture {
-  margin: 0 0 12px;
+  margin: 0 0 8px;
 }
 .runtime-architecture:empty {
   display: none;
@@ -402,6 +413,20 @@ aside {
 .component-status:empty {
   display: none;
 }
+.resource-status {
+  margin: 0 0 10px;
+}
+.resource-status:empty {
+  display: none;
+}
+.resource-entry .component-dot {
+  background: color-mix(in srgb, var(--accent) 62%, var(--muted));
+}
+.resource-entry .component-state {
+  white-space: nowrap;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
 .component-status-title {
   margin: 1px 0 2px;
   color: var(--muted);
@@ -442,6 +467,9 @@ aside {
 }
 .component-entry.running .component-dot {
   background: var(--accent);
+}
+.component-entry.limited .component-dot {
+  background: color-mix(in srgb, #d99824 78%, var(--muted));
 }
 .component-entry.failed .component-dot {
   background: var(--danger);
@@ -782,6 +810,7 @@ main {
 .turn-fold {
   display: inline-flex;
   align-items: center;
+  width: 100%;
   max-width: 100%;
   min-height: 24px;
   margin: 0 0 8px;
@@ -795,30 +824,65 @@ main {
   line-height: 18px;
   text-align: left;
 }
+@media (hover: hover) and (pointer: fine) {
+  .turn-fold:hover {
+    border-color: transparent;
+    background: linear-gradient(
+      to top,
+      color-mix(in srgb, var(--accent) 10%, transparent),
+      transparent 82%
+    );
+  }
+}
 .turn-fold.loading {
   cursor: wait;
   opacity: 0.65;
 }
-.turn-fold::after {
+.turn-fold::before {
   content: "";
   flex: 0 0 auto;
   width: 6px;
   height: 6px;
-  margin: 0 0 3px 7px;
+  margin: 0 8px 3px 2px;
   border-right: 1.5px solid currentColor;
   border-bottom: 1.5px solid currentColor;
   transform: rotate(45deg);
   transition: transform 0.15s;
 }
-.turn-group.expanded > .turn-fold::after {
+.turn-group.expanded > .turn-fold::before {
   margin-bottom: -3px;
   transform: rotate(225deg);
 }
-.turn-fold .tool-icon {
-  flex: 0 0 auto;
-  width: 17px;
-  height: 17px;
-  margin-right: 5px;
+.turn-fold-text {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  align-items: baseline;
+  gap: 10px;
+  overflow: hidden;
+}
+.turn-fold-text .tool-summary-label {
+  flex: 1 1 auto;
+}
+.turn-fold-usage {
+  flex: 0 1 auto;
+  max-width: 48%;
+  margin-left: auto;
+  padding-left: 10px;
+  border-left: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+  overflow: hidden;
+  color: color-mix(in srgb, var(--muted) 88%, var(--text));
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  line-height: 14px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turn-token-usage[hidden] {
+  display: none;
 }
 .turn-divider {
   width: 100%;
@@ -870,6 +934,7 @@ main {
   display: none;
 }
 .message.user .message-body {
+  padding: 0 28px 0 0;
   font-size: 15px;
   line-height: 1.5;
 }
@@ -905,8 +970,8 @@ main {
   opacity: 1;
 }
 .message.user .message-copy {
-  right: 7px;
-  bottom: -20px;
+  right: -8px;
+  bottom: 0;
   color: currentColor;
 }
 .message.context {
@@ -2634,6 +2699,10 @@ label.caption {
   }
   .message-copy {
     opacity: 0.5;
+  }
+  .message.user .message-copy {
+    right: -8px;
+    bottom: 0;
   }
   .model-picker {
     right: 14px;

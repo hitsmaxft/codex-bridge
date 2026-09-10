@@ -79,6 +79,38 @@ test("runtime architecture follows managed and selected voice backends", () => {
   assert.equal(fallback.appServer.labelKey, "componentExternal");
   assert.equal(fallback.voice.phase, "running");
   assert.equal(fallback.voice.nameKey, "whisperBackend");
+
+  const browserLimited = runtimeArchitectureModel({
+    managedServices: {
+      whisper: { enabled: true, fallback: true, needed: true, status: { running: true } },
+    },
+    audioTranscription: { enabled: true, backend: "whisper_cpp" },
+    browserMicrophoneAvailable: false,
+  });
+  assert.equal(browserLimited.microphone.phase, "failed");
+  assert.equal(browserLimited.microphone.labelKey, "browserAudioLimited");
+  assert.equal(browserLimited.voice.phase, "running");
+
+  const starting = runtimeArchitectureModel({
+    managedServices: {
+      whisper: { enabled: true, fallback: true, needed: true, status: { running: true } },
+    },
+    audioTranscription: { enabled: false, backend: "whisper_cpp", reason: "whisper_starting" },
+  });
+  assert.equal(starting.whisper.phase, "running");
+  assert.equal(starting.voice.phase, "standby");
+
+  const desktopLimited = runtimeArchitectureModel({
+    managedServices: {
+      desktop_interposition: {
+        enabled: true,
+        capability: "resume_compatibility_only",
+        status: { running: true },
+      },
+    },
+  });
+  assert.equal(desktopLimited.wsBridge.phase, "standby");
+  assert.equal(desktopLimited.wsBridge.labelKey, "componentLimited");
 });
 
 test("authoritative idle suppresses a stale rollout turn", () => {
@@ -170,8 +202,11 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   assert.equal(status.demo, true);
   assert.equal(status.managed_services.app_server.status.running, true);
   assert.equal(status.managed_services.whisper.fallback, true);
+  assert.equal(status.managed_services.desktop_interposition.max_frame_bytes, 67_108_864);
   assert.equal(status.capabilities.audio_transcription.enabled, true);
   assert.equal(status.capabilities.audio_transcription.backend, "demo_wasm");
+  assert.equal(status.runtime_resources.session_cache.message_capacity, 10);
+  assert.ok(status.runtime_resources.memory.peak_rss_bytes > 0);
 
   const before = result(
     command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
@@ -533,6 +568,14 @@ test("composer keeps images as attachments and transcribes voice into editable t
   assert.match(source, /state\.serverCapabilities = event\.capabilities/);
   assert.match(source, /method === "account\/updated"/);
   assert.match(source, /button\.classList\.toggle\("unavailable", unavailable\)/);
+  assert.match(source, /window\.isSecureContext/);
+  assert.match(source, /browserMicrophoneAvailable: browserAudioAvailable\(\)/);
+  assert.match(source, /state\.runtimeResources = event\.runtime_resources/);
+  assert.match(source, /tr\("cacheSummary"/);
+  assert.match(source, /session\.message_entries/);
+  assert.match(source, /session\.rollout_bytes/);
+  assert.match(index, /<details class="runtime-architecture-disclosure">/);
+  assert.match(index, /id="resourceStatus"/);
   assert.doesNotMatch(source, /type: "audio",\s*url/);
   assert.match(source, /if \(item\.content\) \{[\s\S]*?appendContextValue/);
   const stylesheet = await readFile(stylesheetPath, "utf8");
@@ -658,6 +701,35 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
   assert.doesNotMatch(reconcile, /replaceChildren/);
 });
 
+test("large-session deferred turns hydrate only while visible and at a bounded rate", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /new IntersectionObserver/);
+  assert.match(source, /entry\.isIntersecting/);
+  assert.match(source, /rootMargin: "48px 0px"/);
+  assert.match(source, /VISIBLE_TURN_HYDRATION_INTERVAL_MS = 600/);
+  assert.doesNotMatch(source, /scheduleDeferredTurnPrefetch/);
+  assert.doesNotMatch(source, /requestIdleCallback\(\(\) => prefetch/);
+});
+
+test("pending handoff is cleared only by an authoritative rendered user message", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const merge = source.slice(
+    source.indexOf("function pendingLandedInMessages"),
+    source.indexOf("async function deletePending"),
+  );
+  assert.match(merge, /message\.id === entry\.id/);
+  assert.match(merge, /message\.message_index <= entry\.after_message_index/);
+  assert.match(merge, /pendingLandedInMessages\(entry, authoritativeMessages/);
+  assert.match(source, /after_message_index: state\.lastMessageIndex \?\? -1/);
+  const writeFlow = source.slice(
+    source.indexOf("async function write"),
+    source.indexOf("function approval"),
+  );
+  const acceptedFlow = writeFlow.slice(writeFlow.indexOf("acknowledged = true"));
+  assert.doesNotMatch(acceptedFlow, /preserveOptimistic: false/);
+  assert.match(acceptedFlow, /await openThread/);
+});
+
 test("completed turns collapse by server turn id and preserve the full expansion", async () => {
   const command = await demoClient();
   const page = result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }));
@@ -674,11 +746,24 @@ test("completed turns collapse by server turn id and preserve the full expansion
   assert.match(layout, /state\.expandedTurnIds/);
   assert.match(layout, /\.\.\.leading,[\s\S]*fold,[\s\S]*divider,[\s\S]*finalNode/);
   assert.match(layout, /turnSummaryText\(group\)/);
+  assert.match(layout, /usage = turnUsageItem\(group\)/);
+  assert.match(layout, /turnTokenUsageText\(usage\)/);
+  assert.match(layout, /querySelectorAll\("\.turn-token-usage"\)/);
+  assert.doesNotMatch(layout, /latestTool/);
+  assert.doesNotMatch(layout, /toolIconClass/);
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  assert.match(stylesheet, /\.turn-fold::before\s*\{/);
+  assert.doesNotMatch(stylesheet, /\.turn-fold::after\s*\{/);
+  assert.match(stylesheet, /\.turn-fold\s*\{[^}]*width:\s*100%/s);
+  assert.match(
+    stylesheet,
+    /\.turn-fold-usage\s*\{[^}]*margin-left:\s*auto;[^}]*text-align:\s*right/s,
+  );
   assert.match(source, /command: "turn_messages"/);
-  assert.match(source, /requestIdleCallback/);
+  assert.match(source, /observeVisibleDeferredTurns/);
 });
 
-test("memory updates collapse below token usage with deduplicated filenames", async () => {
+test("token usage joins the turn fold while memory stays on the final response", async () => {
   assert.deepEqual(
     memoryCitationModel([
       { source: "MEMORY.md:12-18", note: "first" },
@@ -701,6 +786,8 @@ test("memory updates collapse below token usage with deduplicated filenames", as
       source.indexOf("function pendingNode"),
     );
   assert.match(render, /for \(const item of usageItems\)[\s\S]*memoryCitationNode\(memoryItems\)/);
+  assert.match(source, /node\.classList\.add\("turn-token-usage"\)/);
+  assert.match(source, /text\.append\(label, tokenUsage\)/);
 });
 
 test("message copy follows text before tools and completion metadata", async () => {
@@ -717,7 +804,8 @@ test("message copy follows text before tools and completion metadata", async () 
   const copyStyle = stylesheet.match(/\.message-copy\s*\{[^}]*\}/s)?.[0] || "";
   assert.match(copyStyle, /position:\s*absolute/);
   assert.match(copyStyle, /right:\s*0/);
-  assert.match(stylesheet, /\.message\.user \.message-copy\s*\{[^}]*right:\s*7px/s);
+  assert.match(stylesheet, /\.message\.user \.message-body\s*\{[^}]*padding:\s*0 28px 0 0/s);
+  assert.match(stylesheet, /\.message\.user \.message-copy\s*\{[^}]*right:\s*-8px;[^}]*bottom:\s*0/s);
 });
 
 test("queued messages expose withdraw and convert-to-steer actions", async () => {
@@ -728,6 +816,13 @@ test("queued messages expose withdraw and convert-to-steer actions", async () =>
   assert.match(source, /className = "outbox-menu"/);
   assert.match(source, /existingById/);
   assert.match(source, /entry\.status !== "failed"/);
+  const convertFlow = source.slice(
+    source.indexOf("async function convertPendingToSteer"),
+    source.indexOf("function olderButton"),
+  );
+  assert.match(convertFlow, /submission_id: submissionId/);
+  const acceptedFlow = convertFlow.slice(0, convertFlow.indexOf("} catch (error)"));
+  assert.doesNotMatch(acceptedFlow, /preserveOptimistic: false/);
 });
 
 test("authentication gate serializes concurrent startup requests", async () => {

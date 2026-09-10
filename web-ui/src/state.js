@@ -59,6 +59,7 @@ export const state = {
   appServerMode: null,
   managedServices: null,
   serverCapabilities: null,
+  runtimeResources: null,
   activityFileLen: null,
   activeTurnId: null,
   activityPhase: null,

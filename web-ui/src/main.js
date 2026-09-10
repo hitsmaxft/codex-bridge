@@ -56,6 +56,75 @@ function setProjectExpanded(projectPath, expanded, persist = true) {
   if (persist) rememberExpandedProjects();
 }
 
+function browserAudioAvailable() {
+  return Boolean(
+    demoMode ||
+    (window.isSecureContext &&
+      navigator.mediaDevices?.getUserMedia &&
+      window.MediaRecorder &&
+      (window.AudioContext || window.webkitAudioContext)),
+  );
+}
+
+function formatResourceBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return tr("unknownValue");
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / 1024 ** 2).toFixed(bytes < 10 * 1024 ** 2 ? 1 : 0)} MiB`;
+}
+
+function renderRuntimeResources() {
+  const root = $("resourceStatus"),
+    resources = state.runtimeResources;
+  if (!root) return;
+  const wasOpen = Boolean(root.querySelector("details")?.open);
+  root.textContent = "";
+  if (!resources) return;
+  const session = resources.session_cache || {},
+    tools = resources.tool_cache || {},
+    project = resources.project_cache || {},
+    entry = document.createElement("details"),
+    summary = document.createElement("summary"),
+    dot = document.createElement("span"),
+    name = document.createElement("span"),
+    value = document.createElement("span"),
+    detail = document.createElement("div");
+  entry.className = "component-entry resource-entry";
+  entry.open = wasOpen;
+  dot.className = "component-dot";
+  name.className = "component-name";
+  name.textContent = tr("memoryAndCaches");
+  value.className = "component-state";
+  value.textContent = tr("cacheSummary", {
+    used: session.message_entries ?? 0,
+    capacity: session.message_capacity ?? 0,
+    size: formatResourceBytes(session.rollout_bytes ?? 0),
+  });
+  detail.className = "component-detail resource-detail";
+  for (const text of [
+    tr("peakMemory", { size: formatResourceBytes(resources.memory?.peak_rss_bytes) }),
+    tr("sessionMessageCache", {
+      used: session.message_entries ?? 0,
+      capacity: session.message_capacity ?? 0,
+      messages: session.messages ?? 0,
+    }),
+    tr("cachedRollouts", {
+      size: formatResourceBytes(session.rollout_bytes ?? 0),
+      records: session.tool_records ?? 0,
+    }),
+    tr("toolParseCache", { threads: tools.threads ?? 0, calls: tools.tool_calls ?? 0 }),
+    tr("projectIndexCache", { state: project.indexed ? tr("cached") : tr("uncached") }),
+  ]) {
+    const row = document.createElement("div");
+    row.textContent = text;
+    detail.appendChild(row);
+  }
+  summary.append(dot, name, value);
+  entry.append(summary, detail);
+  root.appendChild(entry);
+}
+
 function renderManagedServices() {
   const root = $("componentStatus"),
     services = state.managedServices;
@@ -66,9 +135,11 @@ function renderManagedServices() {
       managedServices: state.managedServices,
       directAppServer: state.directAppServer,
       serverCapabilities: state.serverCapabilities,
+      browserMicrophoneAvailable: browserAudioAvailable(),
     },
     tr,
   );
+  renderRuntimeResources();
   const expanded = new Set(
     [...root.querySelectorAll("details[open]")].map((entry) => entry.dataset.component),
   );
@@ -86,6 +157,7 @@ function renderManagedServices() {
     const status = service?.status || {},
       enabled = Boolean(service?.enabled),
       running = enabled && Boolean(status.running),
+      limited = running && service?.capability === "resume_compatibility_only",
       failed = enabled && !running && Boolean(status.last_error),
       entry = document.createElement("details"),
       summary = document.createElement("summary"),
@@ -93,7 +165,7 @@ function renderManagedServices() {
       name = document.createElement("span"),
       value = document.createElement("span"),
       detail = document.createElement("div");
-    entry.className = `component-entry${running ? " running" : failed ? " failed" : ""}`;
+    entry.className = `component-entry${limited ? " limited" : running ? " running" : failed ? " failed" : ""}`;
     entry.dataset.component = key;
     entry.open = expanded.has(key);
     dot.className = "component-dot";
@@ -104,9 +176,11 @@ function renderManagedServices() {
       ? tr("componentExternal")
       : service?.fallback && !service?.needed
         ? tr("componentStandby")
-        : running
-          ? tr("componentRunning")
-          : tr("componentStopped");
+        : limited
+          ? tr("componentLimited")
+          : running
+            ? tr("componentRunning")
+            : tr("componentStopped");
     detail.className = "component-detail";
     if (enabled) {
       const restart = document.createElement("div");
@@ -121,6 +195,19 @@ function renderManagedServices() {
       const listen = document.createElement("div");
       listen.textContent = tr("listenAddress", { address: service.listen });
       detail.appendChild(listen);
+    }
+    if (key === "ws-bridge" && service?.capability === "resume_compatibility_only") {
+      const limitation = document.createElement("div");
+      limitation.textContent = tr("desktopMcpCompatibilityOnly");
+      detail.appendChild(limitation);
+    }
+    if (key === "ws-bridge" && service?.max_frame_bytes) {
+      const limits = document.createElement("div");
+      limits.textContent = tr("webSocketLimits", {
+        frame: formatResourceBytes(service.max_frame_bytes),
+        message: formatResourceBytes(service.max_message_bytes),
+      });
+      detail.appendChild(limits);
     }
     if (enabled) {
       const error = document.createElement("div");
@@ -142,6 +229,7 @@ async function loadStatus() {
   state.appServerMode = backend.app_server_mode || null;
   state.managedServices = r.managed_services || null;
   state.serverCapabilities = r.capabilities || null;
+  state.runtimeResources = r.runtime_resources || null;
   renderManagedServices();
   syncVoiceCapability();
   const appServer = state.directAppServer
@@ -951,6 +1039,7 @@ function audioTranscriptionCapability() {
   return state.serverCapabilities?.audio_transcription || null;
 }
 function voiceCapabilityLabel(capability = audioTranscriptionCapability()) {
+  if (!browserAudioAvailable()) return tr("microphoneUnavailable");
   if (!capability) return tr("voiceStatusPending");
   if (capability.enabled) return tr("recordVoice");
   if (capability.reason === "api_key_auth_required") return tr("voiceApiKeyRequired");
@@ -959,7 +1048,7 @@ function voiceCapabilityLabel(capability = audioTranscriptionCapability()) {
 function syncVoiceCapability() {
   const button = $("voiceBtn"),
     capability = audioTranscriptionCapability(),
-    unavailable = !capability?.enabled,
+    unavailable = !capability?.enabled || !browserAudioAvailable(),
     submitting = document.querySelector(".composer-shell")?.classList.contains("submitting"),
     busy = submitting || voiceTranscribing;
   button.classList.toggle("unavailable", unavailable);
@@ -1219,6 +1308,14 @@ function turnMetaNode(text, title = text) {
   line.title = title;
   return line;
 }
+function turnTokenUsageText(item) {
+  return tr("turnTokenUsage", {
+    total: tokenCountText(item?.total_tokens),
+    input: tokenCountText(item?.input_tokens),
+    cached: tokenCountText(item?.cached_input_tokens),
+    output: tokenCountText(item?.output_tokens),
+  });
+}
 function memoryCitationNode(items) {
   const model = memoryCitationModel(items),
     details = document.createElement("details"),
@@ -1281,13 +1378,9 @@ function appendContextValue(details, value, label) {
 function contentNode(item) {
   if (item.kind === "text") return markdownNode(item.text, markdownOptions(state.current?.id));
   if (item.kind === "turn_usage") {
-    const values = {
-      total: tokenCountText(item.total_tokens),
-      input: tokenCountText(item.input_tokens),
-      cached: tokenCountText(item.cached_input_tokens),
-      output: tokenCountText(item.output_tokens),
-    };
-    return turnMetaNode(tr("turnTokenUsage", values));
+    const node = turnMetaNode(turnTokenUsageText(item));
+    node.classList.add("turn-token-usage");
+    return node;
   }
   const details = document.createElement("details");
   details.className = "context-block";
@@ -1647,6 +1740,12 @@ function turnHasUsage(message) {
   return message.content?.some((item) => item.kind === "turn_usage");
 }
 
+function turnUsageItem(group) {
+  return group.messages
+    .flatMap((message) => message.content || [])
+    .findLast((item) => item.kind === "turn_usage");
+}
+
 function turnDuration(group) {
   const times = group.messages
     .map((message) => Date.parse(message.timestamp))
@@ -1703,34 +1802,48 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
     hiddenNodes = messageNodes.filter((node) => node !== finalNode && !userNodes.includes(node)),
     hasFinalTools = Boolean(finalIndex >= 0 && group.messages[finalIndex].tools?.length),
     hasDeferred = group.messages.some((message) => message.deferred),
+    usage = turnUsageItem(group),
     foldable =
-      completed && Boolean(finalNode) && (hiddenNodes.length > 0 || hasFinalTools || hasDeferred);
+      completed &&
+      Boolean(finalNode) &&
+      (hiddenNodes.length > 0 || hasFinalTools || hasDeferred || Boolean(usage));
 
   section.className = "turn-group";
   section.dataset.turnKey = group.key;
   if (!foldable) {
-    for (const node of messageNodes) node.hidden = false;
+    for (const node of messageNodes) {
+      node.hidden = false;
+      for (const token of node.querySelectorAll(".turn-token-usage")) token.hidden = false;
+    }
     reconcileChildren(section, messageNodes);
     return;
   }
+  for (const node of messageNodes)
+    for (const token of node.querySelectorAll(".turn-token-usage")) token.hidden = true;
 
   const expansionKey = `${state.current?.id || ""}:${group.key}`,
     expanded = state.expandedTurnIds.has(expansionKey),
     fold = section.querySelector(":scope > .turn-fold") || document.createElement("button"),
-    divider = section.querySelector(":scope > .turn-divider") || document.createElement("hr"),
-    latestTool = group.messages.flatMap((message) => message.tools || []).at(-1);
+    divider = section.querySelector(":scope > .turn-divider") || document.createElement("hr");
   fold.type = "button";
   fold.className = "turn-fold tool-group-summary";
   fold.title = tr(expanded ? "collapseTurn" : "expandTurn");
   fold.setAttribute("aria-label", fold.title);
   fold.setAttribute("aria-expanded", String(expanded));
+  if (hasDeferred && group.turnId) fold.dataset.deferredTurnId = group.turnId;
+  else delete fold.dataset.deferredTurnId;
   fold.replaceChildren();
-  const icon = document.createElement("span"),
-    label = document.createElement("span");
-  icon.className = `tool-icon ${toolIconClass(latestTool?.name || "other")}`;
+  const text = document.createElement("span"),
+    label = document.createElement("span"),
+    tokenUsage = document.createElement("span");
+  text.className = "turn-fold-text";
   label.className = "tool-summary-label";
   label.textContent = turnSummaryText(group);
-  fold.append(icon, label);
+  tokenUsage.className = "turn-fold-usage";
+  tokenUsage.textContent = usage ? turnTokenUsageText(usage) : "";
+  tokenUsage.hidden = !usage;
+  text.append(label, tokenUsage);
+  fold.append(text);
   fold.onclick = () => {
     if (!expanded && hasDeferred && group.turnId) {
       fold.disabled = true;
@@ -1913,6 +2026,7 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
     cursor.remove();
     cursor = next;
   }
+  observeVisibleDeferredTurns();
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
@@ -2021,13 +2135,34 @@ function syncOutboxCompactLabel() {
   tray.title = label;
   tray.setAttribute("aria-label", label);
 }
-function mergePendingResponse(messages, preserveOptimistic = true) {
-  const remote = Array.isArray(messages) ? messages : [];
-  if (!preserveOptimistic) return remote;
+function pendingLandedInMessages(entry, messages) {
+  return messages.some((message) => {
+    if (message.role !== "user") return false;
+    if (message.id && message.id === entry.id) return true;
+    if (!Number.isSafeInteger(entry.after_message_index)) return false;
+    if (message.message_index <= entry.after_message_index) return false;
+    const text = (message.content || [])
+      .filter((item) => item.kind === "text" && typeof item.text === "string")
+      .map((item) => item.text)
+      .join("\n");
+    return Boolean(text) && text === entry.text;
+  });
+}
+function mergePendingResponse(
+  messages,
+  preserveLocal = true,
+  authoritativeMessages = state.visibleMessages,
+) {
+  const remote = (Array.isArray(messages) ? messages : []).filter(
+    (entry) => !pendingLandedInMessages(entry, authoritativeMessages || []),
+  );
+  if (!preserveLocal) return remote;
   const ids = new Set(remote.map((entry) => entry.id));
   return [
     ...remote,
-    ...state.pending.filter((entry) => entry.source === "web_optimistic" && !ids.has(entry.id)),
+    ...state.pending.filter(
+      (entry) => !ids.has(entry.id) && !pendingLandedInMessages(entry, authoritativeMessages || []),
+    ),
   ];
 }
 async function refreshPending({ preserveOptimistic = true } = {}) {
@@ -2078,17 +2213,38 @@ async function convertPendingToSteer(entry, button) {
   state.pending = state.pending.filter(
     (item) => item.id !== entry.id || item.thread_id !== entry.thread_id,
   );
+  const submissionId = newSubmissionId();
+  state.pending.push({
+    id: submissionId,
+    thread_id: entry.thread_id,
+    text: withdrawn.text,
+    action: "steer",
+    status: "steering",
+    source: "web_optimistic",
+    after_message_index: state.lastMessageIndex ?? -1,
+  });
   renderPending();
   try {
     await command(
-      { command: "steer", thread_id: entry.thread_id, text: withdrawn.text, attachments: [] },
+      {
+        command: "steer",
+        thread_id: entry.thread_id,
+        text: withdrawn.text,
+        attachments: [],
+        submission_id: submissionId,
+      },
       false,
     );
-    await refreshPending({ preserveOptimistic: false });
     if (state.current?.id === entry.thread_id)
       await openThread(state.current, { quiet: true, preserveView: true });
     notify(tr("queueConverted"));
   } catch (error) {
+    state.pending = state.pending.filter((item) => item.id !== submissionId);
+    try {
+      await refreshPending({ preserveOptimistic: false });
+    } catch {
+      renderPending();
+    }
     if (state.current?.id === entry.thread_id) {
       $("messageText").value = withdrawn.text;
       saveDraft(entry.thread_id, withdrawn.text, true);
@@ -2178,30 +2334,88 @@ async function hydrateTurn(turnId, { render = false } = {}) {
   if (render) renderVisibleMessages();
   return state.hydratedTurns.get(key) || null;
 }
-function scheduleDeferredTurnPrefetch(messages) {
-  const threadId = state.current?.id,
-    openToken = state.openToken,
-    turnIds = [
-      ...new Set(
-        messages
-          .filter((message) => message.deferred && message.turn_id)
-          .map((message) => message.turn_id),
-      ),
-    ];
-  if (!threadId || !turnIds.length) return;
-  const prefetch = async () => {
-    for (const turnId of turnIds) {
-      if (state.current?.id !== threadId || state.openToken !== openToken) return;
-      try {
-        await hydrateTurn(turnId);
-      } catch {
-        // Clicking the turn retries and surfaces the normal request error.
-      }
+const VISIBLE_TURN_HYDRATION_INTERVAL_MS = 600;
+let deferredTurnObserver = null,
+  deferredTurnHydrationTimer = null,
+  deferredTurnHydrationActive = false,
+  lastDeferredTurnHydration = 0;
+const visibleDeferredTurns = new Map();
+
+function resetVisibleTurnHydration() {
+  deferredTurnObserver?.disconnect();
+  deferredTurnObserver = null;
+  clearTimeout(deferredTurnHydrationTimer);
+  deferredTurnHydrationTimer = null;
+  visibleDeferredTurns.clear();
+}
+
+function scheduleVisibleTurnHydration() {
+  if (deferredTurnHydrationActive || deferredTurnHydrationTimer || !visibleDeferredTurns.size)
+    return;
+  const delay = Math.max(
+    0,
+    VISIBLE_TURN_HYDRATION_INTERVAL_MS - (Date.now() - lastDeferredTurnHydration),
+  );
+  deferredTurnHydrationTimer = setTimeout(async () => {
+    deferredTurnHydrationTimer = null;
+    const next = visibleDeferredTurns.entries().next().value;
+    if (!next) return;
+    const [key, candidate] = next;
+    visibleDeferredTurns.delete(key);
+    if (
+      !candidate.element.isConnected ||
+      state.current?.id !== candidate.threadId ||
+      state.openToken !== candidate.openToken
+    ) {
+      scheduleVisibleTurnHydration();
+      return;
     }
-  };
-  if (typeof window.requestIdleCallback === "function") {
-    window.requestIdleCallback(() => prefetch(), { timeout: 2500 });
-  } else setTimeout(prefetch, 1500);
+    deferredTurnHydrationActive = true;
+    try {
+      await hydrateTurn(candidate.turnId);
+    } catch {
+      // Expanding the turn retries through the normal user-visible error path.
+    } finally {
+      lastDeferredTurnHydration = Date.now();
+      deferredTurnHydrationActive = false;
+      scheduleVisibleTurnHydration();
+    }
+  }, delay);
+}
+
+function observeVisibleDeferredTurns() {
+  deferredTurnObserver?.disconnect();
+  visibleDeferredTurns.clear();
+  if (typeof IntersectionObserver !== "function" || !state.current) return;
+  const threadId = state.current.id,
+    openToken = state.openToken;
+  deferredTurnObserver = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        const turnId = entry.target.dataset.deferredTurnId,
+          key = hydratedTurnKey(threadId, turnId);
+        if (!turnId || state.hydratedTurns.has(key) || state.hydratingTurns.has(key)) {
+          visibleDeferredTurns.delete(key);
+          continue;
+        }
+        if (entry.isIntersecting) {
+          visibleDeferredTurns.set(key, { element: entry.target, threadId, turnId, openToken });
+        } else visibleDeferredTurns.delete(key);
+      }
+      scheduleVisibleTurnHydration();
+    },
+    {
+      root: usesDocumentMessageScroll() ? null : $("messages"),
+      rootMargin: "48px 0px",
+      threshold: 0.1,
+    },
+  );
+  for (const fold of $("messages").querySelectorAll(".turn-fold[data-deferred-turn-id]")) {
+    const key = hydratedTurnKey(threadId, fold.dataset.deferredTurnId);
+    if (!state.hydratedTurns.has(key) && !state.hydratingTurns.has(key)) {
+      deferredTurnObserver.observe(fold);
+    }
+  }
 }
 // Message indices come from the current rollout parse, not immutable event IDs. Continue a
 // page only while its boundary is exact; otherwise rebuild the visible region atomically.
@@ -2545,6 +2759,7 @@ function handleBridgeEvent(event) {
   if (event?.type === "bridge_service_snapshot") {
     state.managedServices = event.managed_services || null;
     state.serverCapabilities = event.capabilities || state.serverCapabilities;
+    state.runtimeResources = event.runtime_resources || state.runtimeResources;
     renderManagedServices();
     syncVoiceCapability();
     return;
@@ -2761,6 +2976,7 @@ async function openThread(
   }
   state.current = thread;
   if (changedThread) {
+    resetVisibleTurnHydration();
     restoreComposerDraft($("messageText"), state.drafts.get(thread.id), true);
     state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
     renderComposerAttachments();
@@ -2820,7 +3036,7 @@ async function openThread(
   if (token !== state.openToken) return;
   requireMessagePage(r, { latest: true });
   r.messages = mergeHydratedTurnMessages(r.messages, thread.id);
-  if (pendingResult) state.pending = mergePendingResponse(pendingResult.messages, true);
+  state.pending = mergePendingResponse(pendingResult?.messages || state.pending, true, r.messages);
   state.messageCache.set(thread.id, r);
   state.current = { ...thread, ...r.thread };
   rememberSessionId(window.localStorage, state.current.id);
@@ -2842,7 +3058,6 @@ async function openThread(
     state.expandedTurnIds.add(`${thread.id}:${messageView.anchorTurnKey}`);
   }
   reconcileMessageNodes(root, visibleResponse, activeToolMessage);
-  scheduleDeferredTurnPrefetch(r.messages);
   applyMessagePageState(r);
   if (olderMessages.length) {
     state.historyStart = olderMessages[0].message_index;
@@ -2910,7 +3125,6 @@ async function loadOlder() {
     },
     activeToolMessage,
   );
-  scheduleDeferredTurnPrefetch(r.messages);
   const newHeight = messageScrollMetrics().height;
   if (usesDocumentMessageScroll()) window.scrollTo(0, oldTop + (newHeight - oldHeight));
   else root.scrollTop = oldTop + (newHeight - oldHeight);
@@ -2966,6 +3180,13 @@ async function interruptCurrentRun({ confirm = true, requireActive = false } = {
     syncSubmitAction();
   }
 }
+function newSubmissionId() {
+  return `web-${
+    typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  }`;
+}
 async function write(name) {
   const draft = $("messageText").value,
     text = draft.trim(),
@@ -2974,11 +3195,7 @@ async function write(name) {
   if (voiceRecorder?.state === "recording") throw new Error(tr("stopRecording"));
   if (!state.current) throw new Error(tr("chooseSessionError"));
   const threadId = state.current.id,
-    submissionId = `web-${
-      typeof crypto.randomUUID === "function"
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    }`;
+    submissionId = newSubmissionId();
   let action = name === "steer" ? "steer" : "queue";
   const pendingText =
     text ||
@@ -2995,6 +3212,7 @@ async function write(name) {
     action,
     status: `${action}ing`,
     source: "web_optimistic",
+    after_message_index: state.lastMessageIndex ?? -1,
   });
   renderPending();
   setComposerSubmitting(true);
@@ -3037,7 +3255,6 @@ async function write(name) {
     state.composerAttachments = [];
     state.attachmentDrafts.delete(threadId);
     renderComposerAttachments();
-    await refreshPending({ preserveOptimistic: false });
     try {
       if (state.current?.id === threadId) await openThread(state.current, { quiet: true });
       else await refreshPending();
