@@ -233,6 +233,7 @@ impl Command {
                 Request::Send {
                     thread_id: target_thread,
                     text: text.join(" "),
+                    submission_id: None,
                     attachments: Vec::new(),
                 },
                 json,
@@ -242,6 +243,7 @@ impl Command {
                 Request::Steer {
                     thread_id: target_thread,
                     text: text.join(" "),
+                    submission_id: None,
                     attachments: Vec::new(),
                 },
                 json,
@@ -620,6 +622,7 @@ mod tests {
             Request::Send {
                 thread_id: Some("thread-1".into()),
                 text: "keep going".into(),
+                submission_id: None,
                 attachments: Vec::new(),
             }
         );

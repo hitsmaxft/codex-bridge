@@ -6,7 +6,6 @@ repositories.
 
 <img width="1319" height="1038" alt="图片" src="https://github.com/user-attachments/assets/2bb8da3b-c8d8-4f20-b758-d34e28a4950b" />
 
-
 [Project site](https://gh.bhee.online/codex-bridge/) ·
 [Install](docs/install.md) ·
 [`codexctl` reference](docs/codexctl.md) ·
@@ -30,6 +29,22 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
+### v0.2.7 · 2026-09-10
+
+- **Eventually consistent Queue and Steer:** stable submission identities connect optimistic UI,
+  app-server negotiation, the native queue, and final rollout history without losing repeated
+  follow-ups or clearing their pending state too early.
+- **Event-driven live updates:** app-server WebSocket events drive activity, pending-message, and
+  history reconciliation; bounded polling remains only as a recovery path when the stream drops.
+- **Stable long-session navigation:** recent-message reconciliation keeps global cursor identity,
+  viewport anchoring avoids large jumps, and linked Codex worktrees stay grouped with their
+  repository project without changing their execution directory.
+
+See the complete [v0.2.7 release notes](docs/releases/v0.2.7.md), the
+[v0.2.6 completed-turn release](docs/releases/v0.2.6.md), the
+[v0.2.5 Desktop interoperability release](docs/releases/v0.2.5.md), or the
+[complete release history](docs/releases/).
+
 ### v0.2.6 · 2026-09-10
 
 - **Compact completed turns:** completed runs collapse intermediate assistant progress and tools
@@ -38,14 +53,6 @@ still use the account and network configured by Codex itself.
   snapshot, and structured memory-citation sources without leaking internal markup into the chat.
 - **Reliable first messages and refresh:** a newly created empty thread starts its first native
   app-server turn directly, while paginated history stays visible during live updates.
-
-See the complete [v0.2.6 release notes](docs/releases/v0.2.6.md), the
-[v0.2.5 Desktop interoperability release](docs/releases/v0.2.5.md), the
-[v0.2.4 managed-runtime release](docs/releases/v0.2.4.md), the
-[v0.2.3 project history and lifecycle release](docs/releases/v0.2.3.md), the
-[v0.2.2 voice and sidebar release](docs/releases/v0.2.2.md), the
-[v0.2.1 Firefox iOS fix](docs/releases/v0.2.1.md), or the larger
-[v0.2.0 feature release](docs/releases/v0.2.0.md).
 
 ### v0.2.5 · 2026-09-09
 

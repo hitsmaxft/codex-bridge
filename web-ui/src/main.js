@@ -12,6 +12,7 @@ import {
 } from "./api.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
+import { memoryCitationModel } from "./memory-citations.js";
 import {
   browserNotificationState,
   disableBrowserNotifications,
@@ -1218,11 +1219,25 @@ function turnMetaNode(text, title = text) {
   line.title = title;
   return line;
 }
-function memoryCitationSource(source) {
-  return String(source || "MEMORY.md")
-    .split("/")
-    .at(-1)
-    .replace(/:\d+(?:-\d+)?$/, "");
+function memoryCitationNode(items) {
+  const model = memoryCitationModel(items),
+    details = document.createElement("details"),
+    summary = document.createElement("summary"),
+    list = document.createElement("div");
+  details.className = "memory-citations";
+  summary.textContent = model.files.join(" · ");
+  summary.title = model.entries
+    .map(({ source, note }) => [source, note].filter(Boolean).join(" · "))
+    .join("\n");
+  list.className = "memory-citation-list";
+  for (const { source, note } of model.entries) {
+    const line = document.createElement("div");
+    line.className = "memory-citation-entry";
+    line.textContent = tr("memoryCitation", { source, note: note ? ` · ${note}` : "" });
+    list.appendChild(line);
+  }
+  details.append(summary, list);
+  return details;
 }
 function appendContextValue(details, value, label) {
   const values = Array.isArray(value) ? value : [value];
@@ -1273,14 +1288,6 @@ function contentNode(item) {
       output: tokenCountText(item.output_tokens),
     };
     return turnMetaNode(tr("turnTokenUsage", values));
-  }
-  if (item.kind === "memory_citation") {
-    const source = memoryCitationSource(item.source),
-      note = item.note ? ` · ${item.note}` : "";
-    return turnMetaNode(
-      tr("memoryCitation", { source, note }),
-      [item.source, item.note].filter(Boolean).join(" · "),
-    );
   }
   const details = document.createElement("details");
   details.className = "context-block";
@@ -1655,10 +1662,16 @@ function turnDuration(group) {
 
 function turnSummaryText(group) {
   const tools = group.messages.flatMap((message) => message.tools || []),
-    files = tools.reduce((total, tool) => total + (tool.file_count || 0), 0);
+    deferredTools = group.messages.reduce(
+      (total, message) => total + (message.deferred_tool_count || 0),
+      0,
+    ),
+    files =
+      tools.reduce((total, tool) => total + (tool.file_count || 0), 0) +
+      group.messages.reduce((total, message) => total + (message.deferred_file_count || 0), 0);
   return tr("turnSummary", {
     duration: turnDuration(group),
-    tools: tools.length,
+    tools: tools.length + deferredTools,
     files: files ? tr("turnEditedFiles", { count: files }) : "",
   });
 }
@@ -1689,7 +1702,9 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
     ),
     hiddenNodes = messageNodes.filter((node) => node !== finalNode && !userNodes.includes(node)),
     hasFinalTools = Boolean(finalIndex >= 0 && group.messages[finalIndex].tools?.length),
-    foldable = completed && Boolean(finalNode) && (hiddenNodes.length > 0 || hasFinalTools);
+    hasDeferred = group.messages.some((message) => message.deferred),
+    foldable =
+      completed && Boolean(finalNode) && (hiddenNodes.length > 0 || hasFinalTools || hasDeferred);
 
   section.className = "turn-group";
   section.dataset.turnKey = group.key;
@@ -1717,7 +1732,24 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   label.textContent = turnSummaryText(group);
   fold.append(icon, label);
   fold.onclick = () => {
-    if (state.expandedTurnIds.has(expansionKey)) state.expandedTurnIds.delete(expansionKey);
+    if (!expanded && hasDeferred && group.turnId) {
+      fold.disabled = true;
+      fold.classList.add("loading");
+      run(async () => {
+        try {
+          await hydrateTurn(group.turnId);
+          state.expandedTurnIds.add(expansionKey);
+          renderVisibleMessages();
+        } finally {
+          if (fold.isConnected) {
+            fold.disabled = false;
+            fold.classList.remove("loading");
+          }
+        }
+      });
+      return;
+    }
+    if (expanded) state.expandedTurnIds.delete(expansionKey);
     else state.expandedTurnIds.add(expansionKey);
     layoutTurnGroup(section, group, messageNodes, completed);
   };
@@ -1755,12 +1787,14 @@ function messageNode(m, keepToolsRunning = false) {
   } else head.append(a, b);
   const body = document.createElement("div");
   body.className = "message-body";
-  for (const item of m.content || []) body.appendChild(contentNode(item));
-  const tools = toolGroupNode(m, keepToolsRunning);
-  if (tools) body.appendChild(tools);
-  if (head.childNodes.length) box.appendChild(head);
-  box.appendChild(body);
-  const copyText = (m.content || [])
+  const content = m.content || [],
+    ordinaryItems = content.filter(
+      (item) => !["turn_usage", "memory_citation"].includes(item.kind),
+    ),
+    usageItems = content.filter((item) => item.kind === "turn_usage"),
+    memoryItems = content.filter((item) => item.kind === "memory_citation");
+  for (const item of ordinaryItems) body.appendChild(contentNode(item));
+  const copyText = content
     .filter((item) => item.kind === "text" && typeof item.text === "string")
     .map((item) => item.text)
     .join("\n\n");
@@ -1777,8 +1811,14 @@ function messageNode(m, keepToolsRunning = false) {
         await navigator.clipboard.writeText(copyText);
         notify(tr("messageCopied"));
       });
-    box.appendChild(copy);
+    body.appendChild(copy);
   }
+  const tools = toolGroupNode(m, keepToolsRunning);
+  if (tools) body.appendChild(tools);
+  for (const item of usageItems) body.appendChild(contentNode(item));
+  if (memoryItems.length) body.appendChild(memoryCitationNode(memoryItems));
+  if (head.childNodes.length) box.appendChild(head);
+  box.appendChild(body);
   renderedMessageState.set(box, {
     signature: JSON.stringify(m),
     keepToolsRunning,
@@ -1876,14 +1916,18 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
-  const submitting = ["queueing", "steering"].includes(entry.status);
+  // The dashed outline represents an input that has not yet materialized in
+  // the authoritative rollout. Keep it through queueing/accepted/dequeued;
+  // reconciliation removes the item only when the user message lands.
+  const submitting = entry.status !== "failed";
   box.className = `outbox-item${entry.action === "steer" ? " steer" : ""}${entry.handoff ? " handoff" : ""}${submitting ? " submitting" : ""}`;
   box.dataset.pendingId = entry.id;
+  box.dataset.pendingSignature = JSON.stringify(entry);
   const body = document.createElement("div");
   body.className = "message-body";
   body.appendChild(markdownNode(entry.text, markdownOptions(entry.thread_id || state.current?.id)));
   const meta = document.createElement("div"),
-    busy = ["queueing", "steering"].includes(entry.status);
+    busy = !["queued", "failed"].includes(entry.status);
   meta.className = "outbox-meta";
   if (entry.handoff) {
     const status = document.createElement("div");
@@ -1920,7 +1964,12 @@ function pendingNode(entry) {
       .split("\n")
       .some((line) => ["[Image attachment]", "[Audio attachment]"].includes(line.trim()));
     const nativeQueue = ["app_server_queue", "demo_wasm"].includes(entry.source);
-    if (entry.action === "queue" && nativeQueue && !hasAttachmentSummary) {
+    if (
+      entry.action === "queue" &&
+      entry.status === "queued" &&
+      nativeQueue &&
+      !hasAttachmentSummary
+    ) {
       const convert = document.createElement("button");
       convert.type = "button";
       convert.textContent = tr("convertToSteer");
@@ -1941,35 +1990,27 @@ function pendingNode(entry) {
 function renderPending() {
   const tray = $("outboxTray"),
     entries = state.pending.filter((entry) => entry.thread_id === state.current?.id),
-    openMenus = new Set(
-      [...tray.querySelectorAll(".outbox-item .outbox-menu[open]")]
-        .map((menu) => menu.closest(".outbox-item")?.dataset.pendingId)
-        .filter(Boolean),
-    );
-  tray.textContent = "";
-  for (const entry of entries) {
-    const node = pendingNode(entry);
-    if (openMenus.has(entry.id)) node.querySelector(".outbox-menu").open = true;
-    tray.appendChild(node);
+    displayEntries = [...entries];
+  const existingById = new Map([...tray.children].map((node) => [node.dataset.pendingId, node])),
+    nodes = displayEntries.map((entry) => {
+      const existing = existingById.get(entry.id),
+        signature = JSON.stringify(entry);
+      if (existing?.dataset.pendingSignature === signature) return existing;
+      const open = existing?.querySelector(".outbox-menu")?.open,
+        node = pendingNode(entry);
+      if (open && node.querySelector(".outbox-menu"))
+        node.querySelector(".outbox-menu").open = true;
+      return node;
+    });
+  let cursor = tray.firstChild;
+  for (const node of nodes) {
+    if (node === cursor) cursor = cursor.nextSibling;
+    else tray.insertBefore(node, cursor);
   }
-  const delivery = state.delivery?.threadId === state.current?.id ? state.delivery : null,
-    pendingStillVisible = delivery?.pendingId
-      ? entries.some((entry) => entry.id === delivery.pendingId)
-      : false;
-  if (
-    delivery?.text &&
-    !delivery.onScreen &&
-    !pendingStillVisible &&
-    ["accepted", "processing"].includes(delivery.phase)
-  ) {
-    tray.appendChild(
-      pendingNode({
-        id: `handoff-${delivery.threadId}`,
-        text: delivery.text,
-        status: delivery.phase,
-        handoff: true,
-      }),
-    );
+  while (cursor) {
+    const next = cursor.nextSibling;
+    cursor.remove();
+    cursor = next;
   }
   tray.hidden = !tray.childElementCount;
   syncOutboxCompactLabel();
@@ -1980,19 +2021,21 @@ function syncOutboxCompactLabel() {
   tray.title = label;
   tray.setAttribute("aria-label", label);
 }
-async function refreshPending() {
+function mergePendingResponse(messages, preserveOptimistic = true) {
+  const remote = Array.isArray(messages) ? messages : [];
+  if (!preserveOptimistic) return remote;
+  const ids = new Set(remote.map((entry) => entry.id));
+  return [
+    ...remote,
+    ...state.pending.filter((entry) => entry.source === "web_optimistic" && !ids.has(entry.id)),
+  ];
+}
+async function refreshPending({ preserveOptimistic = true } = {}) {
   const r = await command(
     { command: "pending_messages", thread_id: state.current?.id || null },
     false,
   );
-  state.pending = Array.isArray(r.messages) ? r.messages : [];
-  if (
-    state.delivery?.pendingId &&
-    state.delivery.phase === "queued" &&
-    !state.pending.some((entry) => entry.id === state.delivery.pendingId)
-  ) {
-    setDeliveryState("accepted");
-  }
+  state.pending = mergePendingResponse(r.messages, preserveOptimistic);
   renderPending();
 }
 async function deletePending(entry, button) {
@@ -2012,7 +2055,6 @@ async function deletePending(entry, button) {
     state.pending = state.pending.filter(
       (item) => item.id !== entry.id || item.thread_id !== entry.thread_id,
     );
-    if (state.delivery?.pendingId === entry.id) setDeliveryState(null);
     renderPending();
     $("messageText").focus();
     $("messageText").setSelectionRange(text.length, text.length);
@@ -2029,8 +2071,6 @@ async function convertPendingToSteer(entry, button) {
     button.disabled = false;
     throw new Error(tr("convertRequiresActive"));
   }
-  const initialTurnId = activity.activity.active_turn_id,
-    initialMessageIndex = state.lastMessageIndex;
   const withdrawn = await command(
     { command: "pending_message_delete", id: entry.id, thread_id: entry.thread_id },
     false,
@@ -2038,24 +2078,13 @@ async function convertPendingToSteer(entry, button) {
   state.pending = state.pending.filter(
     (item) => item.id !== entry.id || item.thread_id !== entry.thread_id,
   );
-  if (state.delivery?.pendingId === entry.id) setDeliveryState(null);
   renderPending();
   try {
-    const steered = await command(
+    await command(
       { command: "steer", thread_id: entry.thread_id, text: withdrawn.text, attachments: [] },
       false,
     );
-    setDeliveryState("accepted", {
-      threadId: entry.thread_id,
-      mode: "steer",
-      pendingId: steered.pending_id || null,
-      initialTurnId,
-      initialMessageIndex,
-      started: true,
-      dismissed: false,
-      onScreen: false,
-      text: withdrawn.text,
-    });
+    await refreshPending({ preserveOptimistic: false });
     if (state.current?.id === entry.thread_id)
       await openThread(state.current, { quiet: true, preserveView: true });
     notify(tr("queueConverted"));
@@ -2083,6 +2112,96 @@ function olderButton() {
 }
 async function fetchMessages(before = null, limit = state.pageSize) {
   return command({ command: "messages", thread_id: state.current.id, before, limit }, false);
+}
+function hydratedTurnKey(threadId, turnId) {
+  return `${threadId}:${turnId}`;
+}
+function mergeHydratedTurnMessages(messages, threadId = state.current?.id) {
+  if (!threadId) return messages;
+  return messages.map((message) => {
+    if (!message.turn_id) return message;
+    return (
+      state.hydratedTurns
+        .get(hydratedTurnKey(threadId, message.turn_id))
+        ?.get(message.message_index) || message
+    );
+  });
+}
+function renderVisibleMessages() {
+  if (!state.current) return;
+  const activeToolMessage = state.activeTurnId
+    ? state.visibleMessages.findLast((message) => message.tools?.length)
+    : null;
+  reconcileMessageNodes(
+    $("messages"),
+    {
+      messages: state.visibleMessages,
+      page: {
+        start: state.historyStart ?? 0,
+        end: state.historyEnd ?? state.visibleMessages.length,
+        total: state.historyTotal ?? state.visibleMessages.length,
+        has_more: state.hasMore,
+      },
+    },
+    activeToolMessage,
+  );
+}
+async function hydrateTurn(turnId, { render = false } = {}) {
+  const threadId = state.current?.id;
+  if (!threadId || !turnId) return null;
+  const key = hydratedTurnKey(threadId, turnId);
+  let request = state.hydratingTurns.get(key);
+  if (!request && !state.hydratedTurns.has(key)) {
+    request = command({ command: "turn_messages", thread_id: threadId, turn_id: turnId }, false)
+      .then((result) => {
+        if (result.thread_id !== threadId || result.turn_id !== turnId) {
+          throw new Error(tr("historyOutOfSync"));
+        }
+        const messages = new Map(
+          (result.messages || [])
+            .filter(
+              (message) =>
+                message.turn_id === turnId && Number.isSafeInteger(message.message_index),
+            )
+            .map((message) => [message.message_index, message]),
+        );
+        if (!messages.size) throw new Error(tr("historyOutOfSync"));
+        state.hydratedTurns.set(key, messages);
+        return messages;
+      })
+      .finally(() => state.hydratingTurns.delete(key));
+    state.hydratingTurns.set(key, request);
+  }
+  if (request) await request;
+  if (state.current?.id !== threadId) return null;
+  state.visibleMessages = mergeHydratedTurnMessages(state.visibleMessages, threadId);
+  if (render) renderVisibleMessages();
+  return state.hydratedTurns.get(key) || null;
+}
+function scheduleDeferredTurnPrefetch(messages) {
+  const threadId = state.current?.id,
+    openToken = state.openToken,
+    turnIds = [
+      ...new Set(
+        messages
+          .filter((message) => message.deferred && message.turn_id)
+          .map((message) => message.turn_id),
+      ),
+    ];
+  if (!threadId || !turnIds.length) return;
+  const prefetch = async () => {
+    for (const turnId of turnIds) {
+      if (state.current?.id !== threadId || state.openToken !== openToken) return;
+      try {
+        await hydrateTurn(turnId);
+      } catch {
+        // Clicking the turn retries and surfaces the normal request error.
+      }
+    }
+  };
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(() => prefetch(), { timeout: 2500 });
+  } else setTimeout(prefetch, 1500);
 }
 // Message indices come from the current rollout parse, not immutable event IDs. Continue a
 // page only while its boundary is exact; otherwise rebuild the visible region atomically.
@@ -2126,39 +2245,6 @@ function setSendMode(mode, automatic = false) {
   button.title = tr(isSteer ? "switchToQueue" : "switchToSteer");
   button.setAttribute("aria-label", button.title);
 }
-let deliveryClearTimer = null;
-function setDeliveryState(phase, details = {}) {
-  clearTimeout(deliveryClearTimer);
-  const previousPhase = state.delivery?.phase;
-  state.delivery = phase
-    ? {
-        ...(state.delivery || {}),
-        ...details,
-        phase,
-        announcedPhase: phase === previousPhase ? state.delivery?.announcedPhase : null,
-      }
-    : null;
-  showActivity();
-  if (phase === "completed" || phase === "failed") {
-    deliveryClearTimer = setTimeout(() => {
-      state.delivery = null;
-      showActivity();
-    }, 1800);
-  }
-}
-function transientStatus(active) {
-  const delivery =
-    state.delivery?.threadId === state.current?.id && !state.delivery.dismissed
-      ? state.delivery
-      : null;
-  if (!delivery) return null;
-  if (delivery.phase === "submitting") return ["submitting", tr("submittingToServer")];
-  if (delivery.phase === "queued") return ["queued", tr("serverQueued")];
-  if (delivery.phase === "accepted" && !delivery.started) return ["accepted", tr("serverAccepted")];
-  if (delivery.phase === "processing" && active) return ["processing", tr("handoffProcessing")];
-  if (delivery.phase === "failed") return ["failed", tr("requestFailed")];
-  return null;
-}
 function usesDocumentMessageScroll() {
   return matchMedia("(max-width:800px)").matches;
 }
@@ -2184,40 +2270,6 @@ function messageViewportTop() {
   if (!usesDocumentMessageScroll()) return $("messages").getBoundingClientRect().top;
   return Math.max(0, document.querySelector(".thread-head")?.getBoundingClientRect().bottom || 0);
 }
-function renderTransientStatus(active) {
-  const root = $("messages"),
-    statusState = transientStatus(active),
-    existing = root.querySelector(".transient-status");
-  if (!statusState) {
-    existing?.remove();
-    return;
-  }
-  if (!existing && state.delivery?.announcedPhase === statusState[0]) return;
-  const metrics = messageScrollMetrics(),
-    stickToBottom = metrics.height - metrics.top - metrics.client < 100,
-    status = existing || document.createElement("div");
-  status.className = "transient-status";
-  status.setAttribute("role", "button");
-  status.setAttribute("tabindex", "0");
-  status.setAttribute("aria-live", "polite");
-  status.dataset.phase = statusState[0];
-  status.textContent = statusState[1];
-  status.title = tr("dismissStatus");
-  status.setAttribute("aria-label", `${statusState[1]}. ${tr("dismissStatus")}`);
-  status.onclick = () => {
-    if (state.delivery) state.delivery.dismissed = true;
-    status.remove();
-  };
-  status.onkeydown = (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      status.click();
-    }
-  };
-  if (!existing) root.appendChild(status);
-  if (state.delivery) state.delivery.announcedPhase = statusState[0];
-  if (stickToBottom) scrollMessagesToBottom();
-}
 function showActivity() {
   const active = Boolean(state.activeTurnId),
     el = $("runState"),
@@ -2237,7 +2289,6 @@ function showActivity() {
     : state.pendingChanges
       ? tr("idleUpdates")
       : tr("idle");
-  renderTransientStatus(active);
 }
 function setUsageUnavailable(error) {
   state.usageUnavailable = true;
@@ -2430,21 +2481,6 @@ async function refreshActivity() {
   if (state.activeTurnId) setThreadRunState(threadId, "active");
   else if (state.threadRunStates.get(threadId) === "active")
     setThreadRunState(threadId, "completed");
-  const delivery = state.delivery?.threadId === threadId ? state.delivery : null,
-    pendingDelivery = delivery?.pendingId
-      ? state.pending.some((entry) => entry.id === delivery.pendingId)
-      : false;
-  if (
-    state.activeTurnId &&
-    delivery &&
-    (delivery.mode === "steer" ||
-      (state.activeTurnId !== delivery.initialTurnId && !pendingDelivery)) &&
-    ["accepted", "queued"].includes(delivery.phase)
-  ) {
-    state.delivery = { ...delivery, phase: "processing", started: true };
-  } else if (!state.activeTurnId && delivery?.started && delivery.phase === "processing") {
-    setDeliveryState("completed");
-  }
   renderPending();
   if (!state.activeTurnId && $("sendMode").value === "steer") setSendMode("send", true);
   else if (state.activeTurnId && state.modeAutomatic) setSendMode("steer", true);
@@ -2458,12 +2494,15 @@ async function pollActivity() {
     const result = await refreshActivity();
     if (result?.changed) {
       state.pendingChanges = true;
-      if (state.delivery?.phase === "processing") state.delivery.dismissed = true;
       showActivity();
       refreshWorkspaceDiff().catch(() => {});
     }
     if (state.pendingChanges) {
-      if (Date.now() - state.lastMessageRefresh < 3500) return;
+      const refreshDelay = 400 - (Date.now() - state.lastMessageRefresh);
+      if (refreshDelay > 0) {
+        scheduleEventRefresh(state.current.id, false, refreshDelay);
+        return;
+      }
       await openThread(state.current, { quiet: true, preserveView: true });
       return;
     }
@@ -2473,7 +2512,7 @@ async function pollActivity() {
   }
 }
 let eventRefreshTimer = null;
-function scheduleEventRefresh(threadId, immediate = false) {
+function scheduleEventRefresh(threadId, immediate = false, delay = null) {
   if (threadId !== state.current?.id) return;
   state.pendingChanges = true;
   clearTimeout(eventRefreshTimer);
@@ -2482,10 +2521,15 @@ function scheduleEventRefresh(threadId, immediate = false) {
       eventRefreshTimer = null;
       pollActivity().catch(() => {});
     },
-    immediate ? 0 : 280,
+    immediate ? 0 : (delay ?? 280),
   );
 }
 function handleBridgeEvent(event) {
+  if (event?.type === "bridge_event_stream") {
+    state.eventStreamConnected = event.status === "ready";
+    if (!state.eventStreamConnected) pollActivity().catch(() => {});
+    return;
+  }
   if (event?.type === "bridge_event_gap") {
     state.lastMessageRefresh = 0;
     for (const threadId of state.taskTrackedIds) state.taskDirtyIds.add(threadId);
@@ -2552,10 +2596,6 @@ function handleBridgeEvent(event) {
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = params.turn?.id || state.activeTurnId;
-      const delivery = state.delivery?.threadId === threadId ? state.delivery : null;
-      if (delivery && ["queued", "accepted"].includes(delivery.phase)) {
-        state.delivery = { ...delivery, phase: "processing", started: true };
-      }
       showActivity();
     }
   } else if (method === "turn/completed" && threadId) {
@@ -2566,7 +2606,6 @@ function handleBridgeEvent(event) {
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = null;
-      if (state.delivery?.started) setDeliveryState("completed");
       showActivity();
     }
   }
@@ -2655,12 +2694,17 @@ function captureMessageView() {
     metrics = messageScrollMetrics(),
     viewportTop = messageViewportTop(),
     anchor = [...root.querySelectorAll(".message[data-message-index]")].find(
-      (message) => message.getBoundingClientRect().bottom > viewportTop + 1,
-    );
+      (message) =>
+        !message.hidden &&
+        message.getClientRects().length > 0 &&
+        message.getBoundingClientRect().bottom > viewportTop + 1,
+    ),
+    anchorTurnKey = anchor?.closest(".turn-group")?.dataset.turnKey || null;
   return {
     atBottom: metrics.height - metrics.top - metrics.client < 100,
     top: metrics.top,
     anchorMessageIndex: anchor?.dataset.messageIndex || null,
+    anchorTurnKey,
     anchorOffset: anchor ? anchor.getBoundingClientRect().top - viewportTop : null,
     openDetails: [...root.querySelectorAll(".message details[open]")].map((detail) => {
       const message = detail.closest(".message");
@@ -2688,9 +2732,15 @@ function restoreMessageView(view, { smoothBottom = false } = {}) {
         (message) => message.dataset.messageIndex === view.anchorMessageIndex,
       )
     : null;
-  if (anchor && view.anchorOffset !== null) {
+  if (
+    anchor &&
+    !anchor.hidden &&
+    anchor.getClientRects().length > 0 &&
+    view.anchorOffset !== null
+  ) {
     const delta = anchor.getBoundingClientRect().top - messageViewportTop() - view.anchorOffset;
-    setMessageScrollTop(messageScrollMetrics().top + delta);
+    if (Number.isFinite(delta)) setMessageScrollTop(messageScrollMetrics().top + delta);
+    else setMessageScrollTop(view.top);
   } else setMessageScrollTop(view.top);
 }
 async function openThread(
@@ -2723,6 +2773,8 @@ async function openThread(
     state.pendingChanges = false;
     state.lastMessageIndex = null;
     state.visibleMessages = [];
+    state.hydratedTurns.clear();
+    state.hydratingTurns.clear();
     state.historyStart = null;
     state.historyEnd = null;
     state.historyTotal = null;
@@ -2755,7 +2807,7 @@ async function openThread(
       root.innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
     }
   }
-  const [r] = await Promise.all([
+  const [r, , , pendingResult] = await Promise.all([
     fetchMessages(),
     refreshActivity(),
     demoMode
@@ -2763,27 +2815,16 @@ async function openThread(
       : command({ command: "thread_watch", thread_id: thread.id }, false)
           .then((watch) => updateThreadLiveFromStatus(thread.id, watch.thread?.status))
           .catch(() => {}),
+    command({ command: "pending_messages", thread_id: thread.id }, false).catch(() => null),
   ]);
   if (token !== state.openToken) return;
   requireMessagePage(r, { latest: true });
+  r.messages = mergeHydratedTurnMessages(r.messages, thread.id);
+  if (pendingResult) state.pending = mergePendingResponse(pendingResult.messages, true);
   state.messageCache.set(thread.id, r);
   state.current = { ...thread, ...r.thread };
   rememberSessionId(window.localStorage, state.current.id);
   if (writeHash) updateSessionHash(state.current.id, replaceHash);
-  const delivery = state.delivery?.threadId === thread.id ? state.delivery : null;
-  if (
-    delivery?.text &&
-    r.messages.some(
-      (message) =>
-        message.role === "user" &&
-        message.message_index > (delivery.initialMessageIndex ?? -1) &&
-        message.content?.some(
-          (item) => item.kind === "text" && item.text?.trim() === delivery.text.trim(),
-        ),
-    )
-  ) {
-    delivery.onScreen = true;
-  }
   const activeToolMessage = state.activeTurnId
     ? r.messages.findLast((message) => message.tools?.length)
     : null;
@@ -2797,7 +2838,11 @@ async function openThread(
       page: { ...r.page, has_more: olderMessages.length ? preservedHasMore : r.page.has_more },
     };
   state.visibleMessages = visibleResponse.messages;
+  if (messageView?.anchorTurnKey && !messageView.atBottom) {
+    state.expandedTurnIds.add(`${thread.id}:${messageView.anchorTurnKey}`);
+  }
   reconcileMessageNodes(root, visibleResponse, activeToolMessage);
+  scheduleDeferredTurnPrefetch(r.messages);
   applyMessagePageState(r);
   if (olderMessages.length) {
     state.historyStart = olderMessages[0].message_index;
@@ -2813,7 +2858,6 @@ async function openThread(
   });
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
-  await refreshPending();
   showActivity();
   await refreshWorkspaceDiff(true);
   if (!quiet) settleHorizontalPosition();
@@ -2852,6 +2896,7 @@ async function loadOlder() {
   state.hasMore = r.page.has_more;
   state.historyStart = r.page.start;
   state.historyTotal = Math.max(state.historyTotal ?? 0, r.page.total);
+  r.messages = mergeHydratedTurnMessages(r.messages, threadId);
   state.visibleMessages = [...r.messages, ...state.visibleMessages];
   const activeToolMessage = state.activeTurnId
     ? state.visibleMessages.findLast((message) => message.tools?.length)
@@ -2865,6 +2910,7 @@ async function loadOlder() {
     },
     activeToolMessage,
   );
+  scheduleDeferredTurnPrefetch(r.messages);
   const newHeight = messageScrollMetrics().height;
   if (usesDocumentMessageScroll()) window.scrollTo(0, oldTop + (newHeight - oldHeight));
   else root.scrollTop = oldTop + (newHeight - oldHeight);
@@ -2888,22 +2934,24 @@ function syncSubmitAction() {
   const shell = document.querySelector(".composer-shell"),
     stopReady = shouldOfferStop({
       activeTurnId: state.activeTurnId,
-      inputFocused: shell.classList.contains("input-focused"),
-      submitting: shell.classList.contains("submitting"),
-      interrupting: state.interrupting,
     }),
-    button = $("submitBtn");
-  shell.classList.toggle("stop-ready", stopReady);
+    stop = $("stopBtn"),
+    submit = $("submitBtn");
+  shell.classList.toggle("stop-visible", stopReady);
   shell.classList.toggle("interrupting", state.interrupting);
-  button.dataset.action = stopReady ? "interrupt" : "submit";
-  button.title = tr(stopReady ? "stopRunAria" : "submitAria");
-  button.setAttribute("aria-label", button.title);
+  stop.title = tr("stopRunAria");
+  stop.setAttribute("aria-label", stop.title);
+  stop.setAttribute("aria-hidden", String(!stopReady));
+  stop.tabIndex = stopReady ? 0 : -1;
+  submit.title = tr("submitAria");
+  submit.setAttribute("aria-label", submit.title);
   syncComposerPlaceholder();
 }
 async function interruptCurrentRun({ confirm = true, requireActive = false } = {}) {
   if ((requireActive && !state.activeTurnId) || state.interrupting) return;
   if (confirm && !window.confirm(tr("stopRunConfirm"))) return;
   state.interrupting = true;
+  $("stopBtn").disabled = true;
   $("submitBtn").disabled = true;
   syncSubmitAction();
   try {
@@ -2913,6 +2961,7 @@ async function interruptCurrentRun({ confirm = true, requireActive = false } = {
     await refreshActivity();
   } finally {
     state.interrupting = false;
+    $("stopBtn").disabled = false;
     $("submitBtn").disabled = false;
     syncSubmitAction();
   }
@@ -2924,25 +2973,43 @@ async function write(name) {
   if (!text && !attachments.length) throw new Error(tr("messageRequired"));
   if (voiceRecorder?.state === "recording") throw new Error(tr("stopRecording"));
   if (!state.current) throw new Error(tr("chooseSessionError"));
-  const threadId = state.current.id;
+  const threadId = state.current.id,
+    submissionId = `web-${
+      typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    }`;
+  let action = name === "steer" ? "steer" : "queue";
+  const pendingText =
+    text ||
+    attachments
+      .map((attachment) =>
+        attachment.type === "audio" ? "[Audio attachment]" : "[Image attachment]",
+      )
+      .join("\n");
   let acknowledged = false;
-  setDeliveryState("submitting", {
-    threadId,
-    mode: name,
-    pendingId: null,
-    initialTurnId: state.activeTurnId,
-    initialMessageIndex: state.lastMessageIndex,
-    started: false,
-    dismissed: false,
-    onScreen: false,
-    text: text || `${attachments.length} ${tr("attachment")}`,
+  state.pending.push({
+    id: submissionId,
+    thread_id: threadId,
+    text: pendingText,
+    action,
+    status: `${action}ing`,
+    source: "web_optimistic",
   });
+  renderPending();
   setComposerSubmitting(true);
   try {
     if (name === "steer") {
       const activity = await refreshActivity();
       if (!activity?.activity.active_turn_id) {
         name = "send";
+        action = "queue";
+        const optimistic = state.pending.find((entry) => entry.id === submissionId);
+        if (optimistic) {
+          optimistic.action = action;
+          optimistic.status = "queueing";
+          renderPending();
+        }
         setSendMode("send", true);
         notify(tr("noActiveTurnQueued"));
       }
@@ -2950,15 +3017,19 @@ async function write(name) {
     $("messageText").value = "";
     resizeComposerTextarea();
     saveDraft(threadId, "", true);
-    const request = command({ command: name, thread_id: threadId, text, attachments }).then(
+    const request = command({
+      command: name,
+      thread_id: threadId,
+      text,
+      attachments,
+      submission_id: submissionId,
+    }).then(
       (value) => ({ value }),
       (error) => ({ error }),
     );
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    await refreshPending();
     const outcome = await request;
     if (outcome.error) {
-      await refreshPending();
+      await refreshPending({ preserveOptimistic: false });
       throw outcome.error;
     }
     setComposerSubmitting(false);
@@ -2966,10 +3037,7 @@ async function write(name) {
     state.composerAttachments = [];
     state.attachmentDrafts.delete(threadId);
     renderComposerAttachments();
-    setDeliveryState(outcome.value.status === "queued" ? "queued" : "accepted", {
-      mode: name,
-      pendingId: outcome.value.pending_id || null,
-    });
+    await refreshPending({ preserveOptimistic: false });
     try {
       if (state.current?.id === threadId) await openThread(state.current, { quiet: true });
       else await refreshPending();
@@ -2980,7 +3048,6 @@ async function write(name) {
     notify(name === "send" ? tr("messageQueued") : tr("guidanceSteered"));
   } catch (error) {
     if (!acknowledged) {
-      setDeliveryState("failed", { threadId });
       if (!state.drafts.has(threadId)) saveDraft(threadId, draft, true);
       if (state.current?.id === threadId && !$("messageText").value)
         $("messageText").value = state.drafts.get(threadId) || "";
@@ -3031,20 +3098,8 @@ function toggleSendModeAndKeepFocus() {
   $("messageText").focus({ preventScroll: true });
 }
 $("sendModeToggle").onclick = toggleSendModeAndKeepFocus;
-$("submitBtn").onpointerdown = (event) => {
-  if (!event.isPrimary || event.button !== 0) return;
-  $("submitBtn").dataset.pointerAction ||= $("submitBtn").dataset.action;
-};
-$("submitBtn").onpointercancel = () => delete $("submitBtn").dataset.pointerAction;
-$("submitBtn").onclick = () => {
-  const action = $("submitBtn").dataset.pointerAction || $("submitBtn").dataset.action;
-  delete $("submitBtn").dataset.pointerAction;
-  run(() =>
-    action === "interrupt"
-      ? interruptCurrentRun({ requireActive: true })
-      : write($("sendMode").value),
-  );
-};
+$("submitBtn").onclick = () => run(() => write($("sendMode").value));
+$("stopBtn").onclick = () => run(() => interruptCurrentRun({ requireActive: true }));
 $("interruptBtn").onclick = () => run(() => interruptCurrentRun());
 $("mobileInterruptBtn").onclick = () => $("interruptBtn").click();
 $("renameThreadBtn").onclick = () =>
@@ -3403,6 +3458,8 @@ run(async () => {
   await loadStatus();
   await loadProjects();
 });
-setInterval(() => pollActivity().catch(() => {}), 1500);
+setInterval(() => {
+  if (!state.eventStreamConnected) pollActivity().catch(() => {});
+}, 1500);
 setInterval(() => refreshTaskOverviews().catch(() => {}), 1500);
 setInterval(() => refreshComposerStatus().catch(() => {}), 60000);

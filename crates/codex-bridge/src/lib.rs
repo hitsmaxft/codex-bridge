@@ -26,7 +26,7 @@ pub use write_backend::{
     StartedTurnReceipt, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 25;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +49,10 @@ pub enum Request {
         thread_id: String,
         before: Option<u32>,
         limit: u32,
+    },
+    TurnMessages {
+        thread_id: String,
+        turn_id: String,
     },
     MessageContent {
         thread_id: String,
@@ -109,12 +113,16 @@ pub enum Request {
     Send {
         thread_id: Option<String>,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_id: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<ComposerAttachment>,
     },
     Steer {
         thread_id: Option<String>,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_id: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<ComposerAttachment>,
     },
@@ -188,6 +196,7 @@ impl Request {
             Self::Projects { .. } => "projects",
             Self::ProjectThreads { .. } => "project_threads",
             Self::Messages { .. } => "messages",
+            Self::TurnMessages { .. } => "turn_messages",
             Self::MessageContent { .. } => "message_content",
             Self::ToolContent { .. } => "tool_content",
             Self::ThreadActivity { .. } => "thread_activity",
@@ -375,6 +384,14 @@ mod tests {
         assert_eq!(messages["before"], 90);
         assert_eq!(messages["limit"], 30);
 
+        let turn = serde_json::to_value(Request::TurnMessages {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+        })
+        .unwrap();
+        assert_eq!(turn["command"], "turn_messages");
+        assert_eq!(turn["turn_id"], "turn-1");
+
         let content = serde_json::to_value(Request::MessageContent {
             thread_id: "thread-1".into(),
             message_index: 12,
@@ -468,6 +485,7 @@ mod tests {
         let request = Request::Send {
             thread_id: Some("thread-1".into()),
             text: "continue".into(),
+            submission_id: Some("web-1".into()),
             attachments: Vec::new(),
         };
 
@@ -475,6 +493,7 @@ mod tests {
         assert_eq!(json["command"], "send");
         assert_eq!(json["thread_id"], "thread-1");
         assert_eq!(json["text"], "continue");
+        assert_eq!(json["submission_id"], "web-1");
     }
 
     #[test]

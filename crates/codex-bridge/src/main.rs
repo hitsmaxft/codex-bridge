@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -503,6 +503,8 @@ struct PendingMessage {
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     queued_submission_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
     #[serde(skip)]
     after_message_index: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -513,15 +515,57 @@ struct PendingMessage {
 struct PendingMessages {
     next_id: AtomicU64,
     entries: RwLock<Vec<PendingMessage>>,
+    completed: RwLock<VecDeque<PendingMessage>>,
 }
 
 impl PendingMessages {
-    fn begin(&self, thread_id: &str, text: &str, action: &str, after_message_index: i64) -> String {
-        let id = format!(
-            "bridge-{}",
-            self.next_id.fetch_add(1, Ordering::Relaxed) + 1
-        );
+    fn begin(
+        &self,
+        thread_id: &str,
+        text: &str,
+        action: &str,
+        after_message_index: i64,
+        submission_id: Option<&str>,
+    ) -> Result<(String, bool), &'static str> {
+        let id = match submission_id {
+            Some(id)
+                if !id.is_empty()
+                    && id.len() <= 128
+                    && id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                    }) =>
+            {
+                id.to_owned()
+            }
+            Some(_) => return Err("submission_id must be a safe identifier of at most 128 bytes"),
+            None => format!(
+                "bridge-{}",
+                self.next_id.fetch_add(1, Ordering::Relaxed) + 1
+            ),
+        };
+        if let Ok(completed) = self.completed.read() {
+            if let Some(existing) = completed.iter().find(|entry| entry.id == id) {
+                return if existing.thread_id == thread_id
+                    && existing.text == text
+                    && existing.action == action
+                {
+                    Ok((id, false))
+                } else {
+                    Err("submission_id is already used by a different message")
+                };
+            }
+        }
         if let Ok(mut entries) = self.entries.write() {
+            if let Some(existing) = entries.iter().find(|entry| entry.id == id) {
+                return if existing.thread_id == thread_id
+                    && existing.text == text
+                    && existing.action == action
+                {
+                    Ok((id, false))
+                } else {
+                    Err("submission_id is already used by a different message")
+                };
+            }
             entries.push(PendingMessage {
                 id: id.clone(),
                 thread_id: thread_id.to_owned(),
@@ -530,11 +574,12 @@ impl PendingMessages {
                 status: format!("{action}ing"),
                 source: "bridge".to_owned(),
                 queued_submission_id: None,
+                turn_id: None,
                 after_message_index,
                 error: None,
             });
         }
-        id
+        Ok((id, true))
     }
 
     fn finish(&self, id: &str, status: &str, error: Option<String>) {
@@ -557,6 +602,33 @@ impl PendingMessages {
         }
     }
 
+    fn accept(&self, id: &str, turn_id: Option<String>) {
+        if let Ok(mut entries) = self.entries.write() {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.status = "accepted".to_owned();
+                entry.turn_id = turn_id.or_else(|| entry.turn_id.clone());
+                entry.error = None;
+            }
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<PendingMessage> {
+        self.entries
+            .read()
+            .ok()?
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .or_else(|| {
+                self.completed
+                    .read()
+                    .ok()?
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .cloned()
+            })
+    }
+
     fn reconcile(
         &self,
         session_store: &SessionStore,
@@ -568,24 +640,46 @@ impl PendingMessages {
         };
         let mut messages_by_thread = HashMap::new();
         let mut landed = HashSet::new();
-        entries.retain(|entry| {
-            if entry.status == "failed" {
-                return true;
+        let completed = entries
+            .iter()
+            .filter_map(|entry| {
+                if entry.status == "failed" {
+                    return None;
+                }
+                let messages = messages_by_thread
+                    .entry(entry.thread_id.clone())
+                    .or_insert_with(|| {
+                        session_store
+                            .read_recent_messages(&entry.thread_id, 128)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| (0, Vec::new()))
+                    });
+                pending_message_landed(entry, &messages.1, messages.0, &mut landed).then(|| {
+                    let mut completed = entry.clone();
+                    completed.status = "applied".to_owned();
+                    completed
+                })
+            })
+            .collect::<Vec<_>>();
+        let completed_ids = completed
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<HashSet<_>>();
+        entries.retain(|entry| !completed_ids.contains(entry.id.as_str()));
+        if !completed.is_empty() {
+            if let Ok(mut tombstones) = self.completed.write() {
+                for entry in completed {
+                    if tombstones.iter().all(|existing| existing.id != entry.id) {
+                        tombstones.push_back(entry);
+                    }
+                }
+                while tombstones.len() > 1024 {
+                    tombstones.pop_front();
+                }
             }
-            let messages = messages_by_thread
-                .entry(entry.thread_id.clone())
-                .or_insert_with(|| {
-                    session_store
-                        .read_recent_messages(&entry.thread_id, 128)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default()
-                });
-            let is_landed = pending_message_landed(entry, messages, &mut landed);
-            !is_landed
-        });
+        }
         let mut matched_queue_ids = HashSet::new();
-        let mut matched_entry_ids = HashSet::new();
         for entry in entries
             .iter_mut()
             .filter(|entry| entry.action == "queue" && entry.status != "failed")
@@ -601,17 +695,17 @@ impl PendingMessages {
                             && queued_entry.text == entry.text))
             }) {
                 entry.queued_submission_id = queued_entry.queued_submission_id.clone();
+                if entry.status != "accepted" {
+                    entry.status = "queued".to_owned();
+                }
                 matched_queue_ids.insert(queued_entry.id.clone());
-                matched_entry_ids.insert(entry.id.clone());
+            } else if entry.source == "app_server_queue" {
+                // Leaving the native queue is not proof that the input landed in
+                // the rollout. Keep the transaction visible until the user item
+                // is observed; this closes the dequeue -> rollout gap.
+                entry.status = "accepted".to_owned();
             }
         }
-        entries.retain(|entry| {
-            let in_scope = thread_id.is_none_or(|thread_id| entry.thread_id == thread_id);
-            entry.action != "queue"
-                || entry.source != "app_server_queue"
-                || !in_scope
-                || matched_entry_ids.contains(&entry.id)
-        });
         let mut combined = entries.clone();
         for queued_entry in queued {
             if !matched_queue_ids.contains(&queued_entry.id) {
@@ -628,13 +722,6 @@ impl PendingMessages {
         if let Ok(mut entries) = self.entries.write() {
             entries.retain(|entry| entry.id != id || entry.thread_id != thread_id);
         }
-    }
-
-    fn finish_steer(&self, id: &str, thread_id: &str) {
-        // A successful turn/steer response means app-server has consumed the
-        // input. It is no longer withdrawable, so do not wait for rollout
-        // reconciliation before removing it from the local outbox.
-        self.dismiss(id, thread_id);
     }
 }
 
@@ -672,6 +759,7 @@ fn read_codex_queue(codex_home: &Path) -> Vec<PendingMessage> {
                 status: "queued".to_owned(),
                 source: "codex_queue".to_owned(),
                 after_message_index: -1,
+                turn_id: None,
                 error: None,
             })
         })
@@ -718,6 +806,7 @@ fn read_native_queue(
                 status: "queued".to_owned(),
                 source: "app_server_queue".to_owned(),
                 queued_submission_id: Some(id.to_owned()),
+                turn_id: None,
                 after_message_index: -1,
                 error: None,
             });
@@ -868,25 +957,51 @@ fn queue_payload_text(payload: &str) -> Option<String> {
 fn pending_message_landed(
     entry: &PendingMessage,
     messages: &[ThreadMessage],
+    message_start: usize,
     landed: &mut HashSet<(String, usize, String)>,
 ) -> bool {
+    if messages
+        .iter()
+        .any(|message| message.role == "user" && message.id.as_deref() == Some(entry.id.as_str()))
+    {
+        return true;
+    }
     messages
         .iter()
         .enumerate()
-        .skip((entry.after_message_index + 1).max(0) as usize)
+        .map(|(offset, message)| (message_start + offset, message))
+        .filter(|(message_index, _)| *message_index as i64 > entry.after_message_index)
         .filter(|(_, message)| message.role == "user")
-        .flat_map(|(message_index, message)| {
-            message.content.iter().filter_map(move |content| {
-                content
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(|text| (message_index, text))
-            })
+        .filter_map(|(message_index, message)| {
+            thread_message_input_summary(message).map(|text| (message_index, text))
         })
         .any(|(message_index, text)| {
-            let key = (entry.thread_id.clone(), message_index, text.to_owned());
+            let key = (entry.thread_id.clone(), message_index, text.clone());
             text == entry.text && landed.insert(key)
         })
+}
+
+fn thread_message_input_summary(message: &ThreadMessage) -> Option<String> {
+    let parts = message
+        .content
+        .iter()
+        .filter_map(
+            |content| match content.get("type").and_then(Value::as_str) {
+                Some("input_text" | "text") => content
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                Some("input_image" | "image" | "local_image" | "localImage") => {
+                    Some("[Image attachment]".to_owned())
+                }
+                Some("input_audio" | "audio" | "local_audio" | "localAudio") => {
+                    Some("[Audio attachment]".to_owned())
+                }
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 /// Prefer the CLI shipped with Codex Desktop because launchd does not inherit
@@ -3871,10 +3986,10 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "the pending message no longer exists",
                 );
             };
-            if matches!(entry.status.as_str(), "queueing" | "steering") {
+            if !matches!(entry.status.as_str(), "queued" | "failed") {
                 return Response::error(
                     "pending_message_busy",
-                    "wait for the pending operation to finish before deleting it",
+                    "the input has left the withdrawable queue and is awaiting rollout confirmation",
                 );
             }
             let queue_deleted = if let Some(queued_submission_id) = &entry.queued_submission_id {
@@ -4016,12 +4131,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                         }
                         _ => "rollout_jsonl",
                     };
-                    let messages = page
-                        .messages
-                        .iter()
-                        .enumerate()
-                        .map(|(offset, message)| compact_web_message(message, page.start + offset))
-                        .collect::<Vec<_>>();
+                    let messages = compact_web_message_page(&page.messages, page.start);
                     Response::success(json!({
                         "source": "rollout_jsonl",
                         "tool_source": tool_source,
@@ -4045,6 +4155,51 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                         }
                     }))
                 }
+                Ok(None) => Response::error(
+                    "thread_not_found",
+                    format!("thread {thread_id} was not found in the rollout store"),
+                ),
+                Err(error) => backend_error(error),
+            }
+        }
+        Request::TurnMessages { thread_id, turn_id } => {
+            if turn_id.is_empty() || turn_id.len() > 256 {
+                return Response::error(
+                    "invalid_request",
+                    "turn_id must contain between 1 and 256 bytes",
+                );
+            }
+            match session_store.read_turn_messages(&thread_id, &turn_id) {
+                Ok(Some(indexed)) if !indexed.is_empty() => {
+                    let (indices, mut messages): (Vec<_>, Vec<_>) = indexed.into_iter().unzip();
+                    let tool_source = match app_server_tools_for_messages(
+                        write_backend,
+                        app_server_tools,
+                        &thread_id,
+                        &messages,
+                    ) {
+                        Ok(tools) if overlay_app_server_tools(&mut messages, &tools) > 0 => {
+                            "app_server_items"
+                        }
+                        _ => "rollout_jsonl",
+                    };
+                    let messages = messages
+                        .iter()
+                        .zip(indices)
+                        .map(|(message, index)| compact_web_message(message, index))
+                        .collect::<Vec<_>>();
+                    Response::success(json!({
+                        "source": "rollout_jsonl",
+                        "tool_source": tool_source,
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "messages": messages,
+                    }))
+                }
+                Ok(Some(_)) => Response::error(
+                    "turn_not_found",
+                    format!("turn {turn_id} was not found in thread {thread_id}"),
+                ),
                 Ok(None) => Response::error(
                     "thread_not_found",
                     format!("thread {thread_id} was not found in the rollout store"),
@@ -4607,6 +4762,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
         Request::Send {
             thread_id,
             text,
+            submission_id,
             attachments,
         } => {
             let input = match composer_input(&text, &attachments) {
@@ -4625,22 +4781,42 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     pending_messages,
                     &resolved,
                     &input,
-                    &pending_text,
-                    EmptyThreadAction::Queue,
+                    EmptyThreadSubmission {
+                        text: &pending_text,
+                        action: EmptyThreadAction::Queue,
+                        id: submission_id.as_deref(),
+                    },
                 );
             }
-            let pending_id = pending_messages.begin(
+            let (pending_id, is_new) = match pending_messages.begin(
                 &resolved.thread.id,
                 &pending_text,
                 "queue",
                 latest_message_index(session_store, &resolved.thread.id),
-            );
+                submission_id.as_deref(),
+            ) {
+                Ok(result) => result,
+                Err(message) => return Response::error("invalid_submission_id", message),
+            };
+            if !is_new {
+                let entry = pending_messages
+                    .get(&pending_id)
+                    .expect("existing pending entry");
+                return Response::success(json!({
+                    "action": "send",
+                    "status": entry.status,
+                    "pending_id": pending_id,
+                    "thread_id": resolved.thread.id,
+                    "target": resolved.method,
+                    "replayed": true,
+                }));
+            }
             match write_backend.queue_message(&resolved.thread.id, &input, &pending_id) {
                 Ok(receipt) => {
                     pending_messages
                         .finish_queue(&pending_id, receipt.queued_submission_id.clone());
                     let status = if receipt.started_turn_id.is_some() {
-                        pending_messages.finish(&pending_id, "accepted", None);
+                        pending_messages.accept(&pending_id, receipt.started_turn_id.clone());
                         "accepted"
                     } else {
                         "queued"
@@ -4693,6 +4869,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
         Request::Steer {
             thread_id,
             text,
+            submission_id,
             attachments,
         } => {
             let input = match composer_input(&text, &attachments) {
@@ -4711,8 +4888,11 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     pending_messages,
                     &resolved,
                     &input,
-                    &pending_text,
-                    EmptyThreadAction::Steer,
+                    EmptyThreadSubmission {
+                        text: &pending_text,
+                        action: EmptyThreadAction::Steer,
+                        id: submission_id.as_deref(),
+                    },
                 );
             }
             let turn_id = match session_store.active_turn_id(&resolved.thread.id) {
@@ -4728,15 +4908,32 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 }
                 Err(error) => return backend_error(error),
             };
-            let pending_id = pending_messages.begin(
+            let (pending_id, is_new) = match pending_messages.begin(
                 &resolved.thread.id,
                 &pending_text,
                 "steer",
                 latest_message_index(session_store, &resolved.thread.id),
-            );
+                submission_id.as_deref(),
+            ) {
+                Ok(result) => result,
+                Err(message) => return Response::error("invalid_submission_id", message),
+            };
+            if !is_new {
+                let entry = pending_messages
+                    .get(&pending_id)
+                    .expect("existing pending entry");
+                return Response::success(json!({
+                    "action": "steer",
+                    "status": entry.status,
+                    "pending_id": pending_id,
+                    "thread_id": resolved.thread.id,
+                    "target": resolved.method,
+                    "replayed": true,
+                }));
+            }
             match write_backend.steer_via_app_server(&resolved.thread.id, &turn_id, &input) {
                 Ok(backend) => {
-                    pending_messages.finish_steer(&pending_id, &resolved.thread.id);
+                    pending_messages.accept(&pending_id, Some(turn_id));
                     Response::success(json!({
                         "action": "steer",
                         "status": "steered",
@@ -4946,6 +5143,13 @@ impl EmptyThreadAction {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EmptyThreadSubmission<'a> {
+    text: &'a str,
+    action: EmptyThreadAction,
+    id: Option<&'a str>,
+}
+
 fn latest_message_index(session_store: &SessionStore, thread_id: &str) -> i64 {
     session_store
         .message_count(thread_id)
@@ -4961,21 +5165,37 @@ fn start_empty_thread_turn(
     pending_messages: &PendingMessages,
     resolved: &ResolvedThread,
     input: &[Value],
-    pending_text: &str,
-    action: EmptyThreadAction,
+    submission: EmptyThreadSubmission<'_>,
 ) -> Response {
-    let pending_id = pending_messages.begin(
+    let (pending_id, is_new) = match pending_messages.begin(
         &resolved.thread.id,
-        pending_text,
-        action.pending(),
+        submission.text,
+        submission.action.pending(),
         latest_message_index(session_store, &resolved.thread.id),
-    );
+        submission.id,
+    ) {
+        Ok(result) => result,
+        Err(message) => return Response::error("invalid_submission_id", message),
+    };
+    if !is_new {
+        let entry = pending_messages
+            .get(&pending_id)
+            .expect("existing pending entry");
+        return Response::success(json!({
+            "action": submission.action.response(),
+            "status": entry.status,
+            "pending_id": pending_id,
+            "thread_id": resolved.thread.id,
+            "target": resolved.method,
+            "replayed": true,
+        }));
+    }
     match write_backend.start_turn(&resolved.thread.id, input, &pending_id) {
         Ok(receipt) => {
-            pending_messages.finish(&pending_id, "accepted", None);
+            pending_messages.accept(&pending_id, Some(receipt.turn_id.clone()));
             session_store.invalidate_summary_cache();
             Response::success(json!({
-                "action": action.response(),
+                "action": submission.action.response(),
                 "status": "accepted",
                 "pending_id": pending_id,
                 "thread_id": resolved.thread.id,
@@ -5409,6 +5629,79 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
             .map(|(tool_index, tool)| compact_tool_summary(tool, tool_index))
             .collect::<Vec<_>>(),
     })
+}
+
+fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Value> {
+    let mut compact = messages
+        .iter()
+        .enumerate()
+        .map(|(offset, message)| compact_web_message(message, start + offset))
+        .collect::<Vec<_>>();
+    let mut group_start = 0;
+    while group_start < messages.len() {
+        let Some(turn_id) = messages[group_start].turn_id.as_deref() else {
+            group_start += 1;
+            continue;
+        };
+        let mut group_end = group_start + 1;
+        while group_end < messages.len() && messages[group_end].turn_id.as_deref() == Some(turn_id)
+        {
+            group_end += 1;
+        }
+        let completed = messages[group_start..group_end].iter().any(|message| {
+            message.phase.as_deref() == Some("final_answer")
+                || message.content.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("codex_bridge_turn_usage")
+                })
+        }) || group_end < messages.len();
+        if completed {
+            let final_offset = messages[group_start..group_end]
+                .iter()
+                .rposition(|message| {
+                    message.role == "assistant" && message.phase.as_deref() == Some("final_answer")
+                })
+                .or_else(|| {
+                    messages[group_start..group_end]
+                        .iter()
+                        .rposition(|message| message.role == "assistant")
+                })
+                .map(|offset| group_start + offset);
+            for (relative_index, (message, compact_message)) in messages[group_start..group_end]
+                .iter()
+                .zip(&mut compact[group_start..group_end])
+                .enumerate()
+            {
+                let index = group_start + relative_index;
+                let visible_user = message.role == "user"
+                    && compact_message.get("category").and_then(Value::as_str) == Some("user");
+                let keep_content = visible_user || final_offset == Some(index);
+                let tool_count = compact_message
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                let file_count = compact_message
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tool| tool.get("file_count").and_then(Value::as_u64))
+                    .sum::<u64>();
+                if !keep_content {
+                    compact_message["content"] = json!([]);
+                }
+                if tool_count > 0 {
+                    compact_message["tools"] = json!([]);
+                }
+                if !keep_content || tool_count > 0 {
+                    compact_message["deferred"] = json!(true);
+                    compact_message["deferred_tool_count"] = json!(tool_count);
+                    compact_message["deferred_file_count"] = json!(file_count);
+                }
+            }
+        }
+        group_start = group_end;
+    }
+    compact
 }
 
 fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
@@ -6662,7 +6955,9 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     #[test]
     fn bridge_pending_state_tracks_status_and_new_message_position() {
         let pending = PendingMessages::default();
-        let id = pending.begin("thread-1", "same text", "queue", 1);
+        let (id, _) = pending
+            .begin("thread-1", "same text", "queue", 1, None)
+            .unwrap();
         pending.finish(&id, "queued", None);
         let entry = pending.entries.read().unwrap()[0].clone();
         assert_eq!(entry.status, "queued");
@@ -6682,8 +6977,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             message("user", "same text"),
         ];
         let mut landed = HashSet::new();
-        assert!(pending_message_landed(&entry, &messages, &mut landed));
-        assert!(!pending_message_landed(&entry, &messages, &mut landed));
+        assert!(pending_message_landed(&entry, &messages, 0, &mut landed));
+        assert!(!pending_message_landed(&entry, &messages, 0, &mut landed));
 
         let after_new_message = PendingMessage {
             after_message_index: 2,
@@ -6692,6 +6987,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(!pending_message_landed(
             &after_new_message,
             &messages,
+            0,
             &mut HashSet::new()
         ));
 
@@ -6734,8 +7030,12 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         drop(connection);
 
         let pending = PendingMessages::default();
-        let first = pending.begin("thread-1", "same text", "queue", -1);
-        let second = pending.begin("thread-1", "same text", "queue", -1);
+        let (first, _) = pending
+            .begin("thread-1", "same text", "queue", -1, None)
+            .unwrap();
+        let (second, _) = pending
+            .begin("thread-1", "same text", "queue", -1, None)
+            .unwrap();
         pending.finish(&first, "queued", None);
         pending.finish(&second, "queued", None);
         let queued = read_codex_queue(&home);
@@ -6750,19 +7050,73 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
-    fn consumed_steer_is_removed_without_waiting_for_rollout_reconciliation() {
+    fn accepted_steer_remains_until_rollout_reconciliation() {
         let pending = PendingMessages::default();
-        let id = pending.begin("thread-1", "follow-up", "steer", 12);
+        let (id, _) = pending
+            .begin("thread-1", "follow-up", "steer", 12, None)
+            .unwrap();
 
-        pending.finish_steer(&id, "thread-1");
+        pending.accept(&id, Some("turn-1".to_owned()));
 
-        assert!(pending.entries.read().unwrap().is_empty());
+        let entries = pending.entries.read().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "accepted");
+        assert_eq!(entries[0].turn_id.as_deref(), Some("turn-1"));
+        let landed_without_turn_metadata = ThreadMessage {
+            timestamp: None,
+            id: None,
+            turn_id: None,
+            role: "user".to_owned(),
+            phase: None,
+            content: vec![json!({"type":"input_text", "text":"follow-up"})],
+            tools: Vec::new(),
+        };
+        assert!(pending_message_landed(
+            &entries[0],
+            &[landed_without_turn_metadata],
+            13,
+            &mut HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn stable_submission_id_is_idempotent_before_and_after_application() {
+        let pending = PendingMessages::default();
+        let (id, created) = pending
+            .begin("thread-1", "follow-up", "steer", 12, Some("web-stable-1"))
+            .unwrap();
+        assert!(created);
+        let (_, created_again) = pending
+            .begin("thread-1", "follow-up", "steer", 12, Some("web-stable-1"))
+            .unwrap();
+        assert!(!created_again);
+
+        let mut applied = pending.get(&id).unwrap();
+        applied.status = "applied".to_owned();
+        pending.entries.write().unwrap().clear();
+        pending.completed.write().unwrap().push_back(applied);
+        let (_, replayed_after_application) = pending
+            .begin("thread-1", "follow-up", "steer", 12, Some("web-stable-1"))
+            .unwrap();
+        assert!(!replayed_after_application);
+        assert_eq!(pending.get(&id).unwrap().status, "applied");
+        assert!(pending
+            .begin(
+                "thread-1",
+                "different text",
+                "steer",
+                12,
+                Some("web-stable-1"),
+            )
+            .is_err());
     }
 
     #[test]
     fn app_server_queue_reconciliation_preserves_server_id_and_removes_cancelled_entries() {
         let pending = PendingMessages::default();
-        let local_id = pending.begin("thread-1", "queued text", "queue", -1);
+        let (local_id, _) = pending
+            .begin("thread-1", "queued text", "queue", -1, None)
+            .unwrap();
         pending.finish_queue(&local_id, "server-queue-1".to_owned());
         let queued = vec![PendingMessage {
             id: local_id.clone(),
@@ -6772,6 +7126,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             status: "queued".to_owned(),
             source: "app_server_queue".to_owned(),
             queued_submission_id: Some("server-queue-1".to_owned()),
+            turn_id: None,
             after_message_index: -1,
             error: None,
         }];
@@ -6783,10 +7138,10 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             Some("server-queue-1")
         );
 
-        assert!(pending
-            .reconcile(&store, Vec::new(), Some("thread-1"))
-            .is_empty());
-        assert!(pending.entries.read().unwrap().is_empty());
+        let dequeued = pending.reconcile(&store, Vec::new(), Some("thread-1"));
+        assert_eq!(dequeued.len(), 1);
+        assert_eq!(dequeued[0].status, "accepted");
+        assert_eq!(pending.entries.read().unwrap().len(), 1);
     }
 
     #[test]
@@ -7052,8 +7407,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "/api/file",
             "/api/file-ticket",
             "/api/auth",
-            "setDeliveryState",
-            "serverQueued",
+            "submission_id: submissionId",
             "submit-spin",
             "codex-bridge.language.v1",
             "id=\"sendModeToggle\"",
@@ -7092,6 +7446,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(!source.contains("project-path"));
         assert!(!source.contains("max-height: min(52dvh, 480px)"));
         assert!(!source.contains("sessionStorage"));
+        assert!(!source.contains("state.delivery"));
     }
 
     #[test]
@@ -7143,6 +7498,53 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact["tools"][0]["tool_index"], 0);
         assert!(compact["tools"][0]["has_output"].as_bool().unwrap());
         assert!(!encoded.contains("large private output"));
+    }
+
+    #[test]
+    fn completed_turn_page_defers_intermediate_content_and_tools() {
+        let messages = vec![
+            ThreadMessage {
+                timestamp: None,
+                id: Some("user".into()),
+                turn_id: Some("turn-1".into()),
+                role: "user".into(),
+                phase: None,
+                content: vec![json!({"type":"input_text","text":"Please inspect this."})],
+                tools: Vec::new(),
+            },
+            ThreadMessage {
+                timestamp: None,
+                id: Some("progress".into()),
+                turn_id: Some("turn-1".into()),
+                role: "assistant".into(),
+                phase: Some("commentary".into()),
+                content: vec![json!({"type":"output_text","text":"Inspecting now."})],
+                tools: vec![ThreadToolCall {
+                    call_id: "tool-1".into(),
+                    name: "exec_command".into(),
+                    status: "completed".into(),
+                    input: json!({"command":"true"}),
+                    output: Some(json!({"output":"done"})),
+                }],
+            },
+            ThreadMessage {
+                timestamp: None,
+                id: Some("final".into()),
+                turn_id: Some("turn-1".into()),
+                role: "assistant".into(),
+                phase: Some("final_answer".into()),
+                content: vec![json!({"type":"output_text","text":"Done."})],
+                tools: Vec::new(),
+            },
+        ];
+        let compact = compact_web_message_page(&messages, 8);
+        assert_eq!(compact[0]["content"][0]["text"], "Please inspect this.");
+        assert_eq!(compact[1]["message_index"], 9);
+        assert_eq!(compact[1]["content"], json!([]));
+        assert_eq!(compact[1]["tools"], json!([]));
+        assert_eq!(compact[1]["deferred"], true);
+        assert_eq!(compact[1]["deferred_tool_count"], 1);
+        assert_eq!(compact[2]["content"][0]["text"], "Done.");
     }
 
     #[test]

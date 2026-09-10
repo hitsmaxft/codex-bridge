@@ -895,22 +895,66 @@
         <h2 class="zh">从远程控制到完整会话工作流。</h2>
         <h2 class="en">From remote control to a complete session workflow.</h2>
         <p class="section-intro zh">
-          v0.2.3 让繁忙的 Codex
-          服务更易浏览和控制：项目归类更准确，消息刷新更稳定，
-          Queue、停止、归档和文件下载也完成了可靠性修复。
+          v0.2.7 让远程 Queue、跟进与长会话刷新形成可靠闭环：状态由 app-server
+          事件驱动，并在断流时自动恢复。
         </p>
         <p class="section-intro en">
-          v0.2.3 adds project-aware history, stable live message updates, direct
-          queue controls, and reliability fixes for Stop, archive, and
-          downloads.
+          v0.2.7 closes the loop for remote Queue, Steer, and long-session
+          refreshes with app-server-driven events and automatic recovery.
         </p>
         <div class="release">
           <div class="release-date">
-            2026-09-09
-            <span class="zh">v0.2.3 正式版</span
-            ><span class="en">v0.2.3 release</span>
+            2026-09-10
+            <span class="zh">v0.2.7 正式版</span
+            ><span class="en">v0.2.7 release</span>
           </div>
           <div class="release-list">
+            <article class="release-item">
+              <h3>
+                <span class="zh">Queue / 跟进最终一致</span
+                ><span class="en">Eventually consistent Queue / Steer</span>
+              </h3>
+              <p class="zh">
+                稳定的提交 ID 贯穿视觉缓冲区、请求协商、原生队列与最终会话历史；
+                连续跟进不会再丢失，消息实际执行前会持续保留待处理状态。
+              </p>
+              <p class="en">
+                Stable submission IDs connect the visual outbox, request
+                negotiation, native queue, and final history without losing
+                repeated follow-ups or clearing pending state early.
+              </p>
+            </article>
+            <article class="release-item">
+              <h3>
+                <span class="zh">事件驱动的实时同步</span
+                ><span class="en">Event-driven live synchronization</span>
+              </h3>
+              <p class="zh">
+                app-server WebSocket 事件驱动
+                activity、缓冲消息和历史记录的局部对账；
+                只有断流或事件缺口才启用轮询恢复。
+              </p>
+              <p class="en">
+                App-server WebSocket events drive activity, pending messages,
+                and local history reconciliation, with polling reserved for
+                stream recovery.
+              </p>
+            </article>
+            <article class="release-item">
+              <h3>
+                <span class="zh">长会话与 worktree 稳定性</span
+                ><span class="en">Long-session and worktree stability</span>
+              </h3>
+              <p class="zh">
+                全局游标和稳定视口锚点避免缓冲消息残留与页面跳动；Codex worktree
+                依据 Git common-dir 归入原项目，同时保留真实执行目录。
+              </p>
+              <p class="en">
+                Global cursors and stable viewport anchors prevent stale outbox
+                entries and scroll jumps, while Git common-dir identity keeps
+                Codex worktrees in their original project.
+              </p>
+            </article>
             <article class="release-item">
               <h3>
                 <span class="zh">项目与 Chats 准确归类</span

@@ -226,6 +226,16 @@
               placeholder="Type a message… · ⌘ Enter to send"
             ></textarea
             ><button
+              id="stopBtn"
+              type="button"
+              data-i18n-aria-label="stopRunAria"
+              aria-label="Stop current run"
+              aria-hidden="true"
+              tabindex="-1"
+            >
+              <span class="submit-stop" aria-hidden="true"></span>
+              <span class="submit-spinner" aria-hidden="true"></span></button
+            ><button
               class="primary"
               id="submitBtn"
               data-i18n-aria-label="submitAria"
@@ -234,7 +244,6 @@
               <svg class="submit-arrow" aria-hidden="true" viewBox="0 0 24 24">
                 <path d="M12 19V5M6.5 10.5 12 5l5.5 5.5" />
               </svg>
-              <span class="submit-stop" aria-hidden="true"></span>
               <span class="submit-spinner" aria-hidden="true"></span>
             </button>
           </div>

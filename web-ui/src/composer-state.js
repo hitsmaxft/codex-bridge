@@ -1,5 +1,5 @@
-export function shouldOfferStop({ activeTurnId, inputFocused, submitting, interrupting }) {
-  return Boolean(activeTurnId) && !inputFocused && !submitting && !interrupting;
+export function shouldOfferStop({ activeTurnId }) {
+  return Boolean(activeTurnId);
 }
 
 export function effectiveActiveTurnId(rolloutTurnId, authoritativeActive) {

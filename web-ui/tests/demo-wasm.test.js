@@ -18,6 +18,7 @@ import {
 import { createAuthenticationGate } from "../src/auth-gate.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { localFilePath } from "../src/markdown.js";
+import { memoryCitationModel } from "../src/memory-citations.js";
 import { SessionMessageCache } from "../src/message-cache.js";
 import { runtimeArchitectureModel } from "../src/runtime-architecture.js";
 import {
@@ -181,6 +182,19 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
     ["memory_citation", "turn_usage"],
   );
   assert.equal(completedTurn.content.at(-1).total_tokens, 12480);
+  const deferred = before.messages.find((message) => message.id === "demo-assistant-1");
+  assert.equal(deferred.deferred, true);
+  assert.deepEqual(deferred.content, []);
+  assert.deepEqual(deferred.tools, []);
+  const hydrated = result(
+    command({
+      command: "turn_messages",
+      thread_id: "demo-thread-web-ui",
+      turn_id: "demo-turn-seed-1",
+    }),
+  );
+  assert.equal(hydrated.messages[1].content[0].kind, "text");
+  assert.equal(hydrated.messages[1].tools[0].name, "exec_command");
   assert.equal(
     result(
       command({
@@ -211,7 +225,7 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
       submitting: false,
       interrupting: false,
     }),
-    false,
+    true,
   );
   const refreshed = result(
     command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
@@ -332,6 +346,30 @@ test("live demo supports queued work, steer handoff, dynamic tools, and voice tr
   assert.match(transcribedMessage.content[0].text, /summarize/i);
 });
 
+test("submission ids remain idempotent across queue negotiation and rollout handoff", async () => {
+  const command = await demoClient(),
+    request = {
+      command: "send",
+      thread_id: "demo-thread-web-ui",
+      text: "Run this exactly once",
+      submission_id: "web-demo-idempotent-1",
+    };
+  const first = result(command(request));
+  const negotiating = result(command(request));
+  assert.equal(first.pending_id, request.submission_id);
+  assert.equal(negotiating.replayed, true);
+  assert.equal(result(command({ command: "pending_messages" })).messages[0].status, "queued");
+  result(command({ command: "pending_messages" }));
+  result(command({ command: "pending_messages" }));
+  const applied = result(command(request));
+  assert.equal(applied.replayed, true);
+  assert.equal(applied.status, "applied");
+  const messages = result(
+    command({ command: "messages", thread_id: request.thread_id, limit: 30 }),
+  ).messages.filter((message) => message.id === request.submission_id);
+  assert.equal(messages.length, 1);
+});
+
 test("session hash routes to the requested demo session", async () => {
   const command = await demoClient();
   const hash = sessionHash("demo-thread-protocol");
@@ -389,7 +427,7 @@ test("session run snapshots preserve active, completed, and failed indicators", 
   assert.match(stylesheet, /\.thread-run-state\.cancelled,[\s\S]*?background:\s*var\(--danger\)/);
 });
 
-test("task overview uses the demo server's latest input, tool event, and final response", async () => {
+test("task overview uses the demo server's latest input and final response", async () => {
   const command = await demoClient();
   const messages = result(
     command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 20 }),
@@ -398,7 +436,7 @@ test("task overview uses the demo server's latest input, tool event, and final r
   const overview = taskOverview(messages, activity);
   assert.match(overview.userText, /Can visitors try submitting/);
   assert.match(overview.assistantText, /WASM state machine/);
-  assert.equal(overview.latestTool.name, "web_search");
+  assert.equal(overview.latestTool, null);
   assert.equal(overview.thread.id, "demo-thread-web-ui");
 
   const index = await readFile(indexPath, "utf8");
@@ -486,7 +524,8 @@ test("composer keeps images as attachments and transcribes voice into editable t
   );
   assert.match(index, /id="audioInput"[^>]*accept="audio\/\*"[^>]*capture/);
   assert.match(source, /attachments = state\.composerAttachments\.map/);
-  assert.match(source, /command\(\{ command: name, thread_id: threadId, text, attachments \}\)/);
+  assert.match(source, /submission_id: submissionId/);
+  assert.match(source, /source: "web_optimistic"/);
   assert.match(source, /new MediaRecorder/);
   assert.match(source, /async function pcmAudio\(blob\)/);
   assert.match(source, /command: "audio_transcribe"/);
@@ -524,11 +563,9 @@ test("expanded folders preload summaries and mobile buttons keep native click de
   assert.match(source, /preloadExpandedProjectThreads\(\)/);
   assert.match(source, /Promise\.allSettled\(Array\.from\(\{ length: Math\.min\(3,/);
   assert.match(source, /\$\("sendModeToggle"\)\.onclick = toggleSendModeAndKeepFocus/);
-  const pointerHandler = source.match(
-    /\$\("submitBtn"\)\.onpointerdown = \(event\) => \{[\s\S]*?\n\};/,
-  )?.[0];
-  assert.ok(pointerHandler);
-  assert.doesNotMatch(pointerHandler, /preventDefault/);
+  assert.match(source, /\$\("submitBtn"\)\.onclick = \(\) => run/);
+  assert.match(source, /\$\("stopBtn"\)\.onclick = \(\) => run/);
+  assert.doesNotMatch(source, /pointerAction/);
   assert.doesNotMatch(source, /composerShell\.addEventListener\(\s*"pointerdown"/);
   assert.match(source, /p\.kind === "chats" \? tr\("chats"\) : p\.name/);
   assert.match(source, /if \(p\.kind !== "chats"\)/);
@@ -537,7 +574,15 @@ test("expanded folders preload summaries and mobile buttons keep native click de
 test("structured command actions stay separate and preserve multiline commands", async () => {
   const command = await demoClient();
   const page = result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }));
-  const summary = page.messages[1].tools[0];
+  assert.equal(page.messages[1].deferred_tool_count, 1);
+  const turn = result(
+      command({
+        command: "turn_messages",
+        thread_id: "demo-thread-web-ui",
+        turn_id: "demo-turn-seed-1",
+      }),
+    ),
+    summary = turn.messages[1].tools[0];
   assert.equal(summary.command_action_count, 2);
   assert.equal(summary.command_actions_parallel, false);
   const detail = result(
@@ -591,12 +636,20 @@ test("local task file links resolve to workspace paths", () => {
 test("interrupt requests carry the app-server turn observed by the UI", async () => {
   const source = await readFile(mainScriptPath, "utf8");
   assert.match(source, /targetRequest\("interrupt", \{ turn_id: state\.activeTurnId \}\)/);
+  assert.match(source, /\$\("submitBtn"\)\.onclick = \(\) => run\(\(\) => write/);
+  assert.match(source, /\$\("stopBtn"\)\.onclick = \(\) =>/);
+  const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(css, /\.composer-shell\.stop-visible #stopBtn/);
+  assert.match(css, /translateX\(calc\(var\(--submit-button-width\) \* -1\.5\)\)/);
 });
 
 test("message refresh preserves stable nodes and viewport anchors", async () => {
   const source = await readFile(mainScriptPath, "utf8");
   assert.match(source, /root\.insertBefore\(node, cursor\)/);
   assert.match(source, /anchorMessageIndex/);
+  assert.match(source, /anchorTurnKey/);
+  assert.match(source, /!message\.hidden/);
+  assert.match(source, /message\.getClientRects\(\)\.length > 0/);
   assert.match(source, /smoothBottom/);
   const reconcile = source.slice(
     source.indexOf("function reconcileMessageNodes"),
@@ -621,6 +674,50 @@ test("completed turns collapse by server turn id and preserve the full expansion
   assert.match(layout, /state\.expandedTurnIds/);
   assert.match(layout, /\.\.\.leading,[\s\S]*fold,[\s\S]*divider,[\s\S]*finalNode/);
   assert.match(layout, /turnSummaryText\(group\)/);
+  assert.match(source, /command: "turn_messages"/);
+  assert.match(source, /requestIdleCallback/);
+});
+
+test("memory updates collapse below token usage with deduplicated filenames", async () => {
+  assert.deepEqual(
+    memoryCitationModel([
+      { source: "MEMORY.md:12-18", note: "first" },
+      { source: "MEMORY.md:12-18", note: "first" },
+      { source: "skills/demo/SKILL.md:1-4", note: "rules" },
+      { source: "archive/MEMORY.md:30-32", note: "second" },
+    ]),
+    {
+      entries: [
+        { source: "MEMORY.md:12-18", note: "first" },
+        { source: "skills/demo/SKILL.md:1-4", note: "rules" },
+        { source: "archive/MEMORY.md:30-32", note: "second" },
+      ],
+      files: ["MEMORY.md", "SKILL.md"],
+    },
+  );
+  const source = await readFile(mainScriptPath, "utf8"),
+    render = source.slice(
+      source.indexOf("function messageNode"),
+      source.indexOf("function pendingNode"),
+    );
+  assert.match(render, /for \(const item of usageItems\)[\s\S]*memoryCitationNode\(memoryItems\)/);
+});
+
+test("message copy follows text before tools and completion metadata", async () => {
+  const source = await readFile(mainScriptPath, "utf8"),
+    stylesheet = await readFile(stylesheetPath, "utf8"),
+    render = source.slice(
+      source.indexOf("function messageNode"),
+      source.indexOf("function pendingNode"),
+    );
+  assert.match(
+    render,
+    /for \(const item of ordinaryItems\)[\s\S]*body\.appendChild\(copy\)[\s\S]*toolGroupNode\(m,[\s\S]*usageItems/,
+  );
+  const copyStyle = stylesheet.match(/\.message-copy\s*\{[^}]*\}/s)?.[0] || "";
+  assert.match(copyStyle, /position:\s*absolute/);
+  assert.match(copyStyle, /right:\s*0/);
+  assert.match(stylesheet, /\.message\.user \.message-copy\s*\{[^}]*right:\s*7px/s);
 });
 
 test("queued messages expose withdraw and convert-to-steer actions", async () => {
@@ -629,7 +726,8 @@ test("queued messages expose withdraw and convert-to-steer actions", async () =>
   assert.match(source, /command: "pending_message_delete"/);
   assert.match(source, /command: "steer"/);
   assert.match(source, /className = "outbox-menu"/);
-  assert.match(source, /openMenus/);
+  assert.match(source, /existingById/);
+  assert.match(source, /entry\.status !== "failed"/);
 });
 
 test("authentication gate serializes concurrent startup requests", async () => {

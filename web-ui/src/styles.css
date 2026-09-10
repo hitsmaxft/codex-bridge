@@ -795,6 +795,10 @@ main {
   line-height: 18px;
   text-align: left;
 }
+.turn-fold.loading {
+  cursor: wait;
+  opacity: 0.65;
+}
 .turn-fold::after {
   content: "";
   flex: 0 0 auto;
@@ -855,6 +859,7 @@ main {
   background: transparent;
 }
 .message-body {
+  position: relative;
   padding: 0;
   font-size: 16px;
   line-height: 1.6;
@@ -871,7 +876,7 @@ main {
 .message-copy {
   position: absolute;
   right: 0;
-  bottom: -20px;
+  bottom: -18px;
   display: grid;
   place-items: center;
   width: 24px;
@@ -900,7 +905,8 @@ main {
   opacity: 1;
 }
 .message.user .message-copy {
-  right: 9px;
+  right: 7px;
+  bottom: -20px;
   color: currentColor;
 }
 .message.context {
@@ -932,6 +938,27 @@ main {
 }
 .turn-meta-line + .turn-meta-line {
   margin-top: 0;
+}
+.memory-citations {
+  min-width: 0;
+  margin-top: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 16px;
+}
+.memory-citations summary {
+  overflow: hidden;
+  cursor: pointer;
+  list-style-position: inside;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.memory-citation-list {
+  padding: 2px 0 2px 16px;
+  white-space: normal;
+}
+.memory-citation-entry {
+  overflow-wrap: anywhere;
 }
 .markdown > *:first-child {
   margin-top: 0;
@@ -1686,6 +1713,7 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   margin-top: 10px;
 }
 .composer-shell {
+  --submit-button-width: 44px;
   display: grid;
   grid-template-areas:
     "input input input input"
@@ -1929,7 +1957,8 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   color: var(--text);
   box-shadow: 0 1px 4px #0002;
 }
-.composer-shell #submitBtn {
+.composer-shell #submitBtn,
+.composer-shell #stopBtn {
   grid-area: submit;
   position: relative;
   display: grid;
@@ -1942,6 +1971,24 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   border-radius: 50%;
   background: var(--action);
   font-size: 0;
+}
+.composer-shell #submitBtn {
+  z-index: 2;
+}
+.composer-shell #stopBtn {
+  z-index: 1;
+  background: var(--danger);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(0) scale(0.82);
+  transition:
+    transform 0.24s cubic-bezier(0.22, 0.8, 0.28, 1),
+    opacity 0.16s ease;
+}
+.composer-shell.stop-visible #stopBtn {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(calc(var(--submit-button-width) * -1.5)) scale(1);
 }
 .submit-arrow {
   display: block;
@@ -1964,26 +2011,18 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   border-radius: 50%;
 }
 .submit-stop {
-  display: none;
+  display: block;
   width: 13px;
   height: 13px;
   border-radius: 2px;
   background: var(--action-text);
 }
-.composer-shell.stop-ready #submitBtn {
-  background: var(--danger);
-}
-.composer-shell.stop-ready .submit-arrow,
 .composer-shell.submitting .submit-arrow,
-.composer-shell.interrupting .submit-arrow,
-.composer-shell.interrupting .submit-stop {
+.composer-shell.interrupting #stopBtn .submit-stop {
   display: none;
 }
-.composer-shell.stop-ready .submit-stop {
-  display: block;
-}
-.composer-shell.submitting .submit-spinner,
-.composer-shell.interrupting .submit-spinner {
+.composer-shell.submitting #submitBtn .submit-spinner,
+.composer-shell.interrupting #stopBtn .submit-spinner {
   display: block;
   animation: submit-spin 0.72s linear infinite;
 }
@@ -1993,7 +2032,7 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
   }
 }
 .composer-shell.submitting #submitBtn:disabled,
-.composer-shell.interrupting #submitBtn:disabled {
+.composer-shell.interrupting #stopBtn:disabled {
   opacity: 1;
 }
 .composer-foot {
@@ -2549,7 +2588,8 @@ label.caption {
   .composer-shell textarea,
   .composer-shell .send-modes,
   .composer-shell .composer-actions,
-  .composer-shell #submitBtn {
+  .composer-shell #submitBtn,
+  .composer-shell #stopBtn {
     pointer-events: auto;
   }
   .composer,
@@ -2571,6 +2611,7 @@ label.caption {
     zoom: 1;
   }
   .composer-shell {
+    --submit-button-width: 64px;
     grid-template-columns: 64px 72px minmax(0, 1fr) 64px;
     pointer-events: none;
   }
@@ -2579,6 +2620,10 @@ label.caption {
     touch-action: manipulation;
   }
   .composer-shell #submitBtn {
+    width: 64px;
+    border-radius: 22px;
+  }
+  .composer-shell #stopBtn {
     width: 64px;
     border-radius: 22px;
   }

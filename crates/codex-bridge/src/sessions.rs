@@ -253,10 +253,17 @@ impl ThreadProjectIndex {
 }
 
 fn matching_project_root(project: &IndexedProject, cwd: &Path) -> Option<PathBuf> {
+    let repository_root = project_root_for_cwd(cwd);
+    let repository_identity = fs::canonicalize(&repository_root).unwrap_or(repository_root);
     project
         .roots
         .iter()
-        .filter(|root| cwd == root.as_path() || cwd.starts_with(root))
+        .filter(|root| {
+            cwd == root.as_path()
+                || cwd.starts_with(root)
+                || fs::canonicalize(project_root_for_cwd(root))
+                    .is_ok_and(|root| root == repository_identity)
+        })
         .max_by_key(|root| root.as_os_str().len())
         .cloned()
 }
@@ -720,6 +727,28 @@ impl SessionStore {
         Ok(message.content.get(content_index).cloned())
     }
 
+    pub fn read_turn_messages(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<Vec<(usize, ThreadMessage)>>> {
+        let Some(summary) = self.find_thread(thread_id)? else {
+            return Ok(None);
+        };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let messages = self.messages_for_path(&summary.rollout_path)?;
+        Ok(Some(
+            messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.turn_id.as_deref() == Some(turn_id))
+                .map(|(index, message)| (index, message.clone()))
+                .collect(),
+        ))
+    }
+
     pub fn read_message(
         &self,
         thread_id: &str,
@@ -753,16 +782,16 @@ impl SessionStore {
         &self,
         thread_id: &str,
         limit: usize,
-    ) -> Result<Option<Vec<ThreadMessage>>> {
+    ) -> Result<Option<(usize, Vec<ThreadMessage>)>> {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
         if summary.rollout_path.as_os_str().is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Some((0, Vec::new())));
         }
         let messages = self.messages_for_path(&summary.rollout_path)?;
         let start = messages.len().saturating_sub(limit);
-        Ok(Some(messages[start..].to_vec()))
+        Ok(Some((start, messages[start..].to_vec())))
     }
 
     pub fn warm_thread_messages(&self, thread_id: &str) -> Result<bool> {
@@ -984,11 +1013,42 @@ fn filter_archived(mut threads: Vec<ThreadSummary>, include_archived: bool) -> V
 
 fn project_root_for_cwd(cwd: &Path) -> PathBuf {
     for ancestor in cwd.ancestors() {
-        if ancestor.join(".git").exists() {
+        let dot_git = ancestor.join(".git");
+        if dot_git.is_dir() {
             return ancestor.to_path_buf();
+        }
+        if dot_git.is_file() {
+            return linked_worktree_repository_root(&dot_git)
+                .unwrap_or_else(|| ancestor.to_path_buf());
         }
     }
     cwd.to_path_buf()
+}
+
+fn linked_worktree_repository_root(dot_git: &Path) -> Option<PathBuf> {
+    let dot_git_contents = fs::read_to_string(dot_git).ok()?;
+    let git_dir = dot_git_contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+        .trim();
+    let git_dir = resolve_relative_path(dot_git.parent()?, Path::new(git_dir));
+    let common_dir = fs::read_to_string(git_dir.join("commondir"))
+        .ok()?
+        .trim()
+        .to_owned();
+    let common_dir = resolve_relative_path(&git_dir, Path::new(&common_dir));
+    let common_dir = fs::canonicalize(common_dir).ok()?;
+    (common_dir.file_name().is_some_and(|name| name == ".git"))
+        .then(|| common_dir.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+fn resolve_relative_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 fn project_name(path: &Path) -> String {
@@ -2135,6 +2195,75 @@ mod tests {
         assert_eq!(threads[0].id, "thread-one");
         assert!(threads[0].pinned);
         assert_ne!(threads[0].cwd, projects[0].path);
+    }
+
+    #[test]
+    fn linked_worktree_sessions_group_under_the_primary_desktop_project() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("workspace/codexapp-cli");
+        let worktree = fixture.path.join("worktrees/allocation/codexapp-cli");
+        init_git_repo(&workspace, "main");
+        let commit = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Codex Bridge Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(&workspace)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        let added = Command::new("git")
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .current_dir(&workspace)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(added.success());
+
+        let primary = format!(
+            r#"{{"timestamp":"2026-09-10T01:00:00Z","type":"session_meta","payload":{{"id":"thread-primary","cwd":{}}}}}"#,
+            serde_json::to_string(&workspace).unwrap()
+        );
+        let linked = format!(
+            r#"{{"timestamp":"2026-09-10T02:00:00Z","type":"session_meta","payload":{{"id":"thread-worktree","cwd":{}}}}}"#,
+            serde_json::to_string(&worktree).unwrap()
+        );
+        fixture.write_rollout("rollout-primary.jsonl", &[&primary]);
+        fixture.write_rollout("rollout-worktree.jsonl", &[&linked]);
+        assert_eq!(
+            project_root_for_cwd(&worktree),
+            fs::canonicalize(&workspace).unwrap()
+        );
+        let index = ThreadProjectIndex::from_app_server(
+            &serde_json::json!({"data":[{
+                "id":"project-1",
+                "name":"codexapp-cli",
+                "roots":[{"path": workspace}],
+            }]}),
+            &[
+                serde_json::json!({"id":"thread-primary","projectId":"project-1"}),
+                serde_json::json!({"id":"thread-worktree","projectId":null}),
+            ],
+        );
+        let projects = SessionStore::new(fixture.path.clone())
+            .list_projects_with_index(false, Some(&index))
+            .unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, workspace);
+        assert_eq!(projects[0].thread_count, 2);
     }
 
     #[test]
