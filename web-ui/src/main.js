@@ -6,6 +6,7 @@ import {
   createFileDownloadTicket,
   demoMode,
   notify,
+  recordPerformance,
   run,
   subscribeEvents,
   timeText,
@@ -20,7 +21,12 @@ import {
   shouldShowBrowserNotification,
   showBrowserNotification,
 } from "./browser-notifications.js";
-import { effectiveActiveTurnId, restoreComposerDraft, shouldOfferStop } from "./composer-state.js";
+import {
+  completionMatchesActiveTurn,
+  effectiveActiveTurnId,
+  restoreComposerDraft,
+  shouldOfferStop,
+} from "./composer-state.js";
 import { persistExpandedProjects, storedExpandedProjects } from "./project-state.js";
 import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
@@ -84,6 +90,13 @@ function renderRuntimeResources() {
   const session = resources.session_cache || {},
     tools = resources.tool_cache || {},
     project = resources.project_cache || {},
+    performanceSummary = resources.performance?.summary || [],
+    serverTiming = performanceSummary.find(
+      (item) => item.source === "server" && item.metric === "messages_read",
+    ),
+    clientTiming = performanceSummary.find(
+      (item) => item.source === "client" && item.metric === "messages_visible",
+    ),
     entry = document.createElement("details"),
     summary = document.createElement("summary"),
     dot = document.createElement("span"),
@@ -115,7 +128,22 @@ function renderRuntimeResources() {
     }),
     tr("toolParseCache", { threads: tools.threads ?? 0, calls: tools.tool_calls ?? 0 }),
     tr("projectIndexCache", { state: project.indexed ? tr("cached") : tr("uncached") }),
+    serverTiming
+      ? tr("serverMessageTiming", {
+          average: serverTiming.average_ms ?? 0,
+          max: serverTiming.max_ms ?? 0,
+          count: serverTiming.count ?? 0,
+        })
+      : null,
+    clientTiming
+      ? tr("clientMessageTiming", {
+          average: clientTiming.average_ms ?? 0,
+          max: clientTiming.max_ms ?? 0,
+          count: clientTiming.count ?? 0,
+        })
+      : null,
   ]) {
+    if (!text) continue;
     const row = document.createElement("div");
     row.textContent = text;
     detail.appendChild(row);
@@ -267,6 +295,55 @@ function setThreadHeaderExpanded(expanded) {
   title.setAttribute("aria-expanded", String(expanded));
   title.title = tr(expanded ? "collapseHeader" : "expandHeader");
 }
+function renderRepairHint(required = state.repairRequired) {
+  state.repairRequired = Boolean(required);
+  const button = $("repairHintBtn"),
+    bubble = $("repairHintBubble");
+  button.hidden = !state.current || !state.repairRequired;
+  if (button.hidden) {
+    bubble.hidden = true;
+    button.setAttribute("aria-expanded", "false");
+  }
+}
+function formatSessionDuration(milliseconds) {
+  const seconds = Math.max(0, Math.round(Number(milliseconds || 0) / 1000));
+  if (seconds < 60) return tr("turnDurationSeconds", { seconds });
+  return tr("turnDurationMinutes", {
+    minutes: Math.floor(seconds / 60),
+    seconds: seconds % 60,
+  });
+}
+function renderThreadStatistics(statistics = state.threadStatistics) {
+  state.threadStatistics = statistics || null;
+  const section = $("threadStatistics"),
+    grid = $("threadStatGrid");
+  section.hidden = !state.current || !statistics;
+  grid.textContent = "";
+  if (section.hidden) return;
+  const active =
+    Number(statistics.turns || 0) >
+    Number(statistics.completed_turns || 0) + Number(statistics.cancelled_turns || 0);
+  const values = [
+    [tr("sessionDuration"), formatSessionDuration(statistics.total_duration_ms)],
+    [
+      tr("sessionTurns"),
+      active
+        ? tr("activeTurnIncluded", { count: statistics.turns || 0 })
+        : String(statistics.turns || 0),
+    ],
+    [tr("sessionTools"), Number(statistics.tool_calls || 0).toLocaleString()],
+    [tr("sessionTokens"), Number(statistics.total_tokens || 0).toLocaleString()],
+  ];
+  for (const [label, value] of values) {
+    const item = document.createElement("div"),
+      name = document.createElement("span"),
+      amount = document.createElement("strong");
+    name.textContent = label;
+    amount.textContent = value;
+    item.append(name, amount);
+    grid.appendChild(item);
+  }
+}
 async function toggleLanguage() {
   applyLanguage(getLanguage() === "en" ? "zh" : "en");
   syncComposerPlaceholder();
@@ -274,6 +351,7 @@ async function toggleLanguage() {
   renderProjects();
   renderPending();
   renderComposerAttachments();
+  renderComposerReference();
   syncVoiceCapability();
   renderManagedServices();
   renderTasksButton();
@@ -509,6 +587,7 @@ async function toggleBrowserNotifications() {
     notify(tr(next.enabled ? "notificationsEnabled" : "notificationsDisabled"));
   }
 }
+let deferredCompletionToast = null;
 function notifyTurnFinished(threadId, runState, turnId) {
   if (turnId) {
     if (state.notifiedTurnIds.has(turnId)) return;
@@ -517,15 +596,6 @@ function notifyTurnFinished(threadId, runState, turnId) {
       state.notifiedTurnIds.delete(state.notifiedTurnIds.values().next().value);
     }
   }
-  if (
-    !shouldShowBrowserNotification({
-      NotificationApi: globalThis.Notification,
-      storage: window.localStorage,
-      documentHidden: document.hidden,
-      windowFocused: document.hasFocus(),
-    })
-  )
-    return;
   const thread = knownThread(threadId),
     title = thread?.title || tr("session"),
     body = tr(
@@ -534,7 +604,22 @@ function notifyTurnFinished(threadId, runState, turnId) {
         : runState === "cancelled"
           ? "notificationRunCancelled"
           : "notificationRunCompleted",
-    );
+    ),
+    notificationState = browserNotificationState(globalThis.Notification, window.localStorage),
+    useSystemNotification = shouldShowBrowserNotification({
+      NotificationApi: globalThis.Notification,
+      storage: window.localStorage,
+      documentHidden: document.hidden,
+      windowFocused: document.hasFocus(),
+    });
+  if (!useSystemNotification) {
+    if (!notificationState.supported || notificationState.permission !== "granted") {
+      const text = `${title} · ${body}`;
+      if (document.hidden) deferredCompletionToast = text;
+      else notify(text, false, "completion");
+    }
+    return;
+  }
   showBrowserNotification(globalThis.Notification, {
     title,
     body,
@@ -545,6 +630,11 @@ function notifyTurnFinished(threadId, runState, turnId) {
     },
   });
 }
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden || !deferredCompletionToast) return;
+  notify(deferredCompletionToast, false, "completion");
+  deferredCompletionToast = null;
+});
 function trackTask(threadId) {
   if (!threadId) return;
   state.taskTrackedIds.add(threadId);
@@ -949,15 +1039,14 @@ function renderProjects() {
     button.children[2].textContent = `${Math.max(0, p.thread_count - pinnedCount)}`;
     button.onclick = () => run(() => toggleProject(p));
     head.appendChild(button);
-    if (p.kind !== "chats") {
-      const add = document.createElement("button");
-      add.className = "project-add";
-      add.textContent = "+";
-      add.title = tr("createInProject", { project: p.name });
-      add.setAttribute("aria-label", add.title);
-      add.onclick = () => showCreateDialog(p);
-      head.appendChild(add);
-    }
+    const add = document.createElement("button");
+    add.className = "project-add";
+    add.textContent = "+";
+    add.title =
+      p.kind === "chats" ? tr("createInChats") : tr("createInProject", { project: p.name });
+    add.setAttribute("aria-label", add.title);
+    add.onclick = () => showCreateDialog(p);
+    head.appendChild(add);
     wrap.appendChild(head);
     const list = document.createElement("div");
     list.className = "project-threads";
@@ -966,6 +1055,14 @@ function renderProjects() {
     if (!data) {
       list.innerHTML = `<div class="empty" style="padding:8px">${tr("loadingSessions")}</div>`;
     } else {
+      const creation = state.threadCreationJobs.get(p.path);
+      if (creation) {
+        const placeholder = document.createElement("div");
+        placeholder.className = "thread creation-placeholder";
+        placeholder.innerHTML = '<span class="creation-spinner"></span><span></span>';
+        placeholder.children[1].textContent = tr("creatingWorktreeBackground");
+        list.appendChild(placeholder);
+      }
       for (const t of data.threads) {
         if (!state.pinnedIds.has(t.id)) list.appendChild(threadRow(t));
       }
@@ -985,7 +1082,15 @@ function renderProjects() {
 }
 function showCreateDialog(project) {
   state.creatingProject = project;
-  $("createProject").textContent = project.path;
+  const isChat = project.kind === "chats";
+  $("createProject").textContent = isChat ? tr("chats") : project.path;
+  $("createWorktreeBtn").hidden = isChat;
+  $("createCurrentBtn").querySelector("strong").textContent = tr(
+    isChat ? "newChat" : "currentDirectory",
+  );
+  $("createCurrentBtn").querySelector("span").textContent = tr(
+    isChat ? "newChatHelp" : "currentDirectoryHelp",
+  );
   $("createProgress").textContent = "";
   $("createDialog").hidden = false;
   $("createCurrentBtn").focus();
@@ -1002,10 +1107,39 @@ async function createThread(worktree) {
   buttons.forEach((button) => (button.disabled = true));
   $("createProgress").textContent = worktree ? tr("creatingWorktree") : tr("creatingSession");
   try {
-    const r = await command(
-      { command: "thread_create", project_path: project.path, worktree, model: null },
-      false,
-    );
+    let r;
+    if (worktree) {
+      const started = await command(
+          { command: "thread_create_start", project_path: project.path, model: null },
+          false,
+        ),
+        deadline = Date.now() + 10 * 60 * 1000;
+      $("createDialog").hidden = true;
+      state.creatingProject = null;
+      state.threadCreationJobs.set(project.path, {
+        jobId: started.job_id,
+        startedAt: Date.now(),
+      });
+      renderProjects();
+      notify(tr("creatingWorktreeBackground"));
+      do {
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        r = await command({ command: "thread_create_status", job_id: started.job_id }, false);
+      } while (r.status === "running" && Date.now() < deadline);
+      if (r.status === "running") throw new Error(tr("creatingWorktreeTimeout"));
+      state.threadCreationJobs.delete(project.path);
+      renderProjects();
+    } else {
+      r = await command(
+        {
+          command: "thread_create",
+          project_path: project.kind === "chats" ? null : project.path,
+          worktree: false,
+          model: null,
+        },
+        false,
+      );
+    }
     $("createDialog").hidden = true;
     state.creatingProject = null;
     await loadProjects();
@@ -1022,6 +1156,8 @@ async function createThread(worktree) {
     await openThread(thread);
     notify(worktree ? tr("createdWorktree") : tr("createdCurrent"));
   } finally {
+    state.threadCreationJobs.delete(project.path);
+    renderProjects();
     buttons.forEach((button) => (button.disabled = false));
     $("createProgress").textContent = "";
   }
@@ -1111,7 +1247,7 @@ async function pcmAudio(blob) {
     samples_per_channel: samples.length,
   };
 }
-function insertTranscription(text) {
+function insertComposerText(text) {
   const textarea = $("messageText"),
     start = textarea.selectionStart ?? textarea.value.length,
     end = textarea.selectionEnd ?? start,
@@ -1123,6 +1259,214 @@ function insertTranscription(text) {
   saveDraft(state.current?.id, textarea.value);
   resizeComposerTextarea();
   textarea.focus({ preventScroll: true });
+}
+function insertTranscription(text) {
+  insertComposerText(text);
+}
+
+function selectedContextPrompt(selection, question) {
+  if (!selection?.text) return question;
+  return `Selected text from the source conversation:\n\n${selection.text}\n\nQuestion:\n${question}`;
+}
+
+function temporaryItemText(item) {
+  if (!item || typeof item !== "object") return "";
+  if (typeof item.text === "string") return item.text;
+  if (!Array.isArray(item.content)) return "";
+  return item.content
+    .map((part) =>
+      typeof part?.text === "string" ? part.text : typeof part === "string" ? part : "",
+    )
+    .filter(Boolean)
+    .join("");
+}
+
+function messageCopyButton(text) {
+  const copy = document.createElement("button");
+  copy.className = "message-copy";
+  copy.type = "button";
+  copy.innerHTML =
+    '<svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
+  copy.title = tr("copyMessage");
+  copy.setAttribute("aria-label", copy.title);
+  copy.onclick = () =>
+    run(async () => {
+      await navigator.clipboard.writeText(text);
+      notify(tr("messageCopied"));
+    });
+  return copy;
+}
+
+function renderTemporaryMessages() {
+  const root = $("temporaryMessages"),
+    temporary = state.temporaryThread;
+  root.replaceChildren();
+  if (!temporary) return;
+  if (temporary.selection?.text) {
+    const context = document.createElement("article"),
+      body = document.createElement("div"),
+      label = document.createElement("span");
+    context.className = "message context temporary-message";
+    body.className = "message-body";
+    label.className = "temporary-message-label";
+    label.textContent = tr("selectedContext");
+    body.append(label, markdownNode(temporary.selection.text));
+    context.appendChild(body);
+    root.appendChild(context);
+  }
+  for (const message of temporary.messages) {
+    const node = document.createElement("article"),
+      body = document.createElement("div");
+    node.className = `message temporary-message ${message.role}${message.running ? " running" : ""}`;
+    body.className = "message-body";
+    body.appendChild(markdownNode(message.text || "…"));
+    if (message.text) body.appendChild(messageCopyButton(message.text));
+    node.appendChild(body);
+    root.appendChild(node);
+  }
+  const starting = temporary.activeTurnId === "starting";
+  $("temporaryStopBtn").hidden = !temporary.activeTurnId || starting;
+  $("temporarySendBtn").hidden = Boolean(temporary.activeTurnId) && !starting;
+  document.querySelector(".temporary-composer-shell").classList.toggle("submitting", starting);
+  requestAnimationFrame(() => {
+    root.scrollTop = root.scrollHeight;
+    resizeTemporaryTextarea();
+  });
+}
+
+function resizeTemporaryTextarea() {
+  const textarea = $("temporaryText");
+  if (!textarea) return;
+  textarea.style.height = "44px";
+  const limit = Math.min(320, (window.visualViewport?.height || window.innerHeight) * 0.34),
+    height = Math.min(Math.max(44, textarea.scrollHeight), limit);
+  textarea.style.height = `${Math.ceil(height)}px`;
+  textarea.style.overflowY = textarea.scrollHeight > height + 1 ? "auto" : "hidden";
+}
+
+function syncTemporaryForCurrent() {
+  const temporary = state.current ? state.temporaryThreads.get(state.current.id) || null : null;
+  state.temporaryThread = temporary;
+  $("temporaryPanelBtn").hidden = !temporary;
+  if (!temporary) {
+    $("temporaryPanel").classList.remove("open");
+    $("temporaryPanel").inert = true;
+    document.querySelector("main").inert = false;
+    $("sidebar").inert = false;
+    $("tools").inert = false;
+  }
+  renderTemporaryMessages();
+  syncScrim();
+}
+
+function openTemporaryPanel() {
+  if (!state.temporaryThread) return;
+  $("tools").classList.remove("open");
+  $("temporaryPanel").inert = false;
+  $("temporaryPanel").classList.add("open");
+  document.querySelector("main").inert = true;
+  $("sidebar").inert = true;
+  $("tools").inert = true;
+  syncScrim();
+  requestAnimationFrame(() => $("temporaryText").focus({ preventScroll: true }));
+}
+
+function setTemporarySelection(selection = null) {
+  state.temporarySelection = selection?.turnId ? { ...selection } : null;
+  if (state.temporarySelection) setSendMode("temp", false);
+  else if ($("sendMode").value === "temp") setSendMode(state.activeTurnId ? "steer" : "send", true);
+}
+
+async function createTemporaryThread(selection, draft = "") {
+  if (!state.current || !selection?.text) throw new Error(tr("chooseSessionError"));
+  if (state.temporaryCreating) return;
+  const sourceThreadId = state.current.id,
+    sourceDraft = draft,
+    button = $("sendModeToggle"),
+    buttonWasDisabled = button.disabled;
+  let temporary = state.temporaryThreads.get(sourceThreadId);
+  state.temporaryCreating = true;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    if (!temporary) {
+      notify(tr("temporaryCreating"));
+      const result = await command(
+        {
+          command: "temporary_thread_create",
+          thread_id: sourceThreadId,
+          last_turn_id: selection.turnId || null,
+        },
+        false,
+      );
+      temporary = {
+        id: result.thread?.id,
+        sourceThreadId,
+        selection: { ...selection },
+        messages: [],
+        activeTurnId: null,
+      };
+      if (!temporary.id) throw new Error(tr("temporaryCreateFailed"));
+      state.temporaryThreads.set(sourceThreadId, temporary);
+    } else temporary.selection = { ...selection };
+
+    if (state.current?.id !== sourceThreadId) return;
+    state.temporaryThread = temporary;
+    $("temporaryPanelBtn").hidden = false;
+    $("temporaryText").value = sourceDraft;
+    if (sourceDraft && $("messageText").value === sourceDraft) {
+      $("messageText").value = "";
+      saveDraft(sourceThreadId, "", true);
+      resizeComposerTextarea();
+    }
+    setTemporarySelection();
+    renderTemporaryMessages();
+    openTemporaryPanel();
+  } finally {
+    state.temporaryCreating = false;
+    button.disabled = buttonWasDisabled;
+    button.removeAttribute("aria-busy");
+  }
+}
+
+async function sendTemporaryMessage() {
+  const temporary = state.temporaryThread,
+    textarea = $("temporaryText"),
+    text = textarea.value.trim();
+  if (!temporary || !text || temporary.activeTurnId) return;
+  const submissionId = newSubmissionId();
+  temporary.messages.push({ role: "user", text });
+  temporary.messages.push({ role: "assistant", text: "", id: null, running: true });
+  temporary.activeTurnId = "starting";
+  textarea.value = "";
+  renderTemporaryMessages();
+  try {
+    const result = await command(
+      {
+        command: "temporary_turn_start",
+        thread_id: temporary.id,
+        text: selectedContextPrompt(temporary.selection, text),
+        submission_id: submissionId,
+        attachments: [],
+      },
+      false,
+    );
+    if (temporary.activeTurnId === "starting") temporary.activeTurnId = result.turn_id;
+    temporary.selection = null;
+    if (result.demo_reply) {
+      const assistant = temporary.messages.at(-1);
+      assistant.text = result.demo_reply;
+      assistant.running = false;
+      temporary.activeTurnId = null;
+    }
+    renderTemporaryMessages();
+  } catch (error) {
+    temporary.activeTurnId = null;
+    temporary.messages.at(-1).text = error.message;
+    temporary.messages.at(-1).running = false;
+    renderTemporaryMessages();
+    throw error;
+  }
 }
 async function transcribeAudio(audio) {
   if (!state.current) throw new Error(tr("chooseSessionError"));
@@ -1208,6 +1552,45 @@ function renderComposerAttachments() {
     tray.appendChild(item);
   });
   tray.hidden = !state.composerAttachments.length;
+  resizeComposerTextarea();
+}
+function renderComposerReference() {
+  const root = $("composerReference"),
+    reference = state.composerReference;
+  root.replaceChildren();
+  if (!reference?.text) {
+    root.hidden = true;
+    return;
+  }
+  const content = document.createElement("div"),
+    label = document.createElement("span"),
+    text = document.createElement("span"),
+    remove = document.createElement("button");
+  content.className = "composer-reference-content";
+  label.className = "composer-reference-label";
+  label.textContent = tr("selectedContext");
+  text.className = "composer-reference-text";
+  text.textContent = reference.text;
+  remove.type = "button";
+  remove.className = "attachment-remove";
+  remove.textContent = "×";
+  remove.title = tr("removeReference");
+  remove.setAttribute("aria-label", remove.title);
+  remove.onclick = () => setComposerReference();
+  content.append(label, text);
+  root.append(content, remove);
+  root.hidden = false;
+}
+
+function setComposerReference(reference = null, persist = true) {
+  state.composerReference = reference?.turnId ? { ...reference } : null;
+  if (state.current?.id && persist) {
+    if (state.composerReference)
+      state.referenceDrafts.set(state.current.id, state.composerReference);
+    else state.referenceDrafts.delete(state.current.id);
+  }
+  setTemporarySelection(state.composerReference);
+  renderComposerReference();
   resizeComposerTextarea();
 }
 async function addImages(files) {
@@ -1823,8 +2206,12 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
 
   const expansionKey = `${state.current?.id || ""}:${group.key}`,
     expanded = state.expandedTurnIds.has(expansionKey),
-    fold = section.querySelector(":scope > .turn-fold") || document.createElement("button"),
-    divider = section.querySelector(":scope > .turn-divider") || document.createElement("hr");
+    foldBlock = section.querySelector(":scope > .turn-fold-block") || document.createElement("div"),
+    fold = foldBlock.querySelector(":scope > .turn-fold") || document.createElement("button"),
+    divider = foldBlock.querySelector(":scope > .turn-divider") || document.createElement("hr"),
+    tokenUsage =
+      foldBlock.querySelector(":scope > .turn-fold-usage") || document.createElement("span");
+  foldBlock.className = "turn-fold-block";
   fold.type = "button";
   fold.className = "turn-fold tool-group-summary";
   fold.title = tr(expanded ? "collapseTurn" : "expandTurn");
@@ -1834,15 +2221,14 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   else delete fold.dataset.deferredTurnId;
   fold.replaceChildren();
   const text = document.createElement("span"),
-    label = document.createElement("span"),
-    tokenUsage = document.createElement("span");
+    label = document.createElement("span");
   text.className = "turn-fold-text";
   label.className = "tool-summary-label";
   label.textContent = turnSummaryText(group);
   tokenUsage.className = "turn-fold-usage";
   tokenUsage.textContent = usage ? turnTokenUsageText(usage) : "";
   tokenUsage.hidden = !usage;
-  text.append(label, tokenUsage);
+  text.append(label);
   fold.append(text);
   fold.onclick = () => {
     if (!expanded && hasDeferred && group.turnId) {
@@ -1867,14 +2253,14 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
     layoutTurnGroup(section, group, messageNodes, completed);
   };
   divider.className = "turn-divider";
+  foldBlock.replaceChildren(fold, divider, tokenUsage);
   section.classList.toggle("collapsed", !expanded);
   section.classList.toggle("expanded", expanded);
   for (const node of messageNodes) node.hidden = !expanded && hiddenNodes.includes(node);
   const leading = expanded ? messageNodes.filter((node) => node !== finalNode) : userNodes;
   reconcileChildren(section, [
     ...leading,
-    fold,
-    divider,
+    foldBlock,
     finalNode,
     ...hiddenNodes.filter((node) => !leading.includes(node)),
   ]);
@@ -1884,6 +2270,7 @@ function messageNode(m, keepToolsRunning = false) {
   const box = document.createElement("article");
   box.className = `message ${m.category || m.role || ""}`;
   box.dataset.messageIndex = String(m.message_index);
+  if (m.turn_id) box.dataset.turnId = m.turn_id;
   const head = document.createElement("div");
   head.className = "message-head";
   const a = document.createElement("span"),
@@ -1911,21 +2298,7 @@ function messageNode(m, keepToolsRunning = false) {
     .filter((item) => item.kind === "text" && typeof item.text === "string")
     .map((item) => item.text)
     .join("\n\n");
-  if (copyText) {
-    const copy = document.createElement("button");
-    copy.className = "message-copy";
-    copy.type = "button";
-    copy.innerHTML =
-      '<svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
-    copy.title = tr("copyMessage");
-    copy.setAttribute("aria-label", copy.title);
-    copy.onclick = () =>
-      run(async () => {
-        await navigator.clipboard.writeText(copyText);
-        notify(tr("messageCopied"));
-      });
-    body.appendChild(copy);
-  }
+  if (copyText) body.appendChild(messageCopyButton(copyText));
   const tools = toolGroupNode(m, keepToolsRunning);
   if (tools) body.appendChild(tools);
   for (const item of usageItems) body.appendChild(contentNode(item));
@@ -2078,6 +2451,33 @@ function pendingNode(entry) {
       .split("\n")
       .some((line) => ["[Image attachment]", "[Audio attachment]"].includes(line.trim()));
     const nativeQueue = ["app_server_queue", "demo_wasm"].includes(entry.source);
+    const mergeableQueueCount = state.pending.filter(
+      (pending) =>
+        pending.thread_id === entry.thread_id &&
+        pending.action === "queue" &&
+        pending.status === "queued" &&
+        ["app_server_queue", "demo_wasm"].includes(pending.source) &&
+        !pending.text
+          .split("\n")
+          .some((line) => ["[Image attachment]", "[Audio attachment]"].includes(line.trim())),
+    ).length;
+    if (
+      entry.action === "queue" &&
+      entry.status === "queued" &&
+      nativeQueue &&
+      !hasAttachmentSummary &&
+      mergeableQueueCount > 1
+    ) {
+      const merge = document.createElement("button");
+      merge.type = "button";
+      merge.textContent = tr("mergeQueuedMessages");
+      merge.onclick = (event) => {
+        event.stopPropagation();
+        menu.open = false;
+        run(() => mergePendingMessages(entry, merge));
+      };
+      popover.prepend(merge);
+    }
     if (
       entry.action === "queue" &&
       entry.status === "queued" &&
@@ -2256,6 +2656,20 @@ async function convertPendingToSteer(entry, button) {
     if (button.isConnected) button.disabled = false;
   }
 }
+async function mergePendingMessages(entry, button) {
+  if (state.current?.id !== entry.thread_id) throw new Error(tr("pendingWrongSession"));
+  button.disabled = true;
+  try {
+    const result = await command(
+      { command: "pending_messages_merge", id: entry.id, thread_id: entry.thread_id },
+      false,
+    );
+    await refreshPending({ preserveOptimistic: false });
+    notify(tr("queuedMessagesMerged", { count: result.merged_count }));
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
 function olderButton() {
   const button = document.createElement("button"),
     label = tr("loadOlder", { count: state.before });
@@ -2267,7 +2681,31 @@ function olderButton() {
   return button;
 }
 async function fetchMessages(before = null, limit = state.pageSize) {
-  return command({ command: "messages", thread_id: state.current.id, before, limit }, false);
+  const started = performance.now(),
+    result = await command(
+      { command: "messages", thread_id: state.current.id, before, limit },
+      false,
+    ),
+    received = performance.now(),
+    bytes = new TextEncoder().encode(JSON.stringify(result)).byteLength;
+  recordPerformance("messages_receive", received - started, {
+    bytes,
+  });
+  messageResponseTimings.set(result, { started, received });
+  return result;
+}
+const messageResponseTimings = new WeakMap();
+function reportMessagesRendered(result, renderStarted) {
+  const timing = messageResponseTimings.get(result);
+  requestAnimationFrame(() => {
+    const rendered = performance.now(),
+      renderDuration = rendered - renderStarted;
+    // Background WebKit/Chromium tabs can throttle animation frames for tens
+    // of seconds. Those samples do not describe an interactive first paint.
+    if (renderDuration > 5_000) return;
+    recordPerformance("messages_render", renderDuration);
+    if (timing) recordPerformance("messages_visible", rendered - timing.started);
+  });
 }
 function hydratedTurnKey(threadId, turnId) {
   return `${threadId}:${turnId}`;
@@ -2450,13 +2888,27 @@ function applyMessagePageState(result) {
   state.historyTotal = result.page.total;
 }
 function setSendMode(mode, automatic = false) {
+  if (mode === "temp" && !state.temporarySelection?.turnId)
+    mode = state.activeTurnId ? "steer" : "send";
   $("sendMode").value = mode;
   state.modeAutomatic = automatic;
   const button = $("sendModeToggle"),
-    isSteer = mode === "steer";
+    isSteer = mode === "steer",
+    isTemporary = mode === "temp",
+    nextMode = isSteer
+      ? "send"
+      : mode === "send" && state.temporarySelection?.turnId
+        ? "temp"
+        : "steer";
   button.dataset.mode = mode;
-  button.textContent = tr(isSteer ? "followUp" : "queue");
-  button.title = tr(isSteer ? "switchToQueue" : "switchToSteer");
+  button.textContent = tr(isTemporary ? "temporaryShort" : isSteer ? "followUp" : "queue");
+  button.title = tr(
+    nextMode === "temp"
+      ? "temporaryConversation"
+      : nextMode === "send"
+        ? "switchToQueue"
+        : "switchToSteer",
+  );
   button.setAttribute("aria-label", button.title);
 }
 function usesDocumentMessageScroll() {
@@ -2738,6 +3190,43 @@ function scheduleEventRefresh(threadId, immediate = false, delay = null) {
     immediate ? 0 : (delay ?? 280),
   );
 }
+function handleTemporaryAppServerEvent(method, params, threadId) {
+  const temporary = [...state.temporaryThreads.values()].find((entry) => entry.id === threadId);
+  if (!temporary) return false;
+  const item = params.item || null,
+    itemType = item?.type,
+    assistant = () => {
+      let message = temporary.messages.findLast(
+        (entry) => entry.role === "assistant" && entry.running,
+      );
+      if (!message) {
+        message = { role: "assistant", text: "", id: null, running: true };
+        temporary.messages.push(message);
+      }
+      return message;
+    };
+  if (method === "turn/started") temporary.activeTurnId = params.turn?.id || temporary.activeTurnId;
+  else if (method === "item/started" && itemType === "agentMessage") {
+    assistant().id = item.id || null;
+  } else if (method === "item/agentMessage/delta") {
+    const message = assistant();
+    message.id ||= params.itemId || null;
+    message.text += typeof params.delta === "string" ? params.delta : "";
+  } else if (method === "item/completed" && itemType === "agentMessage") {
+    const message = assistant(),
+      text = temporaryItemText(item);
+    message.id = item.id || message.id;
+    if (text) message.text = text;
+    message.running = false;
+  } else if (method === "turn/completed") {
+    temporary.activeTurnId = null;
+    const message = temporary.messages.findLast((entry) => entry.role === "assistant");
+    if (message) message.running = false;
+  } else return true;
+  if (temporary === state.temporaryThread) renderTemporaryMessages();
+  return true;
+}
+
 function handleBridgeEvent(event) {
   if (event?.type === "bridge_event_stream") {
     state.eventStreamConnected = event.status === "ready";
@@ -2798,6 +3287,7 @@ function handleBridgeEvent(event) {
     params = message.params || {},
     threadId = params.threadId || null;
   if (!method) return;
+  if (threadId && handleTemporaryAppServerEvent(method, params, threadId)) return;
   if (method === "account/updated") {
     loadStatus().catch(() => {});
     return;
@@ -2814,12 +3304,21 @@ function handleBridgeEvent(event) {
       showActivity();
     }
   } else if (method === "turn/completed" && threadId) {
-    state.authoritativeThreadActive.set(threadId, false);
-    const runState = completedTurnRunState(params.turn);
-    setThreadRunState(threadId, runState);
+    const completedTurnId = params.turn?.id || null,
+      completionIsCurrent =
+        threadId !== state.current?.id ||
+        completionMatchesActiveTurn(state.activeTurnId, completedTurnId),
+      runState = completedTurnRunState(params.turn);
+    // An interrupted turn may complete after the queued input has already
+    // started a successor turn. Never let that older completion clear the new
+    // active turn or replace its green activity state with a terminal state.
+    if (completionIsCurrent) {
+      state.authoritativeThreadActive.set(threadId, false);
+      setThreadRunState(threadId, runState);
+    }
     notifyTurnFinished(threadId, runState, params.turn?.id);
     renderProjects();
-    if (threadId === state.current?.id) {
+    if (threadId === state.current?.id && completionIsCurrent) {
       state.activeTurnId = null;
       showActivity();
     }
@@ -2940,6 +3439,10 @@ function restoreMessageView(view, { smoothBottom = false } = {}) {
   if (view.atBottom) {
     const smooth = smoothBottom && !matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollMessagesToBottom(smooth ? "smooth" : "auto");
+    // Tool streams can update the same turn several times while the previous DOM change is still
+    // being laid out. Re-assert a non-animated bottom anchor after layout; otherwise WebKit and
+    // Firefox can retain an obsolete smooth-scroll target and jump far above the live tail.
+    if (!smooth) requestAnimationFrame(() => scrollMessagesToBottom("auto"));
     return;
   }
   const anchor = view.anchorMessageIndex
@@ -2973,13 +3476,17 @@ async function openThread(
   if (changedThread && state.current) {
     saveDraft(state.current.id, $("messageText").value, true);
     state.attachmentDrafts.set(state.current.id, state.composerAttachments);
+    if (state.composerReference)
+      state.referenceDrafts.set(state.current.id, state.composerReference);
   }
   state.current = thread;
+  syncTemporaryForCurrent();
   if (changedThread) {
     resetVisibleTurnHydration();
     restoreComposerDraft($("messageText"), state.drafts.get(thread.id), true);
     state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
     renderComposerAttachments();
+    setComposerReference(state.referenceDrafts.get(thread.id) || null, false);
     state.before = null;
     state.hasMore = false;
     state.activityFileLen = null;
@@ -2987,6 +3494,8 @@ async function openThread(
     state.activityPhase = null;
     state.activeTool = null;
     state.pendingChanges = false;
+    state.repairRequired = false;
+    state.threadStatistics = null;
     state.lastMessageIndex = null;
     state.visibleMessages = [];
     state.hydratedTurns.clear();
@@ -3007,6 +3516,8 @@ async function openThread(
   }
   renderProjects();
   $("threadTitle").textContent = thread.title || thread.id;
+  renderRepairHint();
+  renderThreadStatistics();
   $("threadCompactMeta").textContent = thread.git_branch || tr("noBranch");
   $("threadMeta").textContent =
     `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
@@ -3035,6 +3546,8 @@ async function openThread(
   ]);
   if (token !== state.openToken) return;
   requireMessagePage(r, { latest: true });
+  renderRepairHint(r.repair_required);
+  renderThreadStatistics(r.statistics);
   r.messages = mergeHydratedTurnMessages(r.messages, thread.id);
   state.pending = mergePendingResponse(pendingResult?.messages || state.pending, true, r.messages);
   state.messageCache.set(thread.id, r);
@@ -3057,6 +3570,7 @@ async function openThread(
   if (messageView?.anchorTurnKey && !messageView.atBottom) {
     state.expandedTurnIds.add(`${thread.id}:${messageView.anchorTurnKey}`);
   }
+  const renderStarted = performance.now();
   reconcileMessageNodes(root, visibleResponse, activeToolMessage);
   applyMessagePageState(r);
   if (olderMessages.length) {
@@ -3068,9 +3582,11 @@ async function openThread(
   restoreMessageView(messageView, {
     smoothBottom:
       Boolean(messageView?.atBottom) &&
+      !state.activeTurnId &&
       previousHistoryTotal !== null &&
       r.page.total > previousHistoryTotal,
   });
+  reportMessagesRendered(r, renderStarted);
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
   showActivity();
@@ -3116,6 +3632,7 @@ async function loadOlder() {
   const activeToolMessage = state.activeTurnId
     ? state.visibleMessages.findLast((message) => message.tools?.length)
     : null;
+  const renderStarted = performance.now();
   reconcileMessageNodes(
     root,
     {
@@ -3125,6 +3642,7 @@ async function loadOlder() {
     },
     activeToolMessage,
   );
+  reportMessagesRendered(r, renderStarted);
   const newHeight = messageScrollMetrics().height;
   if (usesDocumentMessageScroll()) window.scrollTo(0, oldTop + (newHeight - oldHeight));
   else root.scrollTop = oldTop + (newHeight - oldHeight);
@@ -3134,13 +3652,13 @@ function targetRequest(name, extra = {}) {
   return { command: name, thread_id: state.current.id, ...extra };
 }
 function setComposerSubmitting(active) {
+  state.composerSubmitting = active;
   const shell = document.querySelector(".composer-shell");
   shell.classList.toggle("submitting", active);
   $("messageText").disabled = active;
   $("sendModeToggle").disabled = active;
   $("attachBtn").disabled = active;
   $("imageInput").disabled = active;
-  $("submitBtn").disabled = active;
   syncVoiceCapability();
   syncSubmitAction();
 }
@@ -3157,27 +3675,62 @@ function syncSubmitAction() {
   stop.setAttribute("aria-label", stop.title);
   stop.setAttribute("aria-hidden", String(!stopReady));
   stop.tabIndex = stopReady ? 0 : -1;
+  stop.disabled = state.interrupting;
+  submit.disabled = state.composerSubmitting || state.interrupting;
   submit.title = tr("submitAria");
   submit.setAttribute("aria-label", submit.title);
   syncComposerPlaceholder();
 }
 async function interruptCurrentRun({ confirm = true, requireActive = false } = {}) {
-  if ((requireActive && !state.activeTurnId) || state.interrupting) return;
-  if (confirm && !window.confirm(tr("stopRunConfirm"))) return;
+  const interruptedTurnId = state.activeTurnId;
+  if ((requireActive && !interruptedTurnId) || state.interrupting) return;
+  const pendingCount = state.pending.filter(
+    (entry) => entry.thread_id === state.current?.id && entry.status !== "failed",
+  ).length;
+  if (
+    confirm &&
+    !window.confirm(
+      tr(pendingCount ? "stopRunConfirmPending" : "stopRunConfirm", { count: pendingCount }),
+    )
+  )
+    return;
   state.interrupting = true;
-  $("stopBtn").disabled = true;
-  $("submitBtn").disabled = true;
   syncSubmitAction();
   try {
-    await command(targetRequest("interrupt", { turn_id: state.activeTurnId }));
-    if (state.current?.id) setThreadRunState(state.current.id, "cancelled");
-    notify(tr("turnInterrupted"));
-    await refreshActivity();
+    const threadId = state.current?.id;
+    await command(targetRequest("interrupt", { turn_id: interruptedTurnId }));
+    notify(tr("turnStopRequested"));
+    // Do not delete pending inputs here. A queue/add request may still be in
+    // flight, a queued item remains safely withdrawable, and an accepted item
+    // must stay visible until rollout reconciliation proves that it landed.
+    await Promise.allSettled([refreshPending(), refreshActivity()]);
+    if (state.current?.id === threadId && !state.activeTurnId)
+      setThreadRunState(threadId, "cancelled");
   } finally {
     state.interrupting = false;
-    $("stopBtn").disabled = false;
-    $("submitBtn").disabled = false;
     syncSubmitAction();
+  }
+}
+async function continuePendingQueue() {
+  if (!state.current) throw new Error(tr("chooseSessionError"));
+  const threadId = state.current.id,
+    entry = state.pending.find(
+      (pending) =>
+        pending.thread_id === threadId &&
+        pending.action === "queue" &&
+        pending.status === "queued" &&
+        ["app_server_queue", "demo_wasm"].includes(pending.source),
+    );
+  if (!entry) throw new Error(tr("messageRequired"));
+  setComposerSubmitting(true);
+  try {
+    await command({ command: "pending_message_start", thread_id: threadId, id: entry.id }, false);
+    notify(tr("queueContinueStarted"));
+    await refreshPending({ preserveOptimistic: false });
+    if (state.current?.id === threadId)
+      await openThread(state.current, { quiet: true, preserveView: true });
+  } finally {
+    setComposerSubmitting(false);
   }
 }
 function newSubmissionId() {
@@ -3190,10 +3743,27 @@ function newSubmissionId() {
 async function write(name) {
   const draft = $("messageText").value,
     text = draft.trim(),
-    attachments = state.composerAttachments.map((attachment) => ({ ...attachment }));
-  if (!text && !attachments.length) throw new Error(tr("messageRequired"));
+    attachments = state.composerAttachments.map((attachment) => ({ ...attachment })),
+    reference = state.composerReference ? { ...state.composerReference } : null,
+    requestText = reference ? selectedContextPrompt(reference, text) : text;
+  if (!text && !attachments.length) {
+    if (!reference) return continuePendingQueue();
+    throw new Error(tr("messageRequired"));
+  }
   if (voiceRecorder?.state === "recording") throw new Error(tr("stopRecording"));
   if (!state.current) throw new Error(tr("chooseSessionError"));
+  if (name === "temp") {
+    if (attachments.length) throw new Error(tr("temporaryCreateFailed"));
+    setComposerSubmitting(true);
+    try {
+      await createTemporaryThread(state.temporarySelection, draft);
+      await sendTemporaryMessage();
+      setComposerReference();
+    } finally {
+      setComposerSubmitting(false);
+    }
+    return;
+  }
   const threadId = state.current.id,
     submissionId = newSubmissionId();
   let action = name === "steer" ? "steer" : "queue";
@@ -3238,7 +3808,7 @@ async function write(name) {
     const request = command({
       command: name,
       thread_id: threadId,
-      text,
+      text: requestText,
       attachments,
       submission_id: submissionId,
     }).then(
@@ -3255,6 +3825,8 @@ async function write(name) {
     state.composerAttachments = [];
     state.attachmentDrafts.delete(threadId);
     renderComposerAttachments();
+    state.referenceDrafts.delete(threadId);
+    if (state.current?.id === threadId) setComposerReference(null, false);
     try {
       if (state.current?.id === threadId) await openThread(state.current, { quiet: true });
       else await refreshPending();
@@ -3311,7 +3883,14 @@ $("createDialog").onclick = (event) => {
   if (event.target === $("createDialog")) closeCreateDialog();
 };
 function toggleSendModeAndKeepFocus() {
-  setSendMode($("sendMode").value === "steer" ? "send" : "steer", false);
+  const mode = $("sendMode").value,
+    nextMode =
+      mode === "steer"
+        ? "send"
+        : mode === "send" && state.temporarySelection?.turnId
+          ? "temp"
+          : "steer";
+  setSendMode(nextMode, false);
   $("messageText").focus({ preventScroll: true });
 }
 $("sendModeToggle").onclick = toggleSendModeAndKeepFocus;
@@ -3354,12 +3933,38 @@ $("archiveThreadBtn").onclick = () =>
     $("messageText").value = "";
     state.composerAttachments = [];
     state.attachmentDrafts.delete(threadId);
+    state.composerReference = null;
+    state.referenceDrafts.delete(threadId);
     renderComposerAttachments();
+    renderComposerReference();
     resizeComposerTextarea();
     renderPending();
     closePanels();
     await loadProjects();
     notify(tr("sessionArchived"));
+  });
+$("repairOrdinalsBtn").onclick = () =>
+  run(async () => {
+    if (!state.current) throw new Error(tr("chooseSessionError"));
+    if (!window.confirm(tr("repairOrdinalsConfirm"))) return;
+    const button = $("repairOrdinalsBtn"),
+      threadId = state.current.id;
+    button.disabled = true;
+    try {
+      const result = await command(
+        { command: "thread_repair_ordinals", thread_id: threadId },
+        false,
+      );
+      notify(
+        result.status === "repaired"
+          ? tr("repairOrdinalsDone", { count: result.renumbered_records })
+          : tr("repairOrdinalsClean"),
+      );
+      if (state.current?.id === threadId)
+        await openThread(state.current, { quiet: true, preserveView: true });
+    } finally {
+      button.disabled = false;
+    }
   });
 $("usageHealth").onclick = () => notify($("usageHealth").title || tr("weeklyUnavailable"), true);
 $("usageHealth").onkeydown = (event) => {
@@ -3394,6 +3999,25 @@ $("messageText").onblur = () =>
     if (document.activeElement !== $("messageText")) shell.classList.remove("input-focused");
     syncSubmitAction();
   });
+function keepComposerTextFocus(event) {
+  const composer = event.currentTarget,
+    textarea = composer.querySelector("textarea"),
+    target = event.target;
+  if (
+    !textarea ||
+    textarea.disabled ||
+    target.closest("textarea, select, input:not([type='hidden']), #submitBtn, #temporarySendBtn")
+  )
+    return;
+  // Composer chrome and auxiliary buttons must not dismiss the mobile
+  // keyboard. Cancelling pointer focus still permits the button's click
+  // action, while keeping the editing selection anchored in the textarea.
+  event.preventDefault();
+  textarea.focus({ preventScroll: true });
+}
+document
+  .querySelectorAll(".composer-shell")
+  .forEach((composer) => composer.addEventListener("pointerdown", keepComposerTextFocus));
 document.querySelector(".composer-shell").addEventListener("focusout", () =>
   requestAnimationFrame(() => {
     const shell = document.querySelector(".composer-shell");
@@ -3415,6 +4039,18 @@ $("threadTitle").onkeydown = (event) => {
     $("threadTitle").click();
   }
 };
+$("repairHintBtn").onclick = (event) => {
+  event.stopPropagation();
+  const bubble = $("repairHintBubble"),
+    open = bubble.hidden;
+  bubble.hidden = !open;
+  $("repairHintBtn").setAttribute("aria-expanded", String(open));
+};
+document.addEventListener("click", (event) => {
+  if (event.target.closest("#repairHintBtn, #repairHintBubble")) return;
+  $("repairHintBubble").hidden = true;
+  $("repairHintBtn").setAttribute("aria-expanded", "false");
+});
 $("currentBtn").onclick = () =>
   run(async () => {
     const r = await command({ command: "current" });
@@ -3473,14 +4109,105 @@ $("rawBtn").onclick = () =>
     }
     return command(req);
   });
+$("temporaryPanelBtn").onclick = () => {
+  if ($("temporaryPanel").classList.contains("open")) closePanels();
+  else openTemporaryPanel();
+};
+$("temporaryCloseBtn").onclick = closePanels;
+$("temporarySendBtn").onclick = () => run(sendTemporaryMessage);
+$("temporaryText").onkeydown = (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    $("temporarySendBtn").click();
+  }
+};
+$("temporaryText").oninput = resizeTemporaryTextarea;
+$("temporaryStopBtn").onclick = () =>
+  run(async () => {
+    const temporary = state.temporaryThread;
+    if (!temporary?.activeTurnId || !window.confirm(tr("stopRunConfirm"))) return;
+    await command({
+      command: "temporary_turn_interrupt",
+      thread_id: temporary.id,
+      turn_id: temporary.activeTurnId,
+    });
+  });
+function hideSelectionActions(clear = false) {
+  $("selectionActions").hidden = true;
+  if (clear) {
+    window.getSelection()?.removeAllRanges();
+    state.selectedMessageText = null;
+  }
+}
+function updateSelectionActions() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return hideSelectionActions();
+  const text = selection.toString().trim();
+  if (!text) return hideSelectionActions();
+  const range = selection.getRangeAt(0),
+    ancestor =
+      range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer.parentElement,
+    message = ancestor?.closest?.("#messages .message[data-message-index]");
+  if (!message || !message.contains(selection.anchorNode) || !message.contains(selection.focusNode))
+    return hideSelectionActions();
+  const rect = range.getBoundingClientRect(),
+    menu = $("selectionActions");
+  state.selectedMessageText = {
+    text,
+    turnId: message.dataset.turnId || null,
+    messageIndex: Number(message.dataset.messageIndex),
+  };
+  $("selectionTemporaryBtn").hidden = !state.selectedMessageText.turnId;
+  menu.hidden = false;
+  const width = menu.offsetWidth,
+    height = menu.offsetHeight;
+  menu.style.left = `${Math.max(8, Math.min(innerWidth - width - 8, rect.left + rect.width / 2 - width / 2))}px`;
+  menu.style.top = `${Math.max(8, rect.top - height - 8)}px`;
+}
+let selectionUpdateTimer = null;
+document.addEventListener("selectionchange", () => {
+  clearTimeout(selectionUpdateTimer);
+  selectionUpdateTimer = setTimeout(updateSelectionActions, 40);
+});
+$("selectionActions").addEventListener("pointerdown", (event) => event.preventDefault());
+$("selectionCopyBtn").onclick = () =>
+  run(async () => {
+    const selection = state.selectedMessageText;
+    if (!selection) return;
+    await navigator.clipboard.writeText(selection.text);
+    notify(tr("messageCopied"));
+    hideSelectionActions(true);
+  });
+$("selectionInsertBtn").onclick = () => {
+  const selection = state.selectedMessageText;
+  if (!selection) return;
+  setComposerReference(selection);
+  $("messageText").focus({ preventScroll: true });
+  hideSelectionActions(true);
+};
+$("selectionTemporaryBtn").onclick = () => {
+  const selection = state.selectedMessageText;
+  if (!selection) return;
+  hideSelectionActions(true);
+  run(() => createTemporaryThread(selection));
+};
 function syncScrim() {
   $("scrim").classList.toggle(
     "show",
-    $("tools").classList.contains("open") || $("sidebar").classList.contains("open"),
+    $("tools").classList.contains("open") ||
+      $("temporaryPanel").classList.contains("open") ||
+      $("sidebar").classList.contains("open"),
   );
 }
 function closePanels() {
   $("tools").classList.remove("open");
+  $("temporaryPanel").classList.remove("open");
+  $("temporaryPanel").inert = true;
+  document.querySelector("main").inert = false;
+  $("sidebar").inert = false;
+  $("tools").inert = false;
   $("sidebar").classList.remove("open");
   syncScrim();
 }
@@ -3582,6 +4309,7 @@ window.addEventListener("hashchange", () => {
   run(() => openSessionById(threadId, { fromHash: Boolean(hashedId), replaceHash: !hashedId }));
 });
 const composer = document.querySelector(".composer"),
+  temporaryComposer = document.querySelector(".temporary-composer"),
   mainPanel = document.querySelector("main"),
   threadHead = document.querySelector(".thread-head"),
   syncFrameInsets = () => {
@@ -3593,10 +4321,15 @@ const composer = document.querySelector(".composer"),
       "--thread-head-height",
       `${Math.ceil(threadHead.getBoundingClientRect().height)}px`,
     );
+    $("temporaryPanel").style.setProperty(
+      "--temporary-composer-height",
+      `${Math.ceil(temporaryComposer.getBoundingClientRect().height)}px`,
+    );
   };
 const frameResizeObserver = new ResizeObserver(syncFrameInsets);
 frameResizeObserver.observe(composer);
 frameResizeObserver.observe(threadHead);
+frameResizeObserver.observe(temporaryComposer);
 syncFrameInsets();
 resizeComposerTextarea();
 window.addEventListener("resize", resizeComposerAfterViewportChange, { passive: true });
@@ -3618,6 +4351,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (!$("tasksDialog").hidden) closeTasksDialog();
   else if (!$("createDialog").hidden) closeCreateDialog();
+  else closePanels();
 });
 $("outboxTray").addEventListener("click", (event) => {
   if (event.target !== event.currentTarget) return;
@@ -3650,6 +4384,11 @@ document
 document.querySelectorAll(".tool-toggle").forEach(
   (b) =>
     (b.onclick = () => {
+      $("temporaryPanel").classList.remove("open");
+      $("temporaryPanel").inert = true;
+      document.querySelector("main").inert = false;
+      $("sidebar").inert = false;
+      $("tools").inert = false;
       $("tools").classList.toggle("open");
       syncScrim();
     }),

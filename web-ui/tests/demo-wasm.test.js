@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  completionMatchesActiveTurn,
   effectiveActiveTurnId,
   restoreComposerDraft,
   shouldOfferStop,
@@ -41,6 +42,7 @@ const wasmPath = new URL(
 );
 const stylesheetPath = new URL("../src/styles.css", import.meta.url);
 const mainScriptPath = new URL("../src/main.js", import.meta.url);
+const apiScriptPath = new URL("../src/api.js", import.meta.url);
 const indexPath = new URL("../index.html", import.meta.url);
 
 async function demoClient() {
@@ -117,6 +119,8 @@ test("authoritative idle suppresses a stale rollout turn", () => {
   assert.equal(effectiveActiveTurnId("stale-rollout-turn", false), null);
   assert.equal(effectiveActiveTurnId("live-turn", true), "live-turn");
   assert.equal(effectiveActiveTurnId("compatibility-turn", undefined), "compatibility-turn");
+  assert.equal(completionMatchesActiveTurn("old-turn", "old-turn"), true);
+  assert.equal(completionMatchesActiveTurn("new-turn", "old-turn"), false);
 });
 
 test("same-thread refresh does not rewrite the composer or move its caret", () => {
@@ -196,6 +200,34 @@ test("browser notifications require permission, preference, and a background pag
   assert.equal(disableBrowserNotifications(FakeNotification, storage).enabled, false);
 });
 
+test("worktree creation uses a background handle and mobile completion has a toast fallback", async () => {
+  const command = await demoClient();
+  const started = result(
+    command({ command: "thread_create_start", project_path: "/demo/codex-app-server-webui" }),
+  );
+  assert.equal(started.status, "running");
+  assert.equal(
+    result(command({ command: "thread_create_status", job_id: started.job_id })).status,
+    "running",
+  );
+  assert.equal(
+    result(command({ command: "thread_create_status", job_id: started.job_id })).location,
+    "worktree",
+  );
+  const [source, api, stylesheet] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(apiScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+  assert.match(source, /command: "thread_create_start"/);
+  assert.match(source, /command: "thread_create_status"/);
+  assert.match(source, /state\.threadCreationJobs\.set/);
+  assert.match(source, /deferredCompletionToast/);
+  assert.match(api, /kind === "completion" \? 5200 : 2600/);
+  assert.match(stylesheet, /\.composer-status:not\(\[hidden\]\)::before[\s\S]*radial-gradient/);
+  assert.match(stylesheet, /\.toast\[data-kind="completion"\]/);
+});
+
 test("compiled demo WASM supports refresh and active-run interruption", async () => {
   const command = await demoClient();
   const status = result(command({ command: "status" }));
@@ -268,6 +300,34 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   assert.equal(refreshed.page.total, before.page.total + 1);
   assert.equal(refreshed.messages.at(-1).content[0].text, "WASM regression");
 
+  const queuedAfterStop = result(
+    command({
+      command: "send",
+      thread_id: "demo-thread-web-ui",
+      text: "Keep me queued after stopping",
+    }),
+  );
+
+  assert.equal(
+    result(command({ command: "interrupt", thread_id: "demo-thread-web-ui" })).status,
+    "interrupted",
+  );
+  const preservedAfterStop = result(command({ command: "pending_messages" }));
+  assert.equal(preservedAfterStop.messages.length, 1);
+  assert.equal(preservedAfterStop.messages[0].id, queuedAfterStop.pending_id);
+  assert.equal(preservedAfterStop.messages[0].status, "queued");
+  const continuedAfterStop = result(
+    command({
+      command: "pending_message_start",
+      thread_id: "demo-thread-web-ui",
+      id: queuedAfterStop.pending_id,
+    }),
+  );
+  assert.equal(continuedAfterStop.status, "accepted");
+  const continuedMessages = result(
+    command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
+  );
+  assert.equal(continuedMessages.messages.at(-1).content[0].text, "Keep me queued after stopping");
   assert.equal(
     result(command({ command: "interrupt", thread_id: "demo-thread-web-ui" })).status,
     "interrupted",
@@ -489,7 +549,7 @@ test("task overview uses the demo server's latest input and final response", asy
   assert.doesNotMatch(taskEntryStyle, /border|background/);
 });
 
-test("mobile composer stays out of the message grid sizing flow", async () => {
+test("mobile composer stays out of the message grid and catches its own pointer input", async () => {
   const index = await readFile(indexPath, "utf8");
   const stylesheet = await readFile(stylesheetPath, "utf8");
   const source = await readFile(mainScriptPath, "utf8");
@@ -506,8 +566,8 @@ test("mobile composer stays out of the message grid sizing flow", async () => {
     /\.composer-shell\s*\{[^}]*grid-template-columns:\s*64px 72px minmax\(0, 1fr\) 64px;/s,
   );
   assert.match(mobile, /\.composer-shell #submitBtn\s*\{[^}]*width:\s*64px;/s);
-  assert.match(mobile, /\.composer\s*\{[^}]*pointer-events:\s*none;/s);
-  assert.match(mobile, /\.composer-shell\s*\{[^}]*pointer-events:\s*none;/s);
+  assert.match(mobile, /\.composer\s*\{[^}]*pointer-events:\s*auto;/s);
+  assert.match(mobile, /\.composer-shell\s*\{[^}]*pointer-events:\s*auto;/s);
   assert.match(mobile, /\.composer-shell textarea,[\s\S]*?touch-action:\s*manipulation;/s);
   assert.match(
     mobile,
@@ -529,6 +589,30 @@ test("mobile composer stays out of the message grid sizing flow", async () => {
   assert.doesNotMatch(stylesheet, /\.outbox-tray\.compact \.outbox-item:not\(:last-child\)/);
   assert.match(stylesheet, /\.outbox-tray\.compact > \.outbox-item\s*\{/);
   assert.match(stylesheet, /\.outbox-tray\.compact \.outbox-actions/);
+  assert.match(source, /recordPerformance\("messages_receive"/);
+  assert.match(source, /recordPerformance\("messages_render"/);
+  assert.match(source, /recordPerformance\("messages_visible"/);
+});
+
+test("browser performance samples use the bounded demo protocol", async () => {
+  const command = await demoClient();
+  const response = result(
+    command({
+      command: "client_performance",
+      samples: [
+        {
+          metric: "messages_visible",
+          count: 2,
+          total_ms: 42,
+          max_ms: 30,
+          total_bytes: 2048,
+        },
+      ],
+    }),
+  );
+  assert.equal(response.recorded, true);
+  const api = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
+  assert.match(api, /window\.setInterval\(\(\) => flushPerformance\(\), 15_000\)/);
 });
 
 test("steer messages use a distinct bean-green outbox palette", async () => {
@@ -585,7 +669,7 @@ test("composer keeps images as attachments and transcribes voice into editable t
   );
 });
 
-test("expanded folders preload summaries and mobile buttons keep native click delivery", async () => {
+test("expanded folders preload summaries and composer focus stays inside its input shell", async () => {
   const command = await demoClient();
   const projects = result(command({ command: "projects", include_archived: false })).projects;
   const chats = projects.find((project) => project.kind === "chats");
@@ -610,8 +694,23 @@ test("expanded folders preload summaries and mobile buttons keep native click de
   assert.match(source, /\$\("stopBtn"\)\.onclick = \(\) => run/);
   assert.doesNotMatch(source, /pointerAction/);
   assert.doesNotMatch(source, /composerShell\.addEventListener\(\s*"pointerdown"/);
+  assert.match(source, /\.querySelectorAll\("\.composer-shell"\)/);
+  assert.doesNotMatch(source, /\.querySelectorAll\("\.composer"\)/);
+  assert.match(source, /addEventListener\("pointerdown", keepComposerTextFocus\)/);
+  assert.match(source, /target\.closest\([\s\S]*?#submitBtn, #temporarySendBtn/);
   assert.match(source, /p\.kind === "chats" \? tr\("chats"\) : p\.name/);
-  assert.match(source, /if \(p\.kind !== "chats"\)/);
+  assert.match(source, /p\.kind === "chats" \? tr\("createInChats"\)/);
+  assert.match(source, /project_path: project\.kind === "chats" \? null : project\.path/);
+  assert.match(source, /\$\("createWorktreeBtn"\)\.hidden = isChat/);
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  assert.match(
+    stylesheet,
+    /@media \(max-width: 800px\)[\s\S]*?\.composer \{[\s\S]*?pointer-events: auto;/,
+  );
+  assert.match(
+    stylesheet,
+    /@media \(max-width: 800px\)[\s\S]*?\.composer-shell \{[\s\S]*?pointer-events: auto;/,
+  );
 });
 
 test("structured command actions stay separate and preserve multiline commands", async () => {
@@ -678,7 +777,12 @@ test("local task file links resolve to workspace paths", () => {
 
 test("interrupt requests carry the app-server turn observed by the UI", async () => {
   const source = await readFile(mainScriptPath, "utf8");
-  assert.match(source, /targetRequest\("interrupt", \{ turn_id: state\.activeTurnId \}\)/);
+  assert.match(source, /const interruptedTurnId = state\.activeTurnId/);
+  assert.match(source, /targetRequest\("interrupt", \{ turn_id: interruptedTurnId \}\)/);
+  assert.match(source, /await Promise\.allSettled\(\[refreshPending\(\), refreshActivity\(\)\]\)/);
+  assert.match(source, /submit\.disabled = state\.composerSubmitting \|\| state\.interrupting/);
+  assert.match(source, /if \(!reference\) return continuePendingQueue\(\)/);
+  assert.match(source, /command: "pending_message_start"/);
   assert.match(source, /\$\("submitBtn"\)\.onclick = \(\) => run\(\(\) => write/);
   assert.match(source, /\$\("stopBtn"\)\.onclick = \(\) =>/);
   const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
@@ -699,6 +803,41 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
     source.indexOf("function pendingNode"),
   );
   assert.doesNotMatch(reconcile, /replaceChildren/);
+});
+
+test("a detected rollout sequence issue appears beside the session title", async () => {
+  const [html, source, stylesheet] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+  assert.match(html, /id="threadTitle"[\s\S]*id="repairHintBtn"[\s\S]*id="repairHintBubble"/);
+  assert.match(source, /renderRepairHint\(r\.repair_required\)/);
+  assert.match(source, /\$\("repairHintBtn"\)\.onclick/);
+  assert.match(stylesheet, /\.repair-hint-bubble\s*\{[\s\S]*position:\s*absolute/);
+  const command = await demoClient();
+  const page = result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 1 }));
+  assert.equal(page.repair_required, false);
+});
+
+test("session statistics are generated by the backend and rendered in Tools", async () => {
+  const command = await demoClient();
+  const page = result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 1 }));
+  assert.deepEqual(
+    {
+      turns: page.statistics.turns,
+      tools: page.statistics.tool_calls,
+      tokens: page.statistics.total_tokens,
+      duration: page.statistics.total_duration_ms,
+    },
+    { turns: 2, tools: 2, tokens: 12840, duration: 42000 },
+  );
+  const [html, source] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+  ]);
+  assert.match(html, /id="threadStatistics"[\s\S]*id="threadStatGrid"/);
+  assert.match(source, /renderThreadStatistics\(r\.statistics\)/);
 });
 
 test("large-session deferred turns hydrate only while visible and at a bounded rate", async () => {
@@ -744,7 +883,8 @@ test("completed turns collapse by server turn id and preserve the full expansion
   );
   assert.match(layout, /message\.turn_id/);
   assert.match(layout, /state\.expandedTurnIds/);
-  assert.match(layout, /\.\.\.leading,[\s\S]*fold,[\s\S]*divider,[\s\S]*finalNode/);
+  assert.match(layout, /foldBlock\.replaceChildren\(fold, divider, tokenUsage\)/);
+  assert.match(layout, /\.\.\.leading,[\s\S]*foldBlock,[\s\S]*finalNode/);
   assert.match(layout, /turnSummaryText\(group\)/);
   assert.match(layout, /usage = turnUsageItem\(group\)/);
   assert.match(layout, /turnTokenUsageText\(usage\)/);
@@ -754,10 +894,15 @@ test("completed turns collapse by server turn id and preserve the full expansion
   const stylesheet = await readFile(stylesheetPath, "utf8");
   assert.match(stylesheet, /\.turn-fold::before\s*\{/);
   assert.doesNotMatch(stylesheet, /\.turn-fold::after\s*\{/);
-  assert.match(stylesheet, /\.turn-fold\s*\{[^}]*width:\s*100%/s);
+  assert.match(stylesheet, /\.turn-fold\s*\{[^}]*width:\s*fit-content;[^}]*justify-self:\s*start/s);
   assert.match(
     stylesheet,
-    /\.turn-fold-usage\s*\{[^}]*margin-left:\s*auto;[^}]*text-align:\s*right/s,
+    /\.turn-fold-text \.tool-summary-label\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s,
+  );
+  assert.match(stylesheet, /\.turn-fold-usage\s*\{[^}]*grid-column:\s*2;[^}]*text-align:\s*right/s);
+  assert.match(
+    stylesheet,
+    /@media \(max-width: 800px\)[\s\S]*\.turn-fold-usage\s*\{[^}]*grid-row:\s*2;[^}]*justify-self:\s*start;[^}]*margin:\s*0 2px 6px 18px[\s\S]*\.turn-fold-block > \.turn-divider\s*\{[^}]*grid-row:\s*3/s,
   );
   assert.match(source, /command: "turn_messages"/);
   assert.match(source, /observeVisibleDeferredTurns/);
@@ -787,7 +932,8 @@ test("token usage joins the turn fold while memory stays on the final response",
     );
   assert.match(render, /for \(const item of usageItems\)[\s\S]*memoryCitationNode\(memoryItems\)/);
   assert.match(source, /node\.classList\.add\("turn-token-usage"\)/);
-  assert.match(source, /text\.append\(label, tokenUsage\)/);
+  assert.match(source, /text\.append\(label\)/);
+  assert.match(source, /foldBlock\.replaceChildren\(fold, divider, tokenUsage\)/);
 });
 
 test("message copy follows text before tools and completion metadata", async () => {
@@ -799,13 +945,16 @@ test("message copy follows text before tools and completion metadata", async () 
     );
   assert.match(
     render,
-    /for \(const item of ordinaryItems\)[\s\S]*body\.appendChild\(copy\)[\s\S]*toolGroupNode\(m,[\s\S]*usageItems/,
+    /for \(const item of ordinaryItems\)[\s\S]*body\.appendChild\(messageCopyButton\(copyText\)\)[\s\S]*toolGroupNode\(m,[\s\S]*usageItems/,
   );
   const copyStyle = stylesheet.match(/\.message-copy\s*\{[^}]*\}/s)?.[0] || "";
   assert.match(copyStyle, /position:\s*absolute/);
   assert.match(copyStyle, /right:\s*0/);
   assert.match(stylesheet, /\.message\.user \.message-body\s*\{[^}]*padding:\s*0 28px 0 0/s);
-  assert.match(stylesheet, /\.message\.user \.message-copy\s*\{[^}]*right:\s*-8px;[^}]*bottom:\s*0/s);
+  assert.match(
+    stylesheet,
+    /\.message\.user \.message-copy\s*\{[^}]*right:\s*-8px;[^}]*bottom:\s*0/s,
+  );
 });
 
 test("queued messages expose withdraw and convert-to-steer actions", async () => {
@@ -823,6 +972,87 @@ test("queued messages expose withdraw and convert-to-steer actions", async () =>
   assert.match(convertFlow, /submission_id: submissionId/);
   const acceptedFlow = convertFlow.slice(0, convertFlow.indexOf("} catch (error)"));
   assert.doesNotMatch(acceptedFlow, /preserveOptimistic: false/);
+});
+
+test("queued text messages expose an ordered merge action", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /command: "pending_messages_merge"/);
+  assert.match(source, /mergeableQueueCount > 1/);
+  assert.match(source, /refreshPending\(\{ preserveOptimistic: false \}\)/);
+});
+
+test("selected text creates an annotated full-screen temporary conversation", async () => {
+  const [source, stylesheet, html] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+    readFile(indexPath, "utf8"),
+  ]);
+  assert.match(
+    html,
+    /id="temporaryPanelBtn"[\s\S]*class="tool-toggle"/,
+    "the temporary entry belongs immediately before Tools",
+  );
+  assert.match(html, /id="temporaryPanelBtn"[\s\S]*?hidden/);
+  assert.match(
+    stylesheet,
+    /\.head-actions \.temporary-toggle:not\(\[hidden\]\)/,
+    "the mobile header must not override an unavailable temporary entry",
+  );
+  assert.doesNotMatch(html, /temporaryDraftBtn/, "Temp reuses the Queue/Steer mode control");
+  assert.match(
+    html,
+    /id="composerStatus"[\s\S]*?id="composerReference"[\s\S]*?class="composer-shell"/,
+    "the reference annotation sits between composer status and input",
+  );
+  const temporaryPanel = html.slice(
+    html.indexOf('class="temporary-chat"'),
+    html.indexOf('<section class="tools"'),
+  );
+  assert.match(temporaryPanel, /class="thread-head temporary-head"/);
+  assert.match(temporaryPanel, /class="composer-shell temporary-composer-shell"/);
+  assert.doesNotMatch(temporaryPanel, /tool-toggle/, "temporary chat has no toolbar action");
+  assert.match(
+    html,
+    /id="selectionCopyBtn"[\s\S]*id="selectionInsertBtn"[\s\S]*id="selectionTemporaryBtn"/,
+  );
+  assert.match(source, /command: "temporary_thread_create"/);
+  assert.match(source, /command: "temporary_turn_start"/);
+  assert.match(source, /command: "temporary_turn_interrupt"/);
+  assert.match(source, /last_turn_id: selection\.turnId \|\| null/);
+  assert.match(source, /state\.temporaryThreads\.set\(sourceThreadId, temporary\)/);
+  assert.match(source, /mode === "send" && state\.temporarySelection\?\.turnId/);
+  assert.match(source, /if \(name === "temp"\)[\s\S]*?sendTemporaryMessage\(\)/);
+  const insertHandler = source.slice(
+    source.indexOf('$("selectionInsertBtn").onclick'),
+    source.indexOf('$("selectionTemporaryBtn").onclick'),
+  );
+  assert.match(insertHandler, /setComposerReference\(selection\)/);
+  assert.doesNotMatch(insertHandler, /insertComposerText/);
+  assert.match(stylesheet, /\.temporary-chat\.open\s*\{[\s\S]*?transform:\s*none/);
+  assert.match(stylesheet, /\.temporary-chat\s*\{[\s\S]*?inset:\s*0;[\s\S]*?width:\s*100%/);
+  assert.match(stylesheet, /\.selection-actions\s*\{[^}]*position:\s*fixed/s);
+
+  const command = await demoClient();
+  const temporary = result(
+    command({
+      command: "temporary_thread_create",
+      thread_id: "demo-thread-web-ui",
+      last_turn_id: "demo-turn-1",
+    }),
+  );
+  assert.equal(temporary.thread.ephemeral, true);
+  assert.equal(temporary.thread.forked_from_id, "demo-thread-web-ui");
+  const turn = result(
+    command({
+      command: "temporary_turn_start",
+      thread_id: temporary.thread.id,
+      text: "Explain this selection",
+      submission_id: "temporary-test-1",
+      attachments: [],
+    }),
+  );
+  assert.equal(turn.turn_id, "demo-temporary-turn");
+  assert.match(turn.demo_reply, /in-memory temporary branch/);
 });
 
 test("authentication gate serializes concurrent startup requests", async () => {

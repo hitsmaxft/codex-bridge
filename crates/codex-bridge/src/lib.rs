@@ -17,16 +17,17 @@ pub use host_executor::{
     MAX_HOST_EXEC_TIMEOUT_SECONDS,
 };
 pub use sessions::{
-    default_codex_home, MessagePage, ProjectKind, ProjectSummary, ProjectThreadSummary,
-    SessionStore, ThreadActivity, ThreadMessage, ThreadProjectIndex, ThreadSnapshot, ThreadSummary,
-    ThreadToolCall, CHATS_PROJECT_PATH, CODEX_HOME_ENV,
+    default_codex_home, MessagePage, MessageReadProfile, ProjectKind, ProjectSummary,
+    ProjectThreadSummary, RolloutOrdinalRepair, SessionStore, ThreadActivity, ThreadMessage,
+    ThreadProjectIndex, ThreadSnapshot, ThreadSummary, ThreadToolCall, CHATS_PROJECT_PATH,
+    CODEX_HOME_ENV,
 };
 pub use write_backend::{
     AppServerRuntimeInfo, BackendFailure, BackendSuccess, CodexCliBackend, NativeQueueReceipt,
     StartedTurnReceipt, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 32;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +50,9 @@ pub enum Request {
         thread_id: String,
         before: Option<u32>,
         limit: u32,
+    },
+    ClientPerformance {
+        samples: Vec<ClientPerformanceSample>,
     },
     TurnMessages {
         thread_id: String,
@@ -76,9 +80,34 @@ pub enum Request {
     },
     ComposerOptions,
     ThreadCreate {
-        project_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_path: Option<PathBuf>,
         worktree: bool,
         model: Option<String>,
+    },
+    ThreadCreateStart {
+        project_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    ThreadCreateStatus {
+        job_id: String,
+    },
+    TemporaryThreadCreate {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_turn_id: Option<String>,
+    },
+    TemporaryTurnStart {
+        thread_id: String,
+        text: String,
+        submission_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ComposerAttachment>,
+    },
+    TemporaryTurnInterrupt {
+        thread_id: String,
+        turn_id: String,
     },
     ThreadSettingsUpdate {
         thread_id: String,
@@ -90,6 +119,9 @@ pub enum Request {
         name: String,
     },
     ThreadArchive {
+        thread_id: String,
+    },
+    ThreadRepairOrdinals {
         thread_id: String,
     },
     ThreadPins,
@@ -141,6 +173,14 @@ pub enum Request {
         thread_id: Option<String>,
     },
     PendingMessageDelete {
+        id: String,
+        thread_id: String,
+    },
+    PendingMessagesMerge {
+        id: String,
+        thread_id: String,
+    },
+    PendingMessageStart {
         id: String,
         thread_id: String,
     },
@@ -196,6 +236,7 @@ impl Request {
             Self::Projects { .. } => "projects",
             Self::ProjectThreads { .. } => "project_threads",
             Self::Messages { .. } => "messages",
+            Self::ClientPerformance { .. } => "client_performance",
             Self::TurnMessages { .. } => "turn_messages",
             Self::MessageContent { .. } => "message_content",
             Self::ToolContent { .. } => "tool_content",
@@ -204,9 +245,15 @@ impl Request {
             Self::ComposerStatus { .. } => "composer_status",
             Self::ComposerOptions => "composer_options",
             Self::ThreadCreate { .. } => "thread_create",
+            Self::ThreadCreateStart { .. } => "thread_create_start",
+            Self::ThreadCreateStatus { .. } => "thread_create_status",
+            Self::TemporaryThreadCreate { .. } => "temporary_thread_create",
+            Self::TemporaryTurnStart { .. } => "temporary_turn_start",
+            Self::TemporaryTurnInterrupt { .. } => "temporary_turn_interrupt",
             Self::ThreadSettingsUpdate { .. } => "thread_settings_update",
             Self::ThreadRename { .. } => "thread_rename",
             Self::ThreadArchive { .. } => "thread_archive",
+            Self::ThreadRepairOrdinals { .. } => "thread_repair_ordinals",
             Self::ThreadPins => "thread_pins",
             Self::ThreadPin { .. } => "thread_pin",
             Self::WorkspaceDiff { .. } => "workspace_diff",
@@ -222,6 +269,8 @@ impl Request {
             Self::Pending => "pending",
             Self::PendingMessages { .. } => "pending_messages",
             Self::PendingMessageDelete { .. } => "pending_message_delete",
+            Self::PendingMessagesMerge { .. } => "pending_messages_merge",
+            Self::PendingMessageStart { .. } => "pending_message_start",
             Self::Approve { .. } => "approve",
             Self::Decline { .. } => "decline",
             Self::Interrupt { .. } => "interrupt",
@@ -229,6 +278,16 @@ impl Request {
             Self::AppServerRpc { .. } => "app_server_rpc",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientPerformanceSample {
+    pub metric: String,
+    pub count: u32,
+    pub total_ms: u64,
+    pub max_ms: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -384,6 +443,19 @@ mod tests {
         assert_eq!(messages["before"], 90);
         assert_eq!(messages["limit"], 30);
 
+        let performance = serde_json::to_value(Request::ClientPerformance {
+            samples: vec![ClientPerformanceSample {
+                metric: "messages_visible".into(),
+                count: 3,
+                total_ms: 120,
+                max_ms: 70,
+                total_bytes: 4096,
+            }],
+        })
+        .unwrap();
+        assert_eq!(performance["command"], "client_performance");
+        assert_eq!(performance["samples"][0]["count"], 3);
+
         let turn = serde_json::to_value(Request::TurnMessages {
             thread_id: "thread-1".into(),
             turn_id: "turn-1".into(),
@@ -427,7 +499,7 @@ mod tests {
         assert_eq!(composer["thread_id"], "thread-1");
 
         let create = serde_json::to_value(Request::ThreadCreate {
-            project_path: PathBuf::from("/tmp/project"),
+            project_path: Some(PathBuf::from("/tmp/project")),
             worktree: true,
             model: Some("gpt-test".into()),
         })
@@ -436,6 +508,44 @@ mod tests {
         assert_eq!(create["project_path"], "/tmp/project");
         assert_eq!(create["worktree"], true);
         assert_eq!(create["model"], "gpt-test");
+
+        let chat = serde_json::to_value(Request::ThreadCreate {
+            project_path: None,
+            worktree: false,
+            model: None,
+        })
+        .unwrap();
+        assert!(chat.get("project_path").is_none());
+
+        let create_start = serde_json::to_value(Request::ThreadCreateStart {
+            project_path: PathBuf::from("/tmp/project"),
+            model: None,
+        })
+        .unwrap();
+        assert_eq!(create_start["command"], "thread_create_start");
+        let create_status = serde_json::to_value(Request::ThreadCreateStatus {
+            job_id: "job-1".into(),
+        })
+        .unwrap();
+        assert_eq!(create_status["command"], "thread_create_status");
+
+        let temporary = serde_json::to_value(Request::TemporaryThreadCreate {
+            thread_id: "thread-1".into(),
+            last_turn_id: Some("turn-7".into()),
+        })
+        .unwrap();
+        assert_eq!(temporary["command"], "temporary_thread_create");
+        assert_eq!(temporary["last_turn_id"], "turn-7");
+
+        let temporary_turn = serde_json::to_value(Request::TemporaryTurnStart {
+            thread_id: "temporary-1".into(),
+            text: "Explain this".into(),
+            submission_id: "submission-1".into(),
+            attachments: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(temporary_turn["command"], "temporary_turn_start");
+        assert_eq!(temporary_turn["submission_id"], "submission-1");
 
         let settings = serde_json::to_value(Request::ThreadSettingsUpdate {
             thread_id: "thread-1".into(),
@@ -548,6 +658,18 @@ mod tests {
         };
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["command"], "pending_message_delete");
+        assert_eq!(json["id"], "bridge-1");
+        assert_eq!(json["thread_id"], "thread-1");
+    }
+
+    #[test]
+    fn pending_message_start_targets_one_thread_entry() {
+        let request = Request::PendingMessageStart {
+            id: "bridge-1".into(),
+            thread_id: "thread-1".into(),
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["command"], "pending_message_start");
         assert_eq!(json["id"], "bridge-1");
         assert_eq!(json["thread_id"], "thread-1");
     }

@@ -39,6 +39,7 @@ struct DemoState {
     effort: String,
     pinned_thread: Option<String>,
     renamed_threads: HashMap<String, String>,
+    worktree_job_polled: bool,
 }
 
 impl DemoState {
@@ -60,6 +61,7 @@ impl DemoState {
             effort: "medium".to_owned(),
             pinned_thread: Some(PRIMARY_THREAD.to_owned()),
             renamed_threads: HashMap::new(),
+            worktree_job_polled: false,
         }
     }
 
@@ -718,7 +720,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 25,
+            "protocol_version": 32,
             "capabilities": {
                 "audio_transcription": {
                     "enabled": true,
@@ -736,7 +738,8 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 "memory": {"peak_rss_bytes": 12_582_912},
                 "session_cache": {"message_entries": 1, "message_capacity": 10, "messages": 42, "rollout_bytes": 48_320, "tool_records": 2, "summary_threads": 2, "activity_entries": 1},
                 "tool_cache": {"threads": 1, "messages": 12, "tool_calls": 2},
-                "project_cache": {"indexed": true}
+                "project_cache": {"indexed": true},
+                "performance": {"capacity": 128, "samples": 0, "summary": [], "recent": []}
             },
             "rollout_store": {"available": true, "codex_home": "/demo/.codex", "read_only": true},
             "selected_thread_id": PRIMARY_THREAD,
@@ -815,11 +818,24 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             json!({
                 "source": "demo_wasm",
                 "tool_source": "demo_wasm",
+                "repair_required": false,
+                "statistics": {
+                    "turns": 2,
+                    "completed_turns": 1,
+                    "cancelled_turns": 0,
+                    "tool_calls": 2,
+                    "total_duration_ms": 42000,
+                    "total_tokens": 12840,
+                    "input_tokens": 11200,
+                    "cached_input_tokens": 7300,
+                    "output_tokens": 1640
+                },
                 "thread": state.thread(thread_id),
                 "messages": messages,
                 "page": {"start": start, "end": end, "total": total, "has_more": start > 0, "before": start}
             })
         }
+        "client_performance" => json!({"recorded": true}),
         "turn_messages" => {
             let Some(turn_id) = request.get("turn_id").and_then(Value::as_str) else {
                 return error("invalid_request", "turn_id must be a string");
@@ -887,6 +903,78 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             };
             let pending = state.pending.remove(index);
             json!({"id": pending.id, "thread_id": pending.thread_id, "text": pending.text, "message_action": pending.action, "queue_deleted": true})
+        }
+        "pending_messages_merge" => {
+            let requested_id = request
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mergeable = state
+                .pending
+                .iter()
+                .filter(|pending| {
+                    pending.thread_id == thread_id
+                        && pending.action == "queue"
+                        && pending.status == "queued"
+                        && pending.attachments.is_empty()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if mergeable.len() < 2 || mergeable.iter().all(|pending| pending.id != requested_id) {
+                return error(
+                    "pending_messages_not_mergeable",
+                    "the demo needs two queued text messages to merge",
+                );
+            }
+            let ids = mergeable
+                .iter()
+                .map(|pending| pending.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            state
+                .pending
+                .retain(|pending| !ids.contains(pending.id.as_str()));
+            let merged_text = mergeable
+                .iter()
+                .map(|pending| pending.text.trim())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let merged_id = format!("demo-merged-{}", state.next_pending);
+            state.next_pending += 1;
+            state.pending.push(PendingMessage {
+                id: merged_id.clone(),
+                thread_id: thread_id.to_owned(),
+                text: merged_text.clone(),
+                action: "queue".to_owned(),
+                status: "queued".to_owned(),
+                polls: 0,
+                attachments: Vec::new(),
+            });
+            json!({"action":"pending_messages_merge", "thread_id":thread_id, "merged_count":mergeable.len(), "message":{"id":merged_id,"text":merged_text}})
+        }
+        "pending_message_start" => {
+            if state.active_thread.is_some() {
+                return error(
+                    "active_turn",
+                    "stop the active demo turn before continuing the queue",
+                );
+            }
+            let requested_id = request
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let Some(index) = state.pending.iter().position(|pending| {
+                pending.id == requested_id
+                    && pending.thread_id == thread_id
+                    && pending.action == "queue"
+            }) else {
+                return error(
+                    "pending_message_not_queued",
+                    "the demo message is no longer queued",
+                );
+            };
+            let pending = state.pending.remove(index);
+            state.start_run(pending);
+            json!({"action": "pending_message_start", "status": "accepted", "pending_id": requested_id, "thread_id": thread_id, "turn_id": "demo-turn-processing"})
         }
         "send" | "steer" => {
             let text = request
@@ -1026,6 +1114,62 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .to_owned();
             json!({"thread_id": thread_id, "model": state.model, "reasoning_effort": state.effort, "backend": "demo_wasm"})
         }
+        "temporary_thread_create" => {
+            let source_thread_id = request
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .unwrap_or(PRIMARY_THREAD);
+            json!({
+                "action": "temporary_thread_create",
+                "source_thread_id": source_thread_id,
+                "thread": {
+                    "id": format!("demo-temporary-{source_thread_id}"),
+                    "ephemeral": true,
+                    "forked_from_id": source_thread_id,
+                },
+                "backend": "demo_wasm",
+            })
+        }
+        "temporary_turn_start" => {
+            let text = request
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if text.trim().is_empty() {
+                return error("invalid_request", "temporary message must contain text");
+            }
+            json!({
+                "action": "temporary_turn_start",
+                "thread_id": thread_id,
+                "turn_id": "demo-temporary-turn",
+                "backend": "demo_wasm",
+                "demo_reply": "This is a simulated answer in an in-memory temporary branch. It is intentionally excluded from the demo session history.",
+            })
+        }
+        "temporary_turn_interrupt" => json!({
+            "action": "temporary_turn_interrupt",
+            "thread_id": thread_id,
+            "turn_id": request.get("turn_id"),
+            "backend": "demo_wasm",
+        }),
+        "thread_create_start" => {
+            state.worktree_job_polled = false;
+            json!({"action":"thread_create_start", "status":"running", "job_id":"demo-worktree-job"})
+        }
+        "thread_create_status" => {
+            if !state.worktree_job_polled {
+                state.worktree_job_polled = true;
+                json!({"action":"thread_create_status", "status":"running", "job_id":"demo-worktree-job", "elapsed_ms":900})
+            } else {
+                json!({
+                    "action":"thread_create",
+                    "project_path":PROJECT_PATH,
+                    "location":"worktree",
+                    "worktree_path":"/demo/worktrees/new-session",
+                    "thread":state.thread(SECONDARY_THREAD)
+                })
+            }
+        }
         "thread_rename" => {
             let name = request
                 .get("name")
@@ -1068,7 +1212,12 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 "the demo messages are already fully loaded",
             )
         }
-        "thread_create" | "thread_archive" | "approve" | "decline" | "host_exec"
+        "thread_create"
+        | "thread_archive"
+        | "thread_repair_ordinals"
+        | "approve"
+        | "decline"
+        | "host_exec"
         | "app_server_rpc" => {
             return error(
                 "demo_limited",
@@ -1156,7 +1305,7 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 25);
+        assert_eq!(response["result"]["protocol_version"], 32);
     }
 
     #[test]
@@ -1337,6 +1486,30 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("follow-up instruction"));
+    }
+
+    #[test]
+    fn queued_text_messages_can_be_merged_in_order() {
+        let mut state = DemoState::new();
+        for (id, text) in [("queue-a", "First request"), ("queue-b", "Second request")] {
+            state.pending.push(PendingMessage {
+                id: id.to_owned(),
+                thread_id: PRIMARY_THREAD.to_owned(),
+                text: text.to_owned(),
+                action: "queue".to_owned(),
+                status: "queued".to_owned(),
+                polls: 0,
+                attachments: Vec::new(),
+            });
+        }
+        let merged = result(dispatch(
+            json!({"command":"pending_messages_merge", "thread_id":PRIMARY_THREAD, "id":"queue-a"}),
+            &mut state,
+        ));
+        assert_eq!(merged["merged_count"], 2);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending[0].text, "First request\n\nSecond request");
+        assert_eq!(state.pending[0].status, "queued");
     }
 
     #[test]

@@ -448,6 +448,133 @@
         color: var(--muted);
         font-size: 14px;
       }
+      .showcase {
+        display: grid;
+        grid-template-columns: 0.82fr 1.18fr;
+        gap: 18px;
+        margin-top: 44px;
+      }
+      .showcase-stack {
+        display: grid;
+        gap: 18px;
+      }
+      .render-card {
+        position: relative;
+        overflow: hidden;
+        min-height: 280px;
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        background:
+          radial-gradient(circle at 85% 0, #dff2ff 0, transparent 38%),
+          linear-gradient(145deg, #fff, #f7f7f3);
+        box-shadow: var(--shadow);
+      }
+      .render-card.dark {
+        background:
+          radial-gradient(circle at 12% 0, #1d5268 0, transparent 38%), #111514;
+        color: #eef5f1;
+        border-color: #303936;
+      }
+      .render-label {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 20px;
+      }
+      .render-label strong {
+        font-size: 17px;
+      }
+      .render-label span {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .dark .render-label span {
+        color: #9ca9a3;
+      }
+      .mobile-render {
+        display: grid;
+        place-items: center;
+        min-height: 578px;
+      }
+      .mobile-render img {
+        display: block;
+        width: min(290px, 88%);
+        border: 7px solid #151716;
+        border-radius: 34px;
+        box-shadow: 0 26px 65px #19242b33;
+      }
+      .task-preview {
+        display: grid;
+        gap: 12px;
+      }
+      .task-preview article {
+        padding: 15px 17px;
+        border-radius: 15px;
+        background: #ffffffd9;
+        box-shadow: 0 8px 25px #2028200b;
+      }
+      .task-preview header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+        font-size: 13px;
+        font-weight: 720;
+      }
+      .task-preview i {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #33a852;
+        box-shadow: 0 0 0 4px #dff5e5;
+      }
+      .task-preview p {
+        margin: 0;
+        color: #565d58;
+        font-size: 12px;
+      }
+      .task-preview small {
+        display: block;
+        margin-top: 8px;
+        color: #929892;
+      }
+      .code-preview {
+        overflow: hidden;
+        border: 1px solid #39433f;
+        border-radius: 17px;
+        background: #191e1c;
+        font:
+          12px/1.65 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          monospace;
+      }
+      .code-preview header {
+        display: flex;
+        justify-content: space-between;
+        padding: 10px 13px;
+        border-bottom: 1px solid #303936;
+        color: #bfc9c4;
+      }
+      .code-preview pre {
+        margin: 0;
+        padding: 15px;
+        color: #c6cec9;
+        white-space: pre-wrap;
+      }
+      .code-preview .add {
+        color: #8fc477;
+      }
+      .code-preview .del {
+        color: #e27b86;
+      }
+      .code-preview .hunk {
+        color: #72acd6;
+      }
       .release {
         display: grid;
         grid-template-columns: 220px 1fr;
@@ -480,6 +607,21 @@
         margin: 0;
         color: var(--muted);
         font-size: 14px;
+      }
+      .release-history {
+        margin-top: 22px;
+        border-top: 1px solid var(--line);
+      }
+      .release-history > a {
+        display: flex;
+        justify-content: space-between;
+        padding: 18px 0;
+        color: var(--muted);
+        font-size: 13px;
+        text-decoration: none;
+      }
+      .release-history > a::after {
+        content: "↗";
       }
       .flow {
         display: grid;
@@ -599,6 +741,66 @@
       .notice code {
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       }
+      .zero-trust {
+        margin-top: 42px;
+        padding: 28px;
+        border: 1px solid #d9e1dd;
+        border-radius: 26px;
+        background:
+          radial-gradient(circle at 18% 0, #e4f4ff, transparent 35%),
+          radial-gradient(circle at 90% 100%, #e7f5e9, transparent 34%), #fff;
+        box-shadow: var(--shadow);
+      }
+      .architecture-flow {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr auto 1.3fr;
+        align-items: center;
+        gap: 13px;
+      }
+      .architecture-node {
+        min-height: 126px;
+        padding: 18px;
+        border: 1px solid #dfe5e1;
+        border-radius: 18px;
+        background: #ffffffd9;
+      }
+      .architecture-node.edge {
+        border-color: #c8dbf3;
+        background: #f1f7ff;
+      }
+      .architecture-node.home {
+        border-color: #cce3d1;
+        background: #f2faf4;
+      }
+      .architecture-node small {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 750;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .architecture-node strong {
+        display: block;
+        margin-bottom: 6px;
+      }
+      .architecture-node p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .architecture-link {
+        color: #8b9690;
+        text-align: center;
+        font-size: 20px;
+      }
+      .architecture-link span {
+        display: block;
+        margin-top: 3px;
+        font-size: 9px;
+        white-space: nowrap;
+      }
       .final {
         text-align: center;
         padding: 105px 0;
@@ -639,6 +841,9 @@
         .grid {
           grid-template-columns: 1fr 1fr;
         }
+        .showcase {
+          grid-template-columns: 1fr;
+        }
         .flow {
           grid-template-columns: 1fr;
         }
@@ -652,6 +857,16 @@
         }
         .safety {
           grid-template-columns: 1fr;
+        }
+        .architecture-flow {
+          grid-template-columns: 1fr;
+        }
+        .architecture-link {
+          transform: rotate(90deg);
+          height: 28px;
+        }
+        .architecture-link span {
+          display: none;
         }
       }
       @media (max-width: 560px) {
@@ -704,6 +919,13 @@
         }
         .release-list {
           grid-template-columns: 1fr;
+        }
+        .mobile-render {
+          min-height: 510px;
+        }
+        .render-card {
+          padding: 18px;
+          border-radius: 20px;
         }
         .section {
           padding: 72px 0;
@@ -888,95 +1110,171 @@
         </div>
       </section>
 
+      <section class="wrap section" id="product">
+        <div class="kicker">
+          <span class="zh">产品界面</span
+          ><span class="en">Product experience</span>
+        </div>
+        <h2 class="zh">在手机上控制，在大屏上掌握全局。</h2>
+        <h2 class="en">
+          Control from mobile. See the whole system on desktop.
+        </h2>
+        <p class="section-intro zh">
+          同一套响应式界面覆盖会话、并行任务、结构化工具和
+          Diff；移动端保持紧凑，桌面端展开导航与工具区。
+        </p>
+        <p class="section-intro en">
+          One responsive interface covers conversations, parallel tasks,
+          structured tools, and diffs—compact on mobile and fully expanded on
+          desktop.
+        </p>
+        <div class="showcase">
+          <article class="render-card mobile-render">
+            <div class="render-label">
+              <strong
+                ><span class="zh">随时跟进任务</span
+                ><span class="en">Steer work anywhere</span></strong
+              >
+              <span>Mobile Web UI</span>
+            </div>
+            <img
+              src="assets/codex-bridge-mobile.jpg"
+              alt="Codex App Server WebUI mobile conversation with tools, diff summary, and composer"
+            />
+          </article>
+          <div class="showcase-stack">
+            <article class="render-card">
+              <div class="render-label">
+                <strong
+                  ><span class="zh">并行任务视角</span
+                  ><span class="en">Parallel task overview</span></strong
+                >
+                <span>Live activity</span>
+              </div>
+              <div class="task-preview">
+                <article>
+                  <header>
+                    <i></i> Large-session performance <span>↗</span>
+                  </header>
+                  <p>
+                    Profile first paint and keep only visible completed turns
+                    hydrated.
+                  </p>
+                  <small>Running · inspecting message cache</small>
+                </article>
+                <article>
+                  <header><i></i> Responsive composer <span>↗</span></header>
+                  <p>
+                    Mobile and desktop now share one layout and focus model.
+                  </p>
+                  <small>Completed · 3 tools · 2 files</small>
+                </article>
+                <article>
+                  <header><i></i> Release validation <span>↗</span></header>
+                  <p>
+                    Demo WASM, Vite assets, and the Rust workspace are verified
+                    together.
+                  </p>
+                  <small>Running · cargo test --workspace</small>
+                </article>
+              </div>
+            </article>
+            <article class="render-card dark">
+              <div class="render-label">
+                <strong
+                  ><span class="zh">工具与 Diff 原生渲染</span
+                  ><span class="en">Native tools and diffs</span></strong
+                >
+                <span>Structured output</span>
+              </div>
+              <div class="code-preview">
+                <header>
+                  <span>Edited · web-ui/src/main.js</span
+                  ><span class="add">+17</span>
+                </header>
+                <pre><span class="hunk">@@ viewport anchor @@</span>
+<span class="del">- scrollTo(previousTop)</span>
+<span class="add">+ preserveMessageAnchor()</span>
+<span class="add">+ requestAnimationFrame(stickToBottom)</span></pre>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
       <section class="wrap section" id="releases">
         <div class="kicker">
           <span class="zh">版本记录</span><span class="en">Release notes</span>
         </div>
-        <h2 class="zh">从远程控制到完整会话工作流。</h2>
-        <h2 class="en">From remote control to a complete session workflow.</h2>
+        <h2 class="zh">最近版本，聚焦三件事。</h2>
+        <h2 class="en">Recent releases, focused on three outcomes.</h2>
         <p class="section-intro zh">
-          v0.2.8 让超大会话保持快速，并把消息交接、运行状态与 Desktop
-          兼容链路变成可验证的完整流程。
+          更快的长会话、可信的远程控制，以及可观察的常驻服务。完整工程细节保留在
+          release notes 中。
         </p>
         <p class="section-intro en">
-          v0.2.8 keeps very large sessions responsive and makes message handoff,
-          runtime health, and Desktop compatibility observable.
+          Faster long histories, trustworthy remote control, and an observable
+          always-on service. Engineering details remain in the full release
+          notes.
         </p>
         <div class="release">
           <div class="release-date">
-            2026-09-10
-            <span class="zh">v0.2.8 正式版</span
-            ><span class="en">v0.2.8 release</span>
+            2026-09-11
+            <span class="zh">v0.2.9 正式版</span
+            ><span class="en">v0.2.9 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">按视口加载超大会话</span
-                ><span class="en">Viewport-driven large sessions</span>
+                <span class="zh">远程任务可靠衔接</span
+                ><span class="en">Reliable remote handoff</span>
               </h3>
               <p class="zh">
-                首屏只加载即将可见的已完成
-                turn，统一观察器、单请求并发和频率限制
-                避免滚动时集中请求；新增超过 20 MiB 的性能基线。
+                Queue
+                合并、权威缓冲状态和显式序号修复，让远程提交、撤回与维护操作保持一致。
               </p>
               <p class="en">
-                Completed turns hydrate only near the viewport, with one
-                observer, bounded concurrency, and a regression baseline above
-                20 MiB.
+                Queue merging, authoritative pending state, and explicit ordinal
+                repair keep remote submission and maintenance consistent.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">原子化消息交接</span
-                ><span class="en">Atomic message handoff</span>
+                <span class="zh">实时视图保持稳定</span
+                ><span class="en">A stable live session</span>
               </h3>
               <p class="zh">
-                Queue 与跟进会保留稳定提交 ID；只有 app-server
-                历史中的对应用户消息 真正渲染后，视觉缓冲区才会清除。
+                工具增量更新保留视口位置和输入焦点；有界解析与缓存继续加速长会话。
               </p>
               <p class="en">
-                Queue and Steer retain stable submission identities and leave
-                the outbox only after authoritative history is rendered.
+                Incremental tools preserve viewport position and composer focus;
+                bounded parsing and caches keep long histories responsive.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">运行与缓存状态</span
-                ><span class="en">Runtime and cache health</span>
+                <span class="zh">更清晰的自托管产品页</span
+                ><span class="en">Clearer self-hosting</span>
               </h3>
               <p class="zh">
-                紧凑架构面板区分浏览器录音能力和服务端转写状态，并展示进程内存、
-                会话 LRU 与工具/项目缓存；完成 turn 同行展示 token 用量。
+                真实移动界面、并行 Tasks、结构化 Diff 与 Cloudflare Zero Trust
+                架构集中呈现。
               </p>
               <p class="en">
-                The compact architecture panel separates browser recording
-                capability from transcription readiness and reports memory,
-                session LRU, and cache usage.
-              </p>
-            </article>
-            <article class="release-item">
-              <h3>
-                <span class="zh">大响应 Desktop 兼容链路</span
-                ><span class="en">Large Desktop compatibility responses</span>
-              </h3>
-              <p class="zh">
-                双向 WebSocket 帧与消息上限提升到 64 MiB，并加入超过 16 MiB
-                的回归测试；该链路仍明确定位为会话恢复兼容层。
-              </p>
-              <p class="en">
-                Both WebSocket legs now accept 64 MiB frames and messages,
-                backed by bidirectional regression coverage above 16 MiB.
+                Real mobile UI, parallel Tasks, structured diffs, and a
+                Cloudflare Zero Trust architecture explain the complete setup.
               </p>
             </article>
           </div>
         </div>
-        <div class="release">
-          <div class="release-date">
-            2026-09-10
-            <span class="zh">v0.2.7 正式版</span
-            ><span class="en">v0.2.7 release</span>
-          </div>
-          <div class="release-list">
+        <div class="release-history">
+          <a href="releases/v0.2.7.md">
+            <span
+              ><span class="zh">查看完整版本记录</span
+              ><span class="en">Read the complete release history</span></span
+            >
+          </a>
+          <div class="release-list" hidden>
             <article class="release-item">
               <h3>
                 <span class="zh">Queue / 跟进最终一致</span
@@ -1144,39 +1442,71 @@
       </section>
 
       <section class="section white">
-        <div class="wrap safety">
-          <div>
-            <div class="kicker">
-              <span class="zh">安全</span><span class="en">Security</span>
-            </div>
-            <h2 class="zh">环回监听，经过认证后再远程访问。</h2>
-            <h2 class="en">Listen on loopback. Authenticate remote access.</h2>
-            <p class="section-intro zh">
-              Web UI 默认使用 Basic Auth 和七天有效的 HttpOnly 会话。部署在 NAS
-              或 Homelab 时，建议保持环回监听，并通过 Cloudflare Access、VPN
-              或同机 HTTPS 反向代理提供远程入口。
-            </p>
-            <p class="section-intro en">
-              Basic Auth normally bootstraps a seven-day HttpOnly browser
-              session. On a NAS or homelab, keep the listener on loopback and
-              publish it through Cloudflare Access, a VPN, or an authenticated
-              same-host HTTPS reverse proxy.
-            </p>
+        <div class="wrap">
+          <div class="kicker">
+            <span class="zh">远程访问架构</span
+            ><span class="en">Remote access architecture</span>
           </div>
-          <aside class="notice">
-            <strong
-              ><span class="zh">不要转发公网端口</span
-              ><span class="en">Do not forward the port publicly</span></strong
-            >
-            <p class="zh">
-              不要把 bridge 端口直接暴露到互联网；使用 Cloudflare Tunnel +
-              Access、TLS 反向代理或 VPN。
-            </p>
-            <p class="en">
-              Do not expose the bridge port directly. Use Cloudflare Tunnel +
-              Access, an authenticated TLS reverse proxy, or a VPN.
-            </p>
-          </aside>
+          <h2 class="zh">
+            通过 Cloudflare Zero Trust，把 Codex 安全带到任何设备。
+          </h2>
+          <h2 class="en">
+            Bring Codex to any device through Cloudflare Zero Trust.
+          </h2>
+          <p class="section-intro zh">
+            Bridge 与 app-server 只监听本机环回地址；Cloudflare Tunnel
+            主动建立出站连接，Access 在请求进入家庭网络前完成身份校验。
+          </p>
+          <p class="section-intro en">
+            Bridge and app-server stay on loopback. Cloudflare Tunnel creates
+            the outbound connection, while Access authenticates requests before
+            they reach your homelab.
+          </p>
+          <figure
+            class="zero-trust"
+            aria-label="Cloudflare Zero Trust remote access architecture"
+          >
+            <div class="architecture-flow">
+              <div class="architecture-node">
+                <small
+                  ><span class="zh">任意设备</span
+                  ><span class="en">Any device</span></small
+                >
+                <strong>Browser / PWA</strong>
+                <p>
+                  <span class="zh">手机、平板或桌面浏览器</span
+                  ><span class="en">Phone, tablet, or desktop browser</span>
+                </p>
+              </div>
+              <div class="architecture-link">→<span>HTTPS</span></div>
+              <div class="architecture-node edge">
+                <small>Cloudflare Zero Trust</small>
+                <strong>Access + Tunnel</strong>
+                <p>
+                  <span class="zh">身份策略、TLS 与私有入口</span
+                  ><span class="en"
+                    >Identity policy, TLS, and private ingress</span
+                  >
+                </p>
+              </div>
+              <div class="architecture-link">
+                →<span
+                  ><span class="zh">出站隧道</span
+                  ><span class="en">Outbound tunnel</span></span
+                >
+              </div>
+              <div class="architecture-node home">
+                <small>Homelab / NAS</small>
+                <strong>Web UI → Bridge → app-server</strong>
+                <p>
+                  <span class="zh">环回监听 · 项目文件 · rollout 历史</span
+                  ><span class="en"
+                    >Loopback only · repositories · rollout history</span
+                  >
+                </p>
+              </div>
+            </div>
+          </figure>
         </div>
       </section>
     </main>

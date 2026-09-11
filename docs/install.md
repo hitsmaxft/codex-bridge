@@ -111,13 +111,11 @@ Mode defaults apply only when a path was not set explicitly:
   `~/.codex-bridge/codex-app-server.sock`);
 - `auto` preserves the previous behavior and does not invent an app-server endpoint.
 
-`services.manage_app_server = true` makes the bridge start or adopt and restart the selected
-`codex app-server` process. A healthy app-server stays alive across a bridge shutdown or upgrade;
-the replacement bridge adopts its existing Unix socket and resumes supervision without changing
-the app-server PID. This makes Web UI and bridge-only releases a control-plane hot deployment
-rather than an interruption of active Codex turns. Explicitly disabling management does not stop
-an app-server preserved by the previous bridge; stop that process separately when retirement is
-intentional. `services.desktop_interposition = true` is valid only in `desktop` mode;
+`services.manage_app_server = true` makes the bridge own, stop, start, and restart the selected
+`codex app-server` process. Ownership prevents competing writers and lets an explicit session
+maintenance command stop the writer before an atomic rollout repair. Restarting the bridge also
+restarts its managed app-server, so perform upgrades between active turns. Explicitly disabling
+management leaves externally started app-servers untouched. `services.desktop_interposition = true` is valid only in `desktop` mode;
 it also supervises `ws-unix-bridge` and sets `CODEX_APP_SERVER_WS_URL` in the user's launchd
 environment. In this topology the bridge starts the app-server with:
 
@@ -222,11 +220,10 @@ To restart after editing `config.toml`:
 launchctl kickstart -k "gui/$(id -u)/local.codex-bridge.daemon"
 ```
 
-When upgrading from v0.2.4 or earlier, the bridge can adopt the already-running app-server but
-cannot retrofit its process arguments. Fully quit ChatGPT, identify the process that owns
+When upgrading from v0.2.4 or earlier, Bridge may initially detect an app-server left running by
+the previous lifecycle. Fully quit ChatGPT, identify the process that owns
 `~/.codex-bridge/bundled-app-server.sock`, stop that exact process once, and restart the daemon.
-This one-time app-server restart applies the Desktop MCP base configuration; later bridge-only
-upgrades can preserve and adopt the corrected process normally.
+This one-time restart transfers lifecycle ownership and applies the Desktop MCP base configuration.
 
 After relaunching ChatGPT, open an existing thread directly in Desktop before opening it in the Web
 UI. A successful direct resume is the acceptance check for the incremental MCP configuration;

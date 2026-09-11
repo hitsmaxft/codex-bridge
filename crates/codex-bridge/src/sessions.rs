@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
 
@@ -16,6 +16,7 @@ const GIT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
 const GIT_BRANCH_PARALLELISM: usize = 16;
 const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(3);
 const MESSAGE_CACHE_ENTRIES: usize = 10;
+const BACKGROUND_COLD_WARM_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 type GitBranchCache = Arc<Mutex<HashMap<PathBuf, (Instant, Option<String>)>>>;
 
@@ -37,6 +38,9 @@ struct CachedMessages {
     tool_locations: HashMap<String, (usize, usize, usize)>,
     tool_records: HashMap<String, ToolRecordLocation>,
     pending_turn: PendingTurnMetadata,
+    expected_ordinal: Option<u64>,
+    ordinal_repair_required: bool,
+    statistics: ThreadStatistics,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,6 +63,7 @@ struct RecordLocation {
 
 #[derive(Debug, Deserialize)]
 struct RawRolloutRecord<'a> {
+    ordinal: Option<u64>,
     #[serde(rename = "type")]
     record_type: &'a str,
     #[serde(borrow)]
@@ -86,6 +91,7 @@ pub struct SessionStore {
     summary_cache: Arc<Mutex<Option<SummaryCache>>>,
     ephemeral_threads: Arc<Mutex<HashMap<String, ThreadSummary>>>,
     message_cache: Arc<Mutex<HashMap<PathBuf, CachedMessages>>>,
+    message_load_locks: Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
     activity_cache: Arc<Mutex<HashMap<PathBuf, CachedActivity>>>,
 }
 
@@ -294,6 +300,35 @@ pub struct MessagePage {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageReadProfile {
+    pub cache: &'static str,
+    pub rollout_bytes: u64,
+    pub ordinal_repair_required: bool,
+    pub statistics: ThreadStatistics,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadStatistics {
+    pub turns: u64,
+    pub completed_turns: u64,
+    pub cancelled_turns: u64,
+    pub tool_calls: u64,
+    pub total_duration_ms: u64,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolloutOrdinalRepair {
+    pub scanned_files: usize,
+    pub repaired_files: usize,
+    pub renumbered_records: usize,
+    pub backups: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadActivity {
     pub file_len: u64,
@@ -330,6 +365,7 @@ impl SessionStore {
             summary_cache: Arc::new(Mutex::new(None)),
             ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
             message_cache: Arc::new(Mutex::new(HashMap::new())),
+            message_load_locks: Arc::new(Mutex::new(HashMap::new())),
             activity_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -340,6 +376,39 @@ impl SessionStore {
 
     pub fn is_available(&self) -> bool {
         self.codex_home.join("sessions").is_dir()
+    }
+
+    /// Validate and repair one session while its app-server writer is stopped by the caller.
+    pub fn repair_thread_ordinals(&self, thread_id: &str) -> Result<RolloutOrdinalRepair> {
+        let thread = self
+            .find_thread(thread_id)?
+            .with_context(|| format!("thread {thread_id} was not found"))?;
+        if thread.rollout_path.as_os_str().is_empty() {
+            return Ok(RolloutOrdinalRepair {
+                scanned_files: 1,
+                ..RolloutOrdinalRepair::default()
+            });
+        }
+        let Some(mismatch) = first_ordinal_mismatch(&thread.rollout_path)? else {
+            return Ok(RolloutOrdinalRepair {
+                scanned_files: 1,
+                ..RolloutOrdinalRepair::default()
+            });
+        };
+        let repaired = repair_rollout_ordinal_file(&thread.rollout_path, mismatch)?;
+        self.invalidate_summary_cache();
+        if let Ok(mut cache) = self.message_cache.lock() {
+            cache.remove(&thread.rollout_path);
+        }
+        if let Ok(mut cache) = self.activity_cache.lock() {
+            cache.remove(&thread.rollout_path);
+        }
+        Ok(RolloutOrdinalRepair {
+            scanned_files: 1,
+            repaired_files: 1,
+            renumbered_records: repaired.renumbered_records,
+            backups: vec![repaired.backup],
+        })
     }
 
     pub fn invalidate_summary_cache(&self) {
@@ -490,6 +559,18 @@ impl SessionStore {
             entry.thread_count += 1;
             entry.archived_count += usize::from(thread.archived);
             entry.updated_at_ms = entry.updated_at_ms.max(thread.updated_at_ms);
+        }
+        if project_index.is_some() {
+            projects
+                .entry(PathBuf::from(CHATS_PROJECT_PATH))
+                .or_insert_with(|| ProjectSummary {
+                    name: "Chats".to_owned(),
+                    path: PathBuf::from(CHATS_PROJECT_PATH),
+                    kind: ProjectKind::Chats,
+                    thread_count: 0,
+                    archived_count: 0,
+                    updated_at_ms: 0,
+                });
         }
         let mut projects = projects.into_values().collect::<Vec<_>>();
         projects.sort_by(|left, right| {
@@ -668,6 +749,17 @@ impl SessionStore {
         before: Option<usize>,
         limit: usize,
     ) -> Result<Option<(ThreadSummary, MessagePage)>> {
+        Ok(self
+            .read_message_page_profiled(thread_id, before, limit)?
+            .map(|(thread, page, _)| (thread, page)))
+    }
+
+    pub fn read_message_page_profiled(
+        &self,
+        thread_id: &str,
+        before: Option<usize>,
+        limit: usize,
+    ) -> Result<Option<(ThreadSummary, MessagePage, MessageReadProfile)>> {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
@@ -681,9 +773,15 @@ impl SessionStore {
                     total: 0,
                     has_more: false,
                 },
+                MessageReadProfile {
+                    cache: "empty",
+                    rollout_bytes: 0,
+                    ordinal_repair_required: false,
+                    statistics: ThreadStatistics::default(),
+                },
             )));
         }
-        let messages = self.messages_for_path(&summary.rollout_path)?;
+        let (messages, profile) = self.messages_for_path_profiled(&summary.rollout_path)?;
         let total = messages.len();
         let end = before.unwrap_or(total).min(total);
         let start = end.saturating_sub(limit);
@@ -696,7 +794,39 @@ impl SessionStore {
                 total,
                 has_more: start > 0,
             },
+            profile,
         )))
+    }
+
+    pub fn message_cache_mode(&self, thread_id: &str) -> Result<(&'static str, u64)> {
+        let Some(summary) = self.find_thread(thread_id)? else {
+            return Ok(("missing", 0));
+        };
+        if summary.rollout_path.as_os_str().is_empty() {
+            return Ok(("empty", 0));
+        }
+        let metadata = fs::metadata(&summary.rollout_path)
+            .with_context(|| format!("failed to inspect {}", summary.rollout_path.display()))?;
+        let file_len = metadata.len();
+        let modified = metadata.modified().ok();
+        let identity = file_identity(&metadata);
+        let mode = self
+            .message_cache
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache.get(&summary.rollout_path).map(|entry| {
+                    if entry.modified == modified && entry.file_len == file_len {
+                        "memory_hit"
+                    } else if entry.file_identity == identity && file_len > entry.file_len {
+                        "incremental"
+                    } else {
+                        "cold"
+                    }
+                })
+            })
+            .unwrap_or("cold");
+        Ok((mode, file_len))
     }
 
     pub fn read_message_content(
@@ -801,6 +931,10 @@ impl SessionStore {
         if summary.rollout_path.as_os_str().is_empty() {
             return Ok(true);
         }
+        let (mode, rollout_bytes) = self.message_cache_mode(thread_id)?;
+        if mode == "cold" && rollout_bytes > BACKGROUND_COLD_WARM_MAX_BYTES {
+            return Ok(false);
+        }
         self.messages_for_path(&summary.rollout_path)?;
         Ok(true)
     }
@@ -846,33 +980,91 @@ impl SessionStore {
     }
 
     fn messages_for_path(&self, path: &Path) -> Result<Arc<Vec<ThreadMessage>>> {
+        Ok(self.messages_for_path_profiled(path)?.0)
+    }
+
+    fn messages_for_path_profiled(
+        &self,
+        path: &Path,
+    ) -> Result<(Arc<Vec<ThreadMessage>>, MessageReadProfile)> {
+        let load_lock = {
+            let mut locks = self
+                .message_load_locks
+                .lock()
+                .map_err(|_| anyhow!("message load lock registry is poisoned"))?;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _load_guard = load_lock
+            .lock()
+            .map_err(|_| anyhow!("message load lock is poisoned"))?;
         let metadata =
             fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
         let modified = metadata.modified().ok();
         let file_len = metadata.len();
         let file_identity = file_identity(&metadata);
-        if let Ok(mut cache) = self.message_cache.lock() {
+        let incremental = if let Ok(mut cache) = self.message_cache.lock() {
             if let Some(entry) = cache.get_mut(path) {
                 if entry.modified == modified && entry.file_len == file_len {
                     entry.used_at = Instant::now();
-                    return Ok(entry.messages.clone());
+                    return Ok((
+                        entry.messages.clone(),
+                        MessageReadProfile {
+                            cache: "memory_hit",
+                            rollout_bytes: file_len,
+                            ordinal_repair_required: entry.ordinal_repair_required,
+                            statistics: entry.statistics,
+                        },
+                    ));
                 }
                 if entry.file_identity == file_identity && file_len > entry.file_len {
-                    entry.processed_len = read_rollout_messages_from(
-                        path,
-                        entry.processed_len,
-                        Arc::make_mut(&mut entry.messages),
-                        &mut entry.seen_ids,
-                        &mut entry.tool_locations,
-                        &mut entry.tool_records,
-                        &mut entry.pending_turn,
-                    )?;
-                    entry.modified = modified;
-                    entry.file_len = file_len;
-                    entry.used_at = Instant::now();
-                    return Ok(entry.messages.clone());
+                    cache.remove(path)
+                } else {
+                    cache.remove(path);
+                    None
                 }
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if let Some(mut entry) = incremental {
+            entry.processed_len = read_rollout_messages_from(
+                path,
+                entry.processed_len,
+                Arc::make_mut(&mut entry.messages),
+                &mut entry.seen_ids,
+                &mut entry.tool_locations,
+                &mut entry.tool_records,
+                &mut entry.pending_turn,
+                &mut entry.expected_ordinal,
+                &mut entry.ordinal_repair_required,
+                &mut entry.statistics,
+            )?;
+            entry.modified = modified;
+            entry.file_len = file_len;
+            entry.used_at = Instant::now();
+            let messages = entry.messages.clone();
+            let ordinal_repair_required = entry.ordinal_repair_required;
+            let statistics = entry.statistics;
+            self.insert_message_cache(path, entry);
+            return Ok((
+                messages,
+                MessageReadProfile {
+                    cache: "incremental",
+                    rollout_bytes: file_len,
+                    ordinal_repair_required,
+                    statistics,
+                },
+            ));
         }
 
         let mut messages = Vec::new();
@@ -880,6 +1072,9 @@ impl SessionStore {
         let mut tool_locations = HashMap::new();
         let mut tool_records = HashMap::new();
         let mut pending_turn = PendingTurnMetadata::default();
+        let mut expected_ordinal = None;
+        let mut ordinal_repair_required = false;
+        let mut statistics = ThreadStatistics::default();
         let processed_len = read_rollout_messages_from(
             path,
             0,
@@ -888,8 +1083,41 @@ impl SessionStore {
             &mut tool_locations,
             &mut tool_records,
             &mut pending_turn,
+            &mut expected_ordinal,
+            &mut ordinal_repair_required,
+            &mut statistics,
         )?;
         let messages = Arc::new(messages);
+        self.insert_message_cache(
+            path,
+            CachedMessages {
+                modified,
+                file_len,
+                processed_len,
+                file_identity,
+                used_at: Instant::now(),
+                messages: messages.clone(),
+                seen_ids,
+                tool_locations,
+                tool_records,
+                pending_turn,
+                expected_ordinal,
+                ordinal_repair_required,
+                statistics,
+            },
+        );
+        Ok((
+            messages,
+            MessageReadProfile {
+                cache: "cold",
+                rollout_bytes: file_len,
+                ordinal_repair_required,
+                statistics,
+            },
+        ))
+    }
+
+    fn insert_message_cache(&self, path: &Path, entry: CachedMessages) {
         if let Ok(mut cache) = self.message_cache.lock() {
             if cache.len() >= MESSAGE_CACHE_ENTRIES && !cache.contains_key(path) {
                 let oldest = cache
@@ -900,23 +1128,8 @@ impl SessionStore {
                     cache.remove(&oldest);
                 }
             }
-            cache.insert(
-                path.to_path_buf(),
-                CachedMessages {
-                    modified,
-                    file_len,
-                    processed_len,
-                    file_identity,
-                    used_at: Instant::now(),
-                    messages: messages.clone(),
-                    seen_ids,
-                    tool_locations,
-                    tool_records,
-                    pending_turn,
-                },
-            );
+            cache.insert(path.to_path_buf(), entry);
         }
-        Ok(messages)
     }
 
     fn hydrated_messages_for_path(&self, path: &Path) -> Result<Vec<ThreadMessage>> {
@@ -1127,6 +1340,146 @@ fn collect_rollout_files(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct OrdinalRecord {
+    ordinal: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrdinalMismatch {
+    line: usize,
+    first: u64,
+}
+
+struct RepairedOrdinalFile {
+    renumbered_records: usize,
+    backup: PathBuf,
+}
+
+fn first_ordinal_mismatch(path: &Path) -> Result<Option<OrdinalMismatch>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut first = None;
+    let mut expected = None;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line_number = index + 1;
+        let line = line.with_context(|| {
+            format!("failed to read line {line_number} from {}", path.display())
+        })?;
+        let record: OrdinalRecord = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "invalid rollout record at {}:{line_number}; refusing automatic repair",
+                path.display()
+            )
+        })?;
+        let base = *first.get_or_insert(record.ordinal);
+        if let Some(wanted) = expected {
+            if record.ordinal != wanted {
+                return Ok(Some(OrdinalMismatch {
+                    line: line_number,
+                    first: base,
+                }));
+            }
+        }
+        expected = Some(
+            record
+                .ordinal
+                .checked_add(1)
+                .context("rollout ordinal overflow")?,
+        );
+    }
+    Ok(None)
+}
+
+fn repair_rollout_ordinal_file(
+    path: &Path,
+    mismatch: OrdinalMismatch,
+) -> Result<RepairedOrdinalFile> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("rollout path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("rollout filename is not UTF-8")?;
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let temporary = parent.join(format!(".{file_name}.ordinal-repair-{suffix}.tmp"));
+    let backup = parent.join(format!(".{file_name}.ordinal-repair-{suffix}.bak"));
+    let input = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let permissions = input
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?
+        .permissions();
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    fs::set_permissions(&temporary, permissions)
+        .with_context(|| format!("failed to set permissions on {}", temporary.display()))?;
+    let result = (|| -> Result<usize> {
+        let mut writer = BufWriter::new(output);
+        let mut renumbered = 0;
+        for (index, line) in BufReader::new(input).lines().enumerate() {
+            let line_number = index + 1;
+            let line = line.with_context(|| {
+                format!("failed to read line {line_number} from {}", path.display())
+            })?;
+            let mut record: Value = serde_json::from_str(&line).with_context(|| {
+                format!("invalid rollout record at {}:{line_number}", path.display())
+            })?;
+            if line_number >= mismatch.line {
+                let ordinal = mismatch
+                    .first
+                    .checked_add(u64::try_from(index).context("rollout has too many records")?)
+                    .context("rollout ordinal overflow")?;
+                record["ordinal"] = Value::from(ordinal);
+                renumbered += 1;
+            }
+            serde_json::to_writer(&mut writer, &record)
+                .context("failed to encode repaired rollout record")?;
+            writer
+                .write_all(b"\n")
+                .context("failed to write repaired rollout")?;
+        }
+        writer.flush().context("failed to flush repaired rollout")?;
+        writer
+            .into_inner()
+            .map_err(|error| error.into_error())
+            .context("failed to finish repaired rollout")?
+            .sync_all()
+            .context("failed to sync repaired rollout")?;
+        Ok(renumbered)
+    })();
+    let renumbered_records = match result {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    fs::hard_link(path, &backup)
+        .with_context(|| format!("failed to preserve rollout backup {}", backup.display()))?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&backup);
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync rollout directory {}", parent.display()))?;
+    Ok(RepairedOrdinalFile {
+        renumbered_records,
+        backup,
+    })
+}
+
 fn read_rollout_summary(
     path: &Path,
     archived: bool,
@@ -1321,6 +1674,9 @@ fn read_rollout_messages_from(
     tool_locations: &mut HashMap<String, (usize, usize, usize)>,
     tool_records: &mut HashMap<String, ToolRecordLocation>,
     pending_turn: &mut PendingTurnMetadata,
+    expected_ordinal: &mut Option<u64>,
+    ordinal_repair_required: &mut bool,
+    statistics: &mut ThreadStatistics,
 ) -> Result<u64> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -1341,9 +1697,15 @@ fn read_rollout_messages_from(
         let Ok(envelope) = serde_json::from_slice::<RawRolloutRecord<'_>>(&line) else {
             continue;
         };
+        if let Some(ordinal) = envelope.ordinal {
+            if expected_ordinal.is_some_and(|expected| expected != ordinal) {
+                *ordinal_repair_required = true;
+            }
+            *expected_ordinal = ordinal.checked_add(1);
+        }
         if envelope.record_type == "event_msg" {
             if let Ok(record) = serde_json::from_slice::<Value>(&line) {
-                update_turn_metadata(&record, messages, pending_turn);
+                update_turn_metadata(&record, messages, pending_turn, statistics);
             }
             continue;
         }
@@ -1381,6 +1743,9 @@ fn read_rollout_messages_from(
         ) {
             continue;
         }
+        if matches!(header.payload_type, "custom_tool_call" | "function_call") {
+            statistics.tool_calls = statistics.tool_calls.saturating_add(1);
+        }
         let Ok(record) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
@@ -1393,10 +1758,12 @@ fn update_turn_metadata(
     record: &Value,
     messages: &mut Vec<ThreadMessage>,
     pending: &mut PendingTurnMetadata,
+    statistics: &mut ThreadStatistics,
 ) {
     let payload = &record["payload"];
     match payload.get("type").and_then(Value::as_str) {
         Some("task_started") => {
+            statistics.turns = statistics.turns.saturating_add(1);
             pending.message_start = messages.len();
             pending.turn_id = string_field(payload, "turn_id");
             pending.usage = None;
@@ -1407,9 +1774,44 @@ fn update_turn_metadata(
             }
         }
         Some("task_complete" | "turn_aborted") => {
+            if payload.get("type").and_then(Value::as_str) == Some("task_complete") {
+                statistics.completed_turns = statistics.completed_turns.saturating_add(1);
+            } else {
+                statistics.cancelled_turns = statistics.cancelled_turns.saturating_add(1);
+            }
+            statistics.total_duration_ms = statistics.total_duration_ms.saturating_add(
+                payload
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
             let Some(usage) = pending.usage.take() else {
                 return;
             };
+            statistics.total_tokens = statistics.total_tokens.saturating_add(
+                usage
+                    .get("total_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+            statistics.input_tokens = statistics.input_tokens.saturating_add(
+                usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+            statistics.cached_input_tokens = statistics.cached_input_tokens.saturating_add(
+                usage
+                    .get("cached_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+            statistics.output_tokens = statistics.output_tokens.saturating_add(
+                usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
             let marker = json!({
                 "type": "codex_bridge_turn_usage",
                 "total_tokens": usage.get("total_tokens").and_then(Value::as_u64),
@@ -1621,20 +2023,15 @@ fn normalize_tool_input(name: &str, mut input: Value) -> Value {
         }
         return input;
     }
-    if !matches!(name, "exec" | "exec_command") {
-        return input;
-    }
 
-    // Some transports serialize exec_command's argument object into a JSON
-    // string and then wrap it in `{ "request": "..." }`. Unwrap a bounded
-    // number of layers so the UI receives the same canonical command shape as
-    // native app-server commandExecution items.
+    // Rollout and WebSocket transports can serialize any tool's argument
+    // object into a JSON string, and the bridge transport may wrap that string
+    // in `{ "request": "..." }`. Normalize those representations before
+    // deriving previews so historical and live tools expose the same fields.
     for _ in 0..2 {
         let encoded = match &input {
             Value::String(encoded) => Some(encoded.as_str()),
-            Value::Object(fields)
-                if !fields.contains_key("command") && !fields.contains_key("cmd") =>
-            {
+            Value::Object(fields) if fields.len() == 1 => {
                 fields.get("request").and_then(Value::as_str)
             }
             _ => None,
@@ -1646,6 +2043,10 @@ fn normalize_tool_input(name: &str, mut input: Value) -> Value {
             break;
         };
         input = parsed;
+    }
+
+    if !matches!(name, "exec" | "exec_command") {
+        return input;
     }
 
     let Value::Object(mut fields) = input else {
@@ -1688,15 +2089,33 @@ fn parse_wrapped_tool_calls(
             "exec_command" => "exec_command",
             other => other,
         };
+        let decoded_argument = serde_json::from_str::<Value>(argument).ok();
         let input = match name {
-            "exec_command" => js_string_field(argument, "cmd")
-                .map(|command| serde_json::json!({"command": command}))
+            "exec_command" => decoded_argument.clone().unwrap_or_else(|| {
+                js_string_field(argument, "cmd")
+                    .map(|command| serde_json::json!({"command": command}))
+                    .unwrap_or_else(|| serde_json::json!({"request": argument.trim()}))
+            }),
+            "web_search" => decoded_argument
+                .clone()
+                .and_then(|decoded| {
+                    let query = decoded
+                        .pointer("/search_query/0/q")
+                        .or_else(|| decoded.get("q"))?
+                        .as_str()?;
+                    Some(serde_json::json!({"query": query, "request": decoded}))
+                })
+                .or_else(|| {
+                    js_string_field(argument, "q").map(
+                        |query| serde_json::json!({"query": query, "request": argument.trim()}),
+                    )
+                })
                 .unwrap_or_else(|| serde_json::json!({"request": argument.trim()})),
-            "web_search" => js_string_field(argument, "q")
-                .map(|query| serde_json::json!({"query": query, "request": argument.trim()}))
-                .unwrap_or_else(|| serde_json::json!({"request": argument.trim()})),
-            _ => serde_json::json!({"request": argument.trim()}),
+            _ => {
+                decoded_argument.unwrap_or_else(|| serde_json::json!({"request": argument.trim()}))
+            }
         };
+        let input = normalize_tool_input(name, input);
         tools.push(ThreadToolCall {
             call_id: format!("{outer_call_id}:{}", tools.len()),
             name: name.to_owned(),
@@ -2046,13 +2465,57 @@ mod tests {
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn repairs_a_duplicate_rollout_ordinal_without_dropping_events() {
+        let fixture = Fixture::new();
+        let path = fixture.write_rollout(
+            "rollout-ordinal.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"thread-ordinal","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:02Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:03Z","ordinal":2,"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let (_, _, profile) = store
+            .read_message_page_profiled("thread-ordinal", None, 30)
+            .unwrap()
+            .unwrap();
+        assert!(profile.ordinal_repair_required);
+        let report = store.repair_thread_ordinals("thread-ordinal").unwrap();
+        assert_eq!(report.repaired_files, 1);
+        assert_eq!(report.renumbered_records, 2);
+        assert_eq!(report.backups.len(), 1);
+        assert!(report.backups[0].exists());
+        let records = BufReader::new(File::open(&path).unwrap())
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["ordinal"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(records[2]["payload"]["type"], "task_started");
+        let (_, _, profile) = store
+            .read_message_page_profiled("thread-ordinal", None, 30)
+            .unwrap()
+            .unwrap();
+        assert!(!profile.ordinal_repair_required);
+    }
+
+    #[test]
     fn completed_turn_attaches_its_final_total_token_usage() {
         let mut messages = Vec::new();
         let mut pending = PendingTurnMetadata::default();
+        let mut statistics = ThreadStatistics::default();
         update_turn_metadata(
             &json!({"payload":{"type":"task_started", "turn_id":"turn-1"}}),
             &mut messages,
             &mut pending,
+            &mut statistics,
         );
         messages.push(ThreadMessage {
             timestamp: None,
@@ -2073,11 +2536,13 @@ mod tests {
             }}}}),
             &mut messages,
             &mut pending,
+            &mut statistics,
         );
         update_turn_metadata(
             &json!({"timestamp":"2026-09-09T00:00:00Z", "payload":{"type":"task_complete", "turn_id":"turn-1"}}),
             &mut messages,
             &mut pending,
+            &mut statistics,
         );
 
         let usage = messages[0].content.last().unwrap();
@@ -2085,6 +2550,9 @@ mod tests {
         assert_eq!(usage["total_tokens"], 1280);
         assert_eq!(usage["cached_input_tokens"], 900);
         assert!(pending.usage.is_none());
+        assert_eq!(statistics.turns, 1);
+        assert_eq!(statistics.completed_turns, 1);
+        assert_eq!(statistics.total_tokens, 1280);
     }
 
     struct Fixture {
@@ -2301,9 +2769,19 @@ mod tests {
         let projects = SessionStore::new(fixture.path.clone())
             .list_projects_with_index(false, Some(&index))
             .unwrap();
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].path, workspace);
-        assert_eq!(projects[0].thread_count, 2);
+        assert_eq!(projects.len(), 2);
+        let project = projects
+            .iter()
+            .find(|project| project.kind == ProjectKind::Project)
+            .unwrap();
+        assert_eq!(project.path, workspace);
+        assert_eq!(project.thread_count, 2);
+        let chats = projects
+            .iter()
+            .find(|project| project.kind == ProjectKind::Chats)
+            .unwrap();
+        assert_eq!(chats.path, Path::new(CHATS_PROJECT_PATH));
+        assert_eq!(chats.thread_count, 0);
     }
 
     #[test]
@@ -2583,6 +3061,10 @@ mod tests {
         );
         let store = SessionStore::new(fixture.path.clone());
         assert_eq!(
+            store.message_cache_mode("thread-incremental").unwrap().0,
+            "cold"
+        );
+        assert_eq!(
             store
                 .read_thread("thread-incremental")
                 .unwrap()
@@ -2591,10 +3073,18 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            store.message_cache_mode("thread-incremental").unwrap().0,
+            "memory_hit"
+        );
 
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(br#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","id":"m2","role":"assistant","content":[{"text":"tw"#).unwrap();
         drop(file);
+        assert_eq!(
+            store.message_cache_mode("thread-incremental").unwrap().0,
+            "incremental"
+        );
         assert_eq!(
             store
                 .read_thread("thread-incremental")
@@ -2615,6 +3105,59 @@ mod tests {
         let cache = store.message_cache.lock().unwrap();
         let cached = cache.get(&path).unwrap();
         assert_eq!(cached.processed_len, fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn concurrent_message_reads_parse_a_session_only_once() {
+        let fixture = Fixture::new();
+        let path = fixture.write_rollout(
+            "rollout-single-flight.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-single-flight","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"m1","role":"user","content":[{"text":"one"}]}}"#,
+            ],
+        );
+        let store = Arc::new(SessionStore::new(fixture.path.clone()));
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let readers = (0..4)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.messages_for_path_profiled(&path).unwrap().1.cache
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let modes = readers
+            .into_iter()
+            .map(|reader| reader.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(modes.iter().filter(|mode| **mode == "cold").count(), 1);
+        assert_eq!(
+            modes.iter().filter(|mode| **mode == "memory_hit").count(),
+            3
+        );
+    }
+
+    #[test]
+    fn background_warming_skips_a_large_cold_rollout() {
+        let fixture = Fixture::new();
+        let path = fixture.write_rollout(
+            "rollout-large-cold.jsonl",
+            &[r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-large-cold","cwd":"/tmp/project"}}"#],
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(BACKGROUND_COLD_WARM_MAX_BYTES + 1)
+            .unwrap();
+        let store = SessionStore::new(fixture.path.clone());
+        assert!(!store.warm_thread_messages("thread-large-cold").unwrap());
+        assert!(store.message_cache.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2834,6 +3377,21 @@ text(await tools.web__run({search_query:[{q:"Codex app-server"}],response_length
         assert_eq!(tools[1].input["query"], "Codex app-server");
         assert_eq!(tools[0].call_id, "call-wrapper:0");
         assert_eq!(tools[1].call_id, "call-wrapper:1");
+    }
+
+    #[test]
+    fn wrapped_exec_command_with_json_keys_is_normalized() {
+        let script = r#"const r = await tools.exec_command({"cmd":"sed -n '1,20p' src/main.rs\nrg -n title src","workdir":"/workspace","yield_time_ms":10000,"max_output_tokens":14000}); text(r.output);"#;
+        let tools = parse_wrapped_tool_calls("call-json-wrapper", "completed", script).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "exec_command");
+        assert_eq!(
+            tools[0].input["command"],
+            "sed -n '1,20p' src/main.rs\nrg -n title src"
+        );
+        assert_eq!(tools[0].input["cwd"], "/workspace");
+        assert_eq!(tools[0].input["yield_time_ms"], 10000);
+        assert!(tools[0].input.get("request").is_none());
     }
 
     #[test]

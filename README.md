@@ -29,49 +29,18 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.2.8 · 2026-09-10
+### v0.2.9 · 2026-09-11
 
-- **Faster large sessions:** viewport-driven hydration keeps first paint bounded and loads completed
-  turn details only as they approach the screen.
-- **Atomic message handoff:** Queue and Steer entries remain visible until the matching authoritative
-  user message is rendered from app-server history.
-- **Observable runtime health:** the compact architecture panel now reports browser audio support,
-  managed voice readiness, process memory, and bounded session/cache usage.
-- **Large Desktop responses:** the compatibility WebSocket accepts up to 64 MiB frames and messages
-  on both legs, with regression coverage above the previous 16 MiB ceiling.
+- **Reliable remote work:** merge queued prompts, keep pending work authoritative, repair damaged
+  rollout sequences explicitly, and preserve composer focus while managing the outbox.
+- **Stable live sessions:** incremental tool updates keep the viewport anchored, while bounded
+  parsing and tool caches retain responsive navigation through large histories; backend-generated
+  run time, turn, tool-call, and token totals stay available in Tools.
+- **Clearer self-hosting:** the redesigned product page shows the real mobile UI, parallel task and
+  diff views, and a Cloudflare Zero Trust deployment architecture.
 
-See the complete [v0.2.8 release notes](docs/releases/v0.2.8.md), the
-[v0.2.7 Queue and Steer release](docs/releases/v0.2.7.md), or the
+See the [latest release notes](docs/releases/v0.2.9.md) or the
 [complete release history](docs/releases/).
-
-### v0.2.7 · 2026-09-10
-
-- **Eventually consistent Queue and Steer:** stable submission identities connect optimistic UI,
-  app-server negotiation, the native queue, and final rollout history without losing repeated
-  follow-ups or clearing their pending state too early.
-- **Event-driven live updates:** app-server WebSocket events drive activity, pending-message, and
-  history reconciliation; bounded polling remains only as a recovery path when the stream drops.
-- **Stable long-session navigation:** recent-message reconciliation keeps global cursor identity,
-  viewport anchoring avoids large jumps, and linked Codex worktrees stay grouped with their
-  repository project without changing their execution directory.
-
-### v0.2.6 · 2026-09-10
-
-- **Compact completed turns:** completed runs collapse intermediate assistant progress and tools
-  while keeping the prompt and final response visible, with an expandable full transcript.
-- **Useful completion metadata:** turn summaries expose duration, the final cumulative token-usage
-  snapshot, and structured memory-citation sources without leaking internal markup into the chat.
-- **Reliable first messages and refresh:** a newly created empty thread starts its first native
-  app-server turn directly, while paginated history stays visible during live updates.
-
-### v0.2.5 · 2026-09-09
-
-- **Desktop direct resume:** managed Desktop app-server startup now seeds the disabled MCP transport
-  base required when Desktop sends only its incremental `enabled_tools` configuration.
-- **Compatible worktrees:** new isolated sessions use `CODEX_HOME/worktrees/<UUID>/<repo>` and stay
-  assigned to their original project in both the Web UI and Desktop.
-- **Hot-deployment boundary:** Bridge-only upgrades still preserve app-server; applying the new
-  process-level MCP base to an app-server started by v0.2.4 requires one intentional restart.
 
 ## Web UI
 
@@ -113,8 +82,8 @@ The app-server executable comes from `ChatGPT.app`. In the installed desktop mod
 `codex-bridge` supervises both that process and the loopback adapter, then publishes
 `CODEX_APP_SERVER_WS_URL` through the user's launchd environment. launchd only has to keep the one
 bridge daemon alive. This transport interposition is local and does not patch or re-sign the app
-bundle. Bridge-only upgrades preserve the healthy app-server process and adopt its Unix socket on
-restart, so active turns do not move to a new app-server PID. The managed Desktop app-server also
+bundle. Bridge owns the managed app-server lifecycle so session maintenance can stop the writer,
+repair a rollout atomically, and restart it without a competing process. The managed Desktop app-server also
 starts with a disabled `mcp_servers.codex_app` base entry; Desktop can then send its incremental
 `enabled_tools` configuration and resume an existing thread directly, without a Web UI preload.
 
@@ -132,6 +101,18 @@ unnecessary.
 
 See [Installation and service setup](docs/install.md) for global Cargo installation, launchd and
 systemd examples, optional Web UI configuration, validation, and rollback.
+
+For remote browser access, keep the service on loopback and place it behind Cloudflare Zero Trust:
+
+```mermaid
+flowchart LR
+    Device[Phone / tablet / desktop] -->|HTTPS| Access[Cloudflare Access]
+    Access --> Tunnel[Cloudflare Tunnel]
+    Tunnel -->|outbound private tunnel| WebUI[Loopback Web UI]
+    WebUI --> Bridge[codex-bridge]
+    Bridge --> AppServer[Codex app-server]
+    Bridge --> Rollouts[(Repositories + rollout history)]
+```
 
 The user-level installers build the embedded frontend, install the required Cargo binaries, write
 `~/.config/codex-bridge/config.toml`, and start the appropriate user services without `sudo`:

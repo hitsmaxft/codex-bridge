@@ -9,6 +9,8 @@ let eventRetryTimer;
 let eventRetryDelay = 500;
 let eventStreamUnavailable = false;
 const eventListeners = new Set();
+const performanceBuckets = new Map();
+let performanceFlush = null;
 const authentication = createAuthenticationGate(async () => {
   if (demoMode) return;
   const response = await fetch("/api/auth", {
@@ -58,6 +60,52 @@ async function sendCommand(request) {
   return response.json();
 }
 
+export function recordPerformance(metric, durationMs, { count = 1, bytes = 0 } = {}) {
+  if (!Number.isFinite(durationMs) || durationMs < 0 || !Number.isSafeInteger(count) || count < 1)
+    return;
+  const bucket = performanceBuckets.get(metric) || {
+    metric,
+    count: 0,
+    total_ms: 0,
+    max_ms: 0,
+    total_bytes: 0,
+  };
+  const rounded = Math.ceil(durationMs);
+  bucket.count += count;
+  bucket.total_ms += rounded;
+  bucket.max_ms = Math.max(bucket.max_ms, rounded);
+  bucket.total_bytes += Number.isFinite(bytes) && bytes > 0 ? Math.ceil(bytes) : 0;
+  performanceBuckets.set(metric, bucket);
+}
+
+export async function flushPerformance() {
+  if (performanceFlush || !performanceBuckets.size) return performanceFlush;
+  const samples = [...performanceBuckets.values()];
+  performanceBuckets.clear();
+  performanceFlush = command({ command: "client_performance", samples }, false)
+    .catch(() => {
+      for (const sample of samples) {
+        const current = performanceBuckets.get(sample.metric);
+        if (!current) performanceBuckets.set(sample.metric, sample);
+        else {
+          current.count += sample.count;
+          current.total_ms += sample.total_ms;
+          current.max_ms = Math.max(current.max_ms, sample.max_ms);
+          current.total_bytes += sample.total_bytes;
+        }
+      }
+    })
+    .finally(() => (performanceFlush = null));
+  return performanceFlush;
+}
+
+if (typeof window !== "undefined") {
+  window.setInterval(() => flushPerformance(), 15_000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPerformance();
+  });
+}
+
 export async function command(request, showResult = true) {
   const data = await sendCommand(request);
   if (showResult) {
@@ -70,13 +118,18 @@ export async function command(request, showResult = true) {
   return data.result;
 }
 
-export function notify(text, bad = false) {
+export function notify(text, bad = false, kind = null) {
   const element = $("toast");
   element.textContent = text;
+  if (kind) element.dataset.kind = kind;
+  else delete element.dataset.kind;
   element.style.borderColor = bad ? "var(--danger)" : "";
   element.classList.add("show");
   clearTimeout(notify.timer);
-  notify.timer = setTimeout(() => element.classList.remove("show"), 2600);
+  notify.timer = setTimeout(
+    () => element.classList.remove("show"),
+    kind === "completion" ? 5200 : 2600,
+  );
 }
 
 export async function run(action) {

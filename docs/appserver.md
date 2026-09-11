@@ -68,6 +68,7 @@ a completed bridge or Web UI feature.
 | `model/list`                                                                         | Populate the model selector.                                                                                                                                                      |
 | `project/list`                                                                       | Resolve a project when starting a new thread.                                                                                                                                     |
 | `thread/start`                                                                       | Create a new session.                                                                                                                                                             |
+| `thread/fork`                                                                        | Create the in-memory branch behind the selected-text temporary conversation panel.                                                                                                |
 | `thread/settings/update`                                                             | Change the selected model and related thread settings.                                                                                                                            |
 | `thread/archive`                                                                     | Archive a session.                                                                                                                                                                |
 | `thread/section/move`                                                                | Move a pinned session into or out of the pinned section.                                                                                                                          |
@@ -75,7 +76,7 @@ a completed bridge or Web UI feature.
 | `turn/steer`                                                                         | Follow up on an active turn.                                                                                                                                                      |
 | `turn/interrupt`                                                                     | Stop an active turn.                                                                                                                                                              |
 | `thread/resume`, `thread/unsubscribe`                                                | Keep a bounded LRU set of recently viewed threads subscribed to events.                                                                                                           |
-| `turn/start`                                                                         | Started by app-server's native queue processing after `thread/queue/add`.                                                                                                         |
+| `turn/start`                                                                         | Started by app-server's native queue processing after `thread/queue/add`, or directly for an isolated temporary conversation.                                                     |
 
 Rollout JSONL files remain the authoritative recovery source for paginated history. The bridge
 parses append-only updates from its last complete-line offset instead of reparsing a growing file
@@ -380,9 +381,9 @@ provides a supported transport handoff.
    experimental.
 3. **Restore and delete** — session rename already uses `thread/name/set`; expose
    `thread/unarchive` and optionally guarded `thread/delete` for the remaining lifecycle actions.
-4. **Fork and history undo** — `thread/fork` and `thread/revert` enable “branch from here” and
-   “forget turns after here.” Make it explicit that history revert does not undo workspace files;
-   do not build new UI on deprecated `thread/rollback`.
+4. **History undo** — selected-text temporary conversations now use an ephemeral `thread/fork`.
+   `thread/revert` can separately provide “forget turns after here.” Make it explicit that history
+   revert does not undo workspace files; do not build new UI on deprecated `thread/rollback`.
 5. **Compaction and goals** — expose manual `thread/compact/start` and goal state from
    `thread/goal/*`, including token budget where useful.
 6. **Remote approvals and questions** — implement the server-request loop for command/file/

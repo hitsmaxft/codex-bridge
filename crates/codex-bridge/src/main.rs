@@ -8,7 +8,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -23,10 +23,11 @@ use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_P
 use base64::Engine as _;
 use clap::{Parser, ValueEnum};
 use codex_bridge::{
-    default_codex_home, default_socket_path, BackendFailure, CodexCliBackend, ComposerAttachment,
-    HostExecFailure, HostExecutor, Request, Response, SessionStore, ThreadMessage,
-    ThreadProjectIndex, ThreadSummary, ThreadToolCall, APP_SERVER_SCHEMA_VERSION,
-    APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
+    default_codex_home, default_socket_path, BackendFailure, ClientPerformanceSample,
+    CodexCliBackend, ComposerAttachment, HostExecFailure, HostExecutor, Request, Response,
+    RolloutOrdinalRepair, SessionStore, ThreadMessage, ThreadProjectIndex, ThreadSummary,
+    ThreadToolCall, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV, CHATS_PROJECT_PATH,
+    CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
@@ -61,6 +62,8 @@ const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
 const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
 const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
+const MAX_PERFORMANCE_EVENTS: usize = 128;
+const MAX_APP_SERVER_TOOL_PAGES: usize = 8;
 #[cfg(test)]
 static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -253,6 +256,7 @@ struct BridgeState {
     pending_messages: Arc<PendingMessages>,
     app_server_tools: Arc<AppServerToolCache>,
     app_server_projects: Arc<AppServerProjectCache>,
+    thread_create_jobs: Arc<ThreadCreateJobs>,
     session_run_states: Arc<SessionRunStates>,
     runtime_mode: RuntimeMode,
     config_path: Option<PathBuf>,
@@ -260,11 +264,129 @@ struct BridgeState {
     desktop_interposition: bool,
     ws_bridge_listen: Option<SocketAddr>,
     managed_app_server_status: Option<watch::Receiver<ManagedProcessStatus>>,
+    managed_app_server_control: Option<ManagedAppServerControl>,
     ws_bridge_status: Option<watch::Receiver<ManagedProcessStatus>>,
     whisper: Option<WhisperRuntimeConfig>,
     whisper_needed: Option<watch::Sender<bool>>,
     whisper_status: Option<watch::Receiver<ManagedProcessStatus>>,
     server_capabilities: Arc<RwLock<Value>>,
+    performance: Arc<PerformanceLog>,
+}
+
+#[derive(Debug, Clone)]
+struct PerformanceEvent {
+    observed_at: Instant,
+    source: &'static str,
+    metric: String,
+    duration_ms: u64,
+    max_ms: u64,
+    count: u32,
+    bytes: u64,
+    cache: Option<&'static str>,
+}
+
+#[derive(Debug, Default)]
+struct PerformanceLog {
+    events: RwLock<VecDeque<PerformanceEvent>>,
+}
+
+impl PerformanceLog {
+    fn record(&self, event: PerformanceEvent) {
+        if let Ok(mut events) = self.events.write() {
+            if events.len() >= MAX_PERFORMANCE_EVENTS {
+                events.pop_front();
+            }
+            events.push_back(event);
+        }
+    }
+
+    fn record_client(&self, samples: Vec<ClientPerformanceSample>) -> Result<()> {
+        if samples.len() > 16 {
+            bail!("client performance report exceeds 16 samples");
+        }
+        for sample in samples {
+            if !matches!(
+                sample.metric.as_str(),
+                "messages_receive" | "messages_render" | "messages_visible"
+            ) || sample.count == 0
+                || sample.count > 10_000
+                || sample.total_ms > 24 * 60 * 60 * 1_000
+                || sample.max_ms > 24 * 60 * 60 * 1_000
+            {
+                bail!("client performance sample is invalid");
+            }
+            self.record(PerformanceEvent {
+                observed_at: Instant::now(),
+                source: "client",
+                metric: sample.metric,
+                duration_ms: sample.total_ms,
+                max_ms: sample.max_ms,
+                count: sample.count,
+                bytes: sample.total_bytes,
+                cache: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Value {
+        let Ok(events) = self.events.read() else {
+            return json!({"capacity": MAX_PERFORMANCE_EVENTS, "samples": 0});
+        };
+        let mut groups = HashMap::<(String, String), (u64, u64, u64, u64)>::new();
+        for event in events.iter() {
+            let aggregate = groups
+                .entry((event.source.to_owned(), event.metric.clone()))
+                .or_default();
+            aggregate.0 = aggregate.0.saturating_add(u64::from(event.count));
+            aggregate.1 = aggregate.1.saturating_add(event.duration_ms);
+            aggregate.2 = aggregate.2.max(event.max_ms);
+            aggregate.3 = aggregate.3.saturating_add(event.bytes);
+        }
+        let mut summary = groups
+            .into_iter()
+            .map(
+                |((source, metric), (count, total_ms, max_ms, total_bytes))| {
+                    json!({
+                        "source": source,
+                        "metric": metric,
+                        "count": count,
+                        "average_ms": (count > 0).then(|| total_ms / count),
+                        "max_ms": max_ms,
+                        "total_bytes": total_bytes,
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        summary.sort_by(|left, right| {
+            left["source"]
+                .as_str()
+                .cmp(&right["source"].as_str())
+                .then_with(|| left["metric"].as_str().cmp(&right["metric"].as_str()))
+        });
+        let recent = events
+            .iter()
+            .rev()
+            .take(16)
+            .map(|event| {
+                json!({
+                    "source": event.source,
+                    "metric": event.metric,
+                    "duration_ms": event.duration_ms,
+                    "count": event.count,
+                    "bytes": event.bytes,
+                    "cache": event.cache,
+                    "age_ms": u64::try_from(event.observed_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "capacity": MAX_PERFORMANCE_EVENTS,
+            "samples": events.len(),
+            "summary": summary,
+            "recent": recent,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -319,11 +441,11 @@ enum FileDownloadFailure {
 #[derive(Debug, Default)]
 struct AppServerToolCache {
     threads: RwLock<HashMap<String, CachedAppServerTools>>,
+    loads: Mutex<HashMap<String, Weak<Mutex<()>>>>,
 }
 
 #[derive(Debug, Clone)]
 struct CachedAppServerTools {
-    refreshed_at: Instant,
     known_message_ids: HashSet<String>,
     tools: HashMap<String, Vec<ThreadToolCall>>,
 }
@@ -331,6 +453,20 @@ struct CachedAppServerTools {
 #[derive(Debug, Default)]
 struct AppServerProjectCache {
     index: RwLock<Option<CachedAppServerProjectIndex>>,
+}
+
+const THREAD_CREATE_JOB_LIMIT: usize = 16;
+const THREAD_CREATE_JOB_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug)]
+struct ThreadCreateJob {
+    created_at: Instant,
+    response: Option<Response>,
+}
+
+#[derive(Debug, Default)]
+struct ThreadCreateJobs {
+    entries: RwLock<HashMap<String, ThreadCreateJob>>,
 }
 
 #[derive(Debug, Clone)]
@@ -516,6 +652,7 @@ struct PendingMessages {
     next_id: AtomicU64,
     entries: RwLock<Vec<PendingMessage>>,
     completed: RwLock<VecDeque<PendingMessage>>,
+    queue_operation: Mutex<()>,
 }
 
 impl PendingMessages {
@@ -819,6 +956,49 @@ fn read_native_queue(
             return Ok(queued);
         }
     }
+}
+
+fn add_native_queue_without_start(
+    write_backend: &CodexCliBackend,
+    thread_id: &str,
+    text: &str,
+    client_id: &str,
+) -> Result<String, BackendFailure> {
+    let result = write_backend.app_server_rpc(
+        "thread/queue/add",
+        json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": text}],
+            "clientUserMessageId": client_id,
+        }),
+    )?;
+    result
+        .pointer("/queuedSubmission/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| BackendFailure {
+            code: "app_server_protocol_error",
+            message: "thread/queue/add response has no queuedSubmission.id".to_owned(),
+        })
+}
+
+fn delete_native_queue(
+    write_backend: &CodexCliBackend,
+    thread_id: &str,
+    queued_submission_id: &str,
+) -> Result<bool, BackendFailure> {
+    Ok(write_backend
+        .app_server_rpc(
+            "thread/queue/delete",
+            json!({
+                "threadId": thread_id,
+                "queuedSubmissionId": queued_submission_id,
+            }),
+        )?
+        .get("deleted")
+        .and_then(Value::as_bool)
+        == Some(true))
 }
 
 fn queue_input_text(input: &Value) -> Option<String> {
@@ -1333,6 +1513,58 @@ struct ManagedProcessStatus {
     last_error: Option<String>,
 }
 
+enum ManagedAppServerCommand {
+    RepairThreadOrdinals {
+        thread_id: String,
+        reply: std::sync::mpsc::SyncSender<Result<RolloutOrdinalRepair, String>>,
+    },
+}
+
+#[derive(Clone)]
+struct ManagedAppServerControl {
+    commands: mpsc::UnboundedSender<ManagedAppServerCommand>,
+}
+
+impl ManagedAppServerControl {
+    fn repair_thread_ordinals(&self, thread_id: String) -> Result<RolloutOrdinalRepair> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .send(ManagedAppServerCommand::RepairThreadOrdinals { thread_id, reply })
+            .map_err(|_| anyhow::anyhow!("managed app-server controller is unavailable"))?;
+        result
+            .recv_timeout(Duration::from_secs(90))
+            .map_err(|_| anyhow::anyhow!("timed out waiting for rollout repair"))?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+fn spawn_managed_app_server(
+    spec: ManagedProcessSpec,
+    shutdown: watch::Receiver<bool>,
+    session_store: Arc<SessionStore>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    watch::Receiver<ManagedProcessStatus>,
+    ManagedAppServerControl,
+) {
+    let (status_tx, status_rx) = watch::channel(ManagedProcessStatus::default());
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(supervise_managed_app_server(
+        spec,
+        shutdown,
+        status_tx,
+        commands_rx,
+        session_store,
+    ));
+    (
+        task,
+        status_rx,
+        ManagedAppServerControl {
+            commands: commands_tx,
+        },
+    )
+}
+
 fn spawn_managed_process(
     spec: ManagedProcessSpec,
     shutdown: watch::Receiver<bool>,
@@ -1470,6 +1702,165 @@ async fn supervise_conditional_managed_process(
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {},
             _ = desired.changed() => {},
+            _ = shutdown.changed() => return,
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+async fn supervise_managed_app_server(
+    spec: ManagedProcessSpec,
+    mut shutdown: watch::Receiver<bool>,
+    status_tx: watch::Sender<ManagedProcessStatus>,
+    mut commands: mpsc::UnboundedReceiver<ManagedAppServerCommand>,
+    session_store: Arc<SessionStore>,
+) {
+    let mut restart_count = 0_u64;
+    let mut backoff = Duration::from_millis(500);
+    let mut pending_reply: Option<(
+        std::sync::mpsc::SyncSender<Result<RolloutOrdinalRepair, String>>,
+        Result<RolloutOrdinalRepair, String>,
+    )> = None;
+    while !*shutdown.borrow() {
+        if let Some(path) = spec.socket_path.as_deref() {
+            match prepare_managed_process_socket(path).await {
+                Ok(ManagedSocketState::Active) => {
+                    status_tx.send_replace(ManagedProcessStatus {
+                        running: true,
+                        restart_count,
+                        last_error: None,
+                    });
+                    eprintln!(
+                        "[codex-bridge] adopted managed {} already listening on {}",
+                        spec.name,
+                        path.display()
+                    );
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                                if !matches!(prepare_managed_process_socket(path).await, Ok(ManagedSocketState::Active)) {
+                                    break;
+                                }
+                            }
+                            Some(ManagedAppServerCommand::RepairThreadOrdinals { reply, .. }) = commands.recv() => {
+                                let _ = reply.send(Err("app-server is active but was not started by this Bridge process; restart Bridge once before repairing".to_owned()));
+                            }
+                            _ = shutdown.changed() => return,
+                        }
+                    }
+                    continue;
+                }
+                Ok(ManagedSocketState::Vacant) => {}
+                Err(error) => {
+                    restart_count = restart_count.saturating_add(1);
+                    status_tx.send_replace(ManagedProcessStatus {
+                        running: false,
+                        restart_count,
+                        last_error: Some(error.to_string()),
+                    });
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = shutdown.changed() => return,
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                    continue;
+                }
+            }
+        }
+        eprintln!(
+            "[codex-bridge] starting managed {}: {}",
+            spec.name,
+            spec.program.display()
+        );
+        let mut command = TokioCommand::new(&spec.program);
+        command.args(&spec.args).envs(&spec.environment);
+        for name in &spec.remove_environment {
+            command.env_remove(name);
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                restart_count = restart_count.saturating_add(1);
+                if let Some((reply, _)) = pending_reply.take() {
+                    let _ = reply.send(Err(format!(
+                        "rollout repaired but app-server restart failed: {error}"
+                    )));
+                }
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: Some(error.to_string()),
+                });
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = shutdown.changed() => return,
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(10));
+                continue;
+            }
+        };
+        status_tx.send_replace(ManagedProcessStatus {
+            running: true,
+            restart_count,
+            last_error: None,
+        });
+        if let Some((reply, result)) = pending_reply.take() {
+            let _ = reply.send(result);
+        }
+        let started = Instant::now();
+        tokio::select! {
+            child_result = child.wait() => {
+                restart_count = restart_count.saturating_add(1);
+                let message = match child_result {
+                    Ok(exit_status) => format!("process exited with {exit_status}"),
+                    Err(error) => format!("failed to wait for process: {error}"),
+                };
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: Some(message.clone()),
+                });
+                eprintln!("[codex-bridge] managed {} {message}", spec.name);
+            }
+            Some(ManagedAppServerCommand::RepairThreadOrdinals { thread_id, reply }) = commands.recv() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: None,
+                });
+                let store = Arc::clone(&session_store);
+                let repaired = tokio::task::spawn_blocking(move || store.repair_thread_ordinals(&thread_id))
+                    .await
+                    .map_err(|error| format!("rollout repair task failed: {error}"))
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                pending_reply = Some((reply, repaired));
+                backoff = Duration::from_millis(500);
+                continue;
+            }
+            _ = shutdown.changed() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: None,
+                });
+                return;
+            }
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            backoff = Duration::from_millis(500);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
             _ = shutdown.changed() => return,
         }
         backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -1741,6 +2132,7 @@ async fn main() -> Result<()> {
     let (managed_shutdown_tx, managed_shutdown_rx) = watch::channel(false);
     let mut managed_tasks = Vec::new();
     let mut managed_app_server_status = None;
+    let mut managed_app_server_control = None;
     let mut ws_bridge_status = None;
     let mut whisper_needed = None;
     let mut whisper_status = None;
@@ -1758,11 +2150,16 @@ async fn main() -> Result<()> {
                 OsString::from("CODEX_APP_SERVER_USE_LOCAL_DAEMON"),
             ],
             socket_path: Some(socket.to_owned()),
-            preserve_on_shutdown: true,
+            preserve_on_shutdown: false,
         };
-        let (task, status) = spawn_managed_process(spec, managed_shutdown_rx.clone());
+        let (task, status, control) = spawn_managed_app_server(
+            spec,
+            managed_shutdown_rx.clone(),
+            Arc::clone(&session_store),
+        );
         managed_tasks.push(task);
         managed_app_server_status = Some(status);
+        managed_app_server_control = Some(control);
     }
     if args.desktop_interposition {
         if !args.ws_bridge_listen.ip().is_loopback() {
@@ -1880,6 +2277,7 @@ async fn main() -> Result<()> {
         pending_messages,
         app_server_tools,
         app_server_projects,
+        thread_create_jobs: Arc::new(ThreadCreateJobs::default()),
         session_run_states: Arc::clone(&session_run_states),
         runtime_mode: args.mode,
         config_path: args.config_path.clone(),
@@ -1887,11 +2285,13 @@ async fn main() -> Result<()> {
         desktop_interposition: args.desktop_interposition,
         ws_bridge_listen: args.desktop_interposition.then_some(args.ws_bridge_listen),
         managed_app_server_status,
+        managed_app_server_control,
         ws_bridge_status,
         whisper: args.whisper.clone(),
         whisper_needed,
         whisper_status,
         server_capabilities,
+        performance: Arc::new(PerformanceLog::default()),
     };
     let capability_monitor = spawn_capability_monitor(bridge_state.clone());
     let hot_cache_task = spawn_hot_session_cache(
@@ -3482,11 +3882,29 @@ fn app_server_tools_for_messages(
     if wanted.is_empty() {
         return Ok(HashMap::new());
     }
+    let load_lock = {
+        let mut loads = cache.loads.lock().map_err(|_| BackendFailure {
+            code: "app_server_cache_error",
+            message: "tool cache lock registry is poisoned".to_owned(),
+        })?;
+        loads.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = loads.get(thread_id).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            loads.insert(thread_id.to_owned(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let _load_guard = load_lock.lock().map_err(|_| BackendFailure {
+        code: "app_server_cache_error",
+        message: "tool cache load lock is poisoned".to_owned(),
+    })?;
     if let Ok(cache) = cache.threads.read() {
-        if let Some(entry) = cache.get(thread_id).filter(|entry| {
-            entry.refreshed_at.elapsed() <= Duration::from_secs(2)
-                && wanted.is_subset(&entry.known_message_ids)
-        }) {
+        if let Some(entry) = cache
+            .get(thread_id)
+            .filter(|entry| wanted.is_subset(&entry.known_message_ids))
+        {
             return Ok(wanted
                 .iter()
                 .filter_map(|id| {
@@ -3506,7 +3924,7 @@ fn app_server_tools_for_messages(
     let mut seen_cursors = HashSet::new();
     let mut pending_tools = Vec::<ThreadToolCall>::new();
     let mut current_turn = None::<String>;
-    loop {
+    for _ in 0..MAX_APP_SERVER_TOOL_PAGES {
         let result = write_backend.app_server_rpc(
             "thread/items/list",
             json!({
@@ -3573,11 +3991,9 @@ fn app_server_tools_for_messages(
         let entry = cache
             .entry(thread_id.to_owned())
             .or_insert_with(|| CachedAppServerTools {
-                refreshed_at: Instant::now(),
                 known_message_ids: HashSet::new(),
                 tools: HashMap::new(),
             });
-        entry.refreshed_at = Instant::now();
         entry.known_message_ids.extend(wanted.iter().cloned());
         entry.tools.extend(tools.clone());
     }
@@ -3692,6 +4108,7 @@ fn runtime_resources_snapshot(state: &BridgeState) -> Value {
             "tool_calls": tool_calls,
         },
         "project_cache": {"indexed": project_index_cached},
+        "performance": state.performance.snapshot(),
     })
 }
 
@@ -4092,6 +4509,181 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "message_action": entry.action,
             }))
         }
+        Request::PendingMessagesMerge { id, thread_id } => {
+            if id.is_empty() || thread_id.is_empty() || id.len() > 256 || thread_id.len() > 256 {
+                return Response::error(
+                    "invalid_request",
+                    "pending message and thread identifiers must be non-empty and bounded",
+                );
+            }
+            let _operation = match pending_messages.queue_operation.lock() {
+                Ok(operation) => operation,
+                Err(_) => {
+                    return Response::error("queue_state_unavailable", "queue state is unavailable")
+                }
+            };
+            let queued = match read_native_queue(write_backend, &thread_id) {
+                Ok(queued) => queued,
+                Err(error) => return write_backend_error(error),
+            };
+            let mergeable = queued
+                .into_iter()
+                .filter(|entry| {
+                    entry.status == "queued"
+                        && entry.action == "queue"
+                        && !entry.text.lines().any(|line| {
+                            matches!(line.trim(), "[Image attachment]" | "[Audio attachment]")
+                        })
+                })
+                .collect::<Vec<_>>();
+            if mergeable.len() < 2 || mergeable.iter().all(|entry| entry.id != id) {
+                return Response::error(
+                    "pending_messages_not_mergeable",
+                    "at least two withdrawable text-only queue messages are required",
+                );
+            }
+            let merged_text = mergeable
+                .iter()
+                .map(|entry| entry.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let merged_client_id = format!(
+                "bridge-merge-{}",
+                pending_messages.next_id.fetch_add(1, Ordering::Relaxed) + 1
+            );
+            let merged_queue_id = match add_native_queue_without_start(
+                write_backend,
+                &thread_id,
+                &merged_text,
+                &merged_client_id,
+            ) {
+                Ok(id) => id,
+                Err(error) => return write_backend_error(error),
+            };
+            let mut deleted = Vec::new();
+            let mut failure = None;
+            for entry in &mergeable {
+                let Some(queue_id) = entry.queued_submission_id.as_deref() else {
+                    failure = Some("a queued message has no app-server submission id".to_owned());
+                    break;
+                };
+                match delete_native_queue(write_backend, &thread_id, queue_id) {
+                    Ok(true) => deleted.push(entry.clone()),
+                    Ok(false) => {
+                        failure = Some(
+                            "a queued message started while the merge was in progress".to_owned(),
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        failure = Some(error.message);
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = failure {
+                let _ = delete_native_queue(write_backend, &thread_id, &merged_queue_id);
+                let mut restore_failed = false;
+                for entry in &deleted {
+                    pending_messages.dismiss(&entry.id, &thread_id);
+                    let restore_id = format!(
+                        "bridge-restore-{}",
+                        pending_messages.next_id.fetch_add(1, Ordering::Relaxed) + 1
+                    );
+                    if add_native_queue_without_start(
+                        write_backend,
+                        &thread_id,
+                        &entry.text,
+                        &restore_id,
+                    )
+                    .is_err()
+                    {
+                        restore_failed = true;
+                    }
+                }
+                return Response::error(
+                    if restore_failed {
+                        "queue_merge_restore_failed"
+                    } else {
+                        "queue_merge_conflict"
+                    },
+                    if restore_failed {
+                        format!("queue changed during merge and one or more messages could not be restored: {reason}")
+                    } else {
+                        format!(
+                            "queue changed during merge; original messages were restored: {reason}"
+                        )
+                    },
+                );
+            }
+            for entry in &mergeable {
+                pending_messages.dismiss(&entry.id, &thread_id);
+            }
+            Response::success(json!({
+                "action": "pending_messages_merge",
+                "thread_id": thread_id,
+                "merged_count": mergeable.len(),
+                "message": {
+                    "id": merged_client_id,
+                    "text": merged_text,
+                    "queued_submission_id": merged_queue_id,
+                }
+            }))
+        }
+        Request::PendingMessageStart { id, thread_id } => {
+            if id.is_empty() || thread_id.is_empty() || id.len() > 256 || thread_id.len() > 256 {
+                return Response::error(
+                    "invalid_request",
+                    "pending message and thread identifiers must be non-empty and bounded",
+                );
+            }
+            if let Err(response) =
+                resolve_write_target(Some(thread_id.clone()), session_store, selected_thread)
+            {
+                return response;
+            }
+            let queued = match read_native_queue(write_backend, &thread_id) {
+                Ok(queued) => queued,
+                Err(error) => return write_backend_error(error),
+            };
+            let Some(entry) = queued.into_iter().find(|entry| entry.id == id) else {
+                return Response::error(
+                    "pending_message_not_queued",
+                    "the input is no longer in the app-server queue",
+                );
+            };
+            let Some(queued_submission_id) = entry.queued_submission_id.clone() else {
+                return Response::error(
+                    "pending_message_not_startable",
+                    "the queued input has no app-server submission identifier",
+                );
+            };
+            let result = match write_backend.app_server_rpc(
+                "thread/queue/start",
+                json!({
+                    "threadId": thread_id,
+                    "queuedSubmissionId": queued_submission_id,
+                }),
+            ) {
+                Ok(result) => result,
+                Err(error) => return write_backend_error(error),
+            };
+            let turn_id = result
+                .pointer("/turn/id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            pending_messages.accept(&entry.id, turn_id.clone());
+            Response::success(json!({
+                "action": "pending_message_start",
+                "status": "accepted",
+                "pending_id": entry.id,
+                "thread_id": entry.thread_id,
+                "queued_submission_id": queued_submission_id,
+                "turn_id": turn_id,
+            }))
+        }
         Request::Ls {
             limit,
             include_archived,
@@ -4183,12 +4775,21 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "messages limit must be between 1 and 200",
                 );
             }
-            match session_store.read_message_page(
+            let started = Instant::now();
+            let read = session_store.read_message_page_profiled(
                 &thread_id,
                 before.map(|value| value as usize),
                 limit as usize,
-            ) {
-                Ok(Some((thread, mut page))) => {
+            );
+            let (cache_mode, rollout_bytes) = read
+                .as_ref()
+                .ok()
+                .and_then(|result| result.as_ref().map(|(_, _, profile)| *profile))
+                .map_or(("unknown", 0), |profile| {
+                    (profile.cache, profile.rollout_bytes)
+                });
+            let response = match read {
+                Ok(Some((thread, mut page, profile))) => {
                     let tool_source = match app_server_tools_for_messages(
                         write_backend,
                         app_server_tools,
@@ -4204,6 +4805,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     Response::success(json!({
                         "source": "rollout_jsonl",
                         "tool_source": tool_source,
+                        "repair_required": profile.ordinal_repair_required,
+                        "statistics": profile.statistics,
                         "thread": {
                             "id": thread.id,
                             "title": thread.title,
@@ -4229,6 +4832,25 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     format!("thread {thread_id} was not found in the rollout store"),
                 ),
                 Err(error) => backend_error(error),
+            };
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            state.performance.record(PerformanceEvent {
+                observed_at: Instant::now(),
+                source: "server",
+                metric: "messages_read".to_owned(),
+                duration_ms,
+                max_ms: duration_ms,
+                count: 1,
+                bytes: rollout_bytes,
+                cache: Some(cache_mode),
+            });
+            response
+        }
+        Request::ClientPerformance { samples } => {
+            if let Err(error) = state.performance.record_client(samples) {
+                Response::error("invalid_request", error.to_string())
+            } else {
+                Response::success(json!({"recorded": true}))
             }
         }
         Request::TurnMessages { thread_id, turn_id } => {
@@ -4463,6 +5085,118 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Err(error) => write_backend_error(error),
             }
         }
+        Request::ThreadCreateStart {
+            project_path,
+            model,
+        } => {
+            if !project_path.is_absolute() {
+                return Response::error("invalid_project_path", "project path must be absolute");
+            }
+            if model
+                .as_ref()
+                .is_some_and(|model| model.is_empty() || model.len() > 128)
+            {
+                return Response::error(
+                    "invalid_request",
+                    "model must be omitted or contain between 1 and 128 bytes",
+                );
+            }
+            let mut random = [0_u8; 18];
+            if let Err(error) = getrandom::fill(&mut random) {
+                return Response::error(
+                    "thread_create_unavailable",
+                    format!("failed to allocate a worktree job: {error}"),
+                );
+            }
+            let job_id = URL_SAFE_NO_PAD.encode(random);
+            {
+                let mut jobs = match state.thread_create_jobs.entries.write() {
+                    Ok(jobs) => jobs,
+                    Err(_) => {
+                        return Response::error(
+                            "thread_create_unavailable",
+                            "worktree job state is unavailable",
+                        )
+                    }
+                };
+                jobs.retain(|_, job| job.created_at.elapsed() <= THREAD_CREATE_JOB_TTL);
+                if jobs.len() >= THREAD_CREATE_JOB_LIMIT {
+                    return Response::error(
+                        "thread_create_busy",
+                        "too many worktree creation jobs are still retained",
+                    );
+                }
+                jobs.insert(
+                    job_id.clone(),
+                    ThreadCreateJob {
+                        created_at: Instant::now(),
+                        response: None,
+                    },
+                );
+            }
+            let worker_state = state.clone();
+            let worker_job_id = job_id.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("codex-worktree-create".to_owned())
+                .spawn(move || {
+                    let response = dispatch(
+                        Request::ThreadCreate {
+                            project_path: Some(project_path),
+                            worktree: true,
+                            model,
+                        },
+                        &worker_state,
+                    );
+                    if let Ok(mut jobs) = worker_state.thread_create_jobs.entries.write() {
+                        if let Some(job) = jobs.get_mut(&worker_job_id) {
+                            job.response = Some(response);
+                        }
+                    }
+                })
+            {
+                if let Ok(mut jobs) = state.thread_create_jobs.entries.write() {
+                    jobs.remove(&job_id);
+                }
+                return Response::error(
+                    "thread_create_unavailable",
+                    format!("failed to start the worktree job: {error}"),
+                );
+            }
+            Response::success(json!({
+                "action": "thread_create_start",
+                "status": "running",
+                "job_id": job_id,
+            }))
+        }
+        Request::ThreadCreateStatus { job_id } => {
+            if job_id.is_empty() || job_id.len() > 128 {
+                return Response::error("invalid_request", "job id must be non-empty and bounded");
+            }
+            let jobs = match state.thread_create_jobs.entries.read() {
+                Ok(jobs) => jobs,
+                Err(_) => {
+                    return Response::error(
+                        "thread_create_unavailable",
+                        "worktree job state is unavailable",
+                    )
+                }
+            };
+            let Some(job) = jobs.get(&job_id) else {
+                return Response::error(
+                    "thread_create_job_not_found",
+                    "worktree job was not found",
+                );
+            };
+            match &job.response {
+                Some(response) => response.clone(),
+                None => Response::success(json!({
+                    "action": "thread_create_status",
+                    "status": "running",
+                    "job_id": job_id,
+                    "elapsed_ms": u64::try_from(job.created_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                })),
+            }
+        }
         Request::ThreadCreate {
             project_path,
             worktree,
@@ -4477,14 +5211,23 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "model must be omitted or contain between 1 and 128 bytes",
                 );
             }
-            let canonical_project = match fs::canonicalize(&project_path) {
-                Ok(path) => path,
-                Err(error) => {
-                    return Response::error(
-                        "invalid_project_path",
-                        format!("cannot open project {}: {error}", project_path.display()),
-                    )
-                }
+            if project_path.is_none() && worktree {
+                return Response::error(
+                    "invalid_request",
+                    "a Chats session cannot create a project worktree",
+                );
+            }
+            let canonical_project = match project_path.as_ref() {
+                Some(project_path) => match fs::canonicalize(project_path) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        return Response::error(
+                            "invalid_project_path",
+                            format!("cannot open project {}: {error}", project_path.display()),
+                        )
+                    }
+                },
+                None => None,
             };
             let app_server_project_list = write_backend
                 .app_server_rpc(
@@ -4492,15 +5235,19 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
                 )
                 .ok();
-            let project_id = app_server_project_list
-                .as_ref()
-                .and_then(|projects| project_id_for_path(projects, &canonical_project));
-            let known_project = if project_id.is_some() {
+            let project_id = app_server_project_list.as_ref().and_then(|projects| {
+                canonical_project
+                    .as_ref()
+                    .and_then(|path| project_id_for_path(projects, path))
+            });
+            let known_project = if canonical_project.is_none() || project_id.is_some() {
                 true
             } else {
                 match session_store.list_projects(true) {
                     Ok(projects) => projects.into_iter().any(|project| {
-                        fs::canonicalize(project.path).is_ok_and(|path| path == canonical_project)
+                        canonical_project.as_ref().is_some_and(|canonical| {
+                            fs::canonicalize(project.path).is_ok_and(|path| &path == canonical)
+                        })
                     }),
                     Err(error) => return backend_error(error),
                 }
@@ -4512,12 +5259,26 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 );
             }
 
-            let prepared =
-                match prepare_thread_cwd(&canonical_project, worktree, session_store.home()) {
-                    Ok(prepared) => prepared,
-                    Err(error) => return Response::error(error.code, error.message),
-                };
-            let mut params = json!({"cwd": prepared.cwd});
+            let prepared = match canonical_project.as_ref() {
+                Some(project) => {
+                    match prepare_thread_cwd(project, worktree, session_store.home()) {
+                        Ok(prepared) => prepared,
+                        Err(error) => return Response::error(error.code, error.message),
+                    }
+                }
+                None => PreparedThreadCwd {
+                    cwd: session_store
+                        .home()
+                        .parent()
+                        .unwrap_or(session_store.home())
+                        .to_path_buf(),
+                    worktree: None,
+                },
+            };
+            let mut params = json!({});
+            if canonical_project.is_some() {
+                params["cwd"] = json!(prepared.cwd);
+            }
             if let Some(model) = model {
                 params["model"] = Value::String(model);
             }
@@ -4586,11 +5347,122 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             }
             Response::success(json!({
                 "action": "thread_create",
-                "project_path": canonical_project,
+                "project_path": canonical_project
+                    .as_ref()
+                    .map_or_else(|| Value::String(CHATS_PROJECT_PATH.to_owned()), |path| json!(path)),
                 "location": if worktree { "worktree" } else { "current_directory" },
                 "worktree_path": prepared.worktree.as_ref().map(|created| &created.root),
                 "thread": stored_thread.unwrap_or(fallback_thread),
             }))
+        }
+        Request::TemporaryThreadCreate {
+            thread_id,
+            last_turn_id,
+        } => {
+            if thread_id.is_empty()
+                || thread_id.len() > 256
+                || last_turn_id
+                    .as_ref()
+                    .is_some_and(|turn_id| turn_id.is_empty() || turn_id.len() > 256)
+            {
+                return Response::error(
+                    "invalid_request",
+                    "thread and turn identifiers must contain between 1 and 256 bytes",
+                );
+            }
+            if let Err(response) =
+                resolve_read_target(Some(thread_id.clone()), session_store, selected_thread)
+            {
+                return response;
+            }
+            let mut params = json!({
+                "threadId": thread_id,
+                "ephemeral": true,
+                "excludeTurns": true,
+            });
+            if let Some(last_turn_id) = last_turn_id {
+                params["lastTurnId"] = Value::String(last_turn_id);
+            }
+            match write_backend.app_server_rpc("thread/fork", params) {
+                Ok(result) => {
+                    let Some(temporary_thread_id) = result
+                        .pointer("/thread/id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return Response::error(
+                            "app_server_protocol_error",
+                            "thread/fork returned no temporary thread id",
+                        );
+                    };
+                    Response::success(json!({
+                        "action": "temporary_thread_create",
+                        "source_thread_id": thread_id,
+                        "thread": {
+                            "id": temporary_thread_id,
+                            "ephemeral": result
+                                .pointer("/thread/ephemeral")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true),
+                            "forked_from_id": result
+                                .pointer("/thread/forkedFromId")
+                                .and_then(Value::as_str),
+                        },
+                    }))
+                }
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::TemporaryTurnStart {
+            thread_id,
+            text,
+            submission_id,
+            attachments,
+        } => {
+            if thread_id.is_empty()
+                || thread_id.len() > 256
+                || submission_id.is_empty()
+                || submission_id.len() > 128
+            {
+                return Response::error(
+                    "invalid_request",
+                    "temporary thread and submission identifiers must be non-empty and bounded",
+                );
+            }
+            let input = match composer_input(&text, &attachments) {
+                Ok(input) => input,
+                Err(response) => return response,
+            };
+            match write_backend.start_turn(&thread_id, &input, &submission_id) {
+                Ok(receipt) => Response::success(json!({
+                    "action": "temporary_turn_start",
+                    "thread_id": thread_id,
+                    "turn_id": receipt.turn_id,
+                    "backend": receipt.backend,
+                })),
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::TemporaryTurnInterrupt { thread_id, turn_id } => {
+            if thread_id.is_empty()
+                || thread_id.len() > 256
+                || turn_id.is_empty()
+                || turn_id.len() > 256
+            {
+                return Response::error(
+                    "invalid_request",
+                    "temporary thread and turn identifiers must be non-empty and bounded",
+                );
+            }
+            match write_backend.interrupt_turn(&thread_id, &turn_id) {
+                Ok(backend) => Response::success(json!({
+                    "action": "temporary_turn_interrupt",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "backend": backend,
+                })),
+                Err(error) => write_backend_error(error),
+            }
         }
         Request::ThreadSettingsUpdate {
             thread_id,
@@ -4688,6 +5560,28 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     }))
                 }
                 Err(error) => write_backend_error(error),
+            }
+        }
+        Request::ThreadRepairOrdinals { thread_id } => {
+            if thread_id.is_empty() || thread_id.len() > 256 {
+                return Response::error("invalid_thread_id", "thread id is invalid");
+            }
+            let Some(control) = state.managed_app_server_control.as_ref() else {
+                return Response::error(
+                    "app_server_not_managed",
+                    "rollout repair requires services.manage_app_server so Bridge can stop the writer safely",
+                );
+            };
+            match control.repair_thread_ordinals(thread_id.clone()) {
+                Ok(report) => Response::success(json!({
+                    "action": "thread_repair_ordinals",
+                    "thread_id": thread_id,
+                    "status": if report.repaired_files == 0 { "clean" } else { "repaired" },
+                    "repaired_files": report.repaired_files,
+                    "renumbered_records": report.renumbered_records,
+                    "backup_created": !report.backups.is_empty(),
+                })),
+                Err(error) => Response::error("rollout_repair_failed", error.to_string()),
             }
         }
         Request::ThreadPins => match pinned_thread_ids(write_backend) {
@@ -5896,15 +6790,30 @@ fn tool_preview(tool: &ThreadToolCall) -> String {
 }
 
 fn plugin_title_preview(tool: &ThreadToolCall) -> Option<String> {
-    let plugin_id = tool.input.get("pluginId")?.as_str()?;
-    let title = tool.input.pointer("/arguments/title")?.as_str()?.trim();
+    let title = tool
+        .input
+        .pointer("/arguments/title")
+        .or_else(|| tool.input.get("title"))?
+        .as_str()?
+        .trim();
     if title.is_empty() {
         return None;
     }
-    let plugin_name = plugin_id
-        .rsplit_once('@')
-        .filter(|(name, source)| !name.is_empty() && !source.is_empty())
-        .map_or(plugin_id, |(name, _)| name);
+    let plugin_name = tool
+        .input
+        .get("pluginId")
+        .and_then(Value::as_str)
+        .map(|plugin_id| {
+            plugin_id
+                .rsplit_once('@')
+                .filter(|(name, source)| !name.is_empty() && !source.is_empty())
+                .map_or(plugin_id, |(name, _)| name)
+        })
+        .or_else(|| {
+            tool.name
+                .split_once('.')
+                .map(|(namespace, _)| namespace.trim_start_matches("mcp__"))
+        })?;
     Some(
         format!("{plugin_name} · {title}")
             .chars()
@@ -6730,6 +7639,64 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .unwrap()
             .unwrap();
         assert!(!status.borrow().running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_app_server_stops_repairs_and_restarts() {
+        let root = unique_test_dir("managed-app-server-repair");
+        let sessions = root.join("sessions/2026/09/11");
+        fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("rollout-test.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"timestamp\":\"2026-09-11T00:00:00Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-repair\",\"cwd\":\"/tmp/project\"}}\n",
+                "{\"timestamp\":\"2026-09-11T00:00:01Z\",\"ordinal\":0,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+            ),
+        )
+        .unwrap();
+        let spec = ManagedProcessSpec {
+            name: "test-app-server",
+            program: PathBuf::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from("exec /bin/sleep 30")],
+            environment: HashMap::new(),
+            remove_environment: Vec::new(),
+            socket_path: None,
+            preserve_on_shutdown: false,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (task, mut status, control) =
+            spawn_managed_app_server(spec, shutdown_rx, Arc::new(SessionStore::new(root.clone())));
+        tokio::time::timeout(Duration::from_secs(1), status.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.borrow().running);
+        let repair_control = control.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            repair_control.repair_thread_ordinals("thread-repair".to_owned())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.renumbered_records, 1);
+        assert!(status.borrow().running);
+        let ordinals = fs::read_to_string(&rollout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["ordinal"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, [0, 1]);
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -7704,6 +8671,21 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn plugin_tool_preview_uses_normalized_direct_title_without_plugin_metadata() {
+        let tool = ThreadToolCall {
+            call_id: "plugin-rollout-1".to_owned(),
+            name: "mcp__cua_repl.js".to_owned(),
+            status: "completed".to_owned(),
+            input: json!({
+                "code":"await demoTab.reload();",
+                "title":"检查新版引用与临时会话布局"
+            }),
+            output: None,
+        };
+        assert_eq!(tool_preview(&tool), "cua_repl · 检查新版引用与临时会话布局");
+    }
+
+    #[test]
     fn app_server_file_change_reports_files_and_line_counts() {
         let tool = typed_thread_tool(&json!({
             "type":"fileChange",
@@ -7862,5 +8844,47 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             ),
             None
         );
+    }
+
+    #[test]
+    fn performance_log_keeps_bounded_server_and_client_aggregates() {
+        let log = PerformanceLog::default();
+        log.record(PerformanceEvent {
+            observed_at: Instant::now(),
+            source: "server",
+            metric: "messages_read".into(),
+            duration_ms: 80,
+            max_ms: 80,
+            count: 1,
+            bytes: 2048,
+            cache: Some("cold"),
+        });
+        log.record_client(vec![ClientPerformanceSample {
+            metric: "messages_visible".into(),
+            count: 2,
+            total_ms: 50,
+            max_ms: 35,
+            total_bytes: 1024,
+        }])
+        .unwrap();
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot["samples"], 2);
+        assert_eq!(snapshot["recent"][0]["source"], "client");
+        assert_eq!(snapshot["recent"][1]["cache"], "cold");
+        assert!(snapshot["summary"].as_array().unwrap().iter().any(|entry| {
+            entry["metric"] == "messages_visible"
+                && entry["count"] == 2
+                && entry["average_ms"] == 25
+                && entry["max_ms"] == 35
+        }));
+        assert!(log
+            .record_client(vec![ClientPerformanceSample {
+                metric: "unbounded_metric".into(),
+                count: 1,
+                total_ms: 1,
+                max_ms: 1,
+                total_bytes: 0,
+            }])
+            .is_err());
     }
 }

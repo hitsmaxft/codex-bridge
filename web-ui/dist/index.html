@@ -7,8 +7,8 @@
       content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
     />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=548390e0b486"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=51bd1adcd09b">
+    <script type="module" crossorigin src="/assets/app.js?v=844d39be4f50"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=6e214e42b770">
   </head>
   <body>
     <div class="app">
@@ -116,6 +116,28 @@
             >
               Choose a session
             </h2>
+            <button
+              id="repairHintBtn"
+              class="repair-hint"
+              type="button"
+              data-i18n-aria-label="repairSuggested"
+              aria-label="Session repair suggested"
+              aria-expanded="false"
+              hidden
+            >
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <path
+                  d="M14.7 6.3a4 4 0 0 0-5-5l2.1 2.1-2.4 2.4-2.1-2.1a4 4 0 0 0 5 5l6.2 6.2a2 2 0 1 1-2.8 2.8l-6.2-6.2"
+                />
+              </svg>
+            </button>
+            <div id="repairHintBubble" class="repair-hint-bubble" hidden>
+              <strong data-i18n="repairSuggested">Session repair suggested</strong>
+              <span data-i18n="repairSuggestedHelp"
+                >The rollout event sequence is inconsistent. Open Tools → Other and run Repair event
+                sequence.</span
+              >
+            </div>
             <div class="compact-meta" id="threadCompactMeta"></div>
             <div class="meta">
               <span id="threadMeta" data-i18n="projectsHint"
@@ -125,6 +147,19 @@
           </div>
           <div class="head-actions">
             <button id="refreshBtn" data-i18n="refresh">Refresh</button
+            ><button
+              class="temporary-toggle"
+              id="temporaryPanelBtn"
+              type="button"
+              data-i18n-aria-label="temporaryConversation"
+              aria-label="Temporary conversation"
+              hidden
+            >
+              <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M7 7h10v10H9l-4 3V9a2 2 0 0 1 2-2Z" />
+                <path d="M12 10v4M10 12h4" />
+              </svg>
+              <span class="mobile-button-label" data-i18n="temporaryShort">Temp</span></button
             ><button class="tool-toggle" data-i18n-aria-label="tools" aria-label="Tools">
               <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
                 <circle cx="5" cy="12" r="1.7" />
@@ -176,6 +211,7 @@
               <button class="primary" id="modelApply" type="button" data-i18n="apply">Apply</button>
             </div>
           </div>
+          <div class="composer-reference" id="composerReference" hidden></div>
           <div class="composer-attachments" id="composerAttachments" hidden></div>
           <div class="composer-shell">
             <div
@@ -261,6 +297,57 @@
         </div>
         <div class="toast" id="toast" role="status" aria-live="polite"></div>
       </main>
+      <section class="temporary-chat" id="temporaryPanel" aria-labelledby="temporaryTitle" inert>
+        <div class="thread-head temporary-head">
+          <button
+            class="temporary-back"
+            id="temporaryCloseBtn"
+            type="button"
+            data-i18n-aria-label="backToConversation"
+            aria-label="Back to conversation"
+          >
+            <svg class="desktop-icon" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m15 18-6-6 6-6" />
+            </svg>
+          </button>
+          <div class="head-copy">
+            <h2 id="temporaryTitle" data-i18n="temporaryConversation">Temporary conversation</h2>
+            <div class="compact-meta" data-i18n="temporaryHint">
+              In memory · not saved to history
+            </div>
+            <div class="meta" data-i18n="temporaryHint">In memory · not saved to history</div>
+          </div>
+        </div>
+        <div class="temporary-messages" id="temporaryMessages"></div>
+        <div class="composer temporary-composer">
+          <div class="composer-shell temporary-composer-shell">
+            <div class="send-modes" aria-hidden="true">
+              <span class="mode-button" data-i18n="temporaryShort">Temp</span>
+            </div>
+            <textarea
+              id="temporaryText"
+              rows="1"
+              data-i18n-placeholder="temporaryPlaceholder"
+              placeholder="Ask about the selected text…"
+            ></textarea>
+            <button class="danger" id="temporaryStopBtn" type="button" hidden>
+              <span class="submit-stop" aria-hidden="true"></span>
+            </button>
+            <button
+              class="primary"
+              id="temporarySendBtn"
+              type="button"
+              data-i18n-aria-label="submitAria"
+              aria-label="Submit message"
+            >
+              <svg class="submit-arrow" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M12 19V5M6.5 10.5 12 5l5.5 5.5" />
+              </svg>
+              <span class="submit-spinner" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+      </section>
       <section class="tools" id="tools">
         <div class="tool-section tool-primary">
           <div class="brand-row">
@@ -273,6 +360,10 @@
               Archive current session
             </button>
           </div>
+          <section class="thread-statistics" id="threadStatistics" hidden>
+            <h3 data-i18n="sessionStatistics">Session statistics</h3>
+            <div class="thread-stat-grid" id="threadStatGrid"></div>
+          </section>
         </div>
         <details class="tool-other">
           <summary data-i18n="otherTools">Other</summary>
@@ -289,6 +380,17 @@
             <div class="tool-row">
               <button class="danger" id="mobileInterruptBtn" data-i18n="interruptCurrent">
                 Interrupt current turn
+              </button>
+            </div>
+          </div>
+          <div class="tool-section">
+            <h2 data-i18n="sessionMaintenance">Session maintenance</h2>
+            <p class="caption" data-i18n="repairOrdinalsHelp">
+              Stop the managed app-server, repair duplicate event sequence numbers, then restart it.
+            </p>
+            <div class="tool-row">
+              <button class="danger" id="repairOrdinalsBtn" data-i18n="repairOrdinals">
+                Repair event sequence
               </button>
             </div>
           </div>
@@ -373,6 +475,11 @@
           </div>
         </details>
       </section>
+    </div>
+    <div class="selection-actions" id="selectionActions" role="toolbar" hidden>
+      <button id="selectionCopyBtn" type="button" data-i18n="copy">Copy</button>
+      <button id="selectionInsertBtn" type="button" data-i18n="insertConversation">Insert</button>
+      <button id="selectionTemporaryBtn" type="button" data-i18n="temporaryShort">Temp</button>
     </div>
     <div
       class="create-dialog"
