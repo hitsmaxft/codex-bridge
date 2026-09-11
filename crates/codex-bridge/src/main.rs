@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -1483,6 +1484,96 @@ struct ManagedProcessSpec {
     preserve_on_shutdown: bool,
 }
 
+struct ManagedWriterLock {
+    _file: File,
+}
+
+fn acquire_managed_writer_lock(codex_home: &Path) -> Result<ManagedWriterLock> {
+    fs::create_dir_all(codex_home)
+        .with_context(|| format!("failed to create {}", codex_home.display()))?;
+    let path = codex_home.join(".codex-bridge-managed-writer.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("failed to open managed writer lock {}", path.display()))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure managed writer lock {}", path.display()))?;
+    // SAFETY: flock only observes the valid descriptor owned by `file`, which remains alive in
+    // ManagedWriterLock for the daemon lifetime.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!(
+            "another codex-bridge already manages an app-server for {}",
+            codex_home.display()
+        );
+    }
+    Ok(ManagedWriterLock { _file: file })
+}
+
+fn stdio_app_server_pids(ps_output: &str, program: &Path) -> Vec<u32> {
+    let mut programs = vec![program.to_string_lossy().into_owned()];
+    if let Ok(canonical) = fs::canonicalize(program) {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !programs.contains(&canonical) {
+            programs.push(canonical);
+        }
+    }
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let split = line.find(char::is_whitespace)?;
+            let pid = line[..split].parse::<u32>().ok()?;
+            let command = line[split..].trim_start();
+            let matches_program = programs.iter().any(|program| {
+                command.starts_with(&format!("{program} ")) && command.contains(" app-server")
+            });
+            (matches_program
+                && !command.contains(" --listen")
+                && !command.contains(" generate-json-schema"))
+            .then_some(pid)
+        })
+        .collect()
+}
+
+fn conflicting_stdio_app_servers(program: &Path) -> Result<Vec<u32>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .env("LC_ALL", "C")
+        .output()
+        .context("failed to inspect app-server processes")?;
+    if !output.status.success() {
+        bail!("process inspection exited with {}", output.status);
+    }
+    let stdout = String::from_utf8(output.stdout).context("process list is not UTF-8")?;
+    Ok(stdio_app_server_pids(&stdout, program))
+}
+
+fn stdio_app_server_conflict(program: &Path) -> Option<String> {
+    match conflicting_stdio_app_servers(program) {
+        Ok(pids) if pids.is_empty() => None,
+        Ok(pids) => Some(format!(
+            "refusing managed app-server while {} stdio app-server writer(s) use the same runtime; fully quit Codex/Desktop and relaunch it through WS interposition",
+            pids.len()
+        )),
+        Err(error) => Some(format!(
+            "cannot verify exclusive app-server writer ownership: {error}"
+        )),
+    }
+}
+
+async fn wait_for_stdio_app_server_conflict(program: &Path) -> String {
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Some(message) = stdio_app_server_conflict(program) {
+            return message;
+        }
+    }
+}
+
 const DESKTOP_MCP_BASE_CONFIG: &str = r#"mcp_servers.codex_app={command="",enabled=false}"#;
 
 fn managed_app_server_args(socket: &Path, desktop_interposition: bool) -> Vec<OsString> {
@@ -1722,6 +1813,18 @@ async fn supervise_managed_app_server(
         Result<RolloutOrdinalRepair, String>,
     )> = None;
     while !*shutdown.borrow() {
+        if let Some(message) = stdio_app_server_conflict(&spec.program) {
+            status_tx.send_replace(ManagedProcessStatus {
+                running: false,
+                restart_count,
+                last_error: Some(message),
+            });
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = shutdown.changed() => return,
+            }
+            continue;
+        }
         if let Some(path) = spec.socket_path.as_deref() {
             match prepare_managed_process_socket(path).await {
                 Ok(ManagedSocketState::Active) => {
@@ -1738,6 +1841,14 @@ async fn supervise_managed_app_server(
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                                if let Some(message) = stdio_app_server_conflict(&spec.program) {
+                                    status_tx.send_replace(ManagedProcessStatus {
+                                        running: false,
+                                        restart_count,
+                                        last_error: Some(message),
+                                    });
+                                    break;
+                                }
                                 if !matches!(prepare_managed_process_socket(path).await, Ok(ManagedSocketState::Active)) {
                                     break;
                                 }
@@ -1843,6 +1954,16 @@ async fn supervise_managed_app_server(
                     .and_then(|result| result.map_err(|error| error.to_string()));
                 pending_reply = Some((reply, repaired));
                 backoff = Duration::from_millis(500);
+                continue;
+            }
+            message = wait_for_stdio_app_server_conflict(&spec.program) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                status_tx.send_replace(ManagedProcessStatus {
+                    running: false,
+                    restart_count,
+                    last_error: Some(message),
+                });
                 continue;
             }
             _ = shutdown.changed() => {
@@ -2122,6 +2243,10 @@ async fn main() -> Result<()> {
                 .map(PathBuf::from)
         })
         .unwrap_or_else(default_codex_program);
+    let _managed_writer_lock = args
+        .manage_app_server
+        .then(|| acquire_managed_writer_lock(&codex_home))
+        .transpose()?;
     let app_server_socket = args.app_server_socket.clone();
     let session_store = Arc::new(SessionStore::new(codex_home));
     let write_backend = Arc::new(CodexCliBackend::new_with_thread_cache(
@@ -7157,6 +7282,31 @@ mod tests {
                 OsString::from("unix:///tmp/codex-app-server.sock"),
             ]
         );
+    }
+
+    #[test]
+    fn stdio_app_server_detection_ignores_listeners_and_non_server_commands() {
+        let program = Path::new("/opt/codex/bin/codex");
+        let processes = r#"
+  101 /opt/codex/bin/codex app-server
+  102 /opt/codex/bin/codex -c model=test app-server
+  103 /opt/codex/bin/codex app-server --listen unix:///tmp/app.sock
+  104 /opt/codex/bin/codex exec resume thread-1
+  105 /opt/codex/bin/codex app-server generate-json-schema --out /tmp/schema
+  106 /other/codex app-server
+"#;
+
+        assert_eq!(stdio_app_server_pids(processes, program), [101, 102]);
+    }
+
+    #[test]
+    fn managed_writer_lock_excludes_a_second_bridge_for_the_same_store() {
+        let codex_home = unique_test_dir("managed-writer-lock");
+        let first = acquire_managed_writer_lock(&codex_home).unwrap();
+
+        assert!(acquire_managed_writer_lock(&codex_home).is_err());
+        drop(first);
+        fs::remove_dir_all(codex_home).unwrap();
     }
 
     #[test]

@@ -1220,58 +1220,57 @@
         <div class="release">
           <div class="release-date">
             2026-09-11
-            <span class="zh">v0.2.9 正式版</span
-            ><span class="en">v0.2.9 release</span>
+            <span class="zh">v0.2.10 正式版</span
+            ><span class="en">v0.2.10 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">远程任务可靠衔接</span
-                ><span class="en">Reliable remote handoff</span>
+                <span class="zh">同一历史目录只有一个 Writer</span
+                ><span class="en">One writer per history store</span>
               </h3>
               <p class="zh">
-                Queue
-                合并、权威缓冲状态和显式序号修复，让远程提交、撤回与维护操作保持一致。
+                按 CODEX_HOME 加锁，阻止两个 Bridge 同时管理会写入同一历史的
+                app-server。
               </p>
               <p class="en">
-                Queue merging, authoritative pending state, and explicit ordinal
-                repair keep remote submission and maintenance consistent.
+                A CODEX_HOME-scoped lock prevents two Bridge daemons from
+                managing app-servers against the same history.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">实时视图保持稳定</span
-                ><span class="en">A stable live session</span>
+                <span class="zh">安装时主动避让</span
+                ><span class="en">Safe installation from Codex</span>
               </h3>
               <p class="zh">
-                工具增量更新保留视口位置和输入焦点；有界解析与缓存继续加速长会话。
+                在 Codex 会话内安装时检测私有 stdio app-server，完成安装但延迟启动服务。
               </p>
               <p class="en">
-                Incremental tools preserve viewport position and composer focus;
-                bounded parsing and caches keep long histories responsive.
+                Installers detect a private stdio app-server, finish setup, and
+                defer service startup instead of overlapping writers.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">更清晰的自托管产品页</span
-                ><span class="en">Clearer self-hosting</span>
+                <span class="zh">运行时冲突熔断</span
+                ><span class="en">Runtime conflict containment</span>
               </h3>
               <p class="zh">
-                真实移动界面、并行 Tasks、结构化 Diff 与 Cloudflare Zero Trust
-                架构集中呈现。
+                后续发现 stdio writer 时只停止 Bridge 自己的子进程，并在状态面板报告原因。
               </p>
               <p class="en">
-                Real mobile UI, parallel Tasks, structured diffs, and a
-                Cloudflare Zero Trust architecture explain the complete setup.
+                A later stdio writer stops only Bridge's managed child and
+                surfaces the reason in component status.
               </p>
             </article>
           </div>
         </div>
         <div class="release-history">
-          <a href="releases/v0.2.7.md">
+          <a href="releases/v0.2.10.md">
             <span
-              ><span class="zh">查看完整版本记录</span
-              ><span class="en">Read the complete release history</span></span
+              ><span class="zh">查看完整发布说明</span
+              ><span class="en">Read the complete release notes</span></span
             >
           </a>
           <div class="release-list" hidden>

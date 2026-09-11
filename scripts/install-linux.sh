@@ -3,6 +3,7 @@ set -eu
 
 enable_web_ui=false
 start_services=true
+start_suppressed=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --web-ui) enable_web_ui=true ;;
@@ -92,6 +93,21 @@ else
   fi
 fi
 
+stdio_app_server_pids() {
+  ps -axo pid=,args= | awk -v bin="$codex_bin" '
+    index($0, bin " ") && index($0, " app-server") && !index($0, " --listen") && !index($0, " generate-json-schema") { print $1 }
+  '
+}
+if [ "$start_services" = true ] && [ "$managed_by_bridge" = true ]; then
+  conflicting_pids=$(stdio_app_server_pids)
+  if [ -n "$conflicting_pids" ]; then
+    echo "Refusing to start the managed app-server while a private stdio app-server is running." >&2
+    echo "The service definition will be installed without enabling it. Exit the active Codex process, then start codex-bridge.service." >&2
+    start_services=false
+    start_suppressed=true
+  fi
+fi
+
 cat >"$systemd_dir/codex-bridge.service" <<EOF
 [Unit]
 Description=Codex App Server WebUI bridge
@@ -116,6 +132,9 @@ fi
 
 echo "Installed user configuration: $config_path"
 echo "Installed systemd user services under: $systemd_dir"
+if [ "$start_suppressed" = true ]; then
+  echo "Service start was deferred because an active private stdio app-server owns the rollout store."
+fi
 if [ "$enable_web_ui" = true ]; then
   echo "Web UI: http://127.0.0.1:18791/ (password file: $web_password)"
 fi

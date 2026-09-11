@@ -29,17 +29,16 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.2.9 · 2026-09-11
+### v0.2.10 · 2026-09-11
 
-- **Reliable remote work:** merge queued prompts, keep pending work authoritative, repair damaged
-  rollout sequences explicitly, and preserve composer focus while managing the outbox.
-- **Stable live sessions:** incremental tool updates keep the viewport anchored, while bounded
-  parsing and tool caches retain responsive navigation through large histories; backend-generated
-  run time, turn, tool-call, and token totals stay available in Tools.
-- **Clearer self-hosting:** the redesigned product page shows the real mobile UI, parallel task and
-  diff views, and a Cloudflare Zero Trust deployment architecture.
+- **One managed writer:** an advisory lock prevents two Bridge daemons from managing app-servers
+  against the same Codex history store.
+- **Safe installation from Codex:** macOS and Linux installers detect an active private stdio
+  app-server, finish installing service definitions, and defer startup instead of risking overlap.
+- **Runtime conflict containment:** Bridge monitors for a later stdio writer, stops only its own
+  managed child, reports the conflict, and resumes after the other writer exits.
 
-See the [latest release notes](docs/releases/v0.2.9.md) or the
+See the [latest release notes](docs/releases/v0.2.10.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI

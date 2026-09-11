@@ -112,10 +112,10 @@ Mode defaults apply only when a path was not set explicitly:
 - `auto` preserves the previous behavior and does not invent an app-server endpoint.
 
 `services.manage_app_server = true` makes the bridge own, stop, start, and restart the selected
-`codex app-server` process. Ownership prevents competing writers and lets an explicit session
-maintenance command stop the writer before an atomic rollout repair. Restarting the bridge also
-restarts its managed app-server, so perform upgrades between active turns. Explicitly disabling
-management leaves externally started app-servers untouched. `services.desktop_interposition = true` is valid only in `desktop` mode;
+`codex app-server` process. This lets an explicit session maintenance command stop the writer
+before an atomic rollout repair. Restarting the bridge also restarts its managed app-server, so
+perform upgrades between active turns. Explicitly disabling management leaves externally started
+app-servers untouched. `services.desktop_interposition = true` is valid only in `desktop` mode;
 it also supervises `ws-unix-bridge` and sets `CODEX_APP_SERVER_WS_URL` in the user's launchd
 environment. In this topology the bridge starts the app-server with:
 
@@ -144,6 +144,35 @@ three seconds, so an open settings panel follows recovery without a page reload.
 The macOS installer also verifies both the LaunchAgent label and the control socket. If launchd
 returns error 5 immediately after unloading an older service, the installer enables the per-user
 label, retries bootstrap when necessary, and waits for `codexctl status` before reporting success.
+
+### Exclusive rollout writer safety
+
+All app-servers that use the same `CODEX_HOME` can write the same rollout history. Bundled and
+standalone releases may reject each other, but two copies of the same release do not consistently
+take a shared writer lock. Never run a private stdio app-server and the Bridge-managed listener at
+the same time.
+
+The installers inspect the selected `codex` executable before starting the user service. If that
+executable is already running `app-server` without `--listen`, installation and service-definition
+creation finish but service startup is automatically deferred. This commonly happens when the
+installer is run from an active Codex session:
+
+```sh
+./scripts/install-macos.sh --web-ui --no-start
+# Finish the current turn, fully quit Codex Desktop, then start the LaunchAgent.
+```
+
+Linux follows the same rule for the configured standalone executable and systemd user service.
+The installer and daemon never kill the pre-existing stdio process because it may own an active
+turn. While running, Bridge rechecks every two seconds; if a conflicting stdio writer appears, it
+stops only the app-server child it started, reports the conflict in component status, and resumes
+management after the other writer exits.
+
+Bridge also holds an advisory lock at `${CODEX_HOME}/.codex-bridge-managed-writer.lock`. That lock
+prevents two current Bridge daemons from managing writers for one history store. It cannot make an
+older or independently launched app-server participate in the lock, so process detection is a
+safety fence rather than a transactional guarantee. For strict isolation, give unrelated
+app-server instances different `CODEX_HOME` directories; their histories will also be separate.
 
 ### Optional local Whisper transcription
 
