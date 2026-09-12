@@ -2733,6 +2733,17 @@ function preserveMessageElementPosition(element, change) {
   );
 }
 
+function collapseExpandedMessages() {
+  const prefix = `${state.current?.id || ""}:`,
+    expanded = [...state.expandedTurnIds].filter((key) => key.startsWith(prefix));
+  for (const key of expanded) state.expandedTurnIds.delete(key);
+  if (expanded.length) renderVisibleMessages();
+  notify(
+    tr(expanded.length ? "messagesCollapsed" : "noExpandedMessages", { count: expanded.length }),
+  );
+  closePanels();
+}
+
 function layoutTurnGroup(section, group, messageNodes, completed) {
   const finalPosition = group.messages.findLastIndex(
       (message) => message.role === "assistant" && message.phase === "final_answer",
@@ -4486,6 +4497,7 @@ $("notificationBtn").onclick = () => run(toggleBrowserNotifications);
 $("languageBtn").onclick = () => run(toggleLanguage);
 $("refreshBtn").onclick = () => run(refreshThread);
 $("historyFullscreenBtn").onclick = () => setHistoryFullscreen(!isHistoryFullscreen());
+$("collapseMessagesBtn").onclick = collapseExpandedMessages;
 $("createSessionBtn").onclick = () => showCreateDialog();
 $("createProjectNextBtn").onclick = () => run(chooseCreateProject);
 $("createProjectBackBtn").onclick = backToCreateProject;

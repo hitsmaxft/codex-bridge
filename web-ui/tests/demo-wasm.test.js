@@ -1095,6 +1095,22 @@ test("completed turns collapse by server turn id and preserve the full expansion
   assert.match(source, /observeVisibleDeferredTurns/);
 });
 
+test("Tools can collapse every expanded message in the current session", async () => {
+  const [html, source] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+  ]);
+  assert.match(html, /id="collapseMessagesBtn"[^>]*data-i18n="collapseMessages"/);
+  const collapseFlow = source.slice(
+    source.indexOf("function collapseExpandedMessages"),
+    source.indexOf("function layoutTurnGroup"),
+  );
+  assert.match(collapseFlow, /state\.current\?\.id/);
+  assert.match(collapseFlow, /state\.expandedTurnIds\.delete\(key\)/);
+  assert.match(collapseFlow, /renderVisibleMessages\(\)/);
+  assert.match(source, /\$\("collapseMessagesBtn"\)\.onclick = collapseExpandedMessages/);
+});
+
 test("token usage joins the turn fold while memory stays on the final response", async () => {
   assert.deepEqual(
     memoryCitationModel([
