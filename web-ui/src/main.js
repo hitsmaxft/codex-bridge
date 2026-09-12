@@ -16,6 +16,7 @@ import { goalToggleState } from "./goal-state.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import { memoryCitationModel } from "./memory-citations.js";
+import { pendingInputSummary, reconcilePendingMessages } from "./pending-state.js";
 import {
   browserNotificationState,
   disableBrowserNotifications,
@@ -3164,35 +3165,18 @@ function syncOutboxCompactLabel() {
   tray.title = label;
   tray.setAttribute("aria-label", label);
 }
-function pendingLandedInMessages(entry, messages) {
-  return messages.some((message) => {
-    if (message.role !== "user") return false;
-    if (message.id && message.id === entry.id) return true;
-    if (!Number.isSafeInteger(entry.after_message_index)) return false;
-    if (message.message_index <= entry.after_message_index) return false;
-    const text = (message.content || [])
-      .filter((item) => item.kind === "text" && typeof item.text === "string")
-      .map((item) => item.text)
-      .join("\n");
-    return Boolean(text) && text === entry.text;
-  });
-}
 function mergePendingResponse(
   messages,
   preserveLocal = true,
   authoritativeMessages = state.visibleMessages,
 ) {
-  const remote = (Array.isArray(messages) ? messages : []).filter(
-    (entry) => !pendingLandedInMessages(entry, authoritativeMessages || []),
-  );
-  if (!preserveLocal) return remote;
+  const remote = Array.isArray(messages) ? messages : [];
+  if (!preserveLocal) return reconcilePendingMessages(remote, authoritativeMessages);
   const ids = new Set(remote.map((entry) => entry.id));
-  return [
-    ...remote,
-    ...state.pending.filter(
-      (entry) => !ids.has(entry.id) && !pendingLandedInMessages(entry, authoritativeMessages || []),
-    ),
-  ];
+  return reconcilePendingMessages(
+    [...remote, ...state.pending.filter((entry) => !ids.has(entry.id))],
+    authoritativeMessages,
+  );
 }
 async function refreshPending({ preserveOptimistic = true } = {}) {
   const r = await command(
@@ -4408,13 +4392,7 @@ async function write(name) {
   const threadId = state.current.id,
     submissionId = newSubmissionId();
   let action = name === "steer" ? "steer" : "queue";
-  const pendingText =
-    text ||
-    attachments
-      .map((attachment) =>
-        attachment.type === "audio" ? "[Audio attachment]" : "[Image attachment]",
-      )
-      .join("\n");
+  const pendingText = pendingInputSummary(text, attachments);
   let acknowledged = false;
   state.pending.push({
     id: submissionId,

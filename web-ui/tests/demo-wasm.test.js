@@ -21,6 +21,7 @@ import { demoCommandWithInstance } from "../src/demo-client.js";
 import { goalToggleState } from "../src/goal-state.js";
 import { localFilePath, localFileReference } from "../src/markdown.js";
 import { memoryCitationModel } from "../src/memory-citations.js";
+import { pendingInputSummary, reconcilePendingMessages } from "../src/pending-state.js";
 import { SessionMessageCache } from "../src/message-cache.js";
 import { runtimeArchitectureModel } from "../src/runtime-architecture.js";
 import {
@@ -1051,15 +1052,64 @@ test("goal is a collapsible right-side panel with typed pause resume and edit co
   assert.match(stylesheet, /\.goal-restore\s*\{[^}]*position:\s*fixed;[^}]*right:\s*0;/s);
 });
 
-test("pending handoff is cleared only by an authoritative rendered user message", async () => {
+test("pending handoff matches multimodal user messages one-to-one", async () => {
+  assert.equal(
+    pendingInputSummary("look here", [{ type: "image" }]),
+    "look here\n[Image attachment]",
+  );
+  const pending = [
+    {
+      id: "optimistic-1",
+      text: "look here\n[Image attachment]",
+      after_message_index: 10,
+    },
+    {
+      id: "optimistic-2",
+      text: "look here\n[Image attachment]",
+      after_message_index: 10,
+    },
+  ];
+  const authoritative = [
+    {
+      id: "server-message",
+      role: "user",
+      message_index: 11,
+      content: [
+        { kind: "context", label: "Image attachment" },
+        { kind: "text", text: "look here" },
+      ],
+    },
+  ];
+  assert.deepEqual(reconcilePendingMessages(pending, authoritative), [pending[1]]);
+  assert.deepEqual(
+    reconcilePendingMessages(
+      [{ id: "image-only", text: "[Image attachment]", after_message_index: 11 }],
+      [
+        ...authoritative,
+        {
+          id: "server-image-only",
+          role: "user",
+          message_index: 12,
+          content: [{ kind: "context", label: "Image attachment" }],
+        },
+      ],
+    ),
+    [],
+  );
+  assert.equal(
+    reconcilePendingMessages(
+      [{ id: "future", text: "look here\n[Image attachment]", after_message_index: 11 }],
+      authoritative,
+    ).length,
+    1,
+  );
+
   const source = await readFile(mainScriptPath, "utf8");
   const merge = source.slice(
-    source.indexOf("function pendingLandedInMessages"),
+    source.indexOf("function mergePendingResponse"),
     source.indexOf("async function deletePending"),
   );
-  assert.match(merge, /message\.id === entry\.id/);
-  assert.match(merge, /message\.message_index <= entry\.after_message_index/);
-  assert.match(merge, /pendingLandedInMessages\(entry, authoritativeMessages/);
+  assert.match(merge, /reconcilePendingMessages/);
   assert.match(source, /after_message_index: state\.lastMessageIndex \?\? -1/);
   const writeFlow = source.slice(
     source.indexOf("async function write"),
