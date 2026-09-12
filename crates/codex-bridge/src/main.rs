@@ -51,6 +51,8 @@ const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const DESKTOP_WS_MAX_BYTES: usize = 64 << 20;
 const DOWNLOAD_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 const PROJECT_INDEX_TTL: Duration = Duration::from_secs(10);
+const APP_SERVER_ADOPTION_STABILITY_WINDOW: Duration = Duration::from_secs(2);
+const APP_SERVER_ADOPTION_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_DOWNLOAD_TICKETS: usize = 128;
 const WEB_SESSION_COOKIE: &str = "codex_bridge_session";
 const WEB_SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -71,7 +73,8 @@ static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Local Web UI and control bridge for Codex app-server"
+    about = "Local Web UI and control bridge for Codex app-server",
+    after_help = "Whisper fallback tuning is configured locally in config.toml under [services.whisper]. Use language = \"zh\" plus prompt for Chinese-English dictation, and simplify_chinese = true to normalize Traditional Chinese output. See docs/install.md."
 )]
 struct Args {
     /// Read service settings from this TOML file.
@@ -210,6 +213,8 @@ struct WhisperFileConfig {
     model: Option<PathBuf>,
     listen: Option<SocketAddr>,
     language: Option<String>,
+    prompt: Option<String>,
+    simplify_chinese: Option<bool>,
     threads: Option<usize>,
 }
 
@@ -244,6 +249,8 @@ struct WhisperRuntimeConfig {
     model: PathBuf,
     listen: SocketAddr,
     language: String,
+    prompt: Option<String>,
+    simplify_chinese: bool,
     threads: Option<usize>,
 }
 
@@ -420,6 +427,19 @@ struct FileTicketRequest {
 #[derive(Debug, Deserialize)]
 struct FileDownloadQuery {
     ticket: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FilePreviewResponse {
+    kind: &'static str,
+    name: String,
+    mime_type: String,
+    size: u64,
+    download_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1408,11 +1428,22 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         if threads.is_some_and(|threads| threads == 0 || threads > 256) {
             bail!("services.whisper.threads must be between 1 and 256");
         }
+        let prompt = config
+            .services
+            .whisper
+            .prompt
+            .map(|prompt| prompt.trim().to_owned())
+            .filter(|prompt| !prompt.is_empty());
+        if prompt.as_ref().is_some_and(|prompt| prompt.len() > 4096) {
+            bail!("services.whisper.prompt must be at most 4096 bytes");
+        }
         Some(WhisperRuntimeConfig {
             bin,
             model,
             listen,
             language,
+            prompt,
+            simplify_chinese: config.services.whisper.simplify_chinese.unwrap_or(false),
             threads,
         })
     } else {
@@ -1484,6 +1515,14 @@ struct ManagedProcessSpec {
     preserve_on_shutdown: bool,
 }
 
+fn isolate_preserved_process_group(command: &mut TokioCommand, preserve_on_shutdown: bool) {
+    if preserve_on_shutdown {
+        // launchd kills processes left in a terminating job's process group. Avoiding Tokio's
+        // kill-on-drop is insufficient unless the preserved child also has its own process group.
+        command.process_group(0);
+    }
+}
+
 struct ManagedWriterLock {
     _file: File,
 }
@@ -1513,6 +1552,20 @@ fn acquire_managed_writer_lock(codex_home: &Path) -> Result<ManagedWriterLock> {
     Ok(ManagedWriterLock { _file: file })
 }
 
+fn desktop_parent_program(program: &Path) -> Option<PathBuf> {
+    let resources = program.parent()?;
+    if resources.file_name()? != "Resources" {
+        return None;
+    }
+    let contents = resources.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    let bundle = contents.parent()?;
+    let app_name = bundle.file_stem()?;
+    Some(contents.join("MacOS").join(app_name))
+}
+
 fn stdio_app_server_pids(ps_output: &str, program: &Path) -> Vec<u32> {
     let mut programs = vec![program.to_string_lossy().into_owned()];
     if let Ok(canonical) = fs::canonicalize(program) {
@@ -1521,27 +1574,57 @@ fn stdio_app_server_pids(ps_output: &str, program: &Path) -> Vec<u32> {
             programs.push(canonical);
         }
     }
-    ps_output
+    let processes = ps_output
         .lines()
         .filter_map(|line| {
             let line = line.trim_start();
-            let split = line.find(char::is_whitespace)?;
-            let pid = line[..split].parse::<u32>().ok()?;
-            let command = line[split..].trim_start();
+            let pid_end = line.find(char::is_whitespace)?;
+            let pid = line[..pid_end].parse::<u32>().ok()?;
+            let rest = line[pid_end..].trim_start();
+            let ppid_end = rest.find(char::is_whitespace)?;
+            let ppid = rest[..ppid_end].parse::<u32>().ok()?;
+            let command = rest[ppid_end..].trim_start().to_owned();
+            Some((pid, ppid, command))
+        })
+        .collect::<Vec<_>>();
+    let desktop_parent =
+        desktop_parent_program(program).map(|path| path.to_string_lossy().into_owned());
+    processes
+        .iter()
+        .filter_map(|(pid, ppid, command)| {
             let matches_program = programs.iter().any(|program| {
                 command.starts_with(&format!("{program} ")) && command.contains(" app-server")
             });
+            let explicit_stdio = command
+                .split_whitespace()
+                .find_map(|argument| argument.strip_prefix("--listen="))
+                .is_some_and(|endpoint| endpoint.starts_with("stdio://"))
+                || command
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|arguments| {
+                        arguments[0] == "--listen" && arguments[1].starts_with("stdio://")
+                    });
+            let direct_desktop_child = desktop_parent.as_ref().is_none_or(|desktop_parent| {
+                processes.iter().any(|(candidate_pid, _, parent_command)| {
+                    candidate_pid == ppid
+                        && (parent_command == desktop_parent
+                            || parent_command.starts_with(&format!("{desktop_parent} ")))
+                })
+            });
             (matches_program
-                && !command.contains(" --listen")
-                && !command.contains(" generate-json-schema"))
-            .then_some(pid)
+                && (!command.contains(" --listen") || explicit_stdio)
+                && !command.contains(" generate-json-schema")
+                && direct_desktop_child)
+                .then_some(*pid)
         })
         .collect()
 }
 
 fn conflicting_stdio_app_servers(program: &Path) -> Result<Vec<u32>> {
     let output = Command::new("ps")
-        .args(["-axo", "pid=,command="])
+        .args(["-axo", "pid=,ppid=,command="])
         .env("LC_ALL", "C")
         .output()
         .context("failed to inspect app-server processes")?;
@@ -1609,6 +1692,9 @@ enum ManagedAppServerCommand {
         thread_id: String,
         reply: std::sync::mpsc::SyncSender<Result<RolloutOrdinalRepair, String>>,
     },
+    Restart {
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
 }
 
 #[derive(Clone)]
@@ -1617,6 +1703,17 @@ struct ManagedAppServerControl {
 }
 
 impl ManagedAppServerControl {
+    fn restart(&self) -> Result<()> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .send(ManagedAppServerCommand::Restart { reply })
+            .map_err(|_| anyhow::anyhow!("managed app-server controller is unavailable"))?;
+        result
+            .recv_timeout(Duration::from_secs(15))
+            .map_err(|_| anyhow::anyhow!("timed out waiting for app-server restart request"))?
+            .map_err(anyhow::Error::msg)
+    }
+
     fn repair_thread_ordinals(&self, thread_id: String) -> Result<RolloutOrdinalRepair> {
         let (reply, result) = std::sync::mpsc::sync_channel(1);
         self.commands
@@ -1626,6 +1723,104 @@ impl ManagedAppServerControl {
             .recv_timeout(Duration::from_secs(90))
             .map_err(|_| anyhow::anyhow!("timed out waiting for rollout repair"))?
             .map_err(anyhow::Error::msg)
+    }
+}
+
+fn listening_app_server_pids(ps_output: &str, program: &Path, socket: &Path) -> Vec<u32> {
+    let mut programs = vec![program.to_string_lossy().into_owned()];
+    if let Ok(canonical) = fs::canonicalize(program) {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !programs.contains(&canonical) {
+            programs.push(canonical);
+        }
+    }
+    let endpoint = format!("unix://{}", socket.display());
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let split = line.find(char::is_whitespace)?;
+            let pid = line[..split].parse::<u32>().ok()?;
+            let command = line[split..].trim_start();
+            let arguments = command.split_whitespace().collect::<Vec<_>>();
+            let matches_program = programs
+                .iter()
+                .any(|program| command.starts_with(&format!("{program} ")));
+            let app_server = arguments.iter().any(|argument| *argument == "app-server");
+            let listens_here = arguments
+                .iter()
+                .any(|argument| *argument == format!("--listen={endpoint}"))
+                || arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "--listen" && pair[1] == endpoint);
+            (matches_program && app_server && listens_here).then_some(pid)
+        })
+        .collect()
+}
+
+fn managed_listener_app_server_pids(program: &Path, socket: &Path) -> Result<Vec<u32>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .env("LC_ALL", "C")
+        .output()
+        .context("failed to inspect managed app-server processes")?;
+    if !output.status.success() {
+        bail!("process inspection exited with {}", output.status);
+    }
+    let stdout = String::from_utf8(output.stdout).context("process list is not UTF-8")?;
+    Ok(listening_app_server_pids(&stdout, program, socket))
+}
+
+async fn stop_adopted_app_server(program: &Path, socket: &Path, reason: &str) -> Result<()> {
+    let pids = managed_listener_app_server_pids(program, socket)?;
+    if pids.is_empty() {
+        bail!(
+            "no app-server process matches the configured listener {}",
+            socket.display()
+        );
+    }
+    for pid in &pids {
+        eprintln!("[codex-bridge] stopping adopted app-server reason={reason} pid={pid}");
+        // SAFETY: PIDs were resolved from an exact executable and listener match above.
+        unsafe { libc::kill(*pid as i32, libc::SIGTERM) };
+    }
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if managed_listener_app_server_pids(program, socket)?.is_empty() {
+            return Ok(());
+        }
+    }
+    let remaining = managed_listener_app_server_pids(program, socket)?;
+    for pid in &remaining {
+        eprintln!(
+            "[codex-bridge] escalating adopted app-server stop reason={reason} signal=SIGKILL pid={pid}"
+        );
+        // Revalidated immediately before escalation so an unrelated process is never targeted.
+        unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+    }
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if managed_listener_app_server_pids(program, socket)?.is_empty() {
+            return Ok(());
+        }
+    }
+    bail!("app-server did not stop after the restart request")
+}
+
+async fn managed_socket_stays_active(path: &Path, window: Duration) -> Result<bool> {
+    let started = Instant::now();
+    loop {
+        if !matches!(
+            prepare_managed_process_socket(path).await?,
+            ManagedSocketState::Active
+        ) {
+            return Ok(false);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= window {
+            return Ok(true);
+        }
+        tokio::time::sleep(APP_SERVER_ADOPTION_PROBE_INTERVAL.min(window - elapsed)).await;
     }
 }
 
@@ -1692,7 +1887,7 @@ async fn supervise_conditional_managed_process(
     let mut restart_count = 0_u64;
     let mut last_error = None;
     let mut backoff = Duration::from_millis(500);
-    while !*shutdown.borrow() {
+    'supervisor: while !*shutdown.borrow() {
         while !*desired.borrow() && !*shutdown.borrow() {
             tokio::select! {
                 changed = desired.changed() => if changed.is_err() { return; },
@@ -1716,6 +1911,7 @@ async fn supervise_conditional_managed_process(
         for name in &spec.remove_environment {
             command.env_remove(name);
         }
+        isolate_preserved_process_group(&mut command, spec.preserve_on_shutdown);
         let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1732,10 +1928,8 @@ async fn supervise_conditional_managed_process(
                     restart_count,
                     last_error: last_error.clone(),
                 });
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {},
-                    _ = desired.changed() => {},
-                    _ = shutdown.changed() => return,
+                if !wait_for_conditional_backoff(backoff, &mut desired, &mut shutdown).await {
+                    return;
                 }
                 backoff = (backoff * 2).min(Duration::from_secs(10));
                 continue;
@@ -1747,55 +1941,97 @@ async fn supervise_conditional_managed_process(
             last_error: last_error.clone(),
         });
         let started = Instant::now();
-        tokio::select! {
-            child_result = child.wait() => {
-                restart_count = restart_count.saturating_add(1);
-                let message = match child_result {
-                    Ok(exit_status) => format!("process exited with {exit_status}"),
-                    Err(error) => format!("failed to wait for process: {error}"),
-                };
-                last_error = Some(message.clone());
-                status_tx.send_replace(ManagedProcessStatus {
-                    running: false,
-                    restart_count,
-                    last_error: last_error.clone(),
-                });
-                eprintln!("[codex-bridge] managed {} {message}", spec.name);
-            }
-            changed = desired.changed() => {
-                if changed.is_err() || !*desired.borrow() {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    last_error = None;
+        loop {
+            tokio::select! {
+                child_result = child.wait() => {
+                    restart_count = restart_count.saturating_add(1);
+                    let message = match child_result {
+                        Ok(exit_status) => format!("process exited with {exit_status}"),
+                        Err(error) => format!("failed to wait for process: {error}"),
+                    };
+                    last_error = Some(message.clone());
                     status_tx.send_replace(ManagedProcessStatus {
                         running: false,
                         restart_count,
-                        last_error: None,
+                        last_error: last_error.clone(),
                     });
-                    backoff = Duration::from_millis(500);
-                    continue;
+                    eprintln!("[codex-bridge] managed {} {message}", spec.name);
+                    break;
                 }
-            }
-            _ = shutdown.changed() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                status_tx.send_replace(ManagedProcessStatus {
-                    running: false,
-                    restart_count,
-                    last_error,
-                });
-                return;
+                changed = desired.changed() => {
+                    if changed.is_err() {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        status_tx.send_replace(ManagedProcessStatus {
+                            running: false,
+                            restart_count,
+                            last_error: None,
+                        });
+                        return;
+                    }
+                    if !*desired.borrow_and_update() {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        last_error = None;
+                        status_tx.send_replace(ManagedProcessStatus {
+                            running: false,
+                            restart_count,
+                            last_error: None,
+                        });
+                        backoff = Duration::from_millis(500);
+                        continue 'supervisor;
+                    }
+                    // A sender may publish the same desired value again. Keep waiting on the
+                    // existing child instead of dropping its kill-on-drop handle.
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        status_tx.send_replace(ManagedProcessStatus {
+                            running: false,
+                            restart_count,
+                            last_error,
+                        });
+                        return;
+                    }
+                }
             }
         }
         if started.elapsed() >= Duration::from_secs(30) {
             backoff = Duration::from_millis(500);
         }
-        tokio::select! {
-            _ = tokio::time::sleep(backoff) => {},
-            _ = desired.changed() => {},
-            _ = shutdown.changed() => return,
+        if !wait_for_conditional_backoff(backoff, &mut desired, &mut shutdown).await {
+            return;
         }
         backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+async fn wait_for_conditional_backoff(
+    duration: Duration,
+    desired: &mut watch::Receiver<bool>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    let delay = tokio::time::sleep(duration);
+    tokio::pin!(delay);
+    loop {
+        tokio::select! {
+            _ = &mut delay => return true,
+            changed = desired.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                if !*desired.borrow_and_update() {
+                    return true;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow_and_update() {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -1828,6 +2064,36 @@ async fn supervise_managed_app_server(
         if let Some(path) = spec.socket_path.as_deref() {
             match prepare_managed_process_socket(path).await {
                 Ok(ManagedSocketState::Active) => {
+                    let stable = tokio::select! {
+                        result = managed_socket_stays_active(
+                            path,
+                            APP_SERVER_ADOPTION_STABILITY_WINDOW,
+                        ) => result,
+                        _ = shutdown.changed() => return,
+                    };
+                    match stable {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!(
+                                "[codex-bridge] rejected managed app-server adoption reason=unstable_listener socket={}",
+                                path.display()
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            restart_count = restart_count.saturating_add(1);
+                            status_tx.send_replace(ManagedProcessStatus {
+                                running: false,
+                                restart_count,
+                                last_error: Some(error.to_string()),
+                            });
+                            eprintln!(
+                                "[codex-bridge] rejected managed app-server adoption reason=probe_failed socket={} error={error:#}",
+                                path.display()
+                            );
+                            continue;
+                        }
+                    }
                     status_tx.send_replace(ManagedProcessStatus {
                         running: true,
                         restart_count,
@@ -1853,8 +2119,28 @@ async fn supervise_managed_app_server(
                                     break;
                                 }
                             }
-                            Some(ManagedAppServerCommand::RepairThreadOrdinals { reply, .. }) = commands.recv() => {
-                                let _ = reply.send(Err("app-server is active but was not started by this Bridge process; restart Bridge once before repairing".to_owned()));
+                            command = commands.recv() => {
+                                match command {
+                                    Some(ManagedAppServerCommand::RepairThreadOrdinals { reply, .. }) => {
+                                        let _ = reply.send(Err("app-server is active but was not started by this Bridge process; restart Bridge once before repairing".to_owned()));
+                                    }
+                                    Some(ManagedAppServerCommand::Restart { reply }) => {
+                                        let stopped = stop_adopted_app_server(
+                                            &spec.program,
+                                            path,
+                                            "manual_restart",
+                                        )
+                                            .await
+                                            .map_err(|error| error.to_string());
+                                        let succeeded = stopped.is_ok();
+                                        let _ = reply.send(stopped);
+                                        if succeeded {
+                                            restart_count = restart_count.saturating_add(1);
+                                            break;
+                                        }
+                                    }
+                                    None => return,
+                                }
                             }
                             _ = shutdown.changed() => return,
                         }
@@ -1888,11 +2174,12 @@ async fn supervise_managed_app_server(
         for name in &spec.remove_environment {
             command.env_remove(name);
         }
+        isolate_preserved_process_group(&mut command, spec.preserve_on_shutdown);
         let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(!spec.preserve_on_shutdown)
             .spawn();
         let mut child = match child {
             Ok(child) => child,
@@ -1939,24 +2226,64 @@ async fn supervise_managed_app_server(
                 });
                 eprintln!("[codex-bridge] managed {} {message}", spec.name);
             }
-            Some(ManagedAppServerCommand::RepairThreadOrdinals { thread_id, reply }) = commands.recv() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                status_tx.send_replace(ManagedProcessStatus {
-                    running: false,
-                    restart_count,
-                    last_error: None,
-                });
-                let store = Arc::clone(&session_store);
-                let repaired = tokio::task::spawn_blocking(move || store.repair_thread_ordinals(&thread_id))
-                    .await
-                    .map_err(|error| format!("rollout repair task failed: {error}"))
-                    .and_then(|result| result.map_err(|error| error.to_string()));
-                pending_reply = Some((reply, repaired));
-                backoff = Duration::from_millis(500);
-                continue;
+            command = commands.recv() => {
+                match command {
+                    Some(ManagedAppServerCommand::RepairThreadOrdinals { thread_id, reply }) => {
+                        eprintln!(
+                            "[codex-bridge] stopping managed app-server reason=ordinal_repair pid={}",
+                            child.id().unwrap_or_default()
+                        );
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        status_tx.send_replace(ManagedProcessStatus {
+                            running: false,
+                            restart_count,
+                            last_error: None,
+                        });
+                        let store = Arc::clone(&session_store);
+                        let repaired = tokio::task::spawn_blocking(move || store.repair_thread_ordinals(&thread_id))
+                            .await
+                            .map_err(|error| format!("rollout repair task failed: {error}"))
+                            .and_then(|result| result.map_err(|error| error.to_string()));
+                        pending_reply = Some((reply, repaired));
+                        backoff = Duration::from_millis(500);
+                        continue;
+                    }
+                    Some(ManagedAppServerCommand::Restart { reply }) => {
+                        eprintln!(
+                            "[codex-bridge] stopping managed app-server reason=manual_restart pid={}",
+                            child.id().unwrap_or_default()
+                        );
+                        let stopped = child.start_kill()
+                            .map_err(|error| format!("failed to stop app-server: {error}"));
+                        let stopped = match stopped {
+                            Ok(()) => child.wait().await
+                                .map(|_| ())
+                                .map_err(|error| format!("failed to wait for app-server: {error}")),
+                            Err(error) => Err(error),
+                        };
+                        let succeeded = stopped.is_ok();
+                        let _ = reply.send(stopped);
+                        if !succeeded {
+                            continue;
+                        }
+                        restart_count = restart_count.saturating_add(1);
+                        status_tx.send_replace(ManagedProcessStatus {
+                            running: false,
+                            restart_count,
+                            last_error: None,
+                        });
+                        backoff = Duration::from_millis(500);
+                        continue;
+                    }
+                    None => return,
+                }
             }
             message = wait_for_stdio_app_server_conflict(&spec.program) => {
+                eprintln!(
+                    "[codex-bridge] stopping managed app-server reason=stdio_conflict pid={} detail={message}",
+                    child.id().unwrap_or_default()
+                );
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 status_tx.send_replace(ManagedProcessStatus {
@@ -1967,6 +2294,13 @@ async fn supervise_managed_app_server(
                 continue;
             }
             _ = shutdown.changed() => {
+                if spec.preserve_on_shutdown {
+                    eprintln!(
+                        "[codex-bridge] leaving managed {} running across daemon restart",
+                        spec.name
+                    );
+                    return;
+                }
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 status_tx.send_replace(ManagedProcessStatus {
@@ -2065,6 +2399,7 @@ async fn supervise_managed_process(
         for name in &spec.remove_environment {
             command.env_remove(name);
         }
+        isolate_preserved_process_group(&mut command, spec.preserve_on_shutdown);
         let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2220,6 +2555,68 @@ async fn configure_desktop_interposition(listen: SocketAddr) -> Result<()> {
     }
 }
 
+async fn desktop_interposition_environment_matches(listen: SocketAddr) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let expected = format!("ws://{listen}/rpc");
+        let ws_url = TokioCommand::new("launchctl")
+            .args(["getenv", "CODEX_APP_SERVER_WS_URL"])
+            .output()
+            .await
+            .context("failed to inspect launchctl CODEX_APP_SERVER_WS_URL")?;
+        let local_daemon = TokioCommand::new("launchctl")
+            .args(["getenv", "CODEX_APP_SERVER_USE_LOCAL_DAEMON"])
+            .output()
+            .await
+            .context("failed to inspect launchctl CODEX_APP_SERVER_USE_LOCAL_DAEMON")?;
+        Ok(ws_url.status.success()
+            && String::from_utf8_lossy(&ws_url.stdout).trim() == expected
+            && (!local_daemon.status.success()
+                || String::from_utf8_lossy(&local_daemon.stdout)
+                    .trim()
+                    .is_empty()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = listen;
+        Ok(false)
+    }
+}
+
+fn spawn_desktop_interposition_environment_guard(
+    listen: SocketAddr,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while !*shutdown.borrow() {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+            match desktop_interposition_environment_matches(listen).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "[codex-bridge] restoring Desktop WebSocket launch environment after it changed"
+                    );
+                    if let Err(error) = configure_desktop_interposition(listen).await {
+                        eprintln!(
+                            "[codex-bridge] failed to restore Desktop WebSocket launch environment: {error:#}"
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "[codex-bridge] failed to inspect Desktop WebSocket launch environment: {error:#}"
+                ),
+            }
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = resolve_args(Args::parse())?;
@@ -2275,7 +2672,7 @@ async fn main() -> Result<()> {
                 OsString::from("CODEX_APP_SERVER_USE_LOCAL_DAEMON"),
             ],
             socket_path: Some(socket.to_owned()),
-            preserve_on_shutdown: false,
+            preserve_on_shutdown: true,
         };
         let (task, status, control) = spawn_managed_app_server(
             spec,
@@ -2315,6 +2712,10 @@ async fn main() -> Result<()> {
         managed_tasks.push(task);
         ws_bridge_status = Some(status);
         configure_desktop_interposition(args.ws_bridge_listen).await?;
+        managed_tasks.push(spawn_desktop_interposition_environment_guard(
+            args.ws_bridge_listen,
+            managed_shutdown_rx.clone(),
+        ));
     }
     if let Some(whisper) = args.whisper.as_ref() {
         let mut whisper_args = vec![
@@ -2849,6 +3250,8 @@ fn web_router(state: WebState) -> Router {
         .route("/api/auth", get(web_auth_check))
         .route("/api/file-ticket", post(web_file_ticket))
         .route("/api/file", get(web_file_download))
+        .route("/api/file-preview", post(web_file_preview))
+        .route("/api/file-preview-content", get(web_file_preview_content))
         .route("/api/command", post(web_command))
         .route("/api/events", get(web_events))
         .layer(DefaultBodyLimit::max(MAX_WEB_REQUEST_BYTES))
@@ -2964,6 +3367,69 @@ async fn web_file_download(
     response
 }
 
+async fn web_file_preview_content(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<FileDownloadQuery>,
+) -> HttpResponse {
+    if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let Some(ticket) = get_download_ticket(&state.download_tickets, &query.ticket) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "preview ticket is invalid or expired",
+        )
+            .into_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        read_workspace_preview(&ticket.workspace, ticket.path.to_string_lossy().as_ref())
+    })
+    .await;
+    let preview = match result {
+        Ok(Ok(preview)) if preview.kind == "image" => preview,
+        Ok(Ok(_)) => {
+            return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "file is not an image").into_response()
+        }
+        Ok(Err(FileDownloadFailure::OutsideWorkspace)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "file is outside the session workspace",
+            )
+                .into_response()
+        }
+        Ok(Err(FileDownloadFailure::TooLarge)) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file must be smaller than 16 MiB",
+            )
+                .into_response()
+        }
+        Ok(Err(_)) | Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
+    };
+    let mut response = preview.bytes.into_response();
+    if let Ok(value) = HeaderValue::from_str(&preview.mime_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("inline"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    response
+}
+
 fn get_download_ticket(
     tickets: &RwLock<HashMap<String, DownloadTicket>>,
     token: &str,
@@ -3020,22 +3486,111 @@ async fn web_file_ticket(
         }
         Ok(Err(_)) | Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
     };
-    let mut random = [0_u8; 32];
-    if getrandom::fill(&mut random).is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to create download ticket",
-        )
-            .into_response();
-    }
-    let token = URL_SAFE_NO_PAD.encode(random);
-    let Ok(mut tickets) = state.download_tickets.write() else {
+    let Ok(token) = issue_download_ticket(&state.download_tickets, workspace, path) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "download ticket store is unavailable",
         )
             .into_response();
     };
+    let mut response = Json(json!({
+        "url": format!("/api/file?ticket={token}"),
+        "expires_in_seconds": DOWNLOAD_TICKET_TTL.as_secs(),
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+async fn web_file_preview(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> HttpResponse {
+    if !web_auth_allowed(&headers, state.auth.as_deref()) {
+        return basic_auth_required();
+    }
+    if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let request = match serde_json::from_slice::<FileTicketRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid request").into_response(),
+    };
+    let store = Arc::clone(&state.bridge.session_store);
+    let resolved = tokio::task::spawn_blocking(move || {
+        let thread = store
+            .find_thread(&request.thread_id)
+            .map_err(|_| FileDownloadFailure::ThreadNotFound)?
+            .ok_or(FileDownloadFailure::ThreadNotFound)?;
+        let preview = read_workspace_preview(&thread.cwd, &request.path)?;
+        Ok::<_, FileDownloadFailure>((thread.cwd, preview))
+    })
+    .await;
+    let (workspace, preview) = match resolved {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(FileDownloadFailure::OutsideWorkspace)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "file is outside the session workspace",
+            )
+                .into_response()
+        }
+        Ok(Err(FileDownloadFailure::TooLarge)) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file must be smaller than 16 MiB",
+            )
+                .into_response()
+        }
+        Ok(Err(_)) | Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
+    };
+    let path = preview.path.clone();
+    let Ok(token) = issue_download_ticket(&state.download_tickets, workspace, path) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file ticket store is unavailable",
+        )
+            .into_response();
+    };
+    let response = FilePreviewResponse {
+        kind: preview.kind,
+        name: preview.filename,
+        mime_type: preview.mime_type,
+        size: preview.size,
+        download_url: format!("/api/file?ticket={token}"),
+        preview_url: (preview.kind == "image")
+            .then(|| format!("/api/file-preview-content?ticket={token}")),
+        content: preview.content,
+    };
+    let mut response = Json(response).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+fn issue_download_ticket(
+    tickets: &RwLock<HashMap<String, DownloadTicket>>,
+    workspace: PathBuf,
+    path: PathBuf,
+) -> Result<String, ()> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).map_err(|_| ())?;
+    let token = URL_SAFE_NO_PAD.encode(random);
+    let mut tickets = tickets.write().map_err(|_| ())?;
     let now = Instant::now();
     tickets.retain(|_, ticket| ticket.expires_at > now);
     if tickets.len() >= MAX_DOWNLOAD_TICKETS {
@@ -3055,20 +3610,71 @@ async fn web_file_ticket(
             expires_at: now + DOWNLOAD_TICKET_TTL,
         },
     );
-    let mut response = Json(json!({
-        "url": format!("/api/file?ticket={token}"),
-        "expires_in_seconds": DOWNLOAD_TICKET_TTL.as_secs(),
-    }))
-    .into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
-    response.headers_mut().insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
-    response
+    Ok(token)
+}
+
+struct WorkspacePreview {
+    kind: &'static str,
+    filename: String,
+    mime_type: String,
+    size: u64,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    content: Option<String>,
+}
+
+fn read_workspace_preview(
+    workspace: &Path,
+    requested: &str,
+) -> std::result::Result<WorkspacePreview, FileDownloadFailure> {
+    let (path, filename, size) = resolve_workspace_download(workspace, requested)?;
+    let bytes = fs::read(&path).map_err(|_| FileDownloadFailure::ReadFailed)?;
+    let detected = infer::get(&bytes).map(|kind| kind.mime_type());
+    let safe_image = detected.filter(|mime| {
+        matches!(
+            *mime,
+            "image/avif" | "image/bmp" | "image/gif" | "image/jpeg" | "image/png" | "image/webp"
+        )
+    });
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let markdown = matches!(extension.as_str(), "md" | "markdown" | "mdown" | "mkd");
+    let text = std::str::from_utf8(&bytes)
+        .ok()
+        .filter(|content| !content.contains('\0'))
+        .map(str::to_owned);
+    let (kind, mime_type, content) = if let Some(mime) = safe_image {
+        ("image", mime.to_owned(), None)
+    } else if let Some(content) = text {
+        (
+            if markdown { "markdown" } else { "text" },
+            if markdown {
+                "text/markdown; charset=utf-8"
+            } else {
+                "text/plain; charset=utf-8"
+            }
+            .to_owned(),
+            Some(content),
+        )
+    } else {
+        (
+            "unsupported",
+            detected.unwrap_or("application/octet-stream").to_owned(),
+            None,
+        )
+    };
+    Ok(WorkspacePreview {
+        kind,
+        filename,
+        mime_type,
+        size,
+        path,
+        bytes,
+        content,
+    })
 }
 
 fn read_workspace_download(
@@ -3336,6 +3942,9 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
             return;
         }
     }
+    let mut app_server_status = bridge.managed_app_server_status.clone();
+    let mut ws_bridge_status = bridge.ws_bridge_status.clone();
+    let mut whisper_status = bridge.whisper_status.clone();
     let mut service_snapshot = tokio::time::interval(Duration::from_secs(3));
     service_snapshot.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     service_snapshot.tick().await;
@@ -3370,7 +3979,45 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
                     break;
                 }
             }
+            _ = wait_for_managed_service_change(
+                &mut app_server_status,
+                &mut ws_bridge_status,
+                &mut whisper_status,
+            ) => {
+                let event = json!({
+                    "type": "bridge_service_snapshot",
+                    "managed_services": managed_services_snapshot(&bridge),
+                    "capabilities": server_capabilities_snapshot(&bridge),
+                    "runtime_resources": runtime_resources_snapshot(&bridge),
+                });
+                if sender.send(AxumWsMessage::Text(event.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
         }
+    }
+}
+
+async fn wait_for_optional_status_change(
+    receiver: &mut Option<watch::Receiver<ManagedProcessStatus>>,
+) {
+    match receiver {
+        Some(receiver) => {
+            let _ = receiver.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn wait_for_managed_service_change(
+    app_server: &mut Option<watch::Receiver<ManagedProcessStatus>>,
+    ws_bridge: &mut Option<watch::Receiver<ManagedProcessStatus>>,
+    whisper: &mut Option<watch::Receiver<ManagedProcessStatus>>,
+) {
+    tokio::select! {
+        _ = wait_for_optional_status_change(app_server) => {}
+        _ = wait_for_optional_status_change(ws_bridge) => {}
+        _ = wait_for_optional_status_change(whisper) => {}
     }
 }
 
@@ -3990,6 +4637,7 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
         status,
         input: Value::Object(input),
         output: (!output.is_empty()).then_some(Value::Object(output)),
+        has_image: false,
     })
 }
 
@@ -4179,6 +4827,11 @@ fn managed_services_snapshot(state: &BridgeState) -> Value {
             "fallback": true,
             "needed": state.whisper_needed.as_ref().is_some_and(|needed| *needed.borrow()),
             "listen": state.whisper.as_ref().map(|config| config.listen),
+            "model": state.whisper.as_ref().and_then(|config| config.model.file_name()).and_then(|name| name.to_str()),
+            "language": state.whisper.as_ref().map(|config| config.language.as_str()),
+            "prompt": state.whisper.as_ref().and_then(|config| config.prompt.as_deref()),
+            "simplify_chinese": state.whisper.as_ref().is_some_and(|config| config.simplify_chinese),
+            "threads": state.whisper.as_ref().and_then(|config| config.threads),
             "status": whisper,
         },
     })
@@ -4289,7 +4942,13 @@ fn transcribe_with_whisper(
     config: &WhisperRuntimeConfig,
     audio: &codex_bridge::RealtimeAudioChunk,
 ) -> std::result::Result<String, BackendFailure> {
-    whisper::transcribe(config.listen, audio)
+    whisper::transcribe(
+        config.listen,
+        audio,
+        &config.language,
+        config.prompt.as_deref(),
+        config.simplify_chinese,
+    )
 }
 
 #[cfg(not(feature = "whisper"))]
@@ -4314,7 +4973,7 @@ fn apply_audio_transcription_capability(state: &BridgeState, native: Value) -> V
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if let Some(needed) = state.whisper_needed.as_ref() {
-        needed.send_replace(!native_enabled);
+        set_whisper_needed(needed, !native_enabled);
     }
     let audio_transcription = if native_enabled {
         let mut native = native;
@@ -4341,6 +5000,17 @@ fn apply_audio_transcription_capability(state: &BridgeState, native: Value) -> V
         cached.clone_from(&capabilities);
     }
     capabilities
+}
+
+fn set_whisper_needed(needed: &watch::Sender<bool>, want: bool) {
+    needed.send_if_modified(|current| {
+        if *current == want {
+            false
+        } else {
+            *current = want;
+            true
+        }
+    });
 }
 
 fn spawn_capability_monitor(state: BridgeState) -> tokio::task::JoinHandle<()> {
@@ -5200,6 +5870,76 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "weekly_usage_error": weekly_usage_error,
             }))
         }
+        Request::ThreadGoalGet { thread_id } => {
+            let resolved =
+                match resolve_write_target(Some(thread_id), session_store, selected_thread) {
+                    Ok(resolved) => resolved,
+                    Err(response) => return response,
+                };
+            match write_backend
+                .app_server_rpc("thread/goal/get", json!({"threadId": resolved.thread.id}))
+            {
+                Ok(result) => Response::success(json!({
+                    "thread_id": resolved.thread.id,
+                    "goal": result.get("goal").cloned().unwrap_or(Value::Null),
+                })),
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::ThreadGoalSet {
+            thread_id,
+            objective,
+            status,
+        } => {
+            let objective = objective.map(|value| value.trim().to_owned());
+            if objective
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 16_000)
+            {
+                return Response::error(
+                    "invalid_goal_objective",
+                    "goal objective must contain between 1 and 16000 characters",
+                );
+            }
+            if status
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "active" | "paused"))
+            {
+                return Response::error(
+                    "invalid_goal_status",
+                    "goal status can only be changed to active or paused",
+                );
+            }
+            if objective.is_none() && status.is_none() {
+                return Response::error(
+                    "invalid_request",
+                    "thread_goal_set requires an objective or status",
+                );
+            }
+            let resolved =
+                match resolve_write_target(Some(thread_id), session_store, selected_thread) {
+                    Ok(resolved) => resolved,
+                    Err(response) => return response,
+                };
+            let mut params = serde_json::Map::from_iter([(
+                "threadId".to_owned(),
+                Value::String(resolved.thread.id.clone()),
+            )]);
+            if let Some(objective) = objective {
+                params.insert("objective".to_owned(), Value::String(objective));
+            }
+            if let Some(status) = status {
+                params.insert("status".to_owned(), Value::String(status));
+            }
+            match write_backend.app_server_rpc("thread/goal/set", Value::Object(params)) {
+                Ok(result) => Response::success(json!({
+                    "action": "thread_goal_set",
+                    "thread_id": resolved.thread.id,
+                    "goal": result.get("goal").cloned().unwrap_or(Value::Null),
+                })),
+                Err(error) => write_backend_error(error),
+            }
+        }
         Request::ComposerOptions => {
             match write_backend
                 .app_server_rpc("model/list", json!({"limit": 100, "includeHidden": false}))
@@ -5707,6 +6447,21 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "backup_created": !report.backups.is_empty(),
                 })),
                 Err(error) => Response::error("rollout_repair_failed", error.to_string()),
+            }
+        }
+        Request::ManagedAppServerRestart => {
+            let Some(control) = state.managed_app_server_control.as_ref() else {
+                return Response::error(
+                    "app_server_not_managed",
+                    "app-server restart requires services.manage_app_server",
+                );
+            };
+            match control.restart() {
+                Ok(()) => Response::success(json!({
+                    "action": "managed_app_server_restart",
+                    "status": "requested",
+                })),
+                Err(error) => Response::error("app_server_restart_failed", error.to_string()),
             }
         }
         Request::ThreadPins => match pinned_thread_ids(write_backend) {
@@ -6767,6 +7522,15 @@ fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Val
                     .get("tools")
                     .and_then(Value::as_array)
                     .map_or(0, Vec::len);
+                let has_tool_image = compact_message
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| {
+                        tools.iter().any(|tool| {
+                            tool.get("has_image").and_then(Value::as_bool) == Some(true)
+                        })
+                    });
+                let keep_content = keep_content || has_tool_image;
                 let file_count = compact_message
                     .get("tools")
                     .and_then(Value::as_array)
@@ -6777,10 +7541,10 @@ fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Val
                 if !keep_content {
                     compact_message["content"] = json!([]);
                 }
-                if tool_count > 0 {
+                if tool_count > 0 && !has_tool_image {
                     compact_message["tools"] = json!([]);
                 }
-                if !keep_content || tool_count > 0 {
+                if !keep_content || (tool_count > 0 && !has_tool_image) {
                     compact_message["deferred"] = json!(true);
                     compact_message["deferred_tool_count"] = json!(tool_count);
                     compact_message["deferred_file_count"] = json!(file_count);
@@ -6819,6 +7583,7 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
         "status": tool.status,
         "preview": tool_preview(tool),
         "has_output": tool.output.is_some(),
+        "has_image": tool.has_image || tool.output.as_ref().is_some_and(web_value_contains_image),
         "bytes": compact_tool_bytes(tool),
         "additions": patch_stats.map(|stats| stats.0),
         "deletions": patch_stats.map(|stats| stats.1),
@@ -6827,6 +7592,36 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
         "command_actions_parallel": command_actions
             .is_some_and(|actions| actions.len() > 1 && command_actions_are_parallel(tool)),
     })
+}
+
+fn web_value_contains_image(value: &Value) -> bool {
+    fn contains(value: &Value, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match value {
+            Value::Array(values) => values.iter().any(|value| contains(value, depth + 1)),
+            Value::Object(fields) => {
+                let direct_image =
+                    fields
+                        .get("image_url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| {
+                            url.starts_with("data:image/")
+                                || url.starts_with("http://")
+                                || url.starts_with("https://")
+                        })
+                        || (fields.get("type").and_then(Value::as_str) == Some("image")
+                            && fields.get("data").and_then(Value::as_str).is_some());
+                direct_image || fields.values().any(|value| contains(value, depth + 1))
+            }
+            Value::String(encoded) => serde_json::from_str::<Value>(encoded)
+                .ok()
+                .is_some_and(|value| contains(&value, depth + 1)),
+            _ => false,
+        }
+    }
+    contains(value, 0)
 }
 
 fn compact_tool_bytes(tool: &ThreadToolCall) -> usize {
@@ -7288,15 +8083,36 @@ mod tests {
     fn stdio_app_server_detection_ignores_listeners_and_non_server_commands() {
         let program = Path::new("/opt/codex/bin/codex");
         let processes = r#"
-  101 /opt/codex/bin/codex app-server
-  102 /opt/codex/bin/codex -c model=test app-server
-  103 /opt/codex/bin/codex app-server --listen unix:///tmp/app.sock
-  104 /opt/codex/bin/codex exec resume thread-1
-  105 /opt/codex/bin/codex app-server generate-json-schema --out /tmp/schema
-  106 /other/codex app-server
+  101 1 /opt/codex/bin/codex app-server
+  102 1 /opt/codex/bin/codex -c model=test app-server
+  103 1 /opt/codex/bin/codex app-server --listen unix:///tmp/app.sock
+  104 1 /opt/codex/bin/codex exec resume thread-1
+  105 1 /opt/codex/bin/codex app-server generate-json-schema --out /tmp/schema
+  106 1 /other/codex app-server
+  107 1 /opt/codex/bin/codex app-server --listen stdio://
+  108 1 /opt/codex/bin/codex app-server --listen=stdio://
 "#;
 
-        assert_eq!(stdio_app_server_pids(processes, program), [101, 102]);
+        assert_eq!(
+            stdio_app_server_pids(processes, program),
+            [101, 102, 107, 108]
+        );
+    }
+
+    #[test]
+    fn bundled_stdio_detection_requires_a_direct_desktop_parent() {
+        let program = Path::new("/Applications/ChatGPT.app/Contents/Resources/codex");
+        let processes = r#"
+  10 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
+  11 10 /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://
+  20 1 /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen unix:///tmp/bridge.sock
+  21 20 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node launch.mjs
+  22 21 /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://
+  30 1 /bin/zsh
+  31 30 /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://
+"#;
+
+        assert_eq!(stdio_app_server_pids(processes, program), [11]);
     }
 
     #[test]
@@ -7389,6 +8205,47 @@ mod tests {
             read_workspace_download(&workspace, oversized.to_str().unwrap()).unwrap_err(),
             FileDownloadFailure::TooLarge
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_preview_detects_markdown_text_images_and_binary_files() {
+        let root = unique_test_dir("workspace-preview");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "# Preview\n\nSafe text.\n").unwrap();
+        fs::write(workspace.join("notes.log"), "first\nsecond\n").unwrap();
+        fs::write(workspace.join("app.js"), "export const ready = true;\n").unwrap();
+        fs::write(
+            workspace.join("pixel.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+        )
+        .unwrap();
+        fs::write(workspace.join("payload.bin"), [0xff, 0, 0xfe, 0x81]).unwrap();
+
+        let markdown = read_workspace_preview(&workspace, "README.md").unwrap();
+        assert_eq!(markdown.kind, "markdown");
+        assert_eq!(
+            markdown.content.as_deref(),
+            Some("# Preview\n\nSafe text.\n")
+        );
+        let text = read_workspace_preview(&workspace, "notes.log").unwrap();
+        assert_eq!(text.kind, "text");
+        assert_eq!(text.mime_type, "text/plain; charset=utf-8");
+        let javascript = read_workspace_preview(&workspace, "app.js").unwrap();
+        assert_eq!(javascript.kind, "text");
+        assert_eq!(
+            javascript.content.as_deref(),
+            Some("export const ready = true;\n")
+        );
+        let image = read_workspace_preview(&workspace, "pixel.png").unwrap();
+        assert_eq!(image.kind, "image");
+        assert_eq!(image.mime_type, "image/png");
+        assert!(image.content.is_none());
+        let binary = read_workspace_preview(&workspace, "payload.bin").unwrap();
+        assert_eq!(binary.kind, "unsupported");
+        assert!(binary.content.is_none());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -7794,6 +8651,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn managed_app_server_stops_repairs_and_restarts() {
         let root = unique_test_dir("managed-app-server-repair");
+        let start_log = root.join("starts.log");
         let sessions = root.join("sessions/2026/09/11");
         fs::create_dir_all(&sessions).unwrap();
         let rollout = sessions.join("rollout-test.jsonl");
@@ -7808,8 +8666,14 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let spec = ManagedProcessSpec {
             name: "test-app-server",
             program: PathBuf::from("/bin/sh"),
-            args: vec![OsString::from("-c"), OsString::from("exec /bin/sleep 30")],
-            environment: HashMap::new(),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("printf 'start\\n' >> \"$START_LOG\"; exec /bin/sleep 30"),
+            ],
+            environment: HashMap::from([(
+                "START_LOG".to_owned(),
+                start_log.to_string_lossy().into_owned(),
+            )]),
             remove_environment: Vec::new(),
             socket_path: None,
             preserve_on_shutdown: false,
@@ -7822,6 +8686,22 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .unwrap()
             .unwrap();
         assert!(status.borrow().running);
+        let restart_control = control.clone();
+        tokio::task::spawn_blocking(move || restart_control.restart())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = status.borrow().clone();
+                if snapshot.running && snapshot.restart_count >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
         let repair_control = control.clone();
         let report = tokio::task::spawn_blocking(move || {
             repair_control.repair_thread_ordinals("thread-repair".to_owned())
@@ -7849,13 +8729,39 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn managed_listener_detection_requires_the_exact_program_and_socket() {
+        let program = Path::new("/opt/codex/bin/codex");
+        let socket = Path::new("/tmp/bridge.sock");
+        let processes = r#"
+  101 /opt/codex/bin/codex app-server --listen unix:///tmp/bridge.sock
+  102 /opt/codex/bin/codex app-server --listen=unix:///tmp/bridge.sock
+  103 /opt/codex/bin/codex app-server --listen unix:///tmp/other.sock
+  104 /other/codex app-server --listen unix:///tmp/bridge.sock
+  105 /opt/codex/bin/codex app-server --listen stdio://
+"#;
+        assert_eq!(
+            listening_app_server_pids(processes, program, socket),
+            [101, 102]
+        );
+    }
+
     #[tokio::test]
     async fn conditional_managed_process_runs_only_while_needed() {
+        let root = unique_test_dir("conditional-managed-process");
+        fs::create_dir_all(&root).unwrap();
+        let start_log = root.join("starts.log");
         let spec = ManagedProcessSpec {
             name: "test-fallback",
             program: PathBuf::from("/bin/sh"),
-            args: vec![OsString::from("-c"), OsString::from("exec /bin/sleep 30")],
-            environment: HashMap::new(),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("printf 'start\\n' >> \"$START_LOG\"; exec /bin/sleep 30"),
+            ],
+            environment: HashMap::from([(
+                "START_LOG".to_owned(),
+                start_log.to_string_lossy().into_owned(),
+            )]),
             remove_environment: Vec::new(),
             socket_path: None,
             preserve_on_shutdown: false,
@@ -7871,6 +8777,20 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .unwrap()
             .unwrap();
         assert!(status.borrow().running);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !start_log.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // send_replace deliberately publishes an unchanged value. The supervisor must retain the
+        // existing kill-on-drop child and keep waiting instead of spawning a replacement.
+        desired_tx.send_replace(true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(status.borrow().running);
+        assert_eq!(fs::read_to_string(&start_log).unwrap().lines().count(), 1);
 
         desired_tx.send_replace(false);
         tokio::time::timeout(Duration::from_secs(1), status.changed())
@@ -7883,6 +8803,19 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .await
             .unwrap()
             .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn whisper_needed_notifies_only_when_the_value_changes() {
+        let (needed, mut observed) = watch::channel(true);
+
+        set_whisper_needed(&needed, true);
+        assert!(!observed.has_changed().unwrap());
+
+        set_whisper_needed(&needed, false);
+        assert!(observed.has_changed().unwrap());
+        assert!(!*observed.borrow_and_update());
     }
 
     #[cfg(feature = "whisper")]
@@ -7893,7 +8826,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let config_path = root.join("config.toml");
         fs::write(
             &config_path,
-            "[services.whisper]\nenabled = true\nmodel = \"~/models/ggml-base.bin\"\nlisten = \"127.0.0.1:19092\"\nlanguage = \"auto\"\nthreads = 4\n",
+            "[services.whisper]\nenabled = true\nmodel = \"~/models/ggml-base.bin\"\nlisten = \"127.0.0.1:19092\"\nlanguage = \"zh\"\nprompt = \"简体中文和 English 技术讨论\"\nsimplify_chinese = true\nthreads = 4\n",
         )
         .unwrap();
         let args =
@@ -7902,7 +8835,12 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let resolved = resolve_args(args).unwrap();
         let whisper = resolved.whisper.unwrap();
         assert_eq!(whisper.listen, "127.0.0.1:19092".parse().unwrap());
-        assert_eq!(whisper.language, "auto");
+        assert_eq!(whisper.language, "zh");
+        assert_eq!(
+            whisper.prompt.as_deref(),
+            Some("简体中文和 English 技术讨论")
+        );
+        assert!(whisper.simplify_chinese);
         assert_eq!(whisper.threads, Some(4));
         fs::remove_dir_all(root).unwrap();
     }
@@ -7952,6 +8890,27 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[tokio::test]
+    async fn managed_socket_adoption_rejects_an_unstable_listener() {
+        let socket = PathBuf::from(format!(
+            "/tmp/cb-stable-{}-{}.sock",
+            std::process::id(),
+            NEXT_WORKTREE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let close = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(listener);
+        });
+        assert!(
+            !managed_socket_stays_active(&socket, Duration::from_millis(120))
+                .await
+                .unwrap()
+        );
+        close.await.unwrap();
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
     async fn preserved_managed_process_survives_supervisor_shutdown() {
         let root = unique_test_dir("preserved-managed-process");
         fs::create_dir_all(&root).unwrap();
@@ -7998,6 +8957,56 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserved_app_server_survives_bridge_shutdown() {
+        let root = unique_test_dir("preserved-app-server");
+        fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("child.pid");
+        let spec = ManagedProcessSpec {
+            name: "preserved-app-server",
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("echo $$ > \"$BRIDGE_TEST_PID\"; exec /bin/sleep 30"),
+            ],
+            environment: HashMap::from([(
+                "BRIDGE_TEST_PID".to_owned(),
+                pid_file.display().to_string(),
+            )]),
+            remove_environment: Vec::new(),
+            socket_path: None,
+            preserve_on_shutdown: true,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (task, mut status, _control) =
+            spawn_managed_app_server(spec, shutdown_rx, Arc::new(SessionStore::new(root.clone())));
+        tokio::time::timeout(Duration::from_secs(1), status.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..50 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        assert_ne!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgrp() });
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        unsafe { libc::kill(pid, libc::SIGTERM) };
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -8500,6 +9509,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             include_str!("../../../web-ui/src/runtime-architecture.js"),
             include_str!("../../../web-ui/src/i18n.js"),
             include_str!("../../../web-ui/src/composer-state.js"),
+            include_str!("../../../web-ui/src/file-preview.js"),
             include_str!("../../../web-ui/src/session-route.js"),
             include_str!("../../../web-ui/src/state.js"),
             include_str!("../../../web-ui/src/theme.js"),
@@ -8594,6 +9604,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "bridge_thread_activity_snapshot",
             "/api/file",
             "/api/file-ticket",
+            "/api/file-preview",
             "/api/auth",
             "submission_id: submissionId",
             "submit-spin",
@@ -8605,6 +9616,9 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "codex-bridge.browser-notifications.v1",
             "messagePlaceholderCompact",
             "createFileDownloadTicket",
+            "requestFilePreview",
+            "createFilePreviewController",
+            "id=\"filePreviewDialog\"",
             "id=\"archiveThreadBtn\"",
             "id=\"renameThreadBtn\"",
             "message-copy",
@@ -8677,6 +9691,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 status: "completed".into(),
                 input: json!({"type":"commandExecution","command":"git status --short","cwd":"/workspace","commandActions":[]}),
                 output: Some(json!({"aggregatedOutput":"large private output","exitCode":0})),
+                has_image: false,
             }],
         };
         let compact = compact_web_message(&message, 5);
@@ -8686,6 +9701,32 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact["tools"][0]["tool_index"], 0);
         assert!(compact["tools"][0]["has_output"].as_bool().unwrap());
         assert!(!encoded.contains("large private output"));
+    }
+
+    #[test]
+    fn web_tool_summary_marks_images_without_exposing_the_payload() {
+        let message = ThreadMessage {
+            timestamp: None,
+            id: Some("m-image".into()),
+            turn_id: Some("turn-image".into()),
+            role: "assistant".into(),
+            phase: Some("commentary".into()),
+            content: Vec::new(),
+            tools: vec![ThreadToolCall {
+                call_id: "image-1".into(),
+                name: "view_image".into(),
+                status: "completed".into(),
+                input: json!({"path":"/workspace/image.png"}),
+                output: Some(json!({
+                    "content":[{"type":"image","mimeType":"image/png","data":"private-image-data"}]
+                })),
+                has_image: false,
+            }],
+        };
+        let compact = compact_web_message(&message, 5);
+        let encoded = serde_json::to_string(&compact).unwrap();
+        assert_eq!(compact["tools"][0]["has_image"], true);
+        assert!(!encoded.contains("private-image-data"));
     }
 
     #[test]
@@ -8713,6 +9754,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                     status: "completed".into(),
                     input: json!({"command":"true"}),
                     output: Some(json!({"output":"done"})),
+                    has_image: false,
                 }],
             },
             ThreadMessage {
@@ -8733,6 +9775,40 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact[1]["deferred"], true);
         assert_eq!(compact[1]["deferred_tool_count"], 1);
         assert_eq!(compact[2]["content"][0]["text"], "Done.");
+    }
+
+    #[test]
+    fn completed_turn_page_keeps_image_tools_visible() {
+        let messages = vec![
+            ThreadMessage {
+                timestamp: None,
+                id: Some("image-progress".into()),
+                turn_id: Some("turn-image".into()),
+                role: "assistant".into(),
+                phase: Some("commentary".into()),
+                content: Vec::new(),
+                tools: vec![ThreadToolCall {
+                    call_id: "image-1".into(),
+                    name: "view_image".into(),
+                    status: "completed".into(),
+                    input: json!({"path":"/workspace/image.png"}),
+                    output: Some(json!({"_codex_bridge_lazy":true,"bytes":1024})),
+                    has_image: true,
+                }],
+            },
+            ThreadMessage {
+                timestamp: None,
+                id: Some("final".into()),
+                turn_id: Some("turn-image".into()),
+                role: "assistant".into(),
+                phase: Some("final_answer".into()),
+                content: vec![json!({"type":"output_text","text":"Done."})],
+                tools: Vec::new(),
+            },
+        ];
+        let compact = compact_web_message_page(&messages, 4);
+        assert_eq!(compact[0]["tools"][0]["has_image"], true);
+        assert!(compact[0].get("deferred").is_none());
     }
 
     #[test]
@@ -8831,6 +9907,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 "title":"检查新版引用与临时会话布局"
             }),
             output: None,
+            has_image: false,
         };
         assert_eq!(tool_preview(&tool), "cua_repl · 检查新版引用与临时会话布局");
     }
@@ -8868,6 +9945,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 "patch": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n+more\n*** End Patch"
             }),
             output: None,
+            has_image: false,
         };
         assert_eq!(tool_preview(&tool), "已编辑 main.rs");
         let compact = compact_tool_summary(&tool, 0);

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 const PRIMARY_THREAD: &str = "demo-thread-web-ui";
 const SECONDARY_THREAD: &str = "demo-thread-protocol";
 const PROJECT_PATH: &str = "/Users/demo/projects/codex-bridge";
+const HISTORICAL_PROJECT_PATH: &str = "/Users/demo/projects/previous-project";
 const CHATS_PROJECT_PATH: &str = "codex-bridge://chats";
 
 thread_local! {
@@ -40,6 +41,8 @@ struct DemoState {
     pinned_thread: Option<String>,
     renamed_threads: HashMap<String, String>,
     worktree_job_polled: bool,
+    app_server_restart_count: u64,
+    goal: Value,
 }
 
 impl DemoState {
@@ -62,6 +65,17 @@ impl DemoState {
             pinned_thread: Some(PRIMARY_THREAD.to_owned()),
             renamed_threads: HashMap::new(),
             worktree_job_polled: false,
+            app_server_restart_count: 0,
+            goal: json!({
+                "threadId": PRIMARY_THREAD,
+                "objective": "Ship the interactive Web UI demo with typed protocol coverage.",
+                "status": "active",
+                "tokenBudget": 50_000,
+                "tokensUsed": 12_480,
+                "timeUsedSeconds": 2_765,
+                "createdAt": 1_788_767_500_u64,
+                "updatedAt": 1_788_767_541_u64
+            }),
         }
     }
 
@@ -720,7 +734,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 32,
+            "protocol_version": 34,
             "capabilities": {
                 "audio_transcription": {
                     "enabled": true,
@@ -730,9 +744,9 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 }
             },
             "managed_services": {
-                "app_server": {"enabled": true, "status": {"running": true, "restart_count": 0}},
+                "app_server": {"enabled": true, "status": {"running": true, "restart_count": state.app_server_restart_count}},
                 "desktop_interposition": {"enabled": false, "listen": null, "capability": null, "max_frame_bytes": 67_108_864, "max_message_bytes": 67_108_864, "status": {"running": false, "restart_count": 0}},
-                "whisper": {"enabled": false, "fallback": true, "needed": false, "listen": null, "status": {"running": false, "restart_count": 0}}
+                "whisper": {"enabled": false, "fallback": true, "needed": false, "listen": null, "model": null, "language": null, "prompt": null, "simplify_chinese": false, "threads": null, "status": {"running": false, "restart_count": 0}}
             },
             "runtime_resources": {
                 "memory": {"peak_rss_bytes": 12_582_912},
@@ -750,6 +764,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "include_archived": request.get("include_archived").and_then(Value::as_bool).unwrap_or(false),
             "projects": [
                 {"name": "codex-bridge", "path": PROJECT_PATH, "kind": "project", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_541_844_u64},
+                {"name": "previous-project", "path": HISTORICAL_PROJECT_PATH, "kind": "project", "thread_count": 0, "archived_count": 0, "updated_at_ms": 1_788_760_000_000_u64},
                 {"name": "Chats", "path": CHATS_PROJECT_PATH, "kind": "chats", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_500_000_u64}
             ]
         }),
@@ -760,16 +775,19 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .unwrap_or(PROJECT_PATH);
             let threads = if project_path == CHATS_PROJECT_PATH {
                 vec![state.thread(SECONDARY_THREAD)]
+            } else if project_path == HISTORICAL_PROJECT_PATH {
+                Vec::new()
             } else {
                 vec![state.thread(PRIMARY_THREAD)]
             };
+            let available = threads.len();
             json!({
                 "source": "demo_wasm",
                 "project_path": project_path,
                 "threads": threads,
                 "offset": 0,
-                "returned": 1,
-                "available": 1
+                "returned": available,
+                "available": available
             })
         }
         "thread_pins" => {
@@ -779,6 +797,29 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .map(|thread_id| state.thread(thread_id))
                 .collect::<Vec<_>>();
             json!({"available": true, "section_id": "demo-pins", "thread_ids": thread_ids, "threads": threads})
+        }
+        "thread_goal_get" => json!({
+            "thread_id": thread_id,
+            "goal": if thread_id == PRIMARY_THREAD { state.goal.clone() } else { Value::Null },
+        }),
+        "thread_goal_set" => {
+            if thread_id != PRIMARY_THREAD {
+                return error("goal_not_found", "the demo thread has no goal");
+            }
+            if let Some(objective) = request.get("objective").and_then(Value::as_str) {
+                if objective.trim().is_empty() {
+                    return error("invalid_goal_objective", "goal objective cannot be empty");
+                }
+                state.goal["objective"] = json!(objective.trim());
+            }
+            if let Some(status) = request.get("status").and_then(Value::as_str) {
+                if !matches!(status, "active" | "paused") {
+                    return error("invalid_goal_status", "unsupported demo goal status");
+                }
+                state.goal["status"] = json!(status);
+            }
+            state.goal["updatedAt"] = json!(1_788_767_600_u64);
+            json!({"action": "thread_goal_set", "thread_id": thread_id, "goal": state.goal.clone()})
         }
         "thread_pin" => {
             let pinned = request
@@ -1201,6 +1242,10 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "untracked_files": 1,
             "untracked_lines_skipped": 0
         }),
+        "managed_app_server_restart" => {
+            state.app_server_restart_count = state.app_server_restart_count.saturating_add(1);
+            json!({"action": "managed_app_server_restart", "status": "requested"})
+        }
         "tail" => {
             json!({"source": "demo_wasm", "messages": state.messages.iter().cloned().map(public_message).collect::<Vec<_>>(), "messages_total": state.messages.len()})
         }
@@ -1305,7 +1350,46 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 32);
+        assert_eq!(response["result"]["protocol_version"], 34);
+    }
+
+    #[test]
+    fn managed_app_server_restart_updates_demo_status() {
+        let mut state = DemoState::new();
+        let restart = result(dispatch(
+            json!({"command": "managed_app_server_restart"}),
+            &mut state,
+        ));
+        assert_eq!(restart["status"], "requested");
+        let status = result(dispatch(json!({"command": "status"}), &mut state));
+        assert_eq!(
+            status["managed_services"]["app_server"]["status"]["restart_count"],
+            1
+        );
+    }
+
+    #[test]
+    fn goal_can_be_read_paused_resumed_and_edited() {
+        let mut state = DemoState::new();
+        let initial = result(dispatch(
+            json!({"command": "thread_goal_get", "thread_id": PRIMARY_THREAD}),
+            &mut state,
+        ));
+        assert_eq!(initial["goal"]["status"], "active");
+
+        let paused = result(dispatch(
+            json!({"command": "thread_goal_set", "thread_id": PRIMARY_THREAD, "status": "paused"}),
+            &mut state,
+        ));
+        assert_eq!(paused["goal"]["status"], "paused");
+
+        let edited = result(dispatch(
+            json!({"command": "thread_goal_set", "thread_id": PRIMARY_THREAD, "objective": "Updated demo objective", "status": "active"}),
+            &mut state,
+        ));
+        assert_eq!(edited["goal"]["status"], "active");
+        assert_eq!(edited["goal"]["objective"], "Updated demo objective");
+        assert_eq!(edited["goal"]["tokenBudget"], 50_000);
     }
 
     #[test]
@@ -1562,6 +1646,25 @@ mod tests {
         ] {
             assert!(result(dispatch(request, &mut state)).get(field).is_some());
         }
+    }
+
+    #[test]
+    fn project_history_keeps_projects_without_current_threads() {
+        let mut state = DemoState::new();
+        let projects = result(dispatch(json!({"command": "projects"}), &mut state));
+        let historical = projects["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|project| project["path"] == HISTORICAL_PROJECT_PATH)
+            .unwrap();
+        assert_eq!(historical["thread_count"], 0);
+        let threads = result(dispatch(
+            json!({"command": "project_threads", "project_path": HISTORICAL_PROJECT_PATH}),
+            &mut state,
+        ));
+        assert_eq!(threads["available"], 0);
+        assert!(threads["threads"].as_array().unwrap().is_empty());
     }
 
     #[test]

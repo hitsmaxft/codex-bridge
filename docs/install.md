@@ -113,9 +113,10 @@ Mode defaults apply only when a path was not set explicitly:
 
 `services.manage_app_server = true` makes the bridge own, stop, start, and restart the selected
 `codex app-server` process. This lets an explicit session maintenance command stop the writer
-before an atomic rollout repair. Restarting the bridge also restarts its managed app-server, so
-perform upgrades between active turns. Explicitly disabling management leaves externally started
-app-servers untouched. `services.desktop_interposition = true` is valid only in `desktop` mode;
+before an atomic rollout repair. A normal Bridge restart preserves a healthy app-server; explicit
+app-server restart and ordinal repair remain disruptive. Explicitly disabling management leaves
+externally started app-servers untouched. `services.desktop_interposition = true` is valid only in
+`desktop` mode;
 it also supervises `ws-unix-bridge` and sets `CODEX_APP_SERVER_WS_URL` in the user's launchd
 environment. In this topology the bridge starts the app-server with:
 
@@ -152,21 +153,37 @@ standalone releases may reject each other, but two copies of the same release do
 take a shared writer lock. Never run a private stdio app-server and the Bridge-managed listener at
 the same time.
 
-The installers inspect the selected `codex` executable before starting the user service. If that
-executable is already running `app-server` without `--listen`, installation and service-definition
-creation finish but service startup is automatically deferred. This commonly happens when the
-installer is run from an active Codex session:
+The macOS installer inspects the selected `codex` executable before starting the user service. It
+defers startup only when a stdio app-server—either without `--listen` or with the newer explicit
+`--listen stdio://` form—is a direct child of the Codex/ChatGPT Desktop process. Short-lived stdio
+servers created by Computer Use, tests, terminals, or another app-server are ignored and do not
+interrupt Bridge's managed listener. A Desktop-owned conflict commonly appears when installation
+runs from an active Desktop session:
 
 ```sh
 ./scripts/install-macos.sh --web-ui --no-start
 # Finish the current turn, fully quit Codex Desktop, then start the LaunchAgent.
 ```
 
-Linux follows the same rule for the configured standalone executable and systemd user service.
-The installer and daemon never kill the pre-existing stdio process because it may own an active
-turn. While running, Bridge rechecks every two seconds; if a conflicting stdio writer appears, it
-stops only the app-server child it started, reports the conflict in component status, and resumes
-management after the other writer exits.
+Linux has no Desktop parent to distinguish, so it retains the stricter executable-based rule for
+the configured standalone runtime. The installer and daemon never kill a detected stdio process
+because it may own an active turn. In bundled macOS mode, runtime rechecks apply only to a direct
+Desktop child; unrelated stdio helpers cannot trigger managed app-server replacement.
+
+While Desktop interposition is enabled, Bridge also verifies the launchd user environment every two
+seconds. If a Desktop update removes or changes `CODEX_APP_SERVER_WS_URL` (or restores
+`CODEX_APP_SERVER_USE_LOCAL_DAEMON`), Bridge restores the WebSocket launch environment. An already
+running Desktop process cannot change transport in place; restart that Desktop instance after the
+status panel reports a direct Desktop-owned stdio conflict.
+
+Restarting the Bridge daemon does not restart a healthy managed app-server. Bridge leaves the Unix
+listener running in an independent process group, probes it for a stability window, and adopts it
+after startup. This prevents launchd job cleanup from terminating app-server-owned long-running
+exec sessions during a Bridge-only upgrade. Bridge launches a replacement only when the listener
+is unavailable or fails the stability probe. When an app-server restart is actually required,
+expand **App server** under Settings → Managed components and send the explicit restart request.
+The Web UI confirms the disruptive action and reports stop/failure/recovery transitions through
+its live event connection.
 
 Bridge also holds an advisory lock at `${CODEX_HOME}/.codex-bridge-managed-writer.lock`. That lock
 prevents two current Bridge daemons from managing writers for one history store. It cannot make an
@@ -184,8 +201,9 @@ CARGO_INCREMENTAL=0 cargo install --locked --force \
   --features whisper --path crates/codex-bridge
 ```
 
-For example, the whisper.cpp `base` model occupies about 142 MiB on disk and is a practical default
-for editable Chinese and English dictation. Configure the fallback separately from app-server:
+For example, the whisper.cpp multilingual `base` model occupies about 142 MiB on disk and is a
+lightweight starting point. Mixed Chinese-English dictation benefits from a larger multilingual
+model. Configure the fallback separately from app-server:
 
 ```toml
 [services.whisper]
@@ -194,8 +212,26 @@ bin = "/absolute/path/to/whisper-server"
 model = "~/.local/share/whisper.cpp/ggml-base.bin"
 listen = "127.0.0.1:18792"
 language = "auto"
+# Optional decoder context. This is especially useful for mixed-language vocabulary.
+# prompt = "简体中文和 English 混合的技术讨论；保留命令、文件名和英文专有名词。"
+# Convert Traditional Chinese characters in the transcript to Simplified Chinese.
+# simplify_chinese = true
 # threads = 4
 ```
+
+`language` selects Whisper's primary spoken-language token; `auto` detects one primary language but
+does not provide a separate mixed-language mode. For speech that is mainly Mandarin with embedded
+English terms, `language = "zh"` plus a short `prompt` containing the expected English vocabulary is
+usually more stable than auto-detection. The bridge sends both values on every `/inference` request.
+`simplify_chinese = true` then applies an embedded OpenCC-compatible `t2s` conversion to the final
+text. This conversion preserves Latin text and is independent of recognition, so it cannot repair a
+misrecognized English term.
+
+These tuning values are local-only configuration. The Web UI shows the active model filename,
+language, prompt, simplified-Chinese setting, and optional thread count under **Settings → Managed
+components → Whisper transcription**, but intentionally does not edit them. Restart the bridge after
+changing the TOML file. For higher mixed Chinese-English accuracy, use a multilingual `small`,
+`medium`, or `turbo` model as host memory and latency permit; do not use an `.en` model for Chinese.
 
 This does not create a second always-running user service. `codex-bridge` remains the
 launchd/systemd daemon; it supervises `whisper-server` as a loopback-only child while app-server

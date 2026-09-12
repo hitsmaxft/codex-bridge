@@ -30,6 +30,7 @@ runtime_dir=$HOME/.codex-bridge
 state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/codex-bridge
 launcher_dir=$HOME/Library/LaunchAgents
 desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex
+desktop_main=/Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 app_server_socket=$runtime_dir/bundled-app-server.sock
 adapter_port=18790
 
@@ -100,8 +101,18 @@ else
 fi
 
 stdio_app_server_pids() {
-  ps -axo pid=,command= | awk -v bin="$desktop_codex" '
-    index($0, bin " ") && index($0, " app-server") && !index($0, " --listen") && !index($0, " generate-json-schema") { print $1 }
+  ps -axo pid=,ppid=,command= | awk -v bin="$desktop_codex" -v desktop="$desktop_main" '
+    {
+      pid = $1; ppid = $2; $1 = ""; $2 = ""; sub(/^[[:space:]]+/, "");
+      command[pid] = $0; parent[pid] = ppid;
+      if (index($0, bin " ") == 1 && index($0, " app-server") && (!index($0, " --listen") || index($0, " --listen stdio://") || index($0, " --listen=stdio://")) && !index($0, " generate-json-schema")) candidate[pid] = 1;
+    }
+    END {
+      for (pid in candidate) {
+        parent_command = command[parent[pid]];
+        if (parent_command == desktop || index(parent_command, desktop " ") == 1) print pid;
+      }
+    }
   '
 }
 if [ "$start_services" = true ] && [ "$managed_by_bridge" = true ]; then

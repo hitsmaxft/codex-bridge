@@ -66,7 +66,7 @@ a completed bridge or Web UI feature.
 | `account/read`                                                                       | Detect whether API-key authentication enables realtime voice transcription. The result is cached for Web UI status snapshots; the bridge does not probe realtime sessions.        |
 | `account/rateLimits/read`                                                            | Display account usage and limits.                                                                                                                                                 |
 | `model/list`                                                                         | Populate the model selector.                                                                                                                                                      |
-| `project/list`                                                                       | Resolve a project when starting a new thread.                                                                                                                                     |
+| `project/list`                                                                       | Populate historical projects, retain zero-session project rows, and resolve the selected project when starting a new thread.                                                      |
 | `thread/start`                                                                       | Create a new session.                                                                                                                                                             |
 | `thread/fork`                                                                        | Create the in-memory branch behind the selected-text temporary conversation panel.                                                                                                |
 | `thread/settings/update`                                                             | Change the selected model and related thread settings.                                                                                                                            |
@@ -104,6 +104,12 @@ thread is not materialized on disk. If an older or currently starting rollout is
 index is paged and cached for ten seconds so expanding several folders does not repeat the same
 metadata scan.
 
+The session sidebar has one creation entry above pinned sessions and project groups. Creation first
+selects a project from this app-server history, then reuses the existing current-directory or
+worktree flow. Project headings no longer carry separate add buttons. A project returned by
+`project/list` remains visible even when it currently has zero matching sessions; explicit project
+hiding is intentionally deferred.
+
 Some older or very long threads return `-32601` for `thread/items/list` even after a successful
 metadata-only resume. For those threads only, the rollout compatibility path recognizes the fixed
 `text(await tools.<name>(...))` envelope and splits its calls into bounded structured tool entries.
@@ -124,7 +130,10 @@ value when app-server connects or disconnects without repeatedly reading account
 optional `whisper` feature and `[services.whisper]` configuration are enabled, the bridge starts its loopback-only
 `whisper-server` child only while app-server realtime transcription is unavailable. The Web UI can
 therefore disable the microphone while neither backend is ready and automatically recover when one
-becomes available.
+becomes available. Local `[services.whisper]` tuning can set a primary `language`, an initial
+`prompt` for domain terms and Chinese-English code-switching, and `simplify_chinese` output
+normalization. These effective values are visible in the managed-component detail view but are not
+editable from the browser.
 
 ## Client-to-server method catalogue
 
@@ -180,6 +189,14 @@ Methods marked **experimental** only appear when the schema is generated with `-
 | `thread/queue/start` **experimental**                     | Start one queued submission, or the next available submission.  |
 | `thread/goal/set`, `thread/goal/get`, `thread/goal/clear` | Manage the thread objective, status, and optional token budget. |
 | `thread/approveGuardianDeniedAction`                      | Explicitly approve an action previously denied by Guardian.     |
+
+The Web UI reads the current goal through the typed `thread_goal_get` bridge request and presents
+it in a right-side floating panel. The panel shows objective, status, elapsed time, and token
+budget progress; it can collapse to a right-edge restore tab. Pause and continue use
+`thread/goal/set` with `paused` and `active`, while editing sends only `objective` so an existing
+token budget is preserved. Pausing affects automatic continuation after the current turn; it does
+not interrupt an already-running turn. `thread/goal/updated` and `thread/goal/cleared` notifications
+keep the panel synchronized without polling.
 
 ### Models, account, configuration, and permissions
 
@@ -384,8 +401,8 @@ provides a supported transport handoff.
 4. **History undo** — selected-text temporary conversations now use an ephemeral `thread/fork`.
    `thread/revert` can separately provide “forget turns after here.” Make it explicit that history
    revert does not undo workspace files; do not build new UI on deprecated `thread/rollback`.
-5. **Compaction and goals** — expose manual `thread/compact/start` and goal state from
-   `thread/goal/*`, including token budget where useful.
+5. **Manual compaction** — expose `thread/compact/start`; goal state and controls are already
+   available in the Web UI.
 6. **Remote approvals and questions** — implement the server-request loop for command/file/
    permission approvals and `item/tool/requestUserInput`. This is necessary for unattended remote
    control, but requires strong authentication, expiry, and clear target identity.
@@ -393,6 +410,10 @@ provides a supported transport handoff.
    `turn/diff/updated` for a review-oriented task view.
 8. **Integration settings** — use MCP, skills, apps, plugins, and marketplace interfaces for a
    diagnostics/settings panel rather than exposing raw JSON-RPC.
+9. **Project discovery and visibility** — add a native folder picker for starting a session from an
+   arbitrary user-selected directory, then add an explicit hide/unhide action for historical
+   projects. Until those controls exist, creation is limited to app-server project history and
+   historical projects are never hidden merely because their session count is zero.
 
 ### Higher-risk or exploratory candidates
 

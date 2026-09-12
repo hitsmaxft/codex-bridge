@@ -75,6 +75,8 @@ struct RawPayloadHeader<'a> {
     #[serde(rename = "type")]
     payload_type: &'a str,
     call_id: Option<&'a str>,
+    #[serde(borrow)]
+    output: Option<&'a RawValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +143,8 @@ pub struct ThreadToolCall {
     pub input: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
+    #[serde(default)]
+    pub has_image: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +176,7 @@ pub struct ThreadProjectIndex {
 struct IndexedProject {
     name: String,
     roots: Vec<PathBuf>,
+    updated_at_ms: u64,
 }
 
 impl ThreadProjectIndex {
@@ -196,7 +201,20 @@ impl ThreadProjectIndex {
                     .filter_map(|root| root.get("path").and_then(Value::as_str))
                     .map(PathBuf::from)
                     .collect::<Vec<_>>();
-                (!roots.is_empty()).then_some((id, IndexedProject { name, roots }))
+                let updated_at_ms = project
+                    .get("recencyAt")
+                    .and_then(Value::as_u64)
+                    .or_else(|| project.get("updatedAt").and_then(Value::as_u64))
+                    .unwrap_or(0)
+                    .saturating_mul(1_000);
+                (!roots.is_empty()).then_some((
+                    id,
+                    IndexedProject {
+                        name,
+                        roots,
+                        updated_at_ms,
+                    },
+                ))
             })
             .collect();
         let thread_projects = threads
@@ -560,7 +578,22 @@ impl SessionStore {
             entry.archived_count += usize::from(thread.archived);
             entry.updated_at_ms = entry.updated_at_ms.max(thread.updated_at_ms);
         }
-        if project_index.is_some() {
+        if let Some(project_index) = project_index {
+            for project in project_index.projects.values() {
+                for path in &project.roots {
+                    let entry = projects
+                        .entry(path.clone())
+                        .or_insert_with(|| ProjectSummary {
+                            name: project.name.clone(),
+                            path: path.clone(),
+                            kind: ProjectKind::Project,
+                            thread_count: 0,
+                            archived_count: 0,
+                            updated_at_ms: project.updated_at_ms,
+                        });
+                    entry.updated_at_ms = entry.updated_at_ms.max(project.updated_at_ms);
+                }
+            }
             projects
                 .entry(PathBuf::from(CHATS_PROJECT_PATH))
                 .or_insert_with(|| ProjectSummary {
@@ -1727,6 +1760,10 @@ fn read_rollout_messages_from(
             };
             append_tool_output(
                 call_id,
+                header
+                    .output
+                    .and_then(|output| serde_json::from_str::<Value>(output.get()).ok())
+                    .is_some_and(|output| value_contains_image(&output)),
                 RecordLocation {
                     offset: record_offset,
                     len: bytes,
@@ -1846,6 +1883,7 @@ fn update_turn_metadata(
 
 fn append_tool_output(
     call_id: &str,
+    has_image: bool,
     location: RecordLocation,
     messages: &mut [ThreadMessage],
     tool_locations: &HashMap<String, (usize, usize, usize)>,
@@ -1863,12 +1901,43 @@ fn append_tool_output(
         .tools
         .get_mut(tool_end.saturating_sub(1))
     {
+        tool.has_image = has_image;
         tool.output = Some(serde_json::json!({
             "_codex_bridge_lazy": true,
             "bytes": location.len,
         }));
         tool_records.entry(tool.call_id.clone()).or_default().output = Some(location);
     }
+}
+
+fn value_contains_image(value: &Value) -> bool {
+    fn contains(value: &Value, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match value {
+            Value::Array(values) => values.iter().any(|value| contains(value, depth + 1)),
+            Value::Object(fields) => {
+                let direct_image =
+                    fields
+                        .get("image_url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| {
+                            url.starts_with("data:image/")
+                                || url.starts_with("http://")
+                                || url.starts_with("https://")
+                        })
+                        || (fields.get("type").and_then(Value::as_str) == Some("image")
+                            && fields.get("data").and_then(Value::as_str).is_some());
+                direct_image || fields.values().any(|value| contains(value, depth + 1))
+            }
+            Value::String(encoded) => serde_json::from_str::<Value>(encoded)
+                .ok()
+                .is_some_and(|value| contains(&value, depth + 1)),
+            _ => false,
+        }
+    }
+    contains(value, 0)
 }
 
 fn read_json_record(path: &Path, location: RecordLocation) -> Result<Value> {
@@ -1947,6 +2016,7 @@ fn append_rollout_record(
                 status,
                 input,
                 output: None,
+                has_image: false,
             });
         }
         let tool_end = messages[message_index].tools.len();
@@ -2122,6 +2192,7 @@ fn parse_wrapped_tool_calls(
             status: status.to_owned(),
             input,
             output: None,
+            has_image: false,
         });
         search_from = end;
     }
@@ -2851,6 +2922,38 @@ mod tests {
             .unwrap();
         assert_eq!(available, 1);
         assert_eq!(threads[0].id, "thread-chat");
+    }
+
+    #[test]
+    fn app_server_projects_remain_visible_without_current_threads() {
+        let fixture = Fixture::new();
+        let recent = fixture.path.join("recent-project");
+        let empty = fixture.path.join("historical-project");
+        fs::create_dir_all(&recent).unwrap();
+        fs::create_dir_all(&empty).unwrap();
+        let rollout = format!(
+            r#"{{"timestamp":"2026-09-09T01:00:00Z","type":"session_meta","payload":{{"id":"thread-recent","cwd":{}}}}}"#,
+            serde_json::to_string(&recent).unwrap()
+        );
+        fixture.write_rollout("rollout-recent.jsonl", &[&rollout]);
+        let project_index = ThreadProjectIndex::from_app_server(
+            &serde_json::json!({"data":[
+                {"id":"project-recent","name":"Recent","roots":[{"path":recent}],"recencyAt":1_788_767_500_u64,"updatedAt":1_788_767_400_u64},
+                {"id":"project-empty","name":"Historical","roots":[{"path":empty}],"recencyAt":null,"updatedAt":1_788_760_000_u64}
+            ]}),
+            &[serde_json::json!({"id":"thread-recent","projectId":"project-recent"})],
+        );
+
+        let projects = SessionStore::new(fixture.path.clone())
+            .list_projects_with_index(false, Some(&project_index))
+            .unwrap();
+        let historical = projects
+            .iter()
+            .find(|project| project.path == empty)
+            .expect("historical project should remain in the sidebar");
+        assert_eq!(historical.name, "Historical");
+        assert_eq!(historical.thread_count, 0);
+        assert_eq!(historical.updated_at_ms, 1_788_760_000_000);
     }
 
     #[test]

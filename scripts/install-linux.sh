@@ -95,7 +95,7 @@ fi
 
 stdio_app_server_pids() {
   ps -axo pid=,args= | awk -v bin="$codex_bin" '
-    index($0, bin " ") && index($0, " app-server") && !index($0, " --listen") && !index($0, " generate-json-schema") { print $1 }
+    index($0, bin " ") && index($0, " app-server") && (!index($0, " --listen") || index($0, " --listen stdio://") || index($0, " --listen=stdio://")) && !index($0, " generate-json-schema") { print $1 }
   '
 }
 if [ "$start_services" = true ] && [ "$managed_by_bridge" = true ]; then

@@ -20,23 +20,29 @@ pub(crate) fn is_ready(listen: SocketAddr) -> bool {
 pub(crate) fn transcribe(
     listen: SocketAddr,
     audio: &RealtimeAudioChunk,
+    language: &str,
+    prompt: Option<&str>,
+    simplify_chinese: bool,
 ) -> Result<String, BackendFailure> {
     let wav = pcm16_wav(audio)?;
     let part = Part::bytes(wav)
         .file_name("recording.wav")
         .mime_str("audio/wav")
         .map_err(|error| failure("audio_transcription_failed", error))?;
+    let mut form = Form::new()
+        .part("file", part)
+        .text("response_format", "json")
+        .text("temperature", "0.0")
+        .text("language", language.to_owned());
+    if let Some(prompt) = prompt {
+        form = form.text("prompt", prompt.to_owned());
+    }
     let response = Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|error| failure("audio_transcription_failed", error))?
         .post(format!("http://{listen}/inference"))
-        .multipart(
-            Form::new()
-                .part("file", part)
-                .text("response_format", "json")
-                .text("temperature", "0.0"),
-        )
+        .multipart(form)
         .send()
         .map_err(|error| failure("audio_transcription_unavailable", error))?;
     let status = response.status();
@@ -53,16 +59,20 @@ pub(crate) fn transcribe(
         code: "audio_transcription_failed",
         message: format!("whisper.cpp returned invalid JSON: {error}"),
     })?;
-    value
+    let transcript = value
         .get("text")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .map(str::to_owned)
         .ok_or_else(|| BackendFailure {
             code: "audio_transcription_empty",
             message: "whisper.cpp did not detect speech".to_owned(),
-        })
+        })?;
+    Ok(if simplify_chinese {
+        zhhz::Converter::new(zhhz::Config::T2s).convert(transcript)
+    } else {
+        transcript.to_owned()
+    })
 }
 
 fn pcm16_wav(audio: &RealtimeAudioChunk) -> Result<Vec<u8>, BackendFailure> {
@@ -175,12 +185,37 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = vec![0; 16 * 1024];
-            let count = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..count]);
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "request ended before its multipart body");
+                request.extend_from_slice(&buffer[..count]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
             assert!(request.starts_with("POST /inference HTTP/1.1"));
             assert!(request.contains("name=\"file\"; filename=\"recording.wav\""));
             assert!(request.contains("Content-Type: audio/wav"));
+            assert!(request.contains("name=\"language\""));
+            assert!(request.contains("\r\n\r\nzh\r\n"));
+            assert!(request.contains("name=\"prompt\""));
+            assert!(request.contains("简体中文和 English 技术讨论"));
             let body = r#"{"text":" local transcript "}"#;
             write!(
                 stream,
@@ -196,7 +231,24 @@ mod tests {
             num_channels: 1,
             samples_per_channel: 160,
         };
-        assert_eq!(transcribe(address, &audio).unwrap(), "local transcript");
+        assert_eq!(
+            transcribe(
+                address,
+                &audio,
+                "zh",
+                Some("简体中文和 English 技术讨论"),
+                true,
+            )
+            .unwrap(),
+            "local transcript"
+        );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn normalizes_traditional_chinese_without_changing_english() {
+        let converted =
+            zhhz::Converter::new(zhhz::Config::T2s).convert("這是一段 Rust 和 WebSocket 語音轉寫");
+        assert_eq!(converted, "这是一段 Rust 和 WebSocket 语音转写");
     }
 }

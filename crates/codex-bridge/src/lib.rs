@@ -27,7 +27,7 @@ pub use write_backend::{
     StartedTurnReceipt, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 34;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +78,16 @@ pub enum Request {
     ComposerStatus {
         thread_id: String,
     },
+    ThreadGoalGet {
+        thread_id: String,
+    },
+    ThreadGoalSet {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        objective: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
     ComposerOptions,
     ThreadCreate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +134,7 @@ pub enum Request {
     ThreadRepairOrdinals {
         thread_id: String,
     },
+    ManagedAppServerRestart,
     ThreadPins,
     ThreadPin {
         thread_id: String,
@@ -243,6 +254,8 @@ impl Request {
             Self::ThreadActivity { .. } => "thread_activity",
             Self::ThreadWatch { .. } => "thread_watch",
             Self::ComposerStatus { .. } => "composer_status",
+            Self::ThreadGoalGet { .. } => "thread_goal_get",
+            Self::ThreadGoalSet { .. } => "thread_goal_set",
             Self::ComposerOptions => "composer_options",
             Self::ThreadCreate { .. } => "thread_create",
             Self::ThreadCreateStart { .. } => "thread_create_start",
@@ -254,6 +267,7 @@ impl Request {
             Self::ThreadRename { .. } => "thread_rename",
             Self::ThreadArchive { .. } => "thread_archive",
             Self::ThreadRepairOrdinals { .. } => "thread_repair_ordinals",
+            Self::ManagedAppServerRestart => "managed_app_server_restart",
             Self::ThreadPins => "thread_pins",
             Self::ThreadPin { .. } => "thread_pin",
             Self::WorkspaceDiff { .. } => "workspace_diff",
@@ -360,6 +374,12 @@ mod tests {
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["command"], "scroll");
         assert_eq!(json["direction"], "down");
+    }
+
+    #[test]
+    fn managed_app_server_restart_is_a_typed_request() {
+        let json = serde_json::to_value(Request::ManagedAppServerRestart).unwrap();
+        assert_eq!(json["command"], "managed_app_server_restart");
     }
 
     #[test]
@@ -497,6 +517,16 @@ mod tests {
         .unwrap();
         assert_eq!(composer["command"], "composer_status");
         assert_eq!(composer["thread_id"], "thread-1");
+
+        let goal = serde_json::to_value(Request::ThreadGoalSet {
+            thread_id: "thread-1".into(),
+            objective: Some("Ship the goal panel".into()),
+            status: None,
+        })
+        .unwrap();
+        assert_eq!(goal["command"], "thread_goal_set");
+        assert_eq!(goal["objective"], "Ship the goal panel");
+        assert!(goal.get("status").is_none());
 
         let create = serde_json::to_value(Request::ThreadCreate {
             project_path: Some(PathBuf::from("/tmp/project")),
