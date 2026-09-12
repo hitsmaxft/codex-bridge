@@ -7,8 +7,8 @@
       content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
     />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=49b043291717"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=14b377df40de">
+    <script type="module" crossorigin src="/assets/app.js?v=89fc89b9f765"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=7b6b7236fefe">
   </head>
   <body>
     <div class="app">
@@ -375,11 +375,16 @@
           </div>
         </div>
       </section>
-      <section class="tools" id="tools">
+      <section class="tools" id="tools" inert>
         <div class="tool-section tool-primary">
           <div class="brand-row">
             <h2 data-i18n="tools">Tools</h2>
-            <button class="tool-toggle" data-i18n="close">Close</button>
+            <div class="brand-row-actions">
+              <button id="sessionRefreshBtn" type="button" data-i18n="refreshSession">
+                Refresh session
+              </button>
+              <button class="tool-toggle" data-i18n="close">Close</button>
+            </div>
           </div>
           <div class="tool-row">
             <button id="renameThreadBtn" data-i18n="renameCurrent">Rename session</button>

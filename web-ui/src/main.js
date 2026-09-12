@@ -47,7 +47,11 @@ import {
   storedTheme,
   watchSystemTheme,
 } from "./state.js";
-import { scrollTopForViewportAnchor } from "./viewport-state.js";
+import {
+  messageBottomDistance,
+  scrollTopForViewportAnchor,
+  shouldFollowMessageTail,
+} from "./viewport-state.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
 const restoredExpandedProjects = storedExpandedProjects(window.localStorage);
 if (restoredExpandedProjects !== null) {
@@ -1597,7 +1601,7 @@ function syncTemporaryForCurrent() {
     $("temporaryPanel").inert = true;
     document.querySelector("main").inert = false;
     $("sidebar").inert = false;
-    $("tools").inert = false;
+    $("tools").inert = !$("tools").classList.contains("open");
   }
   renderTemporaryMessages();
   syncScrim();
@@ -2481,8 +2485,6 @@ function toolGroupNode(message, keepRunning = false) {
   const group = document.createElement("details");
   group.className = "tool-group";
   const hasImage = tools.some((tool) => tool.has_image);
-  group.open = hasImage;
-  if (hasImage) group.dataset.hasImage = "1";
   const runningTool = tools.findLast((tool) => !toolFinished(tool)),
     latest = runningTool || tools.at(-1),
     summary = document.createElement("summary"),
@@ -2520,8 +2522,6 @@ function toolGroupNode(message, keepRunning = false) {
     const detail = document.createElement("details");
     detail.className = "tool-call";
     detail.dataset.toolIndex = String(tool.tool_index ?? toolPosition);
-    detail.open = Boolean(tool.has_image);
-    if (tool.has_image) detail.dataset.hasImage = "1";
     const head = document.createElement("summary"),
       icon = document.createElement("span"),
       preview = document.createElement("span"),
@@ -2592,7 +2592,6 @@ function toolGroupNode(message, keepRunning = false) {
         appendToolValue(body, r.tool.output);
       });
     };
-    if (detail.open) detail.ontoggle();
     list.appendChild(detail);
   }
   group.appendChild(list);
@@ -2901,7 +2900,7 @@ function preserveLoadedToolDetails(previous, next) {
   const previousGroup = previous.querySelector(".tool-group"),
     nextGroup = next.querySelector(".tool-group");
   if (!previousGroup || !nextGroup) return;
-  nextGroup.open = nextGroup.dataset.hasImage === "1" || previousGroup.open;
+  nextGroup.open = previousGroup.open;
   const previousTools = new Map(
     [...previousGroup.querySelectorAll(".tool-call")].map((detail) => [
       detail.dataset.toolIndex,
@@ -2911,7 +2910,7 @@ function preserveLoadedToolDetails(previous, next) {
   for (const detail of nextGroup.querySelectorAll(".tool-call")) {
     const previousDetail = previousTools.get(detail.dataset.toolIndex);
     if (!previousDetail) continue;
-    detail.open = detail.dataset.hasImage === "1" || previousDetail.open;
+    detail.open = previousDetail.open;
     const loadedBody = previousDetail.querySelector(":scope > .tool-detail");
     if (!loadedBody) continue;
     detail.dataset.loaded = "1";
@@ -3502,10 +3501,11 @@ function usesDocumentMessageScroll() {
 function messageScrollMetrics() {
   const root = $("messages");
   if (usesDocumentMessageScroll()) {
+    const viewport = window.visualViewport;
     return {
-      top: window.scrollY,
+      top: viewport?.pageTop ?? window.scrollY,
       height: document.documentElement.scrollHeight,
-      client: window.innerHeight,
+      client: viewport?.height ?? window.innerHeight,
     };
   }
   return { top: root.scrollTop, height: root.scrollHeight, client: root.clientHeight };
@@ -3515,6 +3515,7 @@ function setMessageScrollTop(top, behavior = "auto") {
   else $("messages").scrollTo({ top, behavior });
 }
 function scrollMessagesToBottom(behavior = "auto") {
+  state.followMessageTail = true;
   setMessageScrollTop(messageScrollMetrics().height, behavior);
 }
 function messageViewportTop() {
@@ -4036,7 +4037,7 @@ function captureMessageView() {
     ),
     anchorTurnKey = anchor?.closest(".turn-group")?.dataset.turnKey || null;
   return {
-    atBottom: metrics.height - metrics.top - metrics.client < 100,
+    atBottom: shouldFollowMessageTail(state.followMessageTail, metrics),
     top: metrics.top,
     anchorMessageIndex: anchor?.dataset.messageIndex || null,
     anchorTurnKey,
@@ -4049,7 +4050,7 @@ function captureMessageView() {
     }),
   };
 }
-function restoreMessageView(view, { smoothBottom = false } = {}) {
+function restoreMessageView(view) {
   if (!view) return scrollMessagesToBottom();
   const openDetails = new Set(view.openDetails);
   for (const message of $("messages").querySelectorAll(".message")) {
@@ -4058,12 +4059,11 @@ function restoreMessageView(view, { smoothBottom = false } = {}) {
     });
   }
   if (view.atBottom) {
-    const smooth = smoothBottom && !matchMedia("(prefers-reduced-motion: reduce)").matches;
-    scrollMessagesToBottom(smooth ? "smooth" : "auto");
-    // Tool streams can update the same turn several times while the previous DOM change is still
-    // being laid out. Re-assert a non-animated bottom anchor after layout; otherwise WebKit and
-    // Firefox can retain an obsolete smooth-scroll target and jump far above the live tail.
-    if (!smooth) requestAnimationFrame(() => scrollMessagesToBottom("auto"));
+    // Incremental tool and assistant updates can arrive before the previous layout has settled.
+    // Keep tail-following deterministic: an interrupted smooth scroll retains an obsolete target
+    // in WebKit and Firefox and can jump back into older history on the next refresh.
+    scrollMessagesToBottom("auto");
+    requestAnimationFrame(() => scrollMessagesToBottom("auto"));
     return;
   }
   const anchor = view.anchorMessageIndex
@@ -4088,8 +4088,7 @@ async function openThread(
 ) {
   const token = ++state.openToken,
     changedThread = state.current?.id !== thread.id,
-    messageView = quiet && preserveView && !changedThread ? captureMessageView() : null,
-    previousHistoryTotal = state.historyTotal;
+    messageView = quiet && preserveView && !changedThread ? captureMessageView() : null;
   if (!quiet) {
     closePanels();
     setThreadHeaderExpanded(false);
@@ -4134,6 +4133,7 @@ async function openThread(
   renderPending();
   if (!quiet) {
     state.userScrolled = false;
+    state.followMessageTail = true;
     document.activeElement?.blur();
     resetHorizontalPosition();
   }
@@ -4205,13 +4205,7 @@ async function openThread(
     state.hasMore = preservedHasMore;
   }
   renderPending();
-  restoreMessageView(messageView, {
-    smoothBottom:
-      Boolean(messageView?.atBottom) &&
-      !state.activeTurnId &&
-      previousHistoryTotal !== null &&
-      r.page.total > previousHistoryTotal,
-  });
+  restoreMessageView(messageView);
   reportMessagesRendered(r, renderStarted);
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
@@ -4223,10 +4217,42 @@ async function refreshThread() {
   if (!state.current) return notify(tr("chooseSessionError"), true);
   return openThread(state.current);
 }
+function clearCurrentSessionMessageCaches(threadId) {
+  const prefix = `${threadId}:`;
+  state.messageCache.delete(threadId);
+  for (const key of [...state.hydratedTurns.keys()]) {
+    if (key.startsWith(prefix)) state.hydratedTurns.delete(key);
+  }
+  for (const key of [...state.hydratingTurns.keys()]) {
+    if (key.startsWith(prefix)) state.hydratingTurns.delete(key);
+  }
+  resetVisibleTurnHydration();
+  state.visibleMessages = [];
+  state.before = null;
+  state.hasMore = false;
+  state.historyStart = null;
+  state.historyEnd = null;
+  state.historyTotal = null;
+  state.lastMessageIndex = null;
+}
+async function refreshCurrentSessionFromTools() {
+  if (!state.current) throw new Error(tr("chooseSessionError"));
+  const thread = { ...state.current };
+  closePanels();
+  clearCurrentSessionMessageCaches(thread.id);
+  state.userScrolled = false;
+  state.followMessageTail = true;
+  $("messages").innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
+  await openThread(thread, { quiet: true, writeHash: false });
+  scrollMessagesToBottom("auto");
+  requestAnimationFrame(() => scrollMessagesToBottom("auto"));
+  notify(tr("sessionRefreshed"));
+}
 async function loadOlder() {
   if (!state.current || !state.hasMore || state.loadingHistory) return;
   state.loadingHistory = true;
   state.userScrolled = false;
+  state.followMessageTail = false;
   const threadId = state.current.id,
     openToken = state.openToken,
     expectedEnd = state.historyStart ?? state.before,
@@ -4492,6 +4518,7 @@ $("languageBtn").onclick = () => run(toggleLanguage);
 $("refreshBtn").onclick = () => run(refreshThread);
 $("historyFullscreenBtn").onclick = () => setHistoryFullscreen(!isHistoryFullscreen());
 $("collapseMessagesBtn").onclick = collapseExpandedMessages;
+$("sessionRefreshBtn").onclick = () => run(refreshCurrentSessionFromTools);
 $("createSessionBtn").onclick = () => showCreateDialog();
 $("createProjectNextBtn").onclick = () => run(chooseCreateProject);
 $("createProjectBackBtn").onclick = backToCreateProject;
@@ -4862,12 +4889,13 @@ function syncScrim() {
   );
 }
 function closePanels() {
+  if ($("tools").contains(document.activeElement)) document.activeElement.blur();
   $("tools").classList.remove("open");
+  $("tools").inert = true;
   $("temporaryPanel").classList.remove("open");
   $("temporaryPanel").inert = true;
   document.querySelector("main").inert = false;
   $("sidebar").inert = false;
-  $("tools").inert = false;
   $("sidebar").classList.remove("open");
   syncScrim();
 }
@@ -5024,9 +5052,16 @@ $("outboxTray").addEventListener("click", (event) => {
   syncOutboxCompactLabel();
 });
 syncOutboxCompactLabel();
-$("messages").addEventListener("touchmove", () => (state.userScrolled = true), { passive: true });
-$("messages").addEventListener("wheel", () => (state.userScrolled = true), { passive: true });
+const markUserMessageScroll = () => {
+  state.userScrolled = true;
+  state.followMessageTail = false;
+};
+$("messages").addEventListener("touchmove", markUserMessageScroll, { passive: true });
+$("messages").addEventListener("wheel", markUserMessageScroll, { passive: true });
 const handleMessageScroll = () => {
+  if (state.userScrolled) {
+    state.followMessageTail = messageBottomDistance(messageScrollMetrics()) < 100;
+  }
   if (
     state.userScrolled &&
     messageScrollMetrics().top < 8 &&
@@ -5049,12 +5084,14 @@ document
 document.querySelectorAll(".tool-toggle").forEach(
   (b) =>
     (b.onclick = () => {
+      const opening = !$("tools").classList.contains("open");
+      if (!opening && $("tools").contains(document.activeElement)) document.activeElement.blur();
       $("temporaryPanel").classList.remove("open");
       $("temporaryPanel").inert = true;
       document.querySelector("main").inert = false;
       $("sidebar").inert = false;
-      $("tools").inert = false;
-      $("tools").classList.toggle("open");
+      $("tools").inert = !opening;
+      $("tools").classList.toggle("open", opening);
       syncScrim();
     }),
 );

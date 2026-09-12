@@ -36,7 +36,11 @@ import {
   sessionIdFromHash,
   storedSessionId,
 } from "../src/session-route.js";
-import { scrollTopForViewportAnchor } from "../src/viewport-state.js";
+import {
+  messageBottomDistance,
+  scrollTopForViewportAnchor,
+  shouldFollowMessageTail,
+} from "../src/viewport-state.js";
 
 const wasmPath = new URL(
   "../../target/wasm32-unknown-unknown/release/codex_bridge_demo.wasm",
@@ -756,8 +760,8 @@ test("tool output images open in a zoomable viewer", async () => {
   assert.match(stylesheet, /\.image-viewer\s*\{[^}]*touch-action:\s*none;/s);
   assert.match(stylesheet, /\.image-viewer-stage\s*\{[^}]*touch-action:\s*none;/s);
   assert.match(stylesheet, /\.inspectable-image\s*\{[^}]*cursor:\s*zoom-in;/s);
-  assert.match(source, /group\.open = hasImage/);
-  assert.match(source, /detail\.open = Boolean\(tool\.has_image\)/);
+  assert.doesNotMatch(source, /group\.open = hasImage/);
+  assert.doesNotMatch(source, /detail\.open = Boolean\(tool\.has_image\)/);
   assert.doesNotMatch(source, /hasToolImage|imageToolNodes/);
   assert.match(source, /if \(hasImage\) summary\.appendChild\(toolImageIndicator\(\)\)/);
   assert.match(source, /if \(tool\.has_image\) head\.appendChild\(toolImageIndicator\(\)\)/);
@@ -923,12 +927,45 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
   assert.match(source, /anchorTurnKey/);
   assert.match(source, /!message\.hidden/);
   assert.match(source, /message\.getClientRects\(\)\.length > 0/);
-  assert.match(source, /smoothBottom/);
+  assert.match(source, /viewport\?\.pageTop \?\? window\.scrollY/);
+  assert.match(source, /viewport\?\.height \?\? window\.innerHeight/);
+  assert.match(source, /shouldFollowMessageTail\(state\.followMessageTail, metrics\)/);
+  const restoreView = source.slice(
+    source.indexOf("function restoreMessageView"),
+    source.indexOf("async function openThread"),
+  );
+  assert.doesNotMatch(restoreView, /scrollMessagesToBottom\("smooth"\)/);
+  assert.match(
+    restoreView,
+    /if \(view\.atBottom\)[\s\S]*?scrollMessagesToBottom\("auto"\)[\s\S]*?requestAnimationFrame\(\(\) => scrollMessagesToBottom\("auto"\)\)/,
+  );
   const reconcile = source.slice(
     source.indexOf("function reconcileMessageNodes"),
     source.indexOf("function pendingNode"),
   );
   assert.doesNotMatch(reconcile, /replaceChildren/);
+});
+
+test("mobile tail following survives layout growth until the user scrolls away", () => {
+  assert.equal(messageBottomDistance({ top: 900, height: 1500, client: 600 }), 0);
+  assert.equal(messageBottomDistance({ top: 650, height: 1500, client: 600 }), 250);
+  assert.equal(shouldFollowMessageTail(false, { top: 850, height: 1500, client: 600 }), true);
+  assert.equal(shouldFollowMessageTail(false, { top: 650, height: 1500, client: 600 }), false);
+  assert.equal(shouldFollowMessageTail(true, { top: 100, height: 1500, client: 600 }), true);
+});
+
+test("the hidden tools drawer cannot retain focus after it closes", async () => {
+  const [html, source] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+  ]);
+  assert.match(html, /<section class="tools" id="tools" inert>/);
+  assert.match(
+    source,
+    /if \(\$\("tools"\)\.contains\(document\.activeElement\)\) document\.activeElement\.blur\(\)/,
+  );
+  assert.match(source, /\$\("tools"\)\.inert = true/);
+  assert.match(source, /\$\("tools"\)\.inert = !opening/);
 });
 
 test("a detected rollout sequence issue appears beside the session title", async () => {
@@ -1109,6 +1146,23 @@ test("Tools can collapse every expanded message in the current session", async (
   assert.match(collapseFlow, /state\.expandedTurnIds\.delete\(key\)/);
   assert.match(collapseFlow, /renderVisibleMessages\(\)/);
   assert.match(source, /\$\("collapseMessagesBtn"\)\.onclick = collapseExpandedMessages/);
+});
+
+test("Tools refresh clears current message caches and follows the latest tail", async () => {
+  const [html, source] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+  ]);
+  assert.match(html, /class="brand-row-actions"[\s\S]*id="sessionRefreshBtn"/);
+  const refreshFlow = source.slice(
+    source.indexOf("function clearCurrentSessionMessageCaches"),
+    source.indexOf("async function loadOlder"),
+  );
+  assert.match(refreshFlow, /state\.messageCache\.delete\(threadId\)/);
+  assert.match(refreshFlow, /state\.hydratedTurns\.delete\(key\)/);
+  assert.match(refreshFlow, /state\.visibleMessages = \[\]/);
+  assert.match(refreshFlow, /await openThread\(thread, \{ quiet: true, writeHash: false \}\)/);
+  assert.match(refreshFlow, /scrollMessagesToBottom\("auto"\)/);
 });
 
 test("token usage joins the turn fold while memory stays on the final response", async () => {
@@ -1310,4 +1364,6 @@ test("message cache keeps three recently used sessions", () => {
   assert.equal(cache.get("one").page, 1);
   assert.equal(cache.get("three").page, 3);
   assert.equal(cache.get("four").page, 4);
+  assert.equal(cache.delete("three"), true);
+  assert.equal(cache.get("three"), null);
 });

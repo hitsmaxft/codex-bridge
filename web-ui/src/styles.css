@@ -537,6 +537,11 @@ aside {
   justify-content: space-between;
   gap: 10px;
 }
+.brand-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
 .brand-link {
   min-width: 0;
   display: inline-flex;

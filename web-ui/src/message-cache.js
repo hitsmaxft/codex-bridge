@@ -19,4 +19,8 @@ export class SessionMessageCache {
       this.entries.delete(this.entries.keys().next().value);
     }
   }
+
+  delete(threadId) {
+    return this.entries.delete(threadId);
+  }
 }

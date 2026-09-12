@@ -373,11 +373,16 @@
           </div>
         </div>
       </section>
-      <section class="tools" id="tools">
+      <section class="tools" id="tools" inert>
         <div class="tool-section tool-primary">
           <div class="brand-row">
             <h2 data-i18n="tools">Tools</h2>
-            <button class="tool-toggle" data-i18n="close">Close</button>
+            <div class="brand-row-actions">
+              <button id="sessionRefreshBtn" type="button" data-i18n="refreshSession">
+                Refresh session
+              </button>
+              <button class="tool-toggle" data-i18n="close">Close</button>
+            </div>
           </div>
           <div class="tool-row">
             <button id="renameThreadBtn" data-i18n="renameCurrent">Rename session</button>

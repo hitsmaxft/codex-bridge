@@ -48,6 +48,7 @@ export const state = {
   openToken: 0,
   pageSize: 30,
   userScrolled: false,
+  followMessageTail: true,
   pending: [],
   drafts: loadDrafts(),
   composerAttachments: [],
