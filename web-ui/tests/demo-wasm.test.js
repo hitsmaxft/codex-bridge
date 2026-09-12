@@ -18,7 +18,8 @@ import {
 } from "../src/browser-notifications.js";
 import { createAuthenticationGate } from "../src/auth-gate.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
-import { localFilePath } from "../src/markdown.js";
+import { goalToggleState } from "../src/goal-state.js";
+import { localFilePath, localFileReference } from "../src/markdown.js";
 import { memoryCitationModel } from "../src/memory-citations.js";
 import { SessionMessageCache } from "../src/message-cache.js";
 import { runtimeArchitectureModel } from "../src/runtime-architecture.js";
@@ -35,6 +36,7 @@ import {
   sessionIdFromHash,
   storedSessionId,
 } from "../src/session-route.js";
+import { scrollTopForViewportAnchor } from "../src/viewport-state.js";
 
 const wasmPath = new URL(
   "../../target/wasm32-unknown-unknown/release/codex_bridge_demo.wasm",
@@ -113,6 +115,17 @@ test("runtime architecture follows managed and selected voice backends", () => {
   });
   assert.equal(desktopLimited.wsBridge.phase, "standby");
   assert.equal(desktopLimited.wsBridge.labelKey, "componentLimited");
+});
+
+test("managed app-server details expose restart and live transition notifications", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const translations = await readFile(new URL("../src/i18n.js", import.meta.url), "utf8");
+  assert.match(source, /key === "app-server" && enabled/);
+  assert.match(source, /command\(\{ command: "managed_app_server_restart" \}, false\)/);
+  assert.match(source, /observeAppServerService\(event\.managed_services\?\.app_server\)/);
+  assert.match(source, /showBrowserNotification\(globalThis\.Notification/);
+  assert.match(translations, /restartAppServerConfirm/);
+  assert.match(translations, /appServerRecovered/);
 });
 
 test("authoritative idle suppresses a stale rollout turn", () => {
@@ -228,12 +241,38 @@ test("worktree creation uses a background handle and mobile completion has a toa
   assert.match(stylesheet, /\.toast\[data-kind="completion"\]/);
 });
 
+test("new session starts above pinned sessions and chooses from project history", async () => {
+  const command = await demoClient();
+  const projects = result(command({ command: "projects", include_archived: false })).projects;
+  const historical = projects.find((project) => project.path.endsWith("/previous-project"));
+  assert.ok(historical);
+  assert.equal(historical.thread_count, 0);
+  const emptyPage = result(
+    command({ command: "project_threads", project_path: historical.path, limit: 50 }),
+  );
+  assert.equal(emptyPage.available, 0);
+
+  const [html, source, stylesheet] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+  assert.match(html, /id="createSessionBtn"[\s\S]*id="projects"/);
+  assert.match(html, /id="createProjectStep"[\s\S]*id="createProjectSelect"/);
+  assert.match(html, /id="createModeStep"[\s\S]*id="createCurrentBtn"/);
+  assert.match(source, /function populateCreateProjectSelect/);
+  assert.match(source, /function chooseCreateProject/);
+  assert.doesNotMatch(source, /className = "project-add"/);
+  assert.match(stylesheet, /\.session-create-button\s*\{[^}]*width:\s*100%;/s);
+});
+
 test("compiled demo WASM supports refresh and active-run interruption", async () => {
   const command = await demoClient();
   const status = result(command({ command: "status" }));
   assert.equal(status.demo, true);
   assert.equal(status.managed_services.app_server.status.running, true);
   assert.equal(status.managed_services.whisper.fallback, true);
+  assert.equal(status.managed_services.whisper.simplify_chinese, false);
   assert.equal(status.managed_services.desktop_interposition.max_frame_bytes, 67_108_864);
   assert.equal(status.capabilities.audio_transcription.enabled, true);
   assert.equal(status.capabilities.audio_transcription.backend, "demo_wasm");
@@ -517,7 +556,15 @@ test("session run snapshots preserve active, completed, and failed indicators", 
   assert.match(source, /event\.thread_states/);
   assert.match(source, /completedTurnRunState\(params\.turn\)/);
   assert.match(source, /thread-run-state \$\{runState\}/);
-  assert.match(stylesheet, /\.thread-run-state\.active\s*\{/);
+  assert.match(
+    stylesheet,
+    /\.thread-run-state\.active\s*\{[^}]*animation:\s*thread-running-breathe 1\.8s ease-in-out infinite;/s,
+  );
+  assert.match(stylesheet, /@keyframes thread-running-breathe/);
+  assert.match(
+    stylesheet,
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.thread-run-state\.active\s*\{[^}]*animation:\s*none;/s,
+  );
   assert.match(stylesheet, /\.thread-run-state\.completed::before\s*\{[^}]*content:\s*"✓"/s);
   assert.match(stylesheet, /\.thread-run-state\.cancelled,[\s\S]*?background:\s*var\(--danger\)/);
 });
@@ -571,7 +618,7 @@ test("mobile composer stays out of the message grid and catches its own pointer 
   assert.match(mobile, /\.composer-shell textarea,[\s\S]*?touch-action:\s*manipulation;/s);
   assert.match(
     mobile,
-    /\.composer-shell textarea\s*\{[^}]*-webkit-appearance:\s*none;[^}]*padding:\s*12px 5px;[^}]*font-family:\s*-apple-system,[^}]*font-size:\s*16px;[^}]*line-height:\s*20px;[^}]*zoom:\s*1;/s,
+    /\.composer-shell textarea\s*\{[^}]*-webkit-appearance:\s*none;[^}]*min-height:\s*56px;[^}]*padding:\s*18px 7px;[^}]*font-family:\s*-apple-system,[^}]*font-size:\s*16px;[^}]*line-height:\s*20px;[^}]*zoom:\s*1;/s,
   );
   assert.match(
     mobile,
@@ -580,8 +627,10 @@ test("mobile composer stays out of the message grid and catches its own pointer 
   assert.match(source, /function resizeComposerAfterViewportChange\(\)/);
   assert.match(
     source,
-    /document\.activeElement !== \$\("messageText"\)\) resizeComposerTextarea\(\)/,
+    /document\.activeElement === \$\("messageText"\)\) syncFocusedComposerViewport\(\)/,
   );
+  assert.match(mobile, /\.composer\.viewport-anchored\s*\{[^}]*position:\s*absolute;/s);
+  assert.match(source, /viewport\?\.pageTop \?\? window\.scrollY/);
   assert.doesNotMatch(
     source,
     /visualViewport\?\.addEventListener\("resize", resizeComposerTextarea/,
@@ -592,6 +641,23 @@ test("mobile composer stays out of the message grid and catches its own pointer 
   assert.match(source, /recordPerformance\("messages_receive"/);
   assert.match(source, /recordPerformance\("messages_render"/);
   assert.match(source, /recordPerformance\("messages_visible"/);
+});
+
+test("chat history header toggles a composer-free full-screen reading mode", async () => {
+  const [index, stylesheet, source] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+  ]);
+  assert.match(index, /id="historyFullscreenBtn"/);
+  assert.match(index, /data-i18n-aria-label="enterHistoryFullscreen"/);
+  assert.match(index, /aria-pressed="false"/);
+  assert.match(stylesheet, /main\.history-fullscreen \.composer\s*\{[^}]*display:\s*none;/s);
+  assert.match(stylesheet, /main\.history-fullscreen #messages\s*\{[^}]*padding-bottom:\s*24px;/s);
+  assert.match(source, /function setHistoryFullscreen\(fullscreen\)/);
+  assert.match(source, /classList\.toggle\("history-fullscreen", fullscreen\)/);
+  assert.match(source, /setAttribute\("aria-pressed", String\(fullscreen\)\)/);
+  assert.match(source, /else if \(isHistoryFullscreen\(\)\) setHistoryFullscreen\(false\)/);
 });
 
 test("browser performance samples use the bounded demo protocol", async () => {
@@ -669,6 +735,35 @@ test("composer keeps images as attachments and transcribes voice into editable t
   );
 });
 
+test("tool output images open in a zoomable viewer", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  assert.match(source, /function makeInspectableImage\(img\)/);
+  assert.match(source, /parent\.appendChild\(makeInspectableImage\(img\)\)/);
+  assert.match(source, /function openImageViewer\(source, alt = "", trigger = null\)/);
+  assert.match(source, /stage\.onwheel/);
+  assert.match(source, /gesture\?\.kind === "pinch"/);
+  assert.match(source, /stage\.ondblclick/);
+  assert.match(source, /function lockPageZoomForImageViewer\(\)/);
+  assert.match(source, /function restorePageZoomAfterImageViewer\(\)/);
+  assert.match(source, /content\.push\("maximum-scale=1", "user-scalable=no"\)/);
+  assert.match(source, /\["gesturestart", "gesturechange", "gestureend"\]/);
+  assert.match(source, /if \(event\.ctrlKey\) event\.preventDefault\(\)/);
+  assert.match(source, /gesture\.pointerType !== "mouse"/);
+  assert.match(source, /imageViewer\.suppressDoubleClickUntil = now \+ 500/);
+  assert.match(source, /stage\.onlostpointercapture = endPointer/);
+  assert.match(source, /restorePageZoomAfterImageViewer\(\)/);
+  assert.match(stylesheet, /\.image-viewer\s*\{[^}]*touch-action:\s*none;/s);
+  assert.match(stylesheet, /\.image-viewer-stage\s*\{[^}]*touch-action:\s*none;/s);
+  assert.match(stylesheet, /\.inspectable-image\s*\{[^}]*cursor:\s*zoom-in;/s);
+  assert.match(source, /group\.open = hasImage/);
+  assert.match(source, /detail\.open = Boolean\(tool\.has_image\)/);
+  assert.match(source, /node\.dataset\.hasToolImage === "1"/);
+  assert.match(source, /if \(hasImage\) summary\.appendChild\(toolImageIndicator\(\)\)/);
+  assert.match(source, /if \(tool\.has_image\) head\.appendChild\(toolImageIndicator\(\)\)/);
+  assert.match(stylesheet, /\.tool-image-indicator svg\s*\{/);
+});
+
 test("expanded folders preload summaries and composer focus stays inside its input shell", async () => {
   const command = await demoClient();
   const projects = result(command({ command: "projects", include_archived: false })).projects;
@@ -699,7 +794,7 @@ test("expanded folders preload summaries and composer focus stays inside its inp
   assert.match(source, /addEventListener\("pointerdown", keepComposerTextFocus\)/);
   assert.match(source, /target\.closest\([\s\S]*?#submitBtn, #temporarySendBtn/);
   assert.match(source, /p\.kind === "chats" \? tr\("chats"\) : p\.name/);
-  assert.match(source, /p\.kind === "chats" \? tr\("createInChats"\)/);
+  assert.match(source, /option\.textContent = tr\("chatsWithoutProject"\)/);
   assert.match(source, /project_path: project\.kind === "chats" \? null : project\.path/);
   assert.match(source, /\$\("createWorktreeBtn"\)\.hidden = isChat/);
   const stylesheet = await readFile(stylesheetPath, "utf8");
@@ -772,7 +867,38 @@ test("local task file links resolve to workspace paths", () => {
     "/Users/example/project/release.zip",
   );
   assert.equal(localFilePath("/Users/example/project/100%.zip"), "/Users/example/project/100%.zip");
+  assert.deepEqual(localFileReference("/Users/example/project/app.js:123:7"), {
+    path: "/Users/example/project/app.js",
+    line: 123,
+    column: 7,
+  });
+  assert.deepEqual(localFileReference("/Users/example/project/app.js#L45C2"), {
+    path: "/Users/example/project/app.js",
+    line: 45,
+    column: 2,
+  });
   assert.equal(localFilePath("https://example.com/firmware.elf"), null);
+});
+
+test("local workspace files open in a typed preview before download", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const api = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
+  const markdown = await readFile(new URL("../src/markdown.js", import.meta.url), "utf8");
+  const preview = await readFile(new URL("../src/file-preview.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  assert.match(api, /fetch\("\/api\/file-preview"/);
+  assert.match(markdown, /options\.requestLocalFilePreview/);
+  assert.doesNotMatch(markdown, /link\.href = "#"/);
+  assert.match(markdown, /link\.role = "button"/);
+  assert.match(source, /filePreview\.open\(preview, position\)/);
+  assert.match(preview, /new EditorView/);
+  assert.match(preview, /EditorState\.readOnly\.of\(true\)/);
+  assert.match(preview, /EditorView\.scrollIntoView\(anchor/);
+  assert.match(preview, /current\.kind === "markdown"/);
+  assert.match(preview, /current\.kind === "image"/);
+  assert.match(html, /id="filePreviewDialog"/);
+  assert.match(stylesheet, /\.file-preview-card\s*\{/);
 });
 
 test("interrupt requests carry the app-server turn observed by the UI", async () => {
@@ -850,6 +976,45 @@ test("large-session deferred turns hydrate only while visible and at a bounded r
   assert.doesNotMatch(source, /requestIdleCallback\(\(\) => prefetch/);
 });
 
+test("goal is a collapsible right-side panel with typed pause resume and edit controls", async () => {
+  assert.deepEqual(goalToggleState("blocked"), {
+    canPause: false,
+    canResume: true,
+    nextStatus: "active",
+  });
+  assert.equal(goalToggleState("budgetLimited").nextStatus, null);
+  const command = await demoClient();
+  const initial = result(command({ command: "thread_goal_get", thread_id: "demo-thread-web-ui" }));
+  assert.equal(initial.goal.status, "active");
+  const paused = result(
+    command({ command: "thread_goal_set", thread_id: "demo-thread-web-ui", status: "paused" }),
+  );
+  assert.equal(paused.goal.status, "paused");
+  const edited = result(
+    command({
+      command: "thread_goal_set",
+      thread_id: "demo-thread-web-ui",
+      objective: "Updated from the floating panel",
+    }),
+  );
+  assert.equal(edited.goal.objective, "Updated from the floating panel");
+
+  const [html, source, stylesheet] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+  assert.match(html, /id="goalPanel"[\s\S]*id="goalToggleBtn"/);
+  assert.match(html, /id="goalHideBtn"[\s\S]*d="m9 6 6 6-6 6"/);
+  assert.match(html, /id="goalRestoreBtn"[\s\S]*d="m15 6-6 6 6 6"/);
+  assert.match(html, /id="goalEditDialog"[\s\S]*id="goalObjectiveInput"/);
+  assert.match(source, /command: "thread_goal_get"/);
+  assert.match(source, /command: "thread_goal_set"/);
+  assert.match(source, /method === "thread\/goal\/updated"/);
+  assert.match(stylesheet, /\.goal-float\s*\{[^}]*position:\s*fixed;[^}]*right:/s);
+  assert.match(stylesheet, /\.goal-restore\s*\{[^}]*position:\s*fixed;[^}]*right:\s*0;/s);
+});
+
 test("pending handoff is cleared only by an authoritative rendered user message", async () => {
   const source = await readFile(mainScriptPath, "utf8");
   const merge = source.slice(
@@ -870,6 +1035,8 @@ test("pending handoff is cleared only by an authoritative rendered user message"
 });
 
 test("completed turns collapse by server turn id and preserve the full expansion", async () => {
+  assert.equal(scrollTopForViewportAnchor(900, 700, 200), 400);
+  assert.equal(scrollTopForViewportAnchor(400, 200, 700), 900);
   const command = await demoClient();
   const page = result(command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }));
   assert.equal(page.messages[0].turn_id, "demo-turn-seed-1");
@@ -883,6 +1050,7 @@ test("completed turns collapse by server turn id and preserve the full expansion
   );
   assert.match(layout, /message\.turn_id/);
   assert.match(layout, /state\.expandedTurnIds/);
+  assert.match(layout, /preserveMessageElementPosition\(finalNode/);
   assert.match(layout, /foldBlock\.replaceChildren\(fold, divider, tokenUsage\)/);
   assert.match(layout, /\.\.\.leading,[\s\S]*foldBlock,[\s\S]*finalNode/);
   assert.match(layout, /turnSummaryText\(group\)/);
@@ -899,7 +1067,26 @@ test("completed turns collapse by server turn id and preserve the full expansion
     stylesheet,
     /\.turn-fold-text \.tool-summary-label\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s,
   );
-  assert.match(stylesheet, /\.turn-fold-usage\s*\{[^}]*grid-column:\s*2;[^}]*text-align:\s*right/s);
+  assert.match(
+    stylesheet,
+    /\.turn-fold-block\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) max-content;/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-fold-usage\s*\{[^}]*grid-column:\s*2;[^}]*max-width:\s*none;[^}]*overflow:\s*visible;[^}]*text-align:\s*right;[^}]*text-overflow:\s*clip/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-fold:hover \+ \.turn-divider\s*\{[^}]*border-top-color:[^}]*box-shadow:/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-group\.collapsed > \.turn-fold-block > \.turn-fold\s*\{[^}]*font-weight:\s*700;/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-group\.collapsed > \.turn-fold-block > \.turn-divider\s*\{[^}]*border-top-width:\s*2px;/s,
+  );
   assert.match(
     stylesheet,
     /@media \(max-width: 800px\)[\s\S]*\.turn-fold-usage\s*\{[^}]*grid-row:\s*2;[^}]*justify-self:\s*start;[^}]*margin:\s*0 2px 6px 18px[\s\S]*\.turn-fold-block > \.turn-divider\s*\{[^}]*grid-row:\s*3/s,
@@ -945,12 +1132,17 @@ test("message copy follows text before tools and completion metadata", async () 
     );
   assert.match(
     render,
-    /for \(const item of ordinaryItems\)[\s\S]*body\.appendChild\(messageCopyButton\(copyText\)\)[\s\S]*toolGroupNode\(m,[\s\S]*usageItems/,
+    /for \(const item of ordinaryItems\)[\s\S]*copy = copyText \? messageCopyButton\(copyText\) : null,[\s\S]*tools = toolGroupNode\(m,[\s\S]*toolRow\.appendChild\(tools\)[\s\S]*toolRow\.appendChild\(copy\)[\s\S]*usageItems/,
   );
   const copyStyle = stylesheet.match(/\.message-copy\s*\{[^}]*\}/s)?.[0] || "";
   assert.match(copyStyle, /position:\s*absolute/);
   assert.match(copyStyle, /right:\s*0/);
   assert.match(stylesheet, /\.message\.user \.message-body\s*\{[^}]*padding:\s*0 28px 0 0/s);
+  assert.match(
+    stylesheet,
+    /\.message-tool-row > \.tool-message-copy\s*\{[^}]*top:\s*13px;[^}]*right:\s*0;[^}]*bottom:\s*auto;/s,
+  );
+  assert.match(stylesheet, /\.message-tool-row\s*\{[^}]*display:\s*flow-root;/s);
   assert.match(
     stylesheet,
     /\.message\.user \.message-copy\s*\{[^}]*right:\s*-8px;[^}]*bottom:\s*0/s,

@@ -65,6 +65,8 @@ export const state = {
   runtimeResources: null,
   repairRequired: false,
   threadStatistics: null,
+  threadGoal: null,
+  goalBusy: false,
   activityFileLen: null,
   activeTurnId: null,
   activityPhase: null,

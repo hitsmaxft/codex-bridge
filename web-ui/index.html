@@ -55,6 +55,14 @@
               <span data-i18n="includeArchived">Include archived sessions</span></label
             >
           </div>
+          <div class="session-create-bar">
+            <button class="session-create-button" id="createSessionBtn" type="button">
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+              <span data-i18n="createSession">Create new session</span>
+            </button>
+          </div>
           <div id="projects">
             <div class="empty" data-i18n="loadingSessions">Loading sessions…</div>
           </div>
@@ -144,7 +152,26 @@
             </div>
           </div>
           <div class="head-actions">
-            <button id="refreshBtn" data-i18n="refresh">Refresh</button
+            <button
+              class="history-fullscreen-toggle"
+              id="historyFullscreenBtn"
+              type="button"
+              data-i18n-aria-label="enterHistoryFullscreen"
+              aria-label="Enter full-screen history"
+              aria-pressed="false"
+            >
+              <svg
+                class="desktop-icon fullscreen-enter-icon"
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+              >
+                <path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5" />
+              </svg>
+              <svg class="desktop-icon fullscreen-exit-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M8 3v5H3M16 3v5h5M21 16h-5v5M3 16h5v5" />
+              </svg>
+              <span class="mobile-button-label" data-i18n="fullscreenShort">Full</span></button
+            ><button id="refreshBtn" data-i18n="refresh">Refresh</button
             ><button
               class="temporary-toggle"
               id="temporaryPanelBtn"
@@ -474,10 +501,77 @@
         </details>
       </section>
     </div>
+    <aside class="goal-float" id="goalPanel" aria-labelledby="goalPanelTitle" hidden>
+      <header class="goal-head">
+        <div class="goal-heading">
+          <span class="goal-kicker" data-i18n="goal">Goal</span>
+          <strong id="goalPanelTitle" data-i18n="currentGoal">Current goal</strong>
+        </div>
+        <div class="goal-head-actions">
+          <button id="goalEditBtn" type="button" data-i18n="editGoal">Edit</button>
+          <button
+            id="goalHideBtn"
+            class="goal-icon-button"
+            type="button"
+            data-i18n-aria-label="hideGoalPanel"
+            aria-label="Hide goal panel"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" /></svg>
+          </button>
+        </div>
+      </header>
+      <div class="goal-body">
+        <div class="goal-status-row">
+          <span class="goal-status" id="goalStatus"></span>
+          <span class="goal-time" id="goalTime"></span>
+        </div>
+        <p class="goal-objective" id="goalObjective"></p>
+        <div class="goal-budget" id="goalBudget" hidden>
+          <div class="goal-budget-copy">
+            <span data-i18n="goalTokenUsage">Token usage</span><span id="goalBudgetText"></span>
+          </div>
+          <div class="goal-progress" role="progressbar" id="goalProgress"><span></span></div>
+        </div>
+      </div>
+      <footer class="goal-actions">
+        <button id="goalToggleBtn" type="button"></button>
+        <span class="goal-action-help" id="goalActionHelp"></span>
+      </footer>
+    </aside>
+    <button
+      class="goal-restore"
+      id="goalRestoreBtn"
+      type="button"
+      data-i18n-aria-label="showGoalPanel"
+      aria-label="Show goal panel"
+      hidden
+    >
+      <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6" /></svg>
+    </button>
     <div class="selection-actions" id="selectionActions" role="toolbar" hidden>
       <button id="selectionCopyBtn" type="button" data-i18n="copy">Copy</button>
       <button id="selectionInsertBtn" type="button" data-i18n="insertConversation">Insert</button>
       <button id="selectionTemporaryBtn" type="button" data-i18n="temporaryShort">Temp</button>
+    </div>
+    <div
+      class="create-dialog"
+      id="goalEditDialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="goalEditTitle"
+      hidden
+    >
+      <section class="goal-edit-card">
+        <h2 id="goalEditTitle" data-i18n="editGoal">Edit goal</h2>
+        <label for="goalObjectiveInput" data-i18n="goalObjectiveLabel">Objective</label>
+        <textarea id="goalObjectiveInput" maxlength="16000" rows="7"></textarea>
+        <div class="goal-edit-actions">
+          <button id="goalEditCancelBtn" type="button" data-i18n="cancel">Cancel</button>
+          <button id="goalEditSaveBtn" class="primary" type="button" data-i18n="saveGoal">
+            Save
+          </button>
+        </div>
+      </section>
     </div>
     <div
       class="create-dialog"
@@ -489,20 +583,35 @@
     >
       <div class="create-card">
         <h2 id="createTitle" data-i18n="createSession">Create new session</h2>
-        <div class="create-project" id="createProject"></div>
-        <div class="create-options">
-          <button class="create-option" id="createCurrentBtn">
-            <strong data-i18n="currentDirectory">Current directory</strong
-            ><span data-i18n="currentDirectoryHelp"
-              >Start in the existing directory and include current uncommitted changes.</span
-            >
+        <div class="create-step" id="createProjectStep">
+          <p class="create-step-help" data-i18n="chooseRecentProjectHelp">
+            Choose a project previously used with Codex.
+          </p>
+          <label for="createProjectSelect" data-i18n="project">Project</label>
+          <select id="createProjectSelect"></select>
+          <button class="primary create-next" id="createProjectNextBtn" type="button">
+            <span data-i18n="continue">Continue</span>
           </button>
-          <button class="create-option" id="createWorktreeBtn">
-            <strong data-i18n="newWorktree">New worktree</strong
-            ><span data-i18n="newWorktreeHelp"
-              >Create an isolated detached worktree from HEAD; uncommitted changes are not
-              copied.</span
-            >
+        </div>
+        <div class="create-step" id="createModeStep" hidden>
+          <div class="create-project" id="createProject"></div>
+          <div class="create-options">
+            <button class="create-option" id="createCurrentBtn">
+              <strong data-i18n="currentDirectory">Current directory</strong
+              ><span data-i18n="currentDirectoryHelp"
+                >Start in the existing directory and include current uncommitted changes.</span
+              >
+            </button>
+            <button class="create-option" id="createWorktreeBtn">
+              <strong data-i18n="newWorktree">New worktree</strong
+              ><span data-i18n="newWorktreeHelp"
+                >Create an isolated detached worktree from HEAD; uncommitted changes are not
+                copied.</span
+              >
+            </button>
+          </div>
+          <button class="create-back" id="createProjectBackBtn" type="button" data-i18n="back">
+            Back
           </button>
         </div>
         <div class="create-actions">
@@ -525,6 +634,29 @@
           <button id="tasksCloseBtn" type="button" data-i18n="close">Close</button>
         </header>
         <div class="tasks-list" id="tasksList"></div>
+      </section>
+    </div>
+    <div
+      class="file-preview-dialog"
+      id="filePreviewDialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="filePreviewTitle"
+      hidden
+    >
+      <section class="file-preview-card">
+        <header class="file-preview-head">
+          <div class="file-preview-heading">
+            <h2 id="filePreviewTitle" data-i18n="filePreview">File preview</h2>
+            <div class="file-preview-meta" id="filePreviewMeta"></div>
+          </div>
+          <div class="file-preview-actions">
+            <button id="filePreviewMode" type="button" hidden></button>
+            <button id="filePreviewDownload" type="button" data-i18n="download">Download</button>
+            <button id="filePreviewClose" type="button" data-i18n="close">Close</button>
+          </div>
+        </header>
+        <div class="file-preview-body" id="filePreviewBody"></div>
       </section>
     </div>
     <div class="scrim" id="scrim"></div>

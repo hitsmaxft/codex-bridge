@@ -5,7 +5,7 @@ function appendPlain(parent, text) {
   });
 }
 
-export function localFilePath(raw) {
+export function localFileReference(raw) {
   if (typeof raw !== "string") return null;
   let value = raw.trim();
   if (/^https?:\/\//i.test(value)) {
@@ -39,31 +39,52 @@ export function localFilePath(raw) {
       return null;
     }
   }
-  return path;
+  if (!path) return null;
+  let line = null,
+    column = null;
+  const hashPosition = path.match(/^(.*)#L([1-9]\d*)(?:C([1-9]\d*))?$/i),
+    colonPosition = path.match(/^(.*\.[^/:]+):([1-9]\d*)(?::([1-9]\d*))?$/);
+  const position = hashPosition || colonPosition;
+  if (position) {
+    path = position[1];
+    line = Number(position[2]);
+    column = position[3] ? Number(position[3]) : null;
+  }
+  return { path, line, column };
 }
+
+export const localFilePath = (raw) => localFileReference(raw)?.path || null;
 
 function appendLink(parent, label, target, options) {
   const link = document.createElement("a"),
-    downloadPath = localFilePath(target);
+    fileReference = localFileReference(target);
   link.textContent = label;
-  if (downloadPath && options.requestLocalFileDownload) {
-    link.href = "#";
-    link.download = downloadPath.split("/").at(-1) || "download";
-    link.onclick = async (event) => {
-      event.preventDefault();
+  if (fileReference && options.requestLocalFilePreview) {
+    link.className = "local-file-link";
+    link.role = "button";
+    link.tabIndex = 0;
+    const openPreview = async () => {
       if (link.getAttribute("aria-busy") === "true") return;
       link.setAttribute("aria-busy", "true");
       try {
-        const url = await options.requestLocalFileDownload(downloadPath);
-        // Location navigation is more reliable than a detached synthetic
-        // anchor in iOS browsers and still preserves the server-provided
-        // Content-Disposition filename.
-        window.location.assign(url);
+        await options.requestLocalFilePreview(fileReference.path, {
+          line: fileReference.line,
+          column: fileReference.column,
+        });
       } catch (error) {
         options.onError?.(error);
       } finally {
         link.removeAttribute("aria-busy");
       }
+    };
+    link.onclick = (event) => {
+      event.preventDefault();
+      openPreview();
+    };
+    link.onkeydown = (event) => {
+      if (!["Enter", " "].includes(event.key)) return;
+      event.preventDefault();
+      openPreview();
     };
   } else {
     try {
@@ -77,7 +98,7 @@ function appendLink(parent, label, target, options) {
       // Invalid links remain inert text.
     }
   }
-  if (link.href) parent.appendChild(link);
+  if (link.href || fileReference) parent.appendChild(link);
   else parent.appendChild(document.createTextNode(label));
 }
 

@@ -3,14 +3,16 @@ import {
   $,
   authenticate,
   command,
-  createFileDownloadTicket,
   demoMode,
   notify,
   recordPerformance,
+  requestFilePreview,
   run,
   subscribeEvents,
   timeText,
 } from "./api.js";
+import { createFilePreviewController } from "./file-preview.js";
+import { goalToggleState } from "./goal-state.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import { memoryCitationModel } from "./memory-citations.js";
@@ -45,6 +47,7 @@ import {
   storedTheme,
   watchSystemTheme,
 } from "./state.js";
+import { scrollTopForViewportAnchor } from "./viewport-state.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
 const restoredExpandedProjects = storedExpandedProjects(window.localStorage);
 if (restoredExpandedProjects !== null) {
@@ -224,6 +227,20 @@ function renderManagedServices() {
       listen.textContent = tr("listenAddress", { address: service.listen });
       detail.appendChild(listen);
     }
+    if (key === "whisper" && enabled) {
+      for (const text of [
+        service.model ? tr("whisperModel", { model: service.model }) : null,
+        service.language ? tr("whisperLanguage", { language: service.language }) : null,
+        service.prompt ? tr("whisperPrompt", { prompt: service.prompt }) : null,
+        tr(service.simplify_chinese ? "whisperSimplifiedEnabled" : "whisperSimplifiedDisabled"),
+        service.threads ? tr("whisperThreads", { count: service.threads }) : null,
+      ]) {
+        if (!text) continue;
+        const parameter = document.createElement("div");
+        parameter.textContent = text;
+        detail.appendChild(parameter);
+      }
+    }
     if (key === "ws-bridge" && service?.capability === "resume_compatibility_only") {
       const limitation = document.createElement("div");
       limitation.textContent = tr("desktopMcpCompatibilityOnly");
@@ -243,6 +260,29 @@ function renderManagedServices() {
         ? tr("lastStartupError", { error: status.last_error })
         : tr("noStartupError");
       detail.appendChild(error);
+    }
+    if (key === "app-server" && enabled) {
+      const restartButton = document.createElement("button");
+      restartButton.className = "component-action";
+      restartButton.type = "button";
+      restartButton.disabled = appServerRestartPending;
+      restartButton.textContent = tr("restartAppServer");
+      restartButton.onclick = async (event) => {
+        event.stopPropagation();
+        if (!window.confirm(tr("restartAppServerConfirm"))) return;
+        appServerRestartPending = true;
+        appServerRestartBaseline = Number(status.restart_count || 0);
+        renderManagedServices();
+        try {
+          await command({ command: "managed_app_server_restart" }, false);
+          notify(tr("restartAppServerRequested"));
+        } catch (error) {
+          appServerRestartPending = false;
+          renderManagedServices();
+          notify(error.message, true);
+        }
+      };
+      detail.appendChild(restartButton);
     }
     summary.append(dot, name, value);
     entry.append(summary, detail);
@@ -295,6 +335,24 @@ function setThreadHeaderExpanded(expanded) {
   title.setAttribute("aria-expanded", String(expanded));
   title.title = tr(expanded ? "collapseHeader" : "expandHeader");
 }
+function isHistoryFullscreen() {
+  return document.querySelector("main").classList.contains("history-fullscreen");
+}
+function syncHistoryFullscreenButton() {
+  const fullscreen = isHistoryFullscreen(),
+    button = $("historyFullscreenBtn"),
+    labelKey = fullscreen ? "exitHistoryFullscreen" : "enterHistoryFullscreen";
+  button.setAttribute("aria-pressed", String(fullscreen));
+  button.dataset.i18nAriaLabel = labelKey;
+  button.setAttribute("aria-label", tr(labelKey));
+  button.title = tr(labelKey);
+}
+function setHistoryFullscreen(fullscreen) {
+  document.querySelector("main").classList.toggle("history-fullscreen", fullscreen);
+  document.documentElement.classList.toggle("history-fullscreen", fullscreen);
+  setThreadHeaderExpanded(false);
+  syncHistoryFullscreenButton();
+}
 function renderRepairHint(required = state.repairRequired) {
   state.repairRequired = Boolean(required);
   const button = $("repairHintBtn"),
@@ -344,8 +402,98 @@ function renderThreadStatistics(statistics = state.threadStatistics) {
     grid.appendChild(item);
   }
 }
+const GOAL_PANEL_COLLAPSED_KEY = "codex-bridge.goal-panel-collapsed.v1";
+let goalPanelCollapsed = window.localStorage.getItem(GOAL_PANEL_COLLAPSED_KEY) === "1";
+
+function formatGoalDuration(value) {
+  const seconds = Math.max(0, Math.floor(Number(value) || 0));
+  if (seconds < 60) return tr("goalSeconds", { count: seconds });
+  if (seconds < 3600) return tr("goalMinutes", { count: Math.floor(seconds / 60) });
+  return tr("goalHours", { count: (seconds / 3600).toFixed(seconds < 36_000 ? 1 : 0) });
+}
+function renderGoalPanel() {
+  const goal = state.threadGoal,
+    panel = $("goalPanel"),
+    restore = $("goalRestoreBtn");
+  panel.hidden = !goal || goalPanelCollapsed;
+  restore.hidden = !goal || !goalPanelCollapsed;
+  if (!goal) return;
+  const status = goal.status || "active",
+    statusKey =
+      {
+        active: "goalActive",
+        paused: "goalPaused",
+        blocked: "goalBlocked",
+        usageLimited: "goalUsageLimited",
+        budgetLimited: "goalBudgetLimited",
+        complete: "goalComplete",
+      }[status] || "goalUnknown";
+  $("goalStatus").dataset.status = status;
+  $("goalStatus").textContent = tr(statusKey);
+  $("goalTime").textContent = tr("goalElapsed", {
+    time: formatGoalDuration(goal.timeUsedSeconds),
+  });
+  $("goalObjective").textContent = goal.objective || "";
+  const tokenBudget = Number(goal.tokenBudget),
+    tokensUsed = Math.max(0, Number(goal.tokensUsed) || 0),
+    hasBudget = Number.isFinite(tokenBudget) && tokenBudget > 0;
+  $("goalBudget").hidden = !hasBudget;
+  if (hasBudget) {
+    $("goalBudgetText").textContent =
+      `${tokensUsed.toLocaleString()} / ${tokenBudget.toLocaleString()}`;
+    const percent = Math.min(100, Math.max(0, (tokensUsed / tokenBudget) * 100));
+    $("goalProgress").style.setProperty("--goal-progress", `${percent.toFixed(1)}%`);
+    $("goalProgress").setAttribute("aria-valuenow", String(Math.round(percent)));
+    $("goalProgress").setAttribute("aria-valuemin", "0");
+    $("goalProgress").setAttribute("aria-valuemax", "100");
+  }
+  const toggle = $("goalToggleBtn"),
+    { canPause, canResume } = goalToggleState(status);
+  toggle.hidden = !canPause && !canResume;
+  toggle.disabled = state.goalBusy;
+  toggle.textContent = tr(canPause ? "pauseGoal" : "resumeGoal");
+  $("goalEditBtn").disabled = state.goalBusy;
+  $("goalActionHelp").textContent = tr(
+    canPause ? "pauseGoalHelp" : canResume ? "resumeGoalHelp" : "goalReadOnlyHelp",
+  );
+}
+async function setThreadGoal(change, successKey) {
+  if (!state.current || !state.threadGoal || state.goalBusy) return;
+  const threadId = state.current.id;
+  state.goalBusy = true;
+  renderGoalPanel();
+  try {
+    const result = await command(
+      { command: "thread_goal_set", thread_id: threadId, ...change },
+      false,
+    );
+    if (state.current?.id === threadId) {
+      state.threadGoal = result.goal || null;
+      renderGoalPanel();
+    }
+    notify(tr(successKey));
+  } finally {
+    state.goalBusy = false;
+    renderGoalPanel();
+  }
+}
+function setGoalPanelCollapsed(collapsed) {
+  goalPanelCollapsed = collapsed;
+  window.localStorage.setItem(GOAL_PANEL_COLLAPSED_KEY, collapsed ? "1" : "0");
+  renderGoalPanel();
+}
+function openGoalEditDialog() {
+  if (!state.threadGoal) return;
+  $("goalObjectiveInput").value = state.threadGoal.objective || "";
+  $("goalEditDialog").hidden = false;
+  requestAnimationFrame(() => $("goalObjectiveInput").focus());
+}
+function closeGoalEditDialog() {
+  $("goalEditDialog").hidden = true;
+}
 async function toggleLanguage() {
   applyLanguage(getLanguage() === "en" ? "zh" : "en");
+  syncHistoryFullscreenButton();
   syncComposerPlaceholder();
   setSendMode($("sendMode").value, state.modeAutomatic);
   renderProjects();
@@ -357,6 +505,7 @@ async function toggleLanguage() {
   renderTasksButton();
   renderTaskOverviews();
   renderBrowserNotifications();
+  renderGoalPanel();
   showActivity();
   await loadStatus();
   if (state.current) await openThread(state.current, { quiet: true });
@@ -587,7 +736,54 @@ async function toggleBrowserNotifications() {
     notify(tr(next.enabled ? "notificationsEnabled" : "notificationsDisabled"));
   }
 }
-let deferredCompletionToast = null;
+let deferredCompletionToast = null,
+  previousAppServerService = null,
+  appServerRestartPending = false,
+  appServerRestartBaseline = 0;
+
+function notifyServiceEvent(body, bad = false) {
+  const useSystemNotification = shouldShowBrowserNotification({
+    NotificationApi: globalThis.Notification,
+    storage: window.localStorage,
+    documentHidden: document.hidden,
+    windowFocused: document.hasFocus(),
+  });
+  if (useSystemNotification) {
+    showBrowserNotification(globalThis.Notification, {
+      title: tr("appServerComponent"),
+      body,
+      tag: "codex-bridge:app-server",
+      onClick: () => window.focus(),
+    });
+  } else {
+    notify(body, bad);
+  }
+}
+
+function observeAppServerService(service) {
+  if (!service) return;
+  const next = {
+      running: Boolean(service.enabled && service.status?.running),
+      restartCount: Number(service.status?.restart_count || 0),
+      error: service.status?.last_error || null,
+    },
+    previous = previousAppServerService;
+  previousAppServerService = next;
+  if (!previous) return;
+  if (appServerRestartPending && next.running && next.restartCount > appServerRestartBaseline) {
+    appServerRestartPending = false;
+    notifyServiceEvent(tr("appServerRecovered"));
+    return;
+  }
+  if (previous.running && !next.running) {
+    notifyServiceEvent(
+      next.error ? tr("appServerStopped", { reason: next.error }) : tr("appServerUnavailable"),
+      true,
+    );
+  } else if (!previous.running && next.running) {
+    notifyServiceEvent(tr("appServerRecovered"));
+  }
+}
 function notifyTurnFinished(threadId, runState, turnId) {
   if (turnId) {
     if (state.notifiedTurnIds.has(turnId)) return;
@@ -1039,14 +1235,6 @@ function renderProjects() {
     button.children[2].textContent = `${Math.max(0, p.thread_count - pinnedCount)}`;
     button.onclick = () => run(() => toggleProject(p));
     head.appendChild(button);
-    const add = document.createElement("button");
-    add.className = "project-add";
-    add.textContent = "+";
-    add.title =
-      p.kind === "chats" ? tr("createInChats") : tr("createInProject", { project: p.name });
-    add.setAttribute("aria-label", add.title);
-    add.onclick = () => showCreateDialog(p);
-    head.appendChild(add);
     wrap.appendChild(head);
     const list = document.createElement("div");
     list.className = "project-threads";
@@ -1080,7 +1268,50 @@ function renderProjects() {
     root.appendChild(wrap);
   }
 }
-function showCreateDialog(project) {
+function populateCreateProjectSelect() {
+  const select = $("createProjectSelect"),
+    projects = state.projects.filter((project) => project.kind !== "chats"),
+    chats = state.projects.find((project) => project.kind === "chats"),
+    currentProject = state.current ? pinnedProject(state.current) : null;
+  select.textContent = "";
+  if (projects.length) {
+    const group = document.createElement("optgroup");
+    group.label = tr("recentProjects");
+    for (const project of projects) {
+      const option = document.createElement("option");
+      option.value = project.path;
+      option.textContent = `${project.name} — ${project.path}`;
+      group.appendChild(option);
+    }
+    select.appendChild(group);
+  }
+  if (chats) {
+    const group = document.createElement("optgroup"),
+      option = document.createElement("option");
+    group.label = tr("otherLocations");
+    option.value = chats.path;
+    option.textContent = tr("chatsWithoutProject");
+    group.appendChild(option);
+    select.appendChild(group);
+  }
+  if (currentProject && state.projects.some((project) => project.path === currentProject.path)) {
+    select.value = currentProject.path;
+  }
+  const empty = !select.options.length;
+  select.disabled = empty;
+  $("createProjectNextBtn").disabled = empty;
+}
+function showCreateDialog(project = null) {
+  state.creatingProject = null;
+  populateCreateProjectSelect();
+  $("createProjectStep").hidden = false;
+  $("createModeStep").hidden = true;
+  $("createProgress").textContent = "";
+  $("createDialog").hidden = false;
+  if (project) return showCreateMode(project);
+  $("createProjectSelect").focus();
+}
+function showCreateMode(project) {
   state.creatingProject = project;
   const isChat = project.kind === "chats";
   $("createProject").textContent = isChat ? tr("chats") : project.path;
@@ -1091,9 +1322,21 @@ function showCreateDialog(project) {
   $("createCurrentBtn").querySelector("span").textContent = tr(
     isChat ? "newChatHelp" : "currentDirectoryHelp",
   );
-  $("createProgress").textContent = "";
-  $("createDialog").hidden = false;
+  $("createProjectStep").hidden = true;
+  $("createModeStep").hidden = false;
   $("createCurrentBtn").focus();
+}
+function chooseCreateProject() {
+  const project = state.projects.find((item) => item.path === $("createProjectSelect").value);
+  if (!project) throw new Error(tr("chooseProject"));
+  showCreateMode(project);
+}
+function backToCreateProject() {
+  if ($("createCurrentBtn").disabled) return;
+  state.creatingProject = null;
+  $("createModeStep").hidden = true;
+  $("createProjectStep").hidden = false;
+  $("createProjectSelect").focus();
 }
 function closeCreateDialog() {
   if ($("createCurrentBtn").disabled) return;
@@ -1337,9 +1580,10 @@ function renderTemporaryMessages() {
 function resizeTemporaryTextarea() {
   const textarea = $("temporaryText");
   if (!textarea) return;
-  textarea.style.height = "44px";
+  const minimum = window.matchMedia("(max-width: 800px)").matches ? 56 : 44;
+  textarea.style.height = `${minimum}px`;
   const limit = Math.min(320, (window.visualViewport?.height || window.innerHeight) * 0.34),
-    height = Math.min(Math.max(44, textarea.scrollHeight), limit);
+    height = Math.min(Math.max(minimum, textarea.scrollHeight), limit);
   textarea.style.height = `${Math.ceil(height)}px`;
   textarea.style.overflowY = textarea.scrollHeight > height + 1 ? "auto" : "hidden";
 }
@@ -1719,6 +1963,295 @@ function memoryCitationNode(items) {
   details.append(summary, list);
   return details;
 }
+const imageViewer = {
+  root: null,
+  stage: null,
+  image: null,
+  scaleLabel: null,
+  scale: 1,
+  x: 0,
+  y: 0,
+  pointers: new Map(),
+  gesture: null,
+  lastTap: null,
+  suppressDoubleClickUntil: 0,
+  returnFocus: null,
+  viewportMeta: null,
+  viewportContent: null,
+};
+
+function clampImageScale(scale) {
+  return Math.min(8, Math.max(1, scale));
+}
+
+function renderImageTransform() {
+  imageViewer.image.style.transform = `translate3d(${imageViewer.x}px, ${imageViewer.y}px, 0) scale(${imageViewer.scale})`;
+  imageViewer.scaleLabel.textContent = `${Math.round(imageViewer.scale * 100)}%`;
+}
+
+function setImageScale(scale, origin = null) {
+  const previous = imageViewer.scale,
+    next = clampImageScale(scale);
+  if (origin && previous !== next) {
+    const rect = imageViewer.stage.getBoundingClientRect(),
+      offsetX = origin.x - rect.left - rect.width / 2,
+      offsetY = origin.y - rect.top - rect.height / 2,
+      ratio = next / previous;
+    imageViewer.x = offsetX - (offsetX - imageViewer.x) * ratio;
+    imageViewer.y = offsetY - (offsetY - imageViewer.y) * ratio;
+  }
+  imageViewer.scale = next;
+  if (next === 1) imageViewer.x = imageViewer.y = 0;
+  renderImageTransform();
+}
+
+function resetImageZoom() {
+  imageViewer.scale = 1;
+  imageViewer.x = imageViewer.y = 0;
+  renderImageTransform();
+}
+
+function lockPageZoomForImageViewer() {
+  const meta = document.querySelector('meta[name="viewport"]');
+  if (!meta || imageViewer.viewportMeta) return;
+  imageViewer.viewportMeta = meta;
+  imageViewer.viewportContent = meta.getAttribute("content");
+  const content = (imageViewer.viewportContent || "width=device-width,initial-scale=1")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .filter((part) => !/^(maximum-scale|user-scalable)\s*=/i.test(part));
+  content.push("maximum-scale=1", "user-scalable=no");
+  meta.setAttribute("content", content.join(","));
+}
+
+function restorePageZoomAfterImageViewer() {
+  const { viewportMeta, viewportContent } = imageViewer;
+  if (!viewportMeta) return;
+  if (viewportContent === null) viewportMeta.removeAttribute("content");
+  else viewportMeta.setAttribute("content", viewportContent);
+  imageViewer.viewportMeta = null;
+  imageViewer.viewportContent = null;
+}
+
+function closeImageViewer() {
+  if (!imageViewer.root || imageViewer.root.hidden) return;
+  for (const pointerId of imageViewer.pointers.keys()) {
+    if (imageViewer.stage.hasPointerCapture(pointerId)) {
+      imageViewer.stage.releasePointerCapture(pointerId);
+    }
+  }
+  resetImageZoom();
+  imageViewer.root.hidden = true;
+  imageViewer.pointers.clear();
+  imageViewer.gesture = null;
+  imageViewer.lastTap = null;
+  imageViewer.suppressDoubleClickUntil = 0;
+  document.body.classList.remove("image-viewer-open");
+  restorePageZoomAfterImageViewer();
+  imageViewer.returnFocus?.focus();
+  imageViewer.returnFocus = null;
+}
+
+function ensureImageViewer() {
+  if (imageViewer.root) return;
+  const root = document.createElement("div"),
+    toolbar = document.createElement("div"),
+    stage = document.createElement("div"),
+    image = document.createElement("img"),
+    zoomOut = document.createElement("button"),
+    scaleLabel = document.createElement("button"),
+    zoomIn = document.createElement("button"),
+    close = document.createElement("button");
+  root.className = "image-viewer";
+  root.hidden = true;
+  root.setAttribute("role", "dialog");
+  root.setAttribute("aria-modal", "true");
+  root.setAttribute("aria-label", tr("imageViewer"));
+  toolbar.className = "image-viewer-toolbar";
+  stage.className = "image-viewer-stage";
+  image.className = "image-viewer-image";
+  image.alt = "";
+  image.draggable = false;
+  for (const [button, text, title] of [
+    [zoomOut, "−", tr("zoomOut")],
+    [scaleLabel, "100%", tr("resetZoom")],
+    [zoomIn, "+", tr("zoomIn")],
+    [close, "×", tr("closeImageViewer")],
+  ]) {
+    button.type = "button";
+    button.textContent = text;
+    button.title = title;
+    button.setAttribute("aria-label", title);
+  }
+  scaleLabel.className = "image-viewer-scale";
+  close.className = "image-viewer-close";
+  zoomOut.onclick = () => setImageScale(imageViewer.scale / 1.25);
+  scaleLabel.onclick = resetImageZoom;
+  zoomIn.onclick = () => setImageScale(imageViewer.scale * 1.25);
+  close.onclick = closeImageViewer;
+  toolbar.append(zoomOut, scaleLabel, zoomIn, close);
+  stage.appendChild(image);
+  root.append(toolbar, stage);
+  root.onclick = (event) => {
+    if (event.target === root) closeImageViewer();
+  };
+  const preventBrowserZoom = (event) => event.preventDefault();
+  for (const eventName of ["gesturestart", "gesturechange", "gestureend"]) {
+    root.addEventListener(eventName, preventBrowserZoom, { passive: false });
+  }
+  root.addEventListener(
+    "wheel",
+    (event) => {
+      if (event.ctrlKey) event.preventDefault();
+    },
+    { passive: false },
+  );
+  stage.ondblclick = (event) => {
+    event.preventDefault();
+    if (performance.now() < imageViewer.suppressDoubleClickUntil) return;
+    setImageScale(imageViewer.scale > 1 ? 1 : 2, { x: event.clientX, y: event.clientY });
+  };
+  stage.onwheel = (event) => {
+    event.preventDefault();
+    setImageScale(imageViewer.scale * (event.deltaY < 0 ? 1.15 : 1 / 1.15), {
+      x: event.clientX,
+      y: event.clientY,
+    });
+  };
+  stage.onpointerdown = (event) => {
+    event.preventDefault();
+    stage.setPointerCapture(event.pointerId);
+    imageViewer.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const points = [...imageViewer.pointers.values()];
+    if (points.length === 1) {
+      imageViewer.gesture = {
+        kind: "pan",
+        pointerId: event.pointerId,
+        pointerType: event.pointerType,
+        startedAt: performance.now(),
+        x: points[0].x,
+        y: points[0].y,
+        imageX: imageViewer.x,
+        imageY: imageViewer.y,
+      };
+    } else if (points.length === 2) {
+      imageViewer.gesture = {
+        kind: "pinch",
+        distance: Math.max(1, Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y)),
+        centerX: (points[0].x + points[1].x) / 2,
+        centerY: (points[0].y + points[1].y) / 2,
+        scale: imageViewer.scale,
+        imageX: imageViewer.x,
+        imageY: imageViewer.y,
+      };
+    }
+  };
+  stage.onpointermove = (event) => {
+    if (!imageViewer.pointers.has(event.pointerId)) return;
+    imageViewer.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const points = [...imageViewer.pointers.values()],
+      gesture = imageViewer.gesture;
+    if (points.length === 1 && gesture?.kind === "pan" && imageViewer.scale > 1) {
+      imageViewer.x = gesture.imageX + points[0].x - gesture.x;
+      imageViewer.y = gesture.imageY + points[0].y - gesture.y;
+      renderImageTransform();
+    } else if (points.length === 2 && gesture?.kind === "pinch") {
+      const distance = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y),
+        centerX = (points[0].x + points[1].x) / 2,
+        centerY = (points[0].y + points[1].y) / 2,
+        scale = clampImageScale(gesture.scale * (distance / gesture.distance)),
+        ratio = scale / gesture.scale,
+        rect = stage.getBoundingClientRect(),
+        originX = gesture.centerX - rect.left - rect.width / 2,
+        originY = gesture.centerY - rect.top - rect.height / 2,
+        nextOriginX = centerX - rect.left - rect.width / 2,
+        nextOriginY = centerY - rect.top - rect.height / 2;
+      imageViewer.scale = scale;
+      imageViewer.x = nextOriginX - (originX - gesture.imageX) * ratio;
+      imageViewer.y = nextOriginY - (originY - gesture.imageY) * ratio;
+      renderImageTransform();
+    }
+  };
+  const endPointer = (event) => {
+    const gesture = imageViewer.gesture,
+      point = imageViewer.pointers.get(event.pointerId),
+      now = performance.now(),
+      isTouchTap =
+        event.type === "pointerup" &&
+        imageViewer.pointers.size === 1 &&
+        gesture?.kind === "pan" &&
+        gesture.pointerId === event.pointerId &&
+        gesture.pointerType !== "mouse" &&
+        now - gesture.startedAt < 350 &&
+        point &&
+        Math.hypot(point.x - gesture.x, point.y - gesture.y) < 12;
+    if (isTouchTap) {
+      const previous = imageViewer.lastTap;
+      if (
+        previous &&
+        now - previous.time < 350 &&
+        Math.hypot(point.x - previous.x, point.y - previous.y) < 28
+      ) {
+        imageViewer.lastTap = null;
+        imageViewer.suppressDoubleClickUntil = now + 500;
+        setImageScale(imageViewer.scale > 1 ? 1 : 2, { x: point.x, y: point.y });
+      } else {
+        imageViewer.lastTap = { x: point.x, y: point.y, time: now };
+      }
+    } else if (gesture?.kind === "pinch") {
+      imageViewer.lastTap = null;
+    }
+    imageViewer.pointers.delete(event.pointerId);
+    imageViewer.gesture = null;
+  };
+  stage.onpointerup = endPointer;
+  stage.onpointercancel = endPointer;
+  stage.onlostpointercapture = endPointer;
+  document.body.appendChild(root);
+  Object.assign(imageViewer, { root, stage, image, scaleLabel });
+}
+
+function openImageViewer(source, alt = "", trigger = null) {
+  ensureImageViewer();
+  lockPageZoomForImageViewer();
+  imageViewer.image.src = source;
+  imageViewer.image.alt = alt;
+  imageViewer.returnFocus = trigger;
+  resetImageZoom();
+  imageViewer.root.hidden = false;
+  document.body.classList.add("image-viewer-open");
+  imageViewer.root.querySelector(".image-viewer-close").focus();
+}
+
+function makeInspectableImage(img) {
+  img.classList.add("inspectable-image");
+  img.tabIndex = 0;
+  img.setAttribute("role", "button");
+  img.title = tr("openImage");
+  img.setAttribute("aria-label", `${img.alt || tr("attachment")}. ${tr("openImage")}`);
+  img.onclick = () => openImageViewer(img.currentSrc || img.src, img.alt, img);
+  img.onkeydown = (event) => {
+    if (!["Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    openImageViewer(img.currentSrc || img.src, img.alt, img);
+  };
+  return img;
+}
+
+const filePreview = createFilePreviewController({
+  root: $("filePreviewDialog"),
+  title: $("filePreviewTitle"),
+  meta: $("filePreviewMeta"),
+  body: $("filePreviewBody"),
+  closeButton: $("filePreviewClose"),
+  downloadButton: $("filePreviewDownload"),
+  modeButton: $("filePreviewMode"),
+  translate: tr,
+  renderMarkdown: (source) => markdownNode(source, markdownOptions(state.current?.id)),
+  inspectImage: openImageViewer,
+});
+
 function appendContextValue(details, value, label) {
   const values = Array.isArray(value) ? value : [value];
   let rendered = false;
@@ -1727,7 +2260,7 @@ function appendContextValue(details, value, label) {
       const img = document.createElement("img");
       img.src = part.image_url;
       img.alt = label || tr("attachment");
-      details.appendChild(img);
+      details.appendChild(makeInspectableImage(img));
       rendered = true;
       continue;
     }
@@ -1807,11 +2340,10 @@ function contentNode(item) {
 }
 function markdownOptions(threadId) {
   return {
-    requestLocalFileDownload: async (path) => {
+    requestLocalFilePreview: async (path, position) => {
       if (!threadId) throw new Error(tr("chooseSessionError"));
-      const ticket = await createFileDownloadTicket(threadId, path);
-      if (!ticket?.url) throw new Error("download ticket response is invalid");
-      return ticket.url;
+      const preview = await requestFilePreview(threadId, path);
+      filePreview.open(preview, position);
     },
     onError: (error) => notify(error.message, true),
   };
@@ -1847,7 +2379,7 @@ function appendToolValue(parent, value) {
       img.src = imageUrl;
       img.alt = tr("toolResultImage");
       img.loading = "lazy";
-      parent.appendChild(img);
+      parent.appendChild(makeInspectableImage(img));
       continue;
     }
     if (typeof part?.audio_url === "string") {
@@ -1948,6 +2480,9 @@ function toolGroupNode(message, keepRunning = false) {
   if (!tools.length) return null;
   const group = document.createElement("details");
   group.className = "tool-group";
+  const hasImage = tools.some((tool) => tool.has_image);
+  group.open = hasImage;
+  if (hasImage) group.dataset.hasImage = "1";
   const runningTool = tools.findLast((tool) => !toolFinished(tool)),
     latest = runningTool || tools.at(-1),
     summary = document.createElement("summary"),
@@ -1977,6 +2512,7 @@ function toolGroupNode(message, keepRunning = false) {
         .join(" ");
   label.title = running ? latest.preview || latest.name : label.textContent;
   summary.append(icon, label);
+  if (hasImage) summary.appendChild(toolImageIndicator());
   group.appendChild(summary);
   const list = document.createElement("div");
   list.className = "tool-list";
@@ -1984,10 +2520,13 @@ function toolGroupNode(message, keepRunning = false) {
     const detail = document.createElement("details");
     detail.className = "tool-call";
     detail.dataset.toolIndex = String(tool.tool_index ?? toolPosition);
+    detail.open = Boolean(tool.has_image);
+    if (tool.has_image) detail.dataset.hasImage = "1";
     const head = document.createElement("summary"),
       icon = document.createElement("span"),
       preview = document.createElement("span"),
       status = document.createElement("span");
+    head.classList.toggle("has-image", Boolean(tool.has_image));
     icon.className = `tool-icon ${toolIconClass(tool.name)}`;
     icon.title = tool.name;
     preview.className = "tool-preview";
@@ -2003,7 +2542,9 @@ function toolGroupNode(message, keepRunning = false) {
     }
     status.className = "tool-state";
     status.textContent = toolFinished(tool) ? "✓" : "…";
-    head.append(icon, preview, status);
+    head.append(icon, preview);
+    if (tool.has_image) head.appendChild(toolImageIndicator());
+    head.appendChild(status);
     detail.appendChild(head);
     detail.ontoggle = () => {
       if (!detail.open || detail.dataset.loaded) return;
@@ -2051,10 +2592,21 @@ function toolGroupNode(message, keepRunning = false) {
         appendToolValue(body, r.tool.output);
       });
     };
+    if (detail.open) detail.ontoggle();
     list.appendChild(detail);
   }
   group.appendChild(list);
   return group;
+}
+function toolImageIndicator() {
+  const indicator = document.createElement("span");
+  indicator.className = "tool-image-indicator";
+  indicator.title = tr("toolResultImage");
+  indicator.setAttribute("role", "img");
+  indicator.setAttribute("aria-label", indicator.title);
+  indicator.innerHTML =
+    '<svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="m5.5 17 4.2-4.2 3.2 3 2.2-2.1 3.4 3.3"/></svg>';
+  return indicator;
 }
 function toolFinished(tool) {
   return tool.has_output || ["completed", "failed", "declined", "cancelled"].includes(tool.status);
@@ -2171,6 +2723,16 @@ function reconcileChildren(parent, nodes) {
   }
 }
 
+function preserveMessageElementPosition(element, change) {
+  const beforeTop = element?.getBoundingClientRect().top,
+    scrollTop = messageScrollMetrics().top;
+  change();
+  if (!element?.isConnected || element.hidden || element.getClientRects().length === 0) return;
+  setMessageScrollTop(
+    scrollTopForViewportAnchor(scrollTop, beforeTop, element.getBoundingClientRect().top),
+  );
+}
+
 function layoutTurnGroup(section, group, messageNodes, completed) {
   const finalPosition = group.messages.findLastIndex(
       (message) => message.role === "assistant" && message.phase === "final_answer",
@@ -2182,7 +2744,10 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       (node, index) =>
         group.messages[index].role === "user" && group.messages[index].category === "user",
     ),
-    hiddenNodes = messageNodes.filter((node) => node !== finalNode && !userNodes.includes(node)),
+    imageToolNodes = messageNodes.filter((node) => node.dataset.hasToolImage === "1"),
+    hiddenNodes = messageNodes.filter(
+      (node) => node !== finalNode && !userNodes.includes(node) && !imageToolNodes.includes(node),
+    ),
     hasFinalTools = Boolean(finalIndex >= 0 && group.messages[finalIndex].tools?.length),
     hasDeferred = group.messages.some((message) => message.deferred),
     usage = turnUsageItem(group),
@@ -2248,16 +2813,20 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       });
       return;
     }
-    if (expanded) state.expandedTurnIds.delete(expansionKey);
-    else state.expandedTurnIds.add(expansionKey);
-    layoutTurnGroup(section, group, messageNodes, completed);
+    preserveMessageElementPosition(finalNode, () => {
+      if (expanded) state.expandedTurnIds.delete(expansionKey);
+      else state.expandedTurnIds.add(expansionKey);
+      layoutTurnGroup(section, group, messageNodes, completed);
+    });
   };
   divider.className = "turn-divider";
   foldBlock.replaceChildren(fold, divider, tokenUsage);
   section.classList.toggle("collapsed", !expanded);
   section.classList.toggle("expanded", expanded);
   for (const node of messageNodes) node.hidden = !expanded && hiddenNodes.includes(node);
-  const leading = expanded ? messageNodes.filter((node) => node !== finalNode) : userNodes;
+  const leading = expanded
+    ? messageNodes.filter((node) => node !== finalNode)
+    : [...new Set([...userNodes, ...imageToolNodes])];
   reconcileChildren(section, [
     ...leading,
     foldBlock,
@@ -2271,6 +2840,7 @@ function messageNode(m, keepToolsRunning = false) {
   box.className = `message ${m.category || m.role || ""}`;
   box.dataset.messageIndex = String(m.message_index);
   if (m.turn_id) box.dataset.turnId = m.turn_id;
+  if (m.tools?.some((tool) => tool.has_image)) box.dataset.hasToolImage = "1";
   const head = document.createElement("div");
   head.className = "message-head";
   const a = document.createElement("span"),
@@ -2298,9 +2868,19 @@ function messageNode(m, keepToolsRunning = false) {
     .filter((item) => item.kind === "text" && typeof item.text === "string")
     .map((item) => item.text)
     .join("\n\n");
-  if (copyText) body.appendChild(messageCopyButton(copyText));
-  const tools = toolGroupNode(m, keepToolsRunning);
-  if (tools) body.appendChild(tools);
+  const copy = copyText ? messageCopyButton(copyText) : null,
+    tools = toolGroupNode(m, keepToolsRunning);
+  if (tools) {
+    const toolRow = document.createElement("div");
+    toolRow.className = "message-tool-row";
+    toolRow.appendChild(tools);
+    if (copy) {
+      toolRow.classList.add("has-message-copy");
+      copy.classList.add("tool-message-copy");
+      toolRow.appendChild(copy);
+    }
+    body.appendChild(toolRow);
+  } else if (copy) body.appendChild(copy);
   for (const item of usageItems) body.appendChild(contentNode(item));
   if (memoryItems.length) body.appendChild(memoryCitationNode(memoryItems));
   if (head.childNodes.length) box.appendChild(head);
@@ -2316,7 +2896,7 @@ function preserveLoadedToolDetails(previous, next) {
   const previousGroup = previous.querySelector(".tool-group"),
     nextGroup = next.querySelector(".tool-group");
   if (!previousGroup || !nextGroup) return;
-  nextGroup.open = previousGroup.open;
+  nextGroup.open = nextGroup.dataset.hasImage === "1" || previousGroup.open;
   const previousTools = new Map(
     [...previousGroup.querySelectorAll(".tool-call")].map((detail) => [
       detail.dataset.toolIndex,
@@ -2326,7 +2906,7 @@ function preserveLoadedToolDetails(previous, next) {
   for (const detail of nextGroup.querySelectorAll(".tool-call")) {
     const previousDetail = previousTools.get(detail.dataset.toolIndex);
     if (!previousDetail) continue;
-    detail.open = previousDetail.open;
+    detail.open = detail.dataset.hasImage === "1" || previousDetail.open;
     const loadedBody = previousDetail.querySelector(":scope > .tool-detail");
     if (!loadedBody) continue;
     detail.dataset.loaded = "1";
@@ -3246,6 +3826,7 @@ function handleBridgeEvent(event) {
     return;
   }
   if (event?.type === "bridge_service_snapshot") {
+    observeAppServerService(event.managed_services?.app_server);
     state.managedServices = event.managed_services || null;
     state.serverCapabilities = event.capabilities || state.serverCapabilities;
     state.runtimeResources = event.runtime_resources || state.runtimeResources;
@@ -3326,6 +3907,13 @@ function handleBridgeEvent(event) {
   if (method === "thread/queue/changed" && threadId === state.current?.id) {
     refreshPending().catch(() => {});
   }
+  if (method === "thread/goal/updated" && threadId === state.current?.id) {
+    state.threadGoal = params.goal || null;
+    renderGoalPanel();
+  } else if (method === "thread/goal/cleared" && threadId === state.current?.id) {
+    state.threadGoal = null;
+    renderGoalPanel();
+  }
   if (
     threadId === state.current?.id &&
     (method.startsWith("turn/") ||
@@ -3371,21 +3959,49 @@ function resizeComposerTextarea() {
   if (!textarea || !composer || !shell || !threadHead) return;
   shell.classList.toggle("has-text", Boolean(textarea.value || state.composerAttachments.length));
   syncComposerPlaceholder();
-  textarea.style.height = "44px";
+  const minimum = usesDocumentMessageScroll() ? 56 : 44;
+  textarea.style.height = `${minimum}px`;
   const viewportHeight = window.visualViewport?.height || window.innerHeight,
-    composerChrome = Math.max(0, composer.getBoundingClientRect().height - 44),
+    composerChrome = Math.max(0, composer.getBoundingClientRect().height - minimum),
     available = Math.max(
-      44,
+      minimum,
       viewportHeight - threadHead.getBoundingClientRect().height - composerChrome - 16,
     ),
     desktopLimit = Math.min(320, viewportHeight * 0.34),
     limit = usesDocumentMessageScroll() ? available : desktopLimit,
-    height = Math.min(Math.max(44, textarea.scrollHeight), limit);
+    height = Math.min(Math.max(minimum, textarea.scrollHeight), limit);
   textarea.style.height = `${Math.ceil(height)}px`;
   textarea.style.overflowY = textarea.scrollHeight > height + 1 ? "auto" : "hidden";
 }
 function resizeComposerAfterViewportChange() {
-  if (document.activeElement !== $("messageText")) resizeComposerTextarea();
+  if (document.activeElement === $("messageText")) syncFocusedComposerViewport();
+  else resizeComposerTextarea();
+}
+
+let focusedComposerFrame = 0;
+function syncFocusedComposerViewport() {
+  const composer = document.querySelector(".composer"),
+    main = document.querySelector("main"),
+    viewport = window.visualViewport;
+  if (
+    !composer ||
+    !main ||
+    !usesDocumentMessageScroll() ||
+    document.activeElement !== $("messageText")
+  ) {
+    composer?.classList.remove("viewport-anchored");
+    composer?.style.removeProperty("--composer-viewport-top");
+    return;
+  }
+  cancelAnimationFrame(focusedComposerFrame);
+  focusedComposerFrame = requestAnimationFrame(() => {
+    const pageTop = viewport?.pageTop ?? window.scrollY + (viewport?.offsetTop || 0),
+      visibleHeight = viewport?.height || window.innerHeight,
+      mainPageTop = main.getBoundingClientRect().top + window.scrollY,
+      top = Math.max(0, pageTop + visibleHeight - composer.offsetHeight - mainPageTop);
+    composer.style.setProperty("--composer-viewport-top", `${Math.round(top)}px`);
+    composer.classList.add("viewport-anchored");
+  });
 }
 function syncComposerPlaceholder() {
   const textarea = $("messageText"),
@@ -3482,6 +4098,8 @@ async function openThread(
   state.current = thread;
   syncTemporaryForCurrent();
   if (changedThread) {
+    state.threadGoal = null;
+    renderGoalPanel();
     resetVisibleTurnHydration();
     restoreComposerDraft($("messageText"), state.drafts.get(thread.id), true);
     state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
@@ -3534,7 +4152,7 @@ async function openThread(
       root.innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
     }
   }
-  const [r, , , pendingResult] = await Promise.all([
+  const [r, , , pendingResult, goalResult] = await Promise.all([
     fetchMessages(),
     refreshActivity(),
     demoMode
@@ -3543,6 +4161,7 @@ async function openThread(
           .then((watch) => updateThreadLiveFromStatus(thread.id, watch.thread?.status))
           .catch(() => {}),
     command({ command: "pending_messages", thread_id: thread.id }, false).catch(() => null),
+    command({ command: "thread_goal_get", thread_id: thread.id }, false).catch(() => undefined),
   ]);
   if (token !== state.openToken) return;
   requireMessagePage(r, { latest: true });
@@ -3552,6 +4171,8 @@ async function openThread(
   state.pending = mergePendingResponse(pendingResult?.messages || state.pending, true, r.messages);
   state.messageCache.set(thread.id, r);
   state.current = { ...thread, ...r.thread };
+  if (goalResult) state.threadGoal = goalResult.goal || null;
+  renderGoalPanel();
   rememberSessionId(window.localStorage, state.current.id);
   if (writeHash) updateSessionHash(state.current.id, replaceHash);
   const activeToolMessage = state.activeTurnId
@@ -3864,6 +4485,10 @@ $("statusBtn").onclick = () => run(loadStatus);
 $("notificationBtn").onclick = () => run(toggleBrowserNotifications);
 $("languageBtn").onclick = () => run(toggleLanguage);
 $("refreshBtn").onclick = () => run(refreshThread);
+$("historyFullscreenBtn").onclick = () => setHistoryFullscreen(!isHistoryFullscreen());
+$("createSessionBtn").onclick = () => showCreateDialog();
+$("createProjectNextBtn").onclick = () => run(chooseCreateProject);
+$("createProjectBackBtn").onclick = backToCreateProject;
 $("createCurrentBtn").onclick = () => run(() => createThread(false));
 $("createWorktreeBtn").onclick = () => run(() => createThread(true));
 $("attachBtn").onclick = () => $("imageInput").click();
@@ -3882,6 +4507,29 @@ $("createCancelBtn").onclick = closeCreateDialog;
 $("createDialog").onclick = (event) => {
   if (event.target === $("createDialog")) closeCreateDialog();
 };
+$("goalHideBtn").onclick = () => setGoalPanelCollapsed(true);
+$("goalRestoreBtn").onclick = () => setGoalPanelCollapsed(false);
+$("goalEditBtn").onclick = openGoalEditDialog;
+$("goalEditCancelBtn").onclick = closeGoalEditDialog;
+$("goalEditDialog").onclick = (event) => {
+  if (event.target === $("goalEditDialog")) closeGoalEditDialog();
+};
+$("goalToggleBtn").onclick = () =>
+  run(() => {
+    const { nextStatus } = goalToggleState(state.threadGoal?.status);
+    if (!nextStatus) return;
+    return setThreadGoal(
+      { status: nextStatus },
+      nextStatus === "active" ? "goalResumed" : "goalPausedNotice",
+    );
+  });
+$("goalEditSaveBtn").onclick = () =>
+  run(async () => {
+    const objective = $("goalObjectiveInput").value.trim();
+    if (!objective) throw new Error(tr("goalObjectiveRequired"));
+    await setThreadGoal({ objective }, "goalSaved");
+    closeGoalEditDialog();
+  });
 function toggleSendModeAndKeepFocus() {
   const mode = $("sendMode").value,
     nextMode =
@@ -3923,6 +4571,8 @@ $("archiveThreadBtn").onclick = () =>
     if (!window.confirm(tr("archiveConfirm", { title }))) return;
     await command({ command: "thread_archive", thread_id: threadId }, false);
     state.current = null;
+    state.threadGoal = null;
+    renderGoalPanel();
     state.activeTurnId = null;
     state.activeTool = null;
     state.activityPhase = null;
@@ -3991,12 +4641,16 @@ $("messageText").onpointerdown = () => (
 $("messageText").onfocus = () => {
   document.querySelector(".composer-shell").classList.add("focused", "input-focused");
   syncSubmitAction();
-  requestAnimationFrame(resizeComposerTextarea);
+  requestAnimationFrame(() => {
+    resizeComposerTextarea();
+    syncFocusedComposerViewport();
+  });
 };
 $("messageText").onblur = () =>
   requestAnimationFrame(() => {
     const shell = document.querySelector(".composer-shell");
     if (document.activeElement !== $("messageText")) shell.classList.remove("input-focused");
+    syncFocusedComposerViewport();
     syncSubmitAction();
   });
 function keepComposerTextFocus(event) {
@@ -4336,6 +4990,8 @@ window.addEventListener("resize", resizeComposerAfterViewportChange, { passive: 
 window.visualViewport?.addEventListener("resize", resizeComposerAfterViewportChange, {
   passive: true,
 });
+window.visualViewport?.addEventListener("scroll", syncFocusedComposerViewport, { passive: true });
+window.addEventListener("scroll", syncFocusedComposerViewport, { passive: true });
 document.addEventListener("click", (event) => {
   if (
     !$("modelPicker").hidden &&
@@ -4349,8 +5005,11 @@ document.addEventListener("click", (event) => {
 });
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (!$("tasksDialog").hidden) closeTasksDialog();
+  if (imageViewer.root && !imageViewer.root.hidden) closeImageViewer();
+  else if (filePreview.isOpen()) filePreview.close();
+  else if (!$("tasksDialog").hidden) closeTasksDialog();
   else if (!$("createDialog").hidden) closeCreateDialog();
+  else if (isHistoryFullscreen()) setHistoryFullscreen(false);
   else closePanels();
 });
 $("outboxTray").addEventListener("click", (event) => {
