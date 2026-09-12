@@ -2730,7 +2730,6 @@ function messageTailStatusText() {
       current: state.messageSyncBatch,
       total: state.messageSyncBatchTotal,
     });
-  if (state.messageSyncPhase === "waiting") return tr("waitingForModelOutput");
   return "";
 }
 
@@ -3040,7 +3039,6 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
     cursor.remove();
     cursor = next;
   }
-  observeVisibleDeferredTurns();
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
@@ -3413,89 +3411,6 @@ async function hydrateTurn(turnId, { render = false } = {}) {
   if (render) renderVisibleMessages();
   return state.hydratedTurns.get(key) || null;
 }
-const VISIBLE_TURN_HYDRATION_INTERVAL_MS = 600;
-let deferredTurnObserver = null,
-  deferredTurnHydrationTimer = null,
-  deferredTurnHydrationActive = false,
-  lastDeferredTurnHydration = 0;
-const visibleDeferredTurns = new Map();
-
-function resetVisibleTurnHydration() {
-  deferredTurnObserver?.disconnect();
-  deferredTurnObserver = null;
-  clearTimeout(deferredTurnHydrationTimer);
-  deferredTurnHydrationTimer = null;
-  visibleDeferredTurns.clear();
-}
-
-function scheduleVisibleTurnHydration() {
-  if (deferredTurnHydrationActive || deferredTurnHydrationTimer || !visibleDeferredTurns.size)
-    return;
-  const delay = Math.max(
-    0,
-    VISIBLE_TURN_HYDRATION_INTERVAL_MS - (Date.now() - lastDeferredTurnHydration),
-  );
-  deferredTurnHydrationTimer = setTimeout(async () => {
-    deferredTurnHydrationTimer = null;
-    const next = visibleDeferredTurns.entries().next().value;
-    if (!next) return;
-    const [key, candidate] = next;
-    visibleDeferredTurns.delete(key);
-    if (
-      !candidate.element.isConnected ||
-      state.current?.id !== candidate.threadId ||
-      state.openToken !== candidate.openToken
-    ) {
-      scheduleVisibleTurnHydration();
-      return;
-    }
-    deferredTurnHydrationActive = true;
-    try {
-      await hydrateTurn(candidate.turnId);
-    } catch {
-      // Expanding the turn retries through the normal user-visible error path.
-    } finally {
-      lastDeferredTurnHydration = Date.now();
-      deferredTurnHydrationActive = false;
-      scheduleVisibleTurnHydration();
-    }
-  }, delay);
-}
-
-function observeVisibleDeferredTurns() {
-  deferredTurnObserver?.disconnect();
-  visibleDeferredTurns.clear();
-  if (typeof IntersectionObserver !== "function" || !state.current) return;
-  const threadId = state.current.id,
-    openToken = state.openToken;
-  deferredTurnObserver = new IntersectionObserver(
-    (entries) => {
-      for (const entry of entries) {
-        const turnId = entry.target.dataset.deferredTurnId,
-          key = hydratedTurnKey(threadId, turnId);
-        if (!turnId || state.hydratedTurns.has(key) || state.hydratingTurns.has(key)) {
-          visibleDeferredTurns.delete(key);
-          continue;
-        }
-        if (entry.isIntersecting) {
-          visibleDeferredTurns.set(key, { element: entry.target, threadId, turnId, openToken });
-        } else visibleDeferredTurns.delete(key);
-      }
-      scheduleVisibleTurnHydration();
-    },
-    {
-      root: usesDocumentMessageScroll() ? null : $("messages"),
-      rootMargin: "48px 0px",
-      threshold: 0.1,
-    },
-  );
-  for (const fold of $("messages").querySelectorAll(".turn-fold[data-deferred-turn-id]")) {
-    const key = hydratedTurnKey(threadId, fold.dataset.deferredTurnId);
-    if (!state.hydratedTurns.has(key) && !state.hydratingTurns.has(key)) {
-      deferredTurnObserver.observe(fold);
-    }
-  }
-}
 // Message indices come from the current rollout parse, not immutable event IDs. Continue a
 // page only while its boundary is exact; otherwise rebuild the visible region atomically.
 function isValidMessagePage(result, { latest = false, expectedEnd = null } = {}) {
@@ -3598,8 +3513,6 @@ function showActivity() {
     : state.pendingChanges
       ? tr("idleUpdates")
       : tr("idle");
-  if (!["reconnecting", "catching_up"].includes(state.messageSyncPhase))
-    setMessageSyncPhase(active ? "waiting" : null);
 }
 function setUsageUnavailable(error) {
   state.usageUnavailable = true;
@@ -4174,7 +4087,6 @@ async function openThread(
   if (changedThread) {
     state.threadGoal = null;
     renderGoalPanel();
-    resetVisibleTurnHydration();
     restoreComposerDraft($("messageText"), state.drafts.get(thread.id), true);
     state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
     renderComposerAttachments();
@@ -4323,7 +4235,7 @@ async function openThread(
   reportMessagesRendered(r, renderStarted);
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
-  setMessageSyncPhase(state.activeTurnId ? "waiting" : null);
+  setMessageSyncPhase(null);
   showActivity();
   await refreshWorkspaceDiff(true);
   if (!quiet) settleHorizontalPosition();
@@ -4341,7 +4253,6 @@ function clearCurrentSessionMessageCaches(threadId) {
   for (const key of [...state.hydratingTurns.keys()]) {
     if (key.startsWith(prefix)) state.hydratingTurns.delete(key);
   }
-  resetVisibleTurnHydration();
   state.visibleMessages = [];
   state.before = null;
   state.hasMore = false;
