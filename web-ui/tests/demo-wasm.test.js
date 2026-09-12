@@ -758,7 +758,7 @@ test("tool output images open in a zoomable viewer", async () => {
   assert.match(stylesheet, /\.inspectable-image\s*\{[^}]*cursor:\s*zoom-in;/s);
   assert.match(source, /group\.open = hasImage/);
   assert.match(source, /detail\.open = Boolean\(tool\.has_image\)/);
-  assert.match(source, /node\.dataset\.hasToolImage === "1"/);
+  assert.doesNotMatch(source, /hasToolImage|imageToolNodes/);
   assert.match(source, /if \(hasImage\) summary\.appendChild\(toolImageIndicator\(\)\)/);
   assert.match(source, /if \(tool\.has_image\) head\.appendChild\(toolImageIndicator\(\)\)/);
   assert.match(stylesheet, /\.tool-image-indicator svg\s*\{/);

@@ -2755,10 +2755,7 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       (node, index) =>
         group.messages[index].role === "user" && group.messages[index].category === "user",
     ),
-    imageToolNodes = messageNodes.filter((node) => node.dataset.hasToolImage === "1"),
-    hiddenNodes = messageNodes.filter(
-      (node) => node !== finalNode && !userNodes.includes(node) && !imageToolNodes.includes(node),
-    ),
+    hiddenNodes = messageNodes.filter((node) => node !== finalNode && !userNodes.includes(node)),
     hasFinalTools = Boolean(finalIndex >= 0 && group.messages[finalIndex].tools?.length),
     hasDeferred = group.messages.some((message) => message.deferred),
     usage = turnUsageItem(group),
@@ -2835,9 +2832,7 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   section.classList.toggle("collapsed", !expanded);
   section.classList.toggle("expanded", expanded);
   for (const node of messageNodes) node.hidden = !expanded && hiddenNodes.includes(node);
-  const leading = expanded
-    ? messageNodes.filter((node) => node !== finalNode)
-    : [...new Set([...userNodes, ...imageToolNodes])];
+  const leading = expanded ? messageNodes.filter((node) => node !== finalNode) : userNodes;
   reconcileChildren(section, [
     ...leading,
     foldBlock,
@@ -2851,7 +2846,6 @@ function messageNode(m, keepToolsRunning = false) {
   box.className = `message ${m.category || m.role || ""}`;
   box.dataset.messageIndex = String(m.message_index);
   if (m.turn_id) box.dataset.turnId = m.turn_id;
-  if (m.tools?.some((tool) => tool.has_image)) box.dataset.hasToolImage = "1";
   const head = document.createElement("div");
   head.className = "message-head";
   const a = document.createElement("span"),

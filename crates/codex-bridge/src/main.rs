@@ -7522,15 +7522,6 @@ fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Val
                     .get("tools")
                     .and_then(Value::as_array)
                     .map_or(0, Vec::len);
-                let has_tool_image = compact_message
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .is_some_and(|tools| {
-                        tools.iter().any(|tool| {
-                            tool.get("has_image").and_then(Value::as_bool) == Some(true)
-                        })
-                    });
-                let keep_content = keep_content || has_tool_image;
                 let file_count = compact_message
                     .get("tools")
                     .and_then(Value::as_array)
@@ -7541,10 +7532,10 @@ fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Val
                 if !keep_content {
                     compact_message["content"] = json!([]);
                 }
-                if tool_count > 0 && !has_tool_image {
+                if tool_count > 0 {
                     compact_message["tools"] = json!([]);
                 }
-                if !keep_content || (tool_count > 0 && !has_tool_image) {
+                if !keep_content || tool_count > 0 {
                     compact_message["deferred"] = json!(true);
                     compact_message["deferred_tool_count"] = json!(tool_count);
                     compact_message["deferred_file_count"] = json!(file_count);
@@ -9778,7 +9769,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
-    fn completed_turn_page_keeps_image_tools_visible() {
+    fn completed_turn_page_defers_image_tools() {
         let messages = vec![
             ThreadMessage {
                 timestamp: None,
@@ -9807,8 +9798,9 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             },
         ];
         let compact = compact_web_message_page(&messages, 4);
-        assert_eq!(compact[0]["tools"][0]["has_image"], true);
-        assert!(compact[0].get("deferred").is_none());
+        assert_eq!(compact[0]["tools"], json!([]));
+        assert_eq!(compact[0]["deferred"], true);
+        assert_eq!(compact[0]["deferred_tool_count"], 1);
     }
 
     #[test]
