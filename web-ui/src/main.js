@@ -52,6 +52,7 @@ import {
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
 } from "./viewport-state.js";
+import { forwardMessagePageRequests, mergeMessagesByIndex } from "./message-sync.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
 const restoredExpandedProjects = storedExpandedProjects(window.localStorage);
 if (restoredExpandedProjects !== null) {
@@ -2722,6 +2723,61 @@ function reconcileChildren(parent, nodes) {
   }
 }
 
+function messageTailStatusText() {
+  if (state.messageSyncPhase === "reconnecting") return tr("reconnectingMessages");
+  if (state.messageSyncPhase === "catching_up")
+    return tr("catchingUpMessages", {
+      current: state.messageSyncBatch,
+      total: state.messageSyncBatchTotal,
+    });
+  if (state.messageSyncPhase === "waiting") return tr("waitingForModelOutput");
+  return "";
+}
+
+function messageTailStatusNode(root = $("messages")) {
+  const status =
+      root.querySelector(":scope > .message-tail-status") || document.createElement("div"),
+    label = status.querySelector(":scope > span:last-child") || document.createElement("span");
+  status.className = "message-tail-status";
+  status.dataset.phase = state.messageSyncPhase || "";
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  label.textContent = messageTailStatusText();
+  if (!status.childNodes.length) {
+    const spinner = document.createElement("span");
+    spinner.className = "message-tail-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    status.append(spinner, label);
+  }
+  return status;
+}
+
+function renderMessageTailStatus(followTail = true) {
+  const root = $("messages"),
+    previous = root.querySelector(":scope > .message-tail-status");
+  if (!state.messageSyncPhase) {
+    previous?.remove();
+    return;
+  }
+  const status = messageTailStatusNode(root);
+  if (status !== root.lastElementChild) root.appendChild(status);
+  if (followTail && state.followMessageTail)
+    requestAnimationFrame(() => {
+      if (status.isConnected && state.followMessageTail) scrollMessagesToBottom("auto");
+    });
+}
+
+function setMessageSyncPhase(phase = null, batch = 0, batchTotal = 0) {
+  const changed =
+    state.messageSyncPhase !== phase ||
+    state.messageSyncBatch !== batch ||
+    state.messageSyncBatchTotal !== batchTotal;
+  state.messageSyncPhase = phase;
+  state.messageSyncBatch = batch;
+  state.messageSyncBatchTotal = batchTotal;
+  renderMessageTailStatus(changed);
+}
+
 function preserveMessageElementPosition(element, change) {
   const beforeTop = element?.getBoundingClientRect().top,
     scrollTop = messageScrollMetrics().top;
@@ -2971,6 +3027,7 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
     empty.textContent = tr("noMessages");
     nodes.push(empty);
   }
+  if (state.messageSyncPhase) nodes.push(messageTailStatusNode(root));
   // Move only nodes whose order changed. Re-appending every existing message to
   // a fragment briefly detaches the whole timeline and produces a visible jump.
   let cursor = root.firstChild;
@@ -3541,6 +3598,8 @@ function showActivity() {
     : state.pendingChanges
       ? tr("idleUpdates")
       : tr("idle");
+  if (!["reconnecting", "catching_up"].includes(state.messageSyncPhase))
+    setMessageSyncPhase(active ? "waiting" : null);
 }
 function setUsageUnavailable(error) {
   state.usageUnavailable = true;
@@ -3816,10 +3875,15 @@ function handleTemporaryAppServerEvent(method, params, threadId) {
 function handleBridgeEvent(event) {
   if (event?.type === "bridge_event_stream") {
     state.eventStreamConnected = event.status === "ready";
-    if (!state.eventStreamConnected) pollActivity().catch(() => {});
+    if (!state.eventStreamConnected) {
+      setMessageSyncPhase("reconnecting");
+      state.pendingChanges = true;
+      pollActivity().catch(() => {});
+    }
     return;
   }
   if (event?.type === "bridge_event_gap") {
+    setMessageSyncPhase("reconnecting");
     state.lastMessageRefresh = 0;
     for (const threadId of state.taskTrackedIds) state.taskDirtyIds.add(threadId);
     scheduleTasksRefresh(0);
@@ -4084,7 +4148,13 @@ function restoreMessageView(view) {
 }
 async function openThread(
   thread,
-  { quiet = false, preserveView = false, writeHash = true, replaceHash = false } = {},
+  {
+    quiet = false,
+    preserveView = false,
+    writeHash = true,
+    replaceHash = false,
+    reconnect = false,
+  } = {},
 ) {
   const token = ++state.openToken,
     changedThread = state.current?.id !== thread.id,
@@ -4145,31 +4215,77 @@ async function openThread(
   $("threadMeta").textContent =
     `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
   const root = $("messages");
-  const cached = changedThread ? state.messageCache.get(thread.id) : null;
+  const cached = changedThread ? state.messageCache.get(thread.id) : null,
+    validCached = cached && isValidMessagePage(cached, { latest: true }),
+    knownTailEnd = validCached ? cached.page.end : changedThread ? null : state.historyEnd;
+  if (!quiet || changedThread || reconnect) setMessageSyncPhase("reconnecting");
   if (!quiet) {
-    if (cached && isValidMessagePage(cached, { latest: true })) {
+    if (validCached) {
       root.replaceChildren();
       state.visibleMessages = cached.messages;
       reconcileMessageNodes(root, cached, null);
       applyMessagePageState(cached);
       requestAnimationFrame(scrollMessagesToBottom);
     } else {
-      root.innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
+      root.replaceChildren();
+      renderMessageTailStatus();
     }
   }
-  const [r, , , pendingResult, goalResult] = await Promise.all([
-    fetchMessages(),
-    refreshActivity(),
-    demoMode
-      ? Promise.resolve()
-      : command({ command: "thread_watch", thread_id: thread.id }, false)
-          .then((watch) => updateThreadLiveFromStatus(thread.id, watch.thread?.status))
-          .catch(() => {}),
-    command({ command: "pending_messages", thread_id: thread.id }, false).catch(() => null),
-    command({ command: "thread_goal_get", thread_id: thread.id }, false).catch(() => undefined),
-  ]);
+  let r, pendingResult, goalResult;
+  try {
+    [r, , , pendingResult, goalResult] = await Promise.all([
+      fetchMessages(),
+      refreshActivity(),
+      demoMode
+        ? Promise.resolve()
+        : command({ command: "thread_watch", thread_id: thread.id }, false)
+            .then((watch) => updateThreadLiveFromStatus(thread.id, watch.thread?.status))
+            .catch(() => {}),
+      command({ command: "pending_messages", thread_id: thread.id }, false).catch(() => null),
+      command({ command: "thread_goal_get", thread_id: thread.id }, false).catch(() => undefined),
+    ]);
+  } catch (error) {
+    if (token === state.openToken) setMessageSyncPhase(null);
+    throw error;
+  }
   if (token !== state.openToken) return;
   requireMessagePage(r, { latest: true });
+  if (Number.isSafeInteger(knownTailEnd) && knownTailEnd > r.page.end) {
+    state.visibleMessages = [];
+  }
+  const missingMessageCount =
+      Number.isSafeInteger(knownTailEnd) && knownTailEnd < r.page.end
+        ? r.page.end - knownTailEnd
+        : 0,
+    syncBatchTotal = Math.ceil(missingMessageCount / state.pageSize);
+  const forwardRequests = forwardMessagePageRequests(knownTailEnd, r.page.start, state.pageSize);
+  if (forwardRequests.length) {
+    let batch = 0;
+    setMessageSyncPhase("catching_up", 1, syncBatchTotal);
+    try {
+      for (const request of forwardRequests) {
+        const page = requireMessagePage(await fetchMessages(request.before, request.limit), {
+          expectedEnd: request.before,
+        });
+        if (token !== state.openToken) return;
+        page.messages = mergeHydratedTurnMessages(page.messages, thread.id);
+        state.visibleMessages = mergeMessagesByIndex(state.visibleMessages, page.messages);
+        batch += 1;
+        setMessageSyncPhase("catching_up", batch, syncBatchTotal);
+        const incrementalResponse = {
+          ...page,
+          messages: state.visibleMessages,
+          page: { ...page.page, has_more: state.hasMore },
+        };
+        reconcileMessageNodes(root, incrementalResponse, null);
+        restoreMessageView(messageView);
+      }
+    } catch (error) {
+      if (token === state.openToken) setMessageSyncPhase(null);
+      throw error;
+    }
+    setMessageSyncPhase("catching_up", Math.min(syncBatchTotal, batch + 1), syncBatchTotal);
+  }
   renderRepairHint(r.repair_required);
   renderThreadStatistics(r.statistics);
   r.messages = mergeHydratedTurnMessages(r.messages, thread.id);
@@ -4184,9 +4300,7 @@ async function openThread(
     ? r.messages.findLast((message) => message.tools?.length)
     : null;
   const preservedHasMore = state.hasMore,
-    olderMessages = changedThread
-      ? []
-      : state.visibleMessages.filter((message) => message.message_index < r.page.start),
+    olderMessages = state.visibleMessages.filter((message) => message.message_index < r.page.start),
     visibleResponse = {
       ...r,
       messages: [...olderMessages, ...r.messages],
@@ -4209,13 +4323,14 @@ async function openThread(
   reportMessagesRendered(r, renderStarted);
   state.pendingChanges = false;
   state.lastMessageRefresh = Date.now();
+  setMessageSyncPhase(state.activeTurnId ? "waiting" : null);
   showActivity();
   await refreshWorkspaceDiff(true);
   if (!quiet) settleHorizontalPosition();
 }
 async function refreshThread() {
   if (!state.current) return notify(tr("chooseSessionError"), true);
-  return openThread(state.current);
+  return openThread(state.current, { reconnect: true });
 }
 function clearCurrentSessionMessageCaches(threadId) {
   const prefix = `${threadId}:`;
@@ -4242,8 +4357,9 @@ async function refreshCurrentSessionFromTools() {
   clearCurrentSessionMessageCaches(thread.id);
   state.userScrolled = false;
   state.followMessageTail = true;
-  $("messages").innerHTML = `<div class="empty">${tr("loadingLatest")}</div>`;
-  await openThread(thread, { quiet: true, writeHash: false });
+  $("messages").replaceChildren();
+  setMessageSyncPhase("reconnecting");
+  await openThread(thread, { quiet: true, writeHash: false, reconnect: true });
   scrollMessagesToBottom("auto");
   requestAnimationFrame(() => scrollMessagesToBottom("auto"));
   notify(tr("sessionRefreshed"));
@@ -4979,6 +5095,7 @@ window.addEventListener("pagehide", () => {
 });
 const refreshAfterResume = () => {
   if (!state.current || document.visibilityState === "hidden") return;
+  setMessageSyncPhase("reconnecting");
   state.pendingChanges = true;
   state.lastMessageRefresh = 0;
   pollActivity().catch(() => {});

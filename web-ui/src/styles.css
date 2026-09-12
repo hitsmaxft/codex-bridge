@@ -1290,6 +1290,39 @@ main.history-fullscreen .fullscreen-exit-icon {
   min-width: 0;
   max-width: 100%;
 }
+.message-tail-status {
+  display: flex;
+  width: fit-content;
+  min-height: 30px;
+  margin: 8px auto 0;
+  padding: 5px 10px;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--control-bg) 84%, transparent);
+  font-size: 11px;
+  line-height: 18px;
+}
+.message-tail-spinner {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  border: 1.5px solid color-mix(in srgb, var(--muted) 28%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: message-tail-spin 0.75s linear infinite;
+}
+@keyframes message-tail-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .message-tail-spinner {
+    animation-duration: 1.8s;
+  }
+}
 .turn-group {
   position: relative;
 }

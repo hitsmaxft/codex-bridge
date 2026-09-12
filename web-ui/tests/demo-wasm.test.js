@@ -41,6 +41,7 @@ import {
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
 } from "../src/viewport-state.js";
+import { forwardMessagePageRequests, mergeMessagesByIndex } from "../src/message-sync.js";
 
 const wasmPath = new URL(
   "../../target/wasm32-unknown-unknown/release/codex_bridge_demo.wasm",
@@ -1161,8 +1162,46 @@ test("Tools refresh clears current message caches and follows the latest tail", 
   assert.match(refreshFlow, /state\.messageCache\.delete\(threadId\)/);
   assert.match(refreshFlow, /state\.hydratedTurns\.delete\(key\)/);
   assert.match(refreshFlow, /state\.visibleMessages = \[\]/);
-  assert.match(refreshFlow, /await openThread\(thread, \{ quiet: true, writeHash: false \}\)/);
+  assert.match(
+    refreshFlow,
+    /await openThread\(thread, \{ quiet: true, writeHash: false, reconnect: true \}\)/,
+  );
   assert.match(refreshFlow, /scrollMessagesToBottom\("auto"\)/);
+});
+
+test("session return distinguishes reconnect catch-up from waiting at the live tail", async () => {
+  const [source, stylesheet, translations] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+    readFile(new URL("../src/i18n.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(source, /setMessageSyncPhase\("reconnecting"\)/);
+  assert.match(source, /setMessageSyncPhase\("catching_up", batch, syncBatchTotal\)/);
+  assert.match(source, /setMessageSyncPhase\(state\.activeTurnId \? "waiting" : null\)/);
+  assert.match(source, /await fetchMessages\(request\.before, request\.limit\)/);
+  assert.match(source, /state\.visibleMessages = mergeMessagesByIndex/);
+  assert.match(source, /nodes\.push\(messageTailStatusNode\(root\)\)/);
+  assert.match(stylesheet, /\.message-tail-spinner[\s\S]*animation: message-tail-spin/);
+  assert.match(translations, /reconnectingMessages:/);
+  assert.match(translations, /catchingUpMessages:/);
+  assert.match(translations, /waitingForModelOutput:/);
+  assert.deepEqual(forwardMessagePageRequests(500, 550, 30), [
+    { before: 530, limit: 30 },
+    { before: 550, limit: 20 },
+  ]);
+  assert.deepEqual(
+    mergeMessagesByIndex(
+      [{ message_index: 4, text: "old" }],
+      [
+        { message_index: 4, text: "updated" },
+        { message_index: 5, text: "new" },
+      ],
+    ),
+    [
+      { message_index: 4, text: "updated" },
+      { message_index: 5, text: "new" },
+    ],
+  );
 });
 
 test("token usage joins the turn fold while memory stays on the final response", async () => {
