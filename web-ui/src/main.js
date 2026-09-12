@@ -52,7 +52,6 @@ import {
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
 } from "./viewport-state.js";
-import { forwardMessagePageRequests, mergeMessagesByIndex } from "./message-sync.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
 const restoredExpandedProjects = storedExpandedProjects(window.localStorage);
 if (restoredExpandedProjects !== null) {
@@ -2724,12 +2723,8 @@ function reconcileChildren(parent, nodes) {
 }
 
 function messageTailStatusText() {
+  if (state.messageSyncPhase === "loading") return tr("loadingLatest");
   if (state.messageSyncPhase === "reconnecting") return tr("reconnectingMessages");
-  if (state.messageSyncPhase === "catching_up")
-    return tr("catchingUpMessages", {
-      current: state.messageSyncBatch,
-      total: state.messageSyncBatchTotal,
-    });
   return "";
 }
 
@@ -2766,14 +2761,9 @@ function renderMessageTailStatus(followTail = true) {
     });
 }
 
-function setMessageSyncPhase(phase = null, batch = 0, batchTotal = 0) {
-  const changed =
-    state.messageSyncPhase !== phase ||
-    state.messageSyncBatch !== batch ||
-    state.messageSyncBatchTotal !== batchTotal;
+function setMessageSyncPhase(phase = null) {
+  const changed = state.messageSyncPhase !== phase;
   state.messageSyncPhase = phase;
-  state.messageSyncBatch = batch;
-  state.messageSyncBatchTotal = batchTotal;
   renderMessageTailStatus(changed);
 }
 
@@ -4130,14 +4120,16 @@ async function openThread(
   const cached = changedThread ? state.messageCache.get(thread.id) : null,
     validCached = cached && isValidMessagePage(cached, { latest: true }),
     knownTailEnd = validCached ? cached.page.end : changedThread ? null : state.historyEnd;
-  if (!quiet || changedThread || reconnect) setMessageSyncPhase("reconnecting");
+  if (!quiet || changedThread || reconnect)
+    setMessageSyncPhase(validCached || !changedThread ? "reconnecting" : "loading");
   if (!quiet) {
     if (validCached) {
       root.replaceChildren();
       state.visibleMessages = cached.messages;
       reconcileMessageNodes(root, cached, null);
       applyMessagePageState(cached);
-      requestAnimationFrame(scrollMessagesToBottom);
+      scrollMessagesToBottom("auto");
+      requestAnimationFrame(() => scrollMessagesToBottom("auto"));
     } else {
       root.replaceChildren();
       renderMessageTailStatus();
@@ -4146,7 +4138,7 @@ async function openThread(
   let r, pendingResult, goalResult;
   try {
     [r, , , pendingResult, goalResult] = await Promise.all([
-      fetchMessages(),
+      fetchMessages(null, state.initialPageSize),
       refreshActivity(),
       demoMode
         ? Promise.resolve()
@@ -4162,41 +4154,11 @@ async function openThread(
   }
   if (token !== state.openToken) return;
   requireMessagePage(r, { latest: true });
-  if (Number.isSafeInteger(knownTailEnd) && knownTailEnd > r.page.end) {
+  const cachedTailDoesNotOverlap =
+    Number.isSafeInteger(knownTailEnd) &&
+    (knownTailEnd > r.page.end || knownTailEnd < r.page.start);
+  if (cachedTailDoesNotOverlap) {
     state.visibleMessages = [];
-  }
-  const missingMessageCount =
-      Number.isSafeInteger(knownTailEnd) && knownTailEnd < r.page.end
-        ? r.page.end - knownTailEnd
-        : 0,
-    syncBatchTotal = Math.ceil(missingMessageCount / state.pageSize);
-  const forwardRequests = forwardMessagePageRequests(knownTailEnd, r.page.start, state.pageSize);
-  if (forwardRequests.length) {
-    let batch = 0;
-    setMessageSyncPhase("catching_up", 1, syncBatchTotal);
-    try {
-      for (const request of forwardRequests) {
-        const page = requireMessagePage(await fetchMessages(request.before, request.limit), {
-          expectedEnd: request.before,
-        });
-        if (token !== state.openToken) return;
-        page.messages = mergeHydratedTurnMessages(page.messages, thread.id);
-        state.visibleMessages = mergeMessagesByIndex(state.visibleMessages, page.messages);
-        batch += 1;
-        setMessageSyncPhase("catching_up", batch, syncBatchTotal);
-        const incrementalResponse = {
-          ...page,
-          messages: state.visibleMessages,
-          page: { ...page.page, has_more: state.hasMore },
-        };
-        reconcileMessageNodes(root, incrementalResponse, null);
-        restoreMessageView(messageView);
-      }
-    } catch (error) {
-      if (token === state.openToken) setMessageSyncPhase(null);
-      throw error;
-    }
-    setMessageSyncPhase("catching_up", Math.min(syncBatchTotal, batch + 1), syncBatchTotal);
   }
   renderRepairHint(r.repair_required);
   renderThreadStatistics(r.statistics);
