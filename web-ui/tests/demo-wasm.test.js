@@ -45,7 +45,6 @@ import {
   messageRangesCoverPage,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
-  turnSummarySequences,
 } from "../src/viewport-state.js";
 
 const wasmPath = new URL(
@@ -1002,30 +1001,6 @@ test("turn summaries cover sparse message pages and hydrate exactly once", () =>
     merged.map((message) => message.message_index),
     [0, 1, 500, 992, 993],
   );
-});
-
-test("turn summaries retain visible user and final messages when an expanded turn is unloaded", () => {
-  const messages = [
-      { turn_id: "turn-history", role: "user", message_index: 0 },
-      {
-        turn_id: "turn-history",
-        message_index: 1,
-        turn_stub: { start: 1, end: 39 },
-      },
-      {
-        turn_id: "turn-history",
-        role: "assistant",
-        phase: "final_answer",
-        message_index: 39,
-      },
-      { turn_id: "turn-active", role: "user", message_index: 40 },
-    ],
-    summaries = turnSummarySequences(messages);
-  assert.deepEqual(
-    summaries.get("turn-history").map((message) => message.message_index),
-    [0, 1, 39],
-  );
-  assert.equal(summaries.has("turn-active"), false);
 });
 
 test("conversation exposes floating previous and next turn controls", async () => {

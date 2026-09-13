@@ -72,14 +72,3 @@ export function mergeHydratedTurnSequence(messages, hydratedForTurn) {
   }
   return output;
 }
-
-export function turnSummarySequences(messages) {
-  const groups = new Map();
-  for (const message of messages || []) {
-    if (!message.turn_id) continue;
-    const group = groups.get(message.turn_id) || [];
-    group.push(message);
-    groups.set(message.turn_id, group);
-  }
-  return new Map([...groups].filter(([, group]) => group.some((message) => message.turn_stub)));
-}

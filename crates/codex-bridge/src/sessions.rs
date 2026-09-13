@@ -925,50 +925,22 @@ impl SessionStore {
                     })
             }) || global_end < total;
             let summarize = completed && turn_id.is_some();
-            let message_start = if turn_id.is_none() {
-                start
-            } else if summarize {
+            let message_start = if summarize {
+                visible_end
+            } else if turn_id.is_none() {
                 start
             } else {
                 visible_end
                     .saturating_sub(active_tail_limit.max(1))
                     .max(start)
             };
-            let omitted_before = (!summarize && message_start > start).then_some(message_start);
-            let group_messages = if summarize {
-                let visible_group = &messages[start..visible_end];
-                let user_end = visible_group
-                    .iter()
-                    .position(|message| message.role == "user")
-                    .map_or(1, |offset| offset + 1)
-                    .min(visible_group.len());
-                let final_start = visible_group
-                    .iter()
-                    .rposition(|message| {
-                        message.role == "assistant"
-                            && message.phase.as_deref() == Some("final_answer")
-                    })
-                    .or_else(|| {
-                        visible_group
-                            .iter()
-                            .rposition(|message| message.role == "assistant")
-                    })
-                    .unwrap_or_else(|| visible_group.len().saturating_sub(1));
-                visible_group
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .filter(|(offset, _)| *offset < user_end || *offset >= final_start)
-                    .map(|(offset, message)| (start + offset, message))
-                    .collect()
-            } else {
-                messages[message_start..visible_end]
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(offset, message)| (message_start + offset, message))
-                    .collect()
-            };
+            let omitted_before = (message_start > start).then_some(message_start);
+            let group_messages = messages[message_start..visible_end]
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(offset, message)| (message_start + offset, message))
+                .collect();
             let full_group = &messages[start..global_end];
             let total_tokens = full_group
                 .iter()
@@ -3324,16 +3296,7 @@ mod tests {
         assert!(turn_page
             .groups
             .iter()
-            .all(|group| group.messages.len() == 2));
-        assert!(turn_page.groups.iter().all(|group| {
-            group
-                .messages
-                .first()
-                .is_some_and(|(_, message)| message.role == "user")
-                && group.messages.last().is_some_and(|(_, message)| {
-                    message.role == "assistant" && message.phase.as_deref() == Some("final_answer")
-                })
-        }));
+            .all(|group| group.messages.is_empty()));
         assert!(turn_page.groups.iter().all(|group| group.tool_calls == 1));
         assert_eq!(turn_page.end, turn_page.total);
         assert!(turn_page.has_more);
@@ -3415,12 +3378,7 @@ mod tests {
             .unwrap();
         assert_eq!(page.groups.len(), 2);
         assert!(page.groups[0].completed);
-        assert_eq!(page.groups[0].messages.len(), 2);
-        assert_eq!(page.groups[0].messages[0].1.role, "user");
-        assert_eq!(
-            page.groups[0].messages[1].1.phase.as_deref(),
-            Some("final_answer")
-        );
+        assert!(page.groups[0].messages.is_empty());
         assert!(!page.groups[1].completed);
         assert_eq!(page.groups[1].messages.len(), 8);
         assert_eq!(page.groups[1].omitted_before, Some(59));
