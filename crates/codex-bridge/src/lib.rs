@@ -27,7 +27,7 @@ pub use write_backend::{
     StartedTurnReceipt, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 35;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +47,11 @@ pub enum Request {
         limit: u32,
     },
     Messages {
+        thread_id: String,
+        before: Option<u32>,
+        limit: u32,
+    },
+    SubagentMessages {
         thread_id: String,
         before: Option<u32>,
         limit: u32,
@@ -247,6 +252,7 @@ impl Request {
             Self::Projects { .. } => "projects",
             Self::ProjectThreads { .. } => "project_threads",
             Self::Messages { .. } => "messages",
+            Self::SubagentMessages { .. } => "subagent_messages",
             Self::ClientPerformance { .. } => "client_performance",
             Self::TurnMessages { .. } => "turn_messages",
             Self::MessageContent { .. } => "message_content",
@@ -462,6 +468,15 @@ mod tests {
         assert_eq!(messages["command"], "messages");
         assert_eq!(messages["before"], 90);
         assert_eq!(messages["limit"], 30);
+
+        let subagent_messages = serde_json::to_value(Request::SubagentMessages {
+            thread_id: "agent-1".into(),
+            before: None,
+            limit: 30,
+        })
+        .unwrap();
+        assert_eq!(subagent_messages["command"], "subagent_messages");
+        assert_eq!(subagent_messages["thread_id"], "agent-1");
 
         let performance = serde_json::to_value(Request::ClientPerformance {
             samples: vec![ClientPerformanceSample {

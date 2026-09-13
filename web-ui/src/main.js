@@ -49,7 +49,9 @@ import {
   watchSystemTheme,
 } from "./state.js";
 import {
+  activityAgents,
   activityToolTitle,
+  activityThreadIds,
   adjacentTurnIndex,
   documentOwnsMessageScroll,
   latestActivityMessages,
@@ -1558,9 +1560,69 @@ function messageCopyButton(text) {
 
 function renderTemporaryMessages() {
   const root = $("temporaryMessages"),
-    temporary = state.temporaryThread;
+    temporary = state.subagentConversation || state.temporaryThread,
+    readOnly = temporary?.kind === "subagent" || temporary?.kind === "subagent-picker";
   root.replaceChildren();
+  $("temporaryPanel").classList.toggle("read-only", readOnly);
+  $("temporaryComposer").hidden = readOnly;
+  $("temporaryTitle").textContent = readOnly ? `🤖 ${temporary.name}` : tr("temporaryConversation");
+  $("temporaryCompactHint").textContent = tr(
+    readOnly ? "subagentConversationHint" : "temporaryHint",
+  );
+  $("temporaryHint").textContent = tr(readOnly ? "subagentConversationHint" : "temporaryHint");
   if (!temporary) return;
+  if (readOnly) {
+    if (temporary.kind === "subagent-picker") {
+      const picker = document.createElement("div"),
+        hint = document.createElement("div");
+      picker.className = "subagent-picker";
+      hint.className = "meta";
+      hint.textContent = tr("chooseSubagent");
+      picker.appendChild(hint);
+      for (const target of temporary.targets) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = `🤖 ${target.name}`;
+        button.onclick = () => run(() => openSubagentTarget(target));
+        picker.appendChild(button);
+      }
+      root.appendChild(picker);
+      return;
+    }
+    if (temporary.loading) {
+      const status = document.createElement("div");
+      status.className = "loading-state";
+      status.textContent = tr("subagentLoading");
+      root.appendChild(status);
+      return;
+    }
+    if (temporary.error) {
+      const status = document.createElement("div");
+      status.className = "error";
+      status.textContent = temporary.error;
+      root.appendChild(status);
+      return;
+    }
+    if (temporary.hasMore) {
+      const older = document.createElement("button");
+      older.className = "older";
+      older.type = "button";
+      older.textContent = "↑";
+      older.title = tr("loadOlder", { count: temporary.before });
+      older.setAttribute("aria-label", older.title);
+      older.onclick = () => run(prependSubagentMessages);
+      root.appendChild(older);
+    }
+    for (const message of latestActivityMessages(temporary.messages)) {
+      const node = messageNode(message, false, temporary.id);
+      node.classList.add("temporary-message");
+      root.appendChild(node);
+    }
+    requestAnimationFrame(() => {
+      if (temporary.followTail !== false) root.scrollTop = root.scrollHeight;
+    });
+    return;
+  }
   if (temporary.selection?.text) {
     const context = document.createElement("article"),
       body = document.createElement("div"),
@@ -1605,6 +1667,7 @@ function resizeTemporaryTextarea() {
 }
 
 function syncTemporaryForCurrent() {
+  state.subagentConversation = null;
   const temporary = state.current ? state.temporaryThreads.get(state.current.id) || null : null;
   state.temporaryThread = temporary;
   $("temporaryPanelBtn").hidden = !temporary;
@@ -1620,7 +1683,7 @@ function syncTemporaryForCurrent() {
 }
 
 function openTemporaryPanel() {
-  if (!state.temporaryThread) return;
+  if (!state.subagentConversation && !state.temporaryThread) return;
   $("tools").classList.remove("open");
   $("temporaryPanel").inert = false;
   $("temporaryPanel").classList.add("open");
@@ -1628,7 +1691,128 @@ function openTemporaryPanel() {
   $("sidebar").inert = true;
   $("tools").inert = true;
   syncScrim();
-  requestAnimationFrame(() => $("temporaryText").focus({ preventScroll: true }));
+  if (!state.subagentConversation)
+    requestAnimationFrame(() => $("temporaryText").focus({ preventScroll: true }));
+}
+
+async function openSubagentConversation(tool) {
+  const targets = activityAgents(tool, state.current);
+  if (!targets.length) return;
+  if (targets.length > 1) {
+    state.subagentConversation = {
+      kind: "subagent-picker",
+      name: tr("subagentConversation"),
+      targets,
+    };
+    renderTemporaryMessages();
+    openTemporaryPanel();
+    return;
+  }
+  await openSubagentTarget(targets[0]);
+}
+
+async function openSubagentTarget(target) {
+  const threadId = target.id;
+  const conversation = {
+    kind: "subagent",
+    id: threadId,
+    name: target.name || tr("subagentConversation"),
+    messages: [],
+    before: null,
+    hasMore: false,
+    loading: true,
+    error: null,
+    followTail: true,
+  };
+  state.subagentConversation = conversation;
+  renderTemporaryMessages();
+  openTemporaryPanel();
+  try {
+    const result = requireMessagePage(
+      await command(
+        { command: "subagent_messages", thread_id: threadId, before: null, limit: 30 },
+        false,
+      ),
+      { latest: true },
+    );
+    if (state.subagentConversation !== conversation) return;
+    conversation.messages = result.messages;
+    conversation.before = result.page.before;
+    conversation.hasMore = result.page.has_more;
+    conversation.loading = false;
+    renderTemporaryMessages();
+  } catch (error) {
+    if (state.subagentConversation !== conversation) return;
+    conversation.loading = false;
+    conversation.error = `${tr("subagentLoadFailed")}: ${error.message}`;
+    renderTemporaryMessages();
+  }
+}
+
+async function prependSubagentMessages() {
+  const conversation = state.subagentConversation;
+  if (!conversation || conversation.loading || !conversation.hasMore) return;
+  const root = $("temporaryMessages"),
+    previousHeight = root.scrollHeight,
+    previousTop = root.scrollTop;
+  conversation.loading = true;
+  try {
+    const result = requireMessagePage(
+      await command(
+        {
+          command: "subagent_messages",
+          thread_id: conversation.id,
+          before: conversation.before,
+          limit: 30,
+        },
+        false,
+      ),
+      { expectedEnd: conversation.before },
+    );
+    if (state.subagentConversation !== conversation) return;
+    conversation.messages = [...result.messages, ...conversation.messages];
+    conversation.before = result.page.before;
+    conversation.hasMore = result.page.has_more;
+    conversation.followTail = false;
+    conversation.loading = false;
+    renderTemporaryMessages();
+    requestAnimationFrame(() => {
+      root.scrollTop = previousTop + root.scrollHeight - previousHeight;
+    });
+  } catch (error) {
+    if (state.subagentConversation !== conversation) return;
+    conversation.loading = false;
+    conversation.error = `${tr("subagentLoadFailed")}: ${error.message}`;
+    renderTemporaryMessages();
+  }
+}
+
+let subagentRefreshTimer = null;
+function scheduleSubagentConversationRefresh(threadId, delay = 280) {
+  if (threadId !== state.subagentConversation?.id) return;
+  clearTimeout(subagentRefreshTimer);
+  subagentRefreshTimer = setTimeout(() => {
+    subagentRefreshTimer = null;
+    refreshSubagentConversation(threadId).catch(() => {});
+  }, delay);
+}
+
+async function refreshSubagentConversation(threadId) {
+  const conversation = state.subagentConversation;
+  if (!conversation || conversation.id !== threadId || conversation.followTail === false) return;
+  const result = requireMessagePage(
+    await command(
+      { command: "subagent_messages", thread_id: threadId, before: null, limit: 30 },
+      false,
+    ),
+    { latest: true },
+  );
+  if (state.subagentConversation !== conversation) return;
+  conversation.messages = result.messages;
+  conversation.before = result.page.before;
+  conversation.hasMore = result.page.has_more;
+  conversation.loading = false;
+  renderTemporaryMessages();
 }
 
 function setTemporarySelection(selection = null) {
@@ -2307,8 +2491,8 @@ function appendContextValue(details, value, label) {
     details.appendChild(pre);
   }
 }
-function contentNode(item) {
-  if (item.kind === "text") return markdownNode(item.text, markdownOptions(state.current?.id));
+function contentNode(item, threadId = state.current?.id) {
+  if (item.kind === "text") return markdownNode(item.text, markdownOptions(threadId));
   if (item.kind === "turn_usage") {
     const node = turnMetaNode(turnTokenUsageText(item));
     node.classList.add("turn-token-usage");
@@ -2341,7 +2525,7 @@ function contentNode(item) {
       const r = await command(
         {
           command: "message_content",
-          thread_id: state.current.id,
+          thread_id: threadId,
           message_index: item.message_index,
           content_index: item.content_index,
           content_end: item.content_end ?? null,
@@ -2491,7 +2675,7 @@ function appendCommandActions(parent, input) {
 }
 const renderedMessageState = new WeakMap();
 
-function toolGroupNode(message, keepRunning = false) {
+function toolGroupNode(message, keepRunning = false, threadId = state.current?.id) {
   const tools = message.tools || [];
   if (!tools.length) return null;
   const group = document.createElement("details");
@@ -2510,23 +2694,35 @@ function toolGroupNode(message, keepRunning = false) {
   const editedFiles = tools.reduce((total, tool) => total + (tool.file_count || 0), 0);
   const activityTitle = activityToolTitle(latest, state.current);
   label.className = "tool-summary-label";
-  label.textContent = running
-    ? [
-        activityTitle || toolActionText(latest.name, true),
-        activityTitle ? "" : toolSummaryPreview(latest),
-        tools.length > 1 ? `+${tools.length - 1}` : "",
-      ]
-        .filter(Boolean)
-        .join(" ")
-    : [
-        tr("ranTools"),
-        tr("toolCount", { count: tools.length }),
-        editedFiles ? tr("editedFiles", { count: editedFiles }) : "",
-      ]
-        .filter(Boolean)
-        .join(" ");
+  label.textContent = activityTitle
+    ? activityTitle
+    : running
+      ? [
+          activityTitle || toolActionText(latest.name, true),
+          activityTitle ? "" : toolSummaryPreview(latest),
+          tools.length > 1 ? `+${tools.length - 1}` : "",
+        ]
+          .filter(Boolean)
+          .join(" ")
+      : [
+          tr("ranTools"),
+          tr("toolCount", { count: tools.length }),
+          editedFiles ? tr("editedFiles", { count: editedFiles }) : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
   label.title = running ? latest.preview || latest.name : label.textContent;
   summary.append(icon, label);
+  if (activityTitle && activityThreadIds(latest).length > 0) {
+    summary.classList.add("subagent-link");
+    summary.title = tr("openSubagentConversation", { name: activityTitle });
+    summary.setAttribute("aria-label", summary.title);
+    summary.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      run(() => openSubagentConversation(latest));
+    };
+  }
   if (hasImage) summary.appendChild(toolImageIndicator());
   group.appendChild(summary);
   const list = document.createElement("div");
@@ -2570,7 +2766,7 @@ function toolGroupNode(message, keepRunning = false) {
         const r = await command(
           {
             command: "tool_content",
-            thread_id: state.current.id,
+            thread_id: threadId,
             message_index: message.message_index,
             tool_index: tool.tool_index,
           },
@@ -2901,7 +3097,7 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   ]);
 }
 
-function messageNode(m, keepToolsRunning = false) {
+function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) {
   const box = document.createElement("article");
   box.className = `message ${m.category || m.role || ""}`;
   box.dataset.messageIndex = String(m.message_index);
@@ -2928,13 +3124,13 @@ function messageNode(m, keepToolsRunning = false) {
     ),
     usageItems = content.filter((item) => item.kind === "turn_usage"),
     memoryItems = content.filter((item) => item.kind === "memory_citation");
-  for (const item of ordinaryItems) body.appendChild(contentNode(item));
+  for (const item of ordinaryItems) body.appendChild(contentNode(item, threadId));
   const copyText = content
     .filter((item) => item.kind === "text" && typeof item.text === "string")
     .map((item) => item.text)
     .join("\n\n");
   const copy = copyText ? messageCopyButton(copyText) : null,
-    tools = toolGroupNode(m, keepToolsRunning);
+    tools = toolGroupNode(m, keepToolsRunning, threadId);
   if (tools) {
     const toolRow = document.createElement("div");
     toolRow.className = "message-tool-row";
@@ -2946,7 +3142,7 @@ function messageNode(m, keepToolsRunning = false) {
     }
     body.appendChild(toolRow);
   } else if (copy) body.appendChild(copy);
-  for (const item of usageItems) body.appendChild(contentNode(item));
+  for (const item of usageItems) body.appendChild(contentNode(item, threadId));
   if (memoryItems.length) body.appendChild(memoryCitationNode(memoryItems));
   if (head.childNodes.length) box.appendChild(head);
   box.appendChild(body);
@@ -3910,6 +4106,13 @@ function handleBridgeEvent(event) {
     threadId = params.threadId || null;
   if (!method) return;
   if (threadId && handleTemporaryAppServerEvent(method, params, threadId)) return;
+  if (
+    threadId === state.subagentConversation?.id &&
+    (method.startsWith("turn/") || method.startsWith("item/") || method === "thread/status/changed")
+  ) {
+    scheduleSubagentConversationRefresh(threadId, method === "turn/completed" ? 0 : 280);
+    return;
+  }
   if (method === "account/updated") {
     loadStatus().catch(() => {});
     return;
@@ -4938,11 +5141,19 @@ function closePanels() {
   if ($("tools").contains(document.activeElement)) document.activeElement.blur();
   $("tools").classList.remove("open");
   $("tools").inert = true;
+  const closedSubagent =
+    $("temporaryPanel").classList.contains("open") && Boolean(state.subagentConversation);
   $("temporaryPanel").classList.remove("open");
   $("temporaryPanel").inert = true;
   document.querySelector("main").inert = false;
   $("sidebar").inert = false;
   $("sidebar").classList.remove("open");
+  if (closedSubagent) {
+    clearTimeout(subagentRefreshTimer);
+    subagentRefreshTimer = null;
+    state.subagentConversation = null;
+    renderTemporaryMessages();
+  }
   syncScrim();
 }
 function bindSwipe(element, direction, onSwipe, { ignoreInteractive = false } = {}) {

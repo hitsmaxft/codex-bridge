@@ -50,10 +50,28 @@ export function latestActivityMessages(messages) {
   });
 }
 
-export function activityToolTitle(tool, currentThread) {
+export function activityToolTitle(tool, _currentThread) {
   if (!["wait", "wait_agent"].includes(tool?.name)) return null;
-  const currentName =
-      tool.activity_sender_id === currentThread?.id ? currentThread?.title?.trim() : "",
-    agentName = tool.activity_label?.trim() || currentName || "subagent";
+  const agentName = tool.activity_label?.trim() || "subagent";
   return agentName;
+}
+
+export function activityThreadIds(tool) {
+  if (!["wait", "wait_agent"].includes(tool?.name)) return [];
+  if (Array.isArray(tool.activity_thread_ids)) {
+    return [...new Set(tool.activity_thread_ids.filter((id) => typeof id === "string" && id))];
+  }
+  const key = typeof tool.activity_key === "string" ? tool.activity_key : "";
+  return key.startsWith("wait:") ? key.slice(5).split(",").filter(Boolean) : [];
+}
+
+export function activityAgents(tool, currentThread) {
+  const ids = activityThreadIds(tool),
+    supplied = Array.isArray(tool?.activity_agents) ? tool.activity_agents : [],
+    fallbackName = activityToolTitle(tool, currentThread);
+  return ids.map((id) => {
+    const suppliedAgent = supplied.find((agent) => agent?.thread_id === id),
+      name = suppliedAgent?.name?.trim();
+    return { id, name: name || (ids.length === 1 ? fallbackName : "subagent") };
+  });
 }

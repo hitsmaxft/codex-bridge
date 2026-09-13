@@ -174,6 +174,36 @@ aside {
 .temporary-chat.open {
   transform: none;
 }
+.temporary-chat.read-only .temporary-messages {
+  padding-bottom: 24px;
+  scroll-padding-bottom: 18px;
+}
+.temporary-chat.read-only .temporary-composer {
+  display: none;
+}
+.tool-group-summary.subagent-link {
+  border-radius: 6px;
+}
+.tool-group-summary.subagent-link:hover,
+.tool-group-summary.subagent-link:focus-visible {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+.subagent-picker {
+  display: grid;
+  gap: 8px;
+  max-width: 760px;
+  margin: 0 auto;
+}
+.subagent-picker button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 11px 13px;
+  border-color: var(--line);
+  background: var(--panel2);
+  text-align: left;
+}
 .goal-float {
   position: fixed;
   top: clamp(68px, 11vh, 112px);

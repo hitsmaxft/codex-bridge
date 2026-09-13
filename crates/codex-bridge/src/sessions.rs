@@ -161,10 +161,40 @@ impl ThreadToolCall {
         value
     }
 
-    pub fn activity_key(&self) -> Option<String> {
+    pub fn activity_thread_ids(&self) -> Vec<String> {
         let input = self.decoded_input();
+        if !matches!(self.name.as_str(), "wait" | "wait_agent") {
+            return Vec::new();
+        }
+        let mut targets = input
+            .get("receiverThreadIds")
+            .or_else(|| input.get("receiver_thread_ids"))
+            .or_else(|| input.pointer("/arguments/targets"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            targets.extend(
+                input
+                    .get("agentsStates")
+                    .or_else(|| input.get("agents_states"))
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|states| states.keys().cloned()),
+            );
+        }
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
+    pub fn activity_key(&self) -> Option<String> {
         match self.name.as_str() {
             "write_stdin" => {
+                let input = self.decoded_input();
                 let session = input
                     .get("session_id")
                     .or_else(|| input.pointer("/arguments/session_id"))
@@ -172,31 +202,7 @@ impl ThreadToolCall {
                     .unwrap_or_else(|| "default".to_owned());
                 Some(format!("write_stdin:{session}"))
             }
-            "wait" | "wait_agent" => {
-                let mut targets = input
-                    .get("receiverThreadIds")
-                    .or_else(|| input.get("receiver_thread_ids"))
-                    .or_else(|| input.pointer("/arguments/targets"))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                if targets.is_empty() {
-                    targets.extend(
-                        input
-                            .get("agentsStates")
-                            .or_else(|| input.get("agents_states"))
-                            .and_then(Value::as_object)
-                            .into_iter()
-                            .flat_map(|states| states.keys().cloned()),
-                    );
-                }
-                targets.sort();
-                targets.dedup();
-                Some(format!("wait:{}", targets.join(",")))
-            }
+            "wait" | "wait_agent" => Some(format!("wait:{}", self.activity_thread_ids().join(","))),
             _ => None,
         }
     }
@@ -238,6 +244,46 @@ impl ThreadToolCall {
         labels.sort();
         labels.dedup();
         (!labels.is_empty()).then(|| labels.join(", "))
+    }
+
+    pub fn activity_agents(&self) -> Vec<Value> {
+        let input = self.decoded_input();
+        let thread_ids = self.activity_thread_ids();
+        let single_label = (thread_ids.len() == 1)
+            .then(|| self.activity_label())
+            .flatten();
+        let receiver_agents = input
+            .get("receiverAgents")
+            .or_else(|| input.get("receiver_agents"))
+            .and_then(Value::as_array);
+        thread_ids
+            .into_iter()
+            .map(|thread_id| {
+                let name = receiver_agents
+                    .into_iter()
+                    .flatten()
+                    .find(|agent| {
+                        agent
+                            .get("threadId")
+                            .or_else(|| agent.get("thread_id"))
+                            .and_then(Value::as_str)
+                            == Some(thread_id.as_str())
+                    })
+                    .and_then(|agent| {
+                        agent
+                            .get("agentNickname")
+                            .or_else(|| agent.get("agent_nickname"))
+                            .or_else(|| agent.get("agentRole"))
+                            .or_else(|| agent.get("agent_role"))
+                            .and_then(Value::as_str)
+                    })
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| single_label.clone())
+                    .unwrap_or_else(|| "subagent".to_owned());
+                json!({"thread_id": thread_id, "name": name})
+            })
+            .collect()
     }
 
     pub fn activity_sender_id(&self) -> Option<String> {
@@ -650,6 +696,28 @@ impl SessionStore {
         Ok(thread)
     }
 
+    pub fn find_subagent_thread(&self, thread_id: &str) -> Result<Option<ThreadSummary>> {
+        if thread_id.is_empty() || thread_id.len() > 256 {
+            return Ok(None);
+        }
+        let titles = self.read_title_index()?;
+        let mut files = Vec::new();
+        collect_rollout_files(&self.codex_home.join("sessions"), false, &mut files)?;
+        collect_rollout_files(&self.codex_home.join("archived_sessions"), true, &mut files)?;
+        for (path, archived) in files.into_iter().filter(|(path, _)| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(thread_id))
+        }) {
+            if let Some(summary) = read_rollout_summary_mode(&path, archived, &titles, true)?
+                .filter(|summary| summary.id == thread_id)
+            {
+                return Ok(Some(summary));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn composer_settings(&self, thread_id: &str) -> Result<(Option<String>, Option<String>)> {
         let Some(thread) = self.find_thread(thread_id)? else {
             return Ok((None, None));
@@ -939,8 +1007,31 @@ impl SessionStore {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(None);
         };
+        self.read_message_page_for_summary(summary, before, limit)
+            .map(Some)
+    }
+
+    pub fn read_subagent_message_page_profiled(
+        &self,
+        thread_id: &str,
+        before: Option<usize>,
+        limit: usize,
+    ) -> Result<Option<(ThreadSummary, MessagePage, MessageReadProfile)>> {
+        let Some(summary) = self.find_subagent_thread(thread_id)? else {
+            return Ok(None);
+        };
+        self.read_message_page_for_summary(summary, before, limit)
+            .map(Some)
+    }
+
+    fn read_message_page_for_summary(
+        &self,
+        summary: ThreadSummary,
+        before: Option<usize>,
+        limit: usize,
+    ) -> Result<(ThreadSummary, MessagePage, MessageReadProfile)> {
         if summary.rollout_path.as_os_str().is_empty() {
-            return Ok(Some((
+            return Ok((
                 summary,
                 MessagePage {
                     messages: Vec::new(),
@@ -955,7 +1046,7 @@ impl SessionStore {
                     ordinal_repair_required: false,
                     statistics: ThreadStatistics::default(),
                 },
-            )));
+            ));
         }
         let (messages, profile) = self.messages_for_path_profiled(&summary.rollout_path)?;
         let total = messages.len();
@@ -963,7 +1054,7 @@ impl SessionStore {
         let start = end.saturating_sub(limit);
         let mut page_messages = messages[start..end].to_vec();
         retain_latest_tool_activities(&messages, &mut page_messages, start);
-        Ok(Some((
+        Ok((
             summary,
             MessagePage {
                 messages: page_messages,
@@ -973,7 +1064,7 @@ impl SessionStore {
                 has_more: start > 0,
             },
             profile,
-        )))
+        ))
     }
 
     pub fn message_cache_mode(&self, thread_id: &str) -> Result<(&'static str, u64)> {
@@ -1666,6 +1757,15 @@ fn read_rollout_summary(
     archived: bool,
     titles: &HashMap<String, String>,
 ) -> Result<Option<ThreadSummary>> {
+    read_rollout_summary_mode(path, archived, titles, false)
+}
+
+fn read_rollout_summary_mode(
+    path: &Path,
+    archived: bool,
+    titles: &HashMap<String, String>,
+    require_subagent: bool,
+) -> Result<Option<ThreadSummary>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut id = None;
     let mut cwd = None;
@@ -1692,7 +1792,8 @@ fn read_rollout_summary(
 
         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
             let payload = &record["payload"];
-            if payload.get("source").is_some_and(is_internal_source) {
+            let is_subagent = payload.get("source").is_some_and(is_internal_source);
+            if is_subagent != require_subagent {
                 return Ok(None);
             }
             id = string_field(payload, "id").or_else(|| string_field(payload, "session_id"));
@@ -3731,7 +3832,7 @@ text(await tools.web__run({search_query:[{q:"Codex app-server"}],response_length
             &[r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-user","cwd":"/tmp/project","source":"vscode"}}"#],
         );
         fixture.write_rollout(
-            "rollout-guardian.jsonl",
+            "rollout-thread-guardian.jsonl",
             &[
                 r#"{"timestamp":"2026-08-30T01:00:01Z","type":"session_meta","payload":{"id":"thread-guardian","cwd":"/tmp/project","source":{"subagent":{"other":"guardian"}}}}"#,
                 r#"{"timestamp":"2026-08-30T01:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing."}]}}"#,
@@ -3748,6 +3849,16 @@ text(await tools.web__run({search_query:[{q:"Codex app-server"}],response_length
         assert_eq!(threads[0].id, "thread-user");
         assert_eq!(store.list_projects(false).unwrap()[0].thread_count, 1);
         assert!(store.find_thread("thread-guardian").unwrap().is_none());
+        let (subagent, page, _) = store
+            .read_subagent_message_page_profiled("thread-guardian", None, 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(subagent.id, "thread-guardian");
+        assert_eq!(page.messages.len(), 1);
+        assert!(store
+            .read_subagent_message_page_profiled("thread-user", None, 30)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

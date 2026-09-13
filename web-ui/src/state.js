@@ -101,6 +101,7 @@ export const state = {
   temporaryCreating: false,
   temporaryThread: null,
   temporaryThreads: new Map(),
+  subagentConversation: null,
 };
 
 let draftPersistTimer = null;

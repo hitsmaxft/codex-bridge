@@ -38,7 +38,9 @@ import {
   storedSessionId,
 } from "../src/session-route.js";
 import {
+  activityAgents,
   activityToolTitle,
+  activityThreadIds,
   adjacentTurnIndex,
   documentOwnsMessageScroll,
   latestActivityMessages,
@@ -1012,10 +1014,49 @@ test("async tool activities keep only their latest snapshot across turns", () =>
       { name: "wait", activity_sender_id: "agent-a" },
       { id: "agent-a", title: "layout-review" },
     ),
-    "layout-review",
+    "subagent",
   );
   assert.equal(activityToolTitle({ name: "wait", activity_label: "Atlas" }, null), "Atlas");
   assert.equal(activityToolTitle({ name: "wait" }, null), "subagent");
+  assert.deepEqual(
+    activityThreadIds({ name: "wait", activity_thread_ids: ["agent-a", "agent-a"] }),
+    ["agent-a"],
+  );
+  assert.deepEqual(activityThreadIds({ name: "wait", activity_key: "wait:agent-a,agent-b" }), [
+    "agent-a",
+    "agent-b",
+  ]);
+  assert.deepEqual(
+    activityAgents(
+      {
+        name: "wait",
+        activity_thread_ids: ["agent-a"],
+        activity_agents: [{ thread_id: "agent-a", name: "Atlas" }],
+      },
+      null,
+    ),
+    [{ id: "agent-a", name: "Atlas" }],
+  );
+});
+
+test("subagent activity opens its original conversation in the temporary panel", async () => {
+  const [source, stylesheet, html] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+    readFile(indexPath, "utf8"),
+  ]);
+  assert.match(source, /function openSubagentConversation\(tool\)/);
+  assert.match(source, /activityAgents\(tool, state\.current\)/);
+  assert.match(
+    source,
+    /command: "subagent_messages", thread_id: threadId, before: null, limit: 30/,
+  );
+  assert.match(source, /messageNode\(message, false, temporary\.id\)/);
+  assert.match(source, /thread_id: threadId,[\s\S]*message_index: message\.message_index/);
+  assert.match(source, /function prependSubagentMessages\(\)/);
+  assert.match(source, /scheduleSubagentConversationRefresh/);
+  assert.match(html, /id="temporaryComposer"/);
+  assert.match(stylesheet, /\.temporary-chat\.read-only \.temporary-composer/);
 });
 
 test("conversation exposes floating previous and next turn controls", async () => {

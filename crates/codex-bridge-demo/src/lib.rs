@@ -836,7 +836,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
         "current" | "select" => {
             json!({"thread": state.thread(thread_id), "selection": {"method": "demo", "authoritative": true}})
         }
-        "messages" => {
+        "messages" | "subagent_messages" => {
             let total = state.messages.len();
             let end = request
                 .get("before")

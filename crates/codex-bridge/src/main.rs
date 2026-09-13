@@ -4643,6 +4643,62 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
     })
 }
 
+fn subagent_activity_identity(
+    write_backend: &CodexCliBackend,
+    item: &Value,
+    cache: &mut HashMap<String, String>,
+) -> Option<(String, String)> {
+    let thread_id = item.get("agentThreadId")?.as_str()?.to_owned();
+    if let Some(name) = cache.get(&thread_id) {
+        return Some((thread_id, name.clone()));
+    }
+    let name = write_backend
+        .app_server_rpc(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+        )
+        .ok()
+        .and_then(|result| {
+            result
+                .pointer("/thread/agentNickname")
+                .or_else(|| result.pointer("/thread/source/subAgent/thread_spawn/agent_nickname"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            item.get("agentPath")
+                .and_then(Value::as_str)
+                .and_then(|path| path.rsplit('/').find(|part| !part.is_empty()))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "subagent".to_owned());
+    cache.insert(thread_id.clone(), name.clone());
+    Some((thread_id, name))
+}
+
+fn infer_wait_activity(item: &Value, subagent: Option<&(String, String)>) -> Option<Value> {
+    if item.get("type").and_then(Value::as_str) != Some("collabAgentToolCall")
+        || !matches!(
+            item.get("tool").and_then(Value::as_str),
+            Some("wait" | "wait_agent")
+        )
+        || item
+            .get("receiverThreadIds")
+            .and_then(Value::as_array)
+            .is_some_and(|targets| !targets.is_empty())
+    {
+        return None;
+    }
+    let (thread_id, name) = subagent?;
+    let mut enriched = item.clone();
+    enriched["receiverThreadIds"] = json!([thread_id]);
+    enriched["receiverAgents"] = json!([{
+        "threadId": thread_id,
+        "agentNickname": name,
+    }]);
+    Some(enriched)
+}
+
 fn app_server_tools_for_messages(
     write_backend: &CodexCliBackend,
     cache: &AppServerToolCache,
@@ -4707,6 +4763,8 @@ fn app_server_tools_for_messages(
     let mut pending_tools = Vec::<ThreadToolCall>::new();
     let mut current_turn = None::<String>;
     let mut latest_activities = HashSet::<String>::new();
+    let mut recent_subagent = None::<(String, String)>;
+    let mut subagent_names = HashMap::<String, String>::new();
     for _ in 0..MAX_APP_SERVER_TOOL_PAGES {
         let result = write_backend.app_server_rpc(
             "thread/items/list",
@@ -4731,11 +4789,17 @@ fn app_server_tools_for_messages(
                 .is_some_and(|current| Some(current) != turn_id)
             {
                 pending_tools.clear();
+                recent_subagent = None;
             }
             current_turn = turn_id.map(str::to_owned);
             let Some(item) = entry.get("item") else {
                 continue;
             };
+            if item.get("type").and_then(Value::as_str) == Some("subAgentActivity") {
+                recent_subagent =
+                    subagent_activity_identity(write_backend, item, &mut subagent_names);
+                continue;
+            }
             if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
                 if let Some(id) = item.get("id").and_then(Value::as_str) {
                     if wanted.contains(id) {
@@ -4748,7 +4812,8 @@ fn app_server_tools_for_messages(
                 }
                 continue;
             }
-            if let Some(tool) = typed_thread_tool(item) {
+            let inferred = infer_wait_activity(item, recent_subagent.as_ref());
+            if let Some(tool) = typed_thread_tool(inferred.as_ref().unwrap_or(item)) {
                 if let Some(key) = tool.activity_key() {
                     if !latest_activities.insert(key) {
                         continue;
@@ -5648,6 +5713,88 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 observed_at: Instant::now(),
                 source: "server",
                 metric: "messages_read".to_owned(),
+                duration_ms,
+                max_ms: duration_ms,
+                count: 1,
+                bytes: rollout_bytes,
+                cache: Some(cache_mode),
+            });
+            response
+        }
+        Request::SubagentMessages {
+            thread_id,
+            before,
+            limit,
+        } => {
+            if !(1..=200).contains(&limit) {
+                return Response::error(
+                    "invalid_request",
+                    "subagent_messages limit must be between 1 and 200",
+                );
+            }
+            let started = Instant::now();
+            let read = session_store.read_subagent_message_page_profiled(
+                &thread_id,
+                before.map(|value| value as usize),
+                limit as usize,
+            );
+            let (cache_mode, rollout_bytes) = read
+                .as_ref()
+                .ok()
+                .and_then(|result| result.as_ref().map(|(_, _, profile)| *profile))
+                .map_or(("unknown", 0), |profile| {
+                    (profile.cache, profile.rollout_bytes)
+                });
+            let response = match read {
+                Ok(Some((thread, mut page, profile))) => {
+                    let tool_source = match app_server_tools_for_messages(
+                        write_backend,
+                        app_server_tools,
+                        &thread_id,
+                        &page.messages,
+                    ) {
+                        Ok(tools) if overlay_app_server_tools(&mut page.messages, &tools) > 0 => {
+                            "app_server_items"
+                        }
+                        _ => "rollout_jsonl",
+                    };
+                    let messages = compact_web_message_page(&page.messages, page.start);
+                    Response::success(json!({
+                        "source": "rollout_jsonl_subagent",
+                        "tool_source": tool_source,
+                        "repair_required": profile.ordinal_repair_required,
+                        "statistics": profile.statistics,
+                        "thread": {
+                            "id": thread.id,
+                            "title": thread.title,
+                            "cwd": thread.cwd,
+                            "git_branch": thread.git_branch,
+                            "created_at": thread.created_at,
+                            "updated_at_ms": thread.updated_at_ms,
+                            "source": "subagent",
+                            "archived": thread.archived,
+                        },
+                        "messages": messages,
+                        "page": {
+                            "start": page.start,
+                            "end": page.end,
+                            "total": page.total,
+                            "has_more": page.has_more,
+                            "before": page.start,
+                        }
+                    }))
+                }
+                Ok(None) => Response::error(
+                    "subagent_thread_not_found",
+                    format!("subagent thread {thread_id} was not found in the rollout store"),
+                ),
+                Err(error) => backend_error(error),
+            };
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            state.performance.record(PerformanceEvent {
+                observed_at: Instant::now(),
+                source: "server",
+                metric: "subagent_messages_read".to_owned(),
                 duration_ms,
                 max_ms: duration_ms,
                 count: 1,
@@ -7600,6 +7747,8 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
         "activity_key": tool.activity_key(),
         "activity_label": tool.activity_label(),
         "activity_sender_id": tool.activity_sender_id(),
+        "activity_thread_ids": tool.activity_thread_ids(),
+        "activity_agents": tool.activity_agents(),
     })
 }
 
@@ -9890,6 +10039,30 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact["activity_key"], "wait:agent-a");
         assert_eq!(compact["activity_label"], "Atlas");
         assert_eq!(compact["activity_sender_id"], "parent");
+        assert_eq!(compact["activity_thread_ids"], json!(["agent-a"]));
+        assert_eq!(
+            compact["activity_agents"],
+            json!([{"thread_id":"agent-a","name":"Atlas"}])
+        );
+    }
+
+    #[test]
+    fn wait_activity_infers_the_adjacent_subagent_when_targets_are_omitted() {
+        let item = json!({
+            "type":"collabAgentToolCall",
+            "id":"wait-empty",
+            "tool":"wait",
+            "status":"completed",
+            "senderThreadId":"parent",
+            "receiverThreadIds":[],
+            "agentsStates":{}
+        });
+        let inferred =
+            infer_wait_activity(&item, Some(&("agent-a".to_owned(), "Noether".to_owned())))
+                .unwrap();
+        let compact = compact_tool_summary(&typed_thread_tool(&inferred).unwrap(), 0);
+        assert_eq!(compact["activity_label"], "Noether");
+        assert_eq!(compact["activity_thread_ids"], json!(["agent-a"]));
     }
 
     #[test]
