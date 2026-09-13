@@ -1487,6 +1487,11 @@ main.history-fullscreen .fullscreen-exit-icon {
 .turn-token-usage[hidden] {
   display: none;
 }
+.turn-live-usage {
+  margin: -4px 0 14px;
+  color: color-mix(in srgb, var(--accent) 68%, var(--muted));
+  font-variant-numeric: tabular-nums;
+}
 .turn-divider {
   grid-column: 1 / -1;
   grid-row: 2;

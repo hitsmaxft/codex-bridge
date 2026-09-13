@@ -48,6 +48,7 @@ struct PendingTurnMetadata {
     message_start: usize,
     turn_id: Option<String>,
     usage: Option<Value>,
+    usage_baseline: TokenUsageBreakdown,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -84,6 +85,9 @@ struct CachedActivity {
     processed_len: u64,
     active_turn_id: Option<String>,
     active_tools: Vec<(String, String)>,
+    total_usage: Option<TokenUsageBreakdown>,
+    turn_usage_baseline: TokenUsageBreakdown,
+    model_context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -525,7 +529,67 @@ pub struct ThreadStatistics {
     pub total_tokens: u64,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsageBreakdown {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+}
+
+impl TokenUsageBreakdown {
+    fn from_rollout(value: &Value) -> Self {
+        Self {
+            total_tokens: value
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            input_tokens: value
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cached_input_tokens: value
+                .get("cached_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_write_input_tokens: value
+                .get("cache_write_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            output_tokens: value
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            reasoning_output_tokens: value
+                .get("reasoning_output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        }
+    }
+
+    fn since(self, baseline: Self) -> Self {
+        Self {
+            total_tokens: self.total_tokens.saturating_sub(baseline.total_tokens),
+            input_tokens: self.input_tokens.saturating_sub(baseline.input_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_sub(baseline.cached_input_tokens),
+            cache_write_input_tokens: self
+                .cache_write_input_tokens
+                .saturating_sub(baseline.cache_write_input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(baseline.output_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_sub(baseline.reasoning_output_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -546,6 +610,12 @@ pub struct ThreadActivity {
     pub phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_token_usage: Option<TokenUsageBreakdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_token_usage: Option<TokenUsageBreakdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1453,6 +1523,9 @@ impl SessionStore {
                 active_turn_id: None,
                 phase: None,
                 active_tool: None,
+                turn_token_usage: None,
+                thread_token_usage: None,
+                model_context_window: None,
             }));
         }
         read_thread_activity(&summary.rollout_path, &self.activity_cache).map(Some)
@@ -2057,10 +2130,25 @@ fn update_turn_metadata(
             pending.message_start = messages.len();
             pending.turn_id = string_field(payload, "turn_id");
             pending.usage = None;
+            pending.usage_baseline = TokenUsageBreakdown {
+                total_tokens: statistics.total_tokens,
+                input_tokens: statistics.input_tokens,
+                cached_input_tokens: statistics.cached_input_tokens,
+                cache_write_input_tokens: statistics.cache_write_input_tokens,
+                output_tokens: statistics.output_tokens,
+                reasoning_output_tokens: statistics.reasoning_output_tokens,
+            };
         }
         Some("token_count") => {
             if let Some(usage) = payload.pointer("/info/total_token_usage") {
                 pending.usage = Some(usage.clone());
+                let usage = TokenUsageBreakdown::from_rollout(usage);
+                statistics.total_tokens = usage.total_tokens;
+                statistics.input_tokens = usage.input_tokens;
+                statistics.cached_input_tokens = usage.cached_input_tokens;
+                statistics.cache_write_input_tokens = usage.cache_write_input_tokens;
+                statistics.output_tokens = usage.output_tokens;
+                statistics.reasoning_output_tokens = usage.reasoning_output_tokens;
             }
         }
         Some("task_complete" | "turn_aborted") => {
@@ -2078,38 +2166,15 @@ fn update_turn_metadata(
             let Some(usage) = pending.usage.take() else {
                 return;
             };
-            statistics.total_tokens = statistics.total_tokens.saturating_add(
-                usage
-                    .get("total_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
-            statistics.input_tokens = statistics.input_tokens.saturating_add(
-                usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
-            statistics.cached_input_tokens = statistics.cached_input_tokens.saturating_add(
-                usage
-                    .get("cached_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
-            statistics.output_tokens = statistics.output_tokens.saturating_add(
-                usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
+            let usage = TokenUsageBreakdown::from_rollout(&usage).since(pending.usage_baseline);
             let marker = json!({
                 "type": "codex_bridge_turn_usage",
-                "total_tokens": usage.get("total_tokens").and_then(Value::as_u64),
-                "input_tokens": usage.get("input_tokens").and_then(Value::as_u64),
-                "cached_input_tokens": usage
-                    .get("cached_input_tokens")
-                    .and_then(Value::as_u64),
-                "output_tokens": usage.get("output_tokens").and_then(Value::as_u64),
+                "total_tokens": usage.total_tokens,
+                "input_tokens": usage.input_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "cache_write_input_tokens": usage.cache_write_input_tokens,
+                "output_tokens": usage.output_tokens,
+                "reasoning_output_tokens": usage.reasoning_output_tokens,
             });
             let message_start = pending.message_start.min(messages.len());
             if let Some(message) = messages[message_start..]
@@ -2583,19 +2648,43 @@ fn read_thread_activity(
             active_turn_id: cached.active_turn_id.clone(),
             phase: activity_phase(&cached.active_turn_id, &cached.active_tools),
             active_tool: cached.active_tools.last().map(|(_, name)| name.clone()),
+            turn_token_usage: cached
+                .active_turn_id
+                .as_ref()
+                .and(cached.total_usage)
+                .map(|usage| usage.since(cached.turn_usage_baseline)),
+            thread_token_usage: cached.total_usage,
+            model_context_window: cached.model_context_window,
         });
     }
 
-    let (start, mut active_turn_id, mut active_tools) = cached
+    let (
+        start,
+        mut active_turn_id,
+        mut active_tools,
+        mut total_usage,
+        mut turn_usage_baseline,
+        mut model_context_window,
+    ) = cached
         .filter(|cached| cached.processed_len <= file_len)
         .map(|cached| {
             (
                 cached.processed_len,
                 cached.active_turn_id,
                 cached.active_tools,
+                cached.total_usage,
+                cached.turn_usage_baseline,
+                cached.model_context_window,
             )
         })
-        .unwrap_or((0, None, Vec::new()));
+        .unwrap_or((
+            0,
+            None,
+            Vec::new(),
+            None,
+            TokenUsageBreakdown::default(),
+            None,
+        ));
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     file.seek(SeekFrom::Start(start))
@@ -2618,7 +2707,14 @@ fn read_thread_activity(
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        update_activity(&record, &mut active_turn_id, &mut active_tools);
+        update_activity(
+            &record,
+            &mut active_turn_id,
+            &mut active_tools,
+            &mut total_usage,
+            &mut turn_usage_baseline,
+            &mut model_context_window,
+        );
     }
     if let Ok(mut cache) = cache.lock() {
         cache.insert(
@@ -2627,6 +2723,9 @@ fn read_thread_activity(
                 processed_len,
                 active_turn_id: active_turn_id.clone(),
                 active_tools: active_tools.clone(),
+                total_usage,
+                turn_usage_baseline,
+                model_context_window,
             },
         );
     }
@@ -2635,6 +2734,12 @@ fn read_thread_activity(
         updated_at_ms,
         phase: activity_phase(&active_turn_id, &active_tools),
         active_tool: active_tools.last().map(|(_, name)| name.clone()),
+        turn_token_usage: active_turn_id
+            .as_ref()
+            .and(total_usage)
+            .map(|usage| usage.since(turn_usage_baseline)),
+        thread_token_usage: total_usage,
+        model_context_window,
         active_turn_id,
     })
 }
@@ -2655,6 +2760,9 @@ fn update_activity(
     record: &Value,
     active_turn_id: &mut Option<String>,
     active_tools: &mut Vec<(String, String)>,
+    total_usage: &mut Option<TokenUsageBreakdown>,
+    turn_usage_baseline: &mut TokenUsageBreakdown,
+    model_context_window: &mut Option<u64>,
 ) {
     if record.get("type").and_then(Value::as_str) == Some("response_item") {
         let payload = &record["payload"];
@@ -2696,6 +2804,16 @@ fn update_activity(
         Some("task_started") => {
             *active_turn_id = turn_id.map(str::to_owned);
             active_tools.clear();
+            *turn_usage_baseline = total_usage.unwrap_or_default();
+        }
+        Some("token_count") => {
+            if let Some(usage) = payload.pointer("/info/total_token_usage") {
+                *total_usage = Some(TokenUsageBreakdown::from_rollout(usage));
+            }
+            *model_context_window = payload
+                .pointer("/info/model_context_window")
+                .and_then(Value::as_u64)
+                .or(*model_context_window);
         }
         Some("task_complete" | "turn_aborted")
             if turn_id.is_none() || turn_id == active_turn_id.as_deref() =>
@@ -2831,10 +2949,16 @@ mod tests {
     }
 
     #[test]
-    fn completed_turn_attaches_its_final_total_token_usage() {
+    fn completed_turn_attaches_usage_since_the_turn_started() {
         let mut messages = Vec::new();
         let mut pending = PendingTurnMetadata::default();
-        let mut statistics = ThreadStatistics::default();
+        let mut statistics = ThreadStatistics {
+            total_tokens: 1050,
+            input_tokens: 1000,
+            cached_input_tokens: 800,
+            output_tokens: 50,
+            ..ThreadStatistics::default()
+        };
         update_turn_metadata(
             &json!({"payload":{"type":"task_started", "turn_id":"turn-1"}}),
             &mut messages,
@@ -2871,12 +2995,56 @@ mod tests {
 
         let usage = messages[0].content.last().unwrap();
         assert_eq!(usage["type"], "codex_bridge_turn_usage");
-        assert_eq!(usage["total_tokens"], 1280);
-        assert_eq!(usage["cached_input_tokens"], 900);
+        assert_eq!(usage["total_tokens"], 230);
+        assert_eq!(usage["input_tokens"], 200);
+        assert_eq!(usage["cached_input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 30);
         assert!(pending.usage.is_none());
         assert_eq!(statistics.turns, 1);
         assert_eq!(statistics.completed_turns, 1);
         assert_eq!(statistics.total_tokens, 1280);
+    }
+
+    #[test]
+    fn activity_recovers_live_turn_and_thread_token_usage() {
+        let mut active_turn_id = None;
+        let mut active_tools = Vec::new();
+        let mut total_usage = None;
+        let mut baseline = TokenUsageBreakdown::default();
+        let mut model_context_window = None;
+        let mut apply = |record: Value| {
+            update_activity(
+                &record,
+                &mut active_turn_id,
+                &mut active_tools,
+                &mut total_usage,
+                &mut baseline,
+                &mut model_context_window,
+            );
+        };
+        apply(
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":50,"total_tokens":1050},
+                "model_context_window":258400
+            }}}),
+        );
+        apply(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}));
+        apply(
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":1200,"cached_input_tokens":900,"cache_write_input_tokens":12,"output_tokens":80,"reasoning_output_tokens":20,"total_tokens":1280},
+                "model_context_window":258400
+            }}}),
+        );
+        drop(apply);
+
+        assert_eq!(active_turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(total_usage.unwrap().total_tokens, 1280);
+        assert_eq!(total_usage.unwrap().since(baseline).total_tokens, 230);
+        assert_eq!(
+            total_usage.unwrap().since(baseline).cached_input_tokens,
+            100
+        );
+        assert_eq!(model_context_window, Some(258400));
     }
 
     struct Fixture {

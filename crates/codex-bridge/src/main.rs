@@ -7508,7 +7508,9 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
                 "total_tokens": item.get("total_tokens"),
                 "input_tokens": item.get("input_tokens"),
                 "cached_input_tokens": item.get("cached_input_tokens"),
+                "cache_write_input_tokens": item.get("cache_write_input_tokens"),
                 "output_tokens": item.get("output_tokens"),
+                "reasoning_output_tokens": item.get("reasoning_output_tokens"),
             }));
             content_index += 1;
             continue;

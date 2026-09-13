@@ -387,6 +387,57 @@ function formatSessionDuration(milliseconds) {
     seconds: seconds % 60,
   });
 }
+function normalizeTokenUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const read = (snake, camel) => Math.max(0, Number(usage[snake] ?? usage[camel] ?? 0) || 0);
+  return {
+    total_tokens: read("total_tokens", "totalTokens"),
+    input_tokens: read("input_tokens", "inputTokens"),
+    cached_input_tokens: read("cached_input_tokens", "cachedInputTokens"),
+    cache_write_input_tokens: read("cache_write_input_tokens", "cacheWriteInputTokens"),
+    output_tokens: read("output_tokens", "outputTokens"),
+    reasoning_output_tokens: read("reasoning_output_tokens", "reasoningOutputTokens"),
+  };
+}
+function tokenUsageSince(total, baseline) {
+  const current = normalizeTokenUsage(total),
+    before = normalizeTokenUsage(baseline);
+  if (!current) return null;
+  if (!before) return current;
+  return Object.fromEntries(
+    Object.keys(current).map((key) => [key, Math.max(0, current[key] - before[key])]),
+  );
+}
+function cacheHitPercent(usage) {
+  const input = Number(usage?.input_tokens || 0),
+    cached = Number(usage?.cached_input_tokens || 0);
+  return input > 0 ? (cached / input) * 100 : 0;
+}
+function applyThreadTokenUsage(total, turn = null, turnId = state.activeTurnId) {
+  const normalizedTotal = normalizeTokenUsage(total);
+  if (!normalizedTotal) return;
+  state.threadStatistics = { ...(state.threadStatistics || {}), ...normalizedTotal };
+  const normalizedTurn = normalizeTokenUsage(
+    turn || tokenUsageSince(normalizedTotal, state.turnUsageBaseline),
+  );
+  state.liveTurnUsage =
+    turnId && normalizedTurn ? { ...normalizedTurn, turn_id: turnId, live: true } : null;
+}
+function mergeThreadStatistics(statistics) {
+  if (!statistics || !state.threadStatistics) return statistics;
+  const merged = { ...statistics };
+  for (const key of [
+    "total_tokens",
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+  ]) {
+    merged[key] = Math.max(Number(statistics[key] || 0), Number(state.threadStatistics[key] || 0));
+  }
+  return merged;
+}
 function renderThreadStatistics(statistics = state.threadStatistics) {
   state.threadStatistics = statistics || null;
   const section = $("threadStatistics"),
@@ -407,7 +458,17 @@ function renderThreadStatistics(statistics = state.threadStatistics) {
     ],
     [tr("sessionTools"), Number(statistics.tool_calls || 0).toLocaleString()],
     [tr("sessionTokens"), Number(statistics.total_tokens || 0).toLocaleString()],
+    [tr("sessionInputTokens"), Number(statistics.input_tokens || 0).toLocaleString()],
+    [tr("sessionOutputTokens"), Number(statistics.output_tokens || 0).toLocaleString()],
+    [tr("sessionCachedTokens"), Number(statistics.cached_input_tokens || 0).toLocaleString()],
+    [tr("sessionCacheHitRate"), `${cacheHitPercent(statistics).toFixed(1)}%`],
+    [
+      tr("sessionCacheWriteTokens"),
+      Number(statistics.cache_write_input_tokens || 0).toLocaleString(),
+    ],
   ];
+  if (state.modelContextWindow)
+    values.push([tr("modelContextWindow"), Number(state.modelContextWindow).toLocaleString()]);
   for (const [label, value] of values) {
     const item = document.createElement("div"),
       name = document.createElement("span"),
@@ -2141,6 +2202,7 @@ function turnTokenUsageText(item) {
     input: tokenCountText(item?.input_tokens),
     cached: tokenCountText(item?.cached_input_tokens),
     output: tokenCountText(item?.output_tokens),
+    hitRate: cacheHitPercent(item).toFixed(1),
   });
 }
 function memoryCitationNode(items) {
@@ -2887,9 +2949,11 @@ function turnHasUsage(message) {
 }
 
 function turnUsageItem(group) {
-  return group.messages
+  const finalUsage = group.messages
     .flatMap((message) => message.content || [])
     .findLast((item) => item.kind === "turn_usage");
+  if (finalUsage) return finalUsage;
+  return state.liveTurnUsage?.turn_id === group.turnId ? state.liveTurnUsage : null;
 }
 
 function turnDuration(group) {
@@ -3027,7 +3091,14 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       node.hidden = false;
       for (const token of node.querySelectorAll(".turn-token-usage")) token.hidden = false;
     }
-    reconcileChildren(section, messageNodes);
+    const liveUsage = usage?.live
+      ? section.querySelector(":scope > .turn-live-usage") || document.createElement("div")
+      : null;
+    if (liveUsage) {
+      liveUsage.className = "turn-live-usage turn-meta-line";
+      liveUsage.textContent = tr("liveTurnTokenUsage", { usage: turnTokenUsageText(usage) });
+    }
+    reconcileChildren(section, liveUsage ? [...messageNodes, liveUsage] : messageNodes);
     return;
   }
   for (const node of messageNodes)
@@ -3956,6 +4027,20 @@ async function refreshActivity() {
   );
   state.activityPhase = activity.phase || null;
   state.activeTool = activity.active_tool || null;
+  state.modelContextWindow = Number(activity.model_context_window || 0) || null;
+  if (activity.thread_token_usage) {
+    if (state.activeTurnId && activity.turn_token_usage)
+      state.turnUsageBaseline = tokenUsageSince(
+        activity.thread_token_usage,
+        activity.turn_token_usage,
+      );
+    applyThreadTokenUsage(
+      activity.thread_token_usage,
+      activity.turn_token_usage,
+      state.activeTurnId,
+    );
+    renderThreadStatistics();
+  }
   if (state.activeTurnId) setThreadRunState(threadId, "active");
   else if (state.threadRunStates.get(threadId) === "active")
     setThreadRunState(threadId, "completed");
@@ -4126,8 +4211,18 @@ function handleBridgeEvent(event) {
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = params.turn?.id || state.activeTurnId;
+      state.turnUsageBaseline = normalizeTokenUsage(state.threadStatistics);
+      state.liveTurnUsage = null;
       showActivity();
     }
+  } else if (method === "thread/tokenUsage/updated" && threadId === state.current?.id) {
+    const usage = params.tokenUsage || {};
+    state.modelContextWindow = Number(usage.modelContextWindow || 0) || state.modelContextWindow;
+    applyThreadTokenUsage(usage.total, null, params.turnId || state.activeTurnId);
+    const followTail = shouldFollowMessageTail(state.followMessageTail, messageScrollMetrics());
+    renderThreadStatistics();
+    renderVisibleMessages();
+    if (followTail) requestAnimationFrame(() => scrollMessagesToBottom("auto"));
   } else if (method === "turn/completed" && threadId) {
     const completedTurnId = params.turn?.id || null,
       completionIsCurrent =
@@ -4359,6 +4454,9 @@ async function openThread(
     state.pendingChanges = false;
     state.repairRequired = false;
     state.threadStatistics = null;
+    state.liveTurnUsage = null;
+    state.turnUsageBaseline = null;
+    state.modelContextWindow = null;
     state.lastMessageIndex = null;
     state.visibleMessages = [];
     state.hydratedTurns.clear();
@@ -4429,7 +4527,7 @@ async function openThread(
     state.visibleMessages = [];
   }
   renderRepairHint(r.repair_required);
-  renderThreadStatistics(r.statistics);
+  renderThreadStatistics(mergeThreadStatistics(r.statistics));
   r.messages = mergeHydratedTurnMessages(r.messages, thread.id);
   state.pending = mergePendingResponse(pendingResult?.messages || state.pending, true, r.messages);
   state.messageCache.set(thread.id, r);
