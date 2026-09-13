@@ -15,3 +15,21 @@ export function messageBottomDistance({ top, height, client }) {
 export function shouldFollowMessageTail(following, metrics, threshold = 100) {
   return Boolean(following) || messageBottomDistance(metrics) < threshold;
 }
+
+export function documentOwnsMessageScroll({ mobile, fullscreen }) {
+  return Boolean(mobile) && !Boolean(fullscreen);
+}
+
+export function adjacentTurnIndex(turnTops, viewportTop, direction, tolerance = 6) {
+  const top = Number(viewportTop),
+    positions = Array.from(turnTops || [], Number);
+  if (!Number.isFinite(top) || !positions.every(Number.isFinite)) return -1;
+  if (direction === "up") {
+    for (let index = positions.length - 1; index >= 0; index -= 1) {
+      if (positions[index] < top - tolerance) return index;
+    }
+    return -1;
+  }
+  if (direction === "down") return positions.findIndex((position) => position > top + tolerance);
+  return -1;
+}

@@ -1278,6 +1278,44 @@ main.history-fullscreen .fullscreen-exit-icon {
   contain: inline-size;
   background: var(--panel);
 }
+.turn-navigation {
+  position: fixed;
+  z-index: 7;
+  top: 50%;
+  right: max(10px, env(safe-area-inset-right));
+  display: grid;
+  gap: 7px;
+  transform: translateY(-50%);
+}
+.turn-navigation[hidden] {
+  display: none;
+}
+.turn-navigation button {
+  display: grid;
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  place-items: center;
+  border-radius: 50%;
+  border-color: color-mix(in srgb, var(--line) 76%, transparent);
+  background: color-mix(in srgb, var(--panel2) 88%, transparent);
+  box-shadow: 0 3px 14px #0005;
+  backdrop-filter: blur(10px);
+}
+.turn-navigation button:disabled {
+  opacity: 0.3;
+}
+.turn-navigation svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 #messages > *,
 .turn-group,
 .message,

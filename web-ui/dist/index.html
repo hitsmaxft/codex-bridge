@@ -7,8 +7,8 @@
       content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
     />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=eefdec281c8d"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=e795d30283cd">
+    <script type="module" crossorigin src="/assets/app.js?v=20878545dd8a"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=15d008cacae1">
   </head>
   <body>
     <div class="app">
@@ -202,6 +202,24 @@
             Select a session to inspect its conversation.
           </div>
         </div>
+        <nav class="turn-navigation" id="turnNavigation" aria-label="Turn navigation" hidden>
+          <button
+            id="previousTurnBtn"
+            type="button"
+            data-i18n-aria-label="previousTurn"
+            aria-label="Previous turn"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6" /></svg>
+          </button>
+          <button
+            id="nextTurnBtn"
+            type="button"
+            data-i18n-aria-label="nextTurn"
+            aria-label="Next turn"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+        </nav>
         <div class="composer">
           <div class="outbox-tray" id="outboxTray" aria-live="polite" hidden></div>
           <div class="composer-status" id="composerStatus" hidden>

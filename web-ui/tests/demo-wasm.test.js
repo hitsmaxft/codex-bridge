@@ -38,6 +38,8 @@ import {
   storedSessionId,
 } from "../src/session-route.js";
 import {
+  adjacentTurnIndex,
+  documentOwnsMessageScroll,
   messageBottomDistance,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
@@ -936,10 +938,9 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
     source.indexOf("async function openThread"),
   );
   assert.doesNotMatch(restoreView, /scrollMessagesToBottom\("smooth"\)/);
-  assert.match(
-    restoreView,
-    /if \(view\.atBottom\)[\s\S]*?scrollMessagesToBottom\("auto"\)[\s\S]*?requestAnimationFrame\(\(\) => scrollMessagesToBottom\("auto"\)\)/,
-  );
+  assert.match(restoreView, /view\.intentVersion !== messageScrollIntentVersion/);
+  assert.match(restoreView, /if \(view\.atBottom\)[\s\S]*?scrollMessagesToBottom\("auto"\)/);
+  assert.doesNotMatch(restoreView, /else setMessageScrollTop\(view\.top\)/);
   const reconcile = source.slice(
     source.indexOf("function reconcileMessageNodes"),
     source.indexOf("function pendingNode"),
@@ -953,6 +954,49 @@ test("mobile tail following survives layout growth until the user scrolls away",
   assert.equal(shouldFollowMessageTail(false, { top: 850, height: 1500, client: 600 }), true);
   assert.equal(shouldFollowMessageTail(false, { top: 650, height: 1500, client: 600 }), false);
   assert.equal(shouldFollowMessageTail(true, { top: 100, height: 1500, client: 600 }), true);
+});
+
+test("the real scroll owner changes for mobile history fullscreen", () => {
+  assert.equal(documentOwnsMessageScroll({ mobile: false, fullscreen: false }), false);
+  assert.equal(documentOwnsMessageScroll({ mobile: true, fullscreen: false }), true);
+  assert.equal(documentOwnsMessageScroll({ mobile: true, fullscreen: true }), false);
+});
+
+test("turn navigation selects the nearest turn start in either direction", () => {
+  const tops = [-800, -12, 420, 1100];
+  assert.equal(adjacentTurnIndex(tops, 50, "up"), 1);
+  assert.equal(adjacentTurnIndex(tops, 50, "down"), 2);
+  assert.equal(adjacentTurnIndex([50, 420], 50, "up"), -1);
+  assert.equal(adjacentTurnIndex([50, 420], 50, "down"), 1);
+  assert.equal(adjacentTurnIndex(tops, 50, "sideways"), -1);
+});
+
+test("conversation exposes floating previous and next turn controls", async () => {
+  const [html, source, stylesheet] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+  assert.match(html, /id="turnNavigation"/);
+  assert.match(html, /id="previousTurnBtn"/);
+  assert.match(html, /id="nextTurnBtn"/);
+  assert.match(source, /scrollToAdjacentTurn\("up"\)/);
+  assert.match(source, /scrollToAdjacentTurn\("down"\)/);
+  assert.match(source, /messageBottomDistance\(messageScrollMetrics\(\)\) < 2/);
+  assert.match(source, /state\.followMessageTail = false/);
+  assert.match(stylesheet, /\.turn-navigation\s*\{[^}]*position:\s*fixed/s);
+});
+
+test("mobile tail lock covers asynchronous layout changes", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(
+    source,
+    /new MutationObserver\(\(\) => \{[\s\S]*?scheduleMessageTailLock\(\);[\s\S]*?updateTurnNavigation\(\);/,
+  );
+  assert.match(source, /event\.target instanceof HTMLImageElement/);
+  assert.match(source, /document\.fonts\?\.ready\.then\(scheduleMessageTailLock\)/);
+  assert.match(source, /view\.intentVersion !== messageScrollIntentVersion/);
+  assert.match(source, /fullscreen: isHistoryFullscreen\(\)/);
 });
 
 test("the hidden tools drawer cannot retain focus after it closes", async () => {

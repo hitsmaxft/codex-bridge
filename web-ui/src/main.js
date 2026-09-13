@@ -49,6 +49,8 @@ import {
   watchSystemTheme,
 } from "./state.js";
 import {
+  adjacentTurnIndex,
+  documentOwnsMessageScroll,
   messageBottomDistance,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
@@ -353,10 +355,15 @@ function syncHistoryFullscreenButton() {
   button.title = tr(labelKey);
 }
 function setHistoryFullscreen(fullscreen) {
+  const messageView = state.current ? captureMessageView() : null;
   document.querySelector("main").classList.toggle("history-fullscreen", fullscreen);
   document.documentElement.classList.toggle("history-fullscreen", fullscreen);
   setThreadHeaderExpanded(false);
   syncHistoryFullscreenButton();
+  requestAnimationFrame(() => {
+    restoreMessageView(messageView);
+    updateTurnNavigation();
+  });
 }
 function renderRepairHint(required = state.repairRequired) {
   state.repairRequired = Boolean(required);
@@ -2758,7 +2765,7 @@ function renderMessageTailStatus(followTail = true) {
   if (status !== root.lastElementChild) root.appendChild(status);
   if (followTail && state.followMessageTail)
     requestAnimationFrame(() => {
-      if (status.isConnected && state.followMessageTail) scrollMessagesToBottom("auto");
+      if (status.isConnected) scheduleMessageTailLock();
     });
 }
 
@@ -3442,7 +3449,10 @@ function setSendMode(mode, automatic = false) {
   button.setAttribute("aria-label", button.title);
 }
 function usesDocumentMessageScroll() {
-  return matchMedia("(max-width:800px)").matches;
+  return documentOwnsMessageScroll({
+    mobile: matchMedia("(max-width:800px)").matches,
+    fullscreen: isHistoryFullscreen(),
+  });
 }
 function messageScrollMetrics() {
   const root = $("messages");
@@ -3460,13 +3470,78 @@ function setMessageScrollTop(top, behavior = "auto") {
   if (usesDocumentMessageScroll()) window.scrollTo({ top, behavior });
   else $("messages").scrollTo({ top, behavior });
 }
+let messageTailFrame = 0,
+  messageTailSettleFrame = 0,
+  messageScrollIntentVersion = 0,
+  messageUserInteracting = false,
+  messageInteractionTimer = null;
+function settleMessageInteraction() {
+  clearTimeout(messageInteractionTimer);
+  messageInteractionTimer = setTimeout(() => {
+    messageUserInteracting = false;
+    if (messageBottomDistance(messageScrollMetrics()) < 100) scrollMessagesToBottom("auto");
+  }, 180);
+}
+function applyMessageTailLock() {
+  if (!state.followMessageTail || messageUserInteracting) return;
+  setMessageScrollTop(messageScrollMetrics().height, "auto");
+}
+function scheduleMessageTailLock() {
+  if (!state.followMessageTail || messageUserInteracting) return;
+  cancelAnimationFrame(messageTailFrame);
+  cancelAnimationFrame(messageTailSettleFrame);
+  messageTailFrame = requestAnimationFrame(() => {
+    messageTailFrame = 0;
+    applyMessageTailLock();
+    messageTailSettleFrame = requestAnimationFrame(() => {
+      messageTailSettleFrame = 0;
+      applyMessageTailLock();
+    });
+  });
+}
 function scrollMessagesToBottom(behavior = "auto") {
+  state.userScrolled = false;
   state.followMessageTail = true;
   setMessageScrollTop(messageScrollMetrics().height, behavior);
+  scheduleMessageTailLock();
 }
 function messageViewportTop() {
   if (!usesDocumentMessageScroll()) return $("messages").getBoundingClientRect().top;
   return Math.max(0, document.querySelector(".thread-head")?.getBoundingClientRect().bottom || 0);
+}
+function turnNavigationState(direction) {
+  const turns = [...$("messages").querySelectorAll(":scope > .turn-group")],
+    viewportTop = messageViewportTop() + 8,
+    index = adjacentTurnIndex(
+      turns.map((turn) => turn.getBoundingClientRect().top),
+      viewportTop,
+      direction,
+    );
+  return { turns, viewportTop, index };
+}
+function updateTurnNavigation() {
+  const navigation = $("turnNavigation"),
+    hasTurns = $("messages").querySelectorAll(":scope > .turn-group").length > 1;
+  navigation.hidden = !state.current || !hasTurns;
+  if (navigation.hidden) return;
+  $("previousTurnBtn").disabled = turnNavigationState("up").index < 0;
+  $("nextTurnBtn").disabled =
+    messageBottomDistance(messageScrollMetrics()) < 2 || turnNavigationState("down").index < 0;
+}
+function scrollToAdjacentTurn(direction) {
+  if (direction === "down" && messageBottomDistance(messageScrollMetrics()) < 2)
+    return updateTurnNavigation();
+  const { turns, viewportTop, index } = turnNavigationState(direction);
+  if (index < 0) return updateTurnNavigation();
+  messageScrollIntentVersion += 1;
+  messageUserInteracting = false;
+  clearTimeout(messageInteractionTimer);
+  state.userScrolled = true;
+  state.followMessageTail = false;
+  const targetTop = turns[index].getBoundingClientRect().top,
+    scrollTop = messageScrollMetrics().top + targetTop - viewportTop;
+  setMessageScrollTop(scrollTop, "auto");
+  requestAnimationFrame(updateTurnNavigation);
 }
 function showActivity() {
   const active = Boolean(state.activeTurnId),
@@ -3989,10 +4064,10 @@ function captureMessageView() {
     anchorTurnKey = anchor?.closest(".turn-group")?.dataset.turnKey || null;
   return {
     atBottom: shouldFollowMessageTail(state.followMessageTail, metrics),
-    top: metrics.top,
     anchorMessageIndex: anchor?.dataset.messageIndex || null,
     anchorTurnKey,
     anchorOffset: anchor ? anchor.getBoundingClientRect().top - viewportTop : null,
+    intentVersion: messageScrollIntentVersion,
     openDetails: [...root.querySelectorAll(".message details[open]")].map((detail) => {
       const message = detail.closest(".message");
       return `${message?.dataset.messageIndex || ""}:${[
@@ -4009,12 +4084,10 @@ function restoreMessageView(view) {
       detail.open = openDetails.has(`${message.dataset.messageIndex || ""}:${index}`);
     });
   }
+  // Never fight a touch or momentum scroll that began while the refresh request was in flight.
+  if (view.intentVersion !== messageScrollIntentVersion || messageUserInteracting) return;
   if (view.atBottom) {
-    // Incremental tool and assistant updates can arrive before the previous layout has settled.
-    // Keep tail-following deterministic: an interrupted smooth scroll retains an obsolete target
-    // in WebKit and Firefox and can jump back into older history on the next refresh.
     scrollMessagesToBottom("auto");
-    requestAnimationFrame(() => scrollMessagesToBottom("auto"));
     return;
   }
   const anchor = view.anchorMessageIndex
@@ -4030,8 +4103,8 @@ function restoreMessageView(view) {
   ) {
     const delta = anchor.getBoundingClientRect().top - messageViewportTop() - view.anchorOffset;
     if (Number.isFinite(delta)) setMessageScrollTop(messageScrollMetrics().top + delta);
-    else setMessageScrollTop(view.top);
-  } else setMessageScrollTop(view.top);
+    else scrollMessagesToBottom("auto");
+  } else scrollMessagesToBottom("auto");
 }
 async function openThread(
   thread,
@@ -4113,7 +4186,6 @@ async function openThread(
       reconcileMessageNodes(root, cached, null);
       applyMessagePageState(cached);
       scrollMessagesToBottom("auto");
-      requestAnimationFrame(() => scrollMessagesToBottom("auto"));
     } else {
       root.replaceChildren();
       renderMessageTailStatus();
@@ -4218,7 +4290,6 @@ async function refreshCurrentSessionFromTools() {
   setMessageSyncPhase("reconnecting");
   await openThread(thread, { quiet: true, writeHash: false, reconnect: true });
   scrollMessagesToBottom("auto");
-  requestAnimationFrame(() => scrollMessagesToBottom("auto"));
   notify(tr("sessionRefreshed"));
 }
 async function loadOlder() {
@@ -4269,8 +4340,7 @@ async function loadOlder() {
   );
   reportMessagesRendered(r, renderStarted);
   const newHeight = messageScrollMetrics().height;
-  if (usesDocumentMessageScroll()) window.scrollTo(0, oldTop + (newHeight - oldHeight));
-  else root.scrollTop = oldTop + (newHeight - oldHeight);
+  setMessageScrollTop(oldTop + (newHeight - oldHeight));
 }
 function targetRequest(name, extra = {}) {
   if (!state.current) throw new Error(tr("chooseSessionError"));
@@ -4981,6 +5051,7 @@ const composer = document.querySelector(".composer"),
       "--temporary-composer-height",
       `${Math.ceil(temporaryComposer.getBoundingClientRect().height)}px`,
     );
+    scheduleMessageTailLock();
   };
 const frameResizeObserver = new ResizeObserver(syncFrameInsets);
 frameResizeObserver.observe(composer);
@@ -4988,10 +5059,18 @@ frameResizeObserver.observe(threadHead);
 frameResizeObserver.observe(temporaryComposer);
 syncFrameInsets();
 resizeComposerTextarea();
-window.addEventListener("resize", resizeComposerAfterViewportChange, { passive: true });
+window.addEventListener(
+  "resize",
+  () => {
+    resizeComposerAfterViewportChange();
+    scheduleMessageTailLock();
+  },
+  { passive: true },
+);
 window.visualViewport?.addEventListener("resize", resizeComposerAfterViewportChange, {
   passive: true,
 });
+window.visualViewport?.addEventListener("resize", scheduleMessageTailLock, { passive: true });
 window.visualViewport?.addEventListener("scroll", syncFocusedComposerViewport, { passive: true });
 window.addEventListener("scroll", syncFocusedComposerViewport, { passive: true });
 document.addEventListener("click", (event) => {
@@ -5021,13 +5100,32 @@ $("outboxTray").addEventListener("click", (event) => {
 });
 syncOutboxCompactLabel();
 const markUserMessageScroll = () => {
+  messageScrollIntentVersion += 1;
   state.userScrolled = true;
   state.followMessageTail = false;
+  messageUserInteracting = true;
+  settleMessageInteraction();
 };
 $("messages").addEventListener("touchmove", markUserMessageScroll, { passive: true });
 $("messages").addEventListener("wheel", markUserMessageScroll, { passive: true });
+$("messages").addEventListener(
+  "load",
+  (event) => {
+    if (event.target instanceof HTMLImageElement) scheduleMessageTailLock();
+  },
+  true,
+);
+const messageLayoutMutationObserver = new MutationObserver(() => {
+  scheduleMessageTailLock();
+  updateTurnNavigation();
+});
+messageLayoutMutationObserver.observe($("messages"), { childList: true, subtree: true });
+document.fonts?.ready.then(scheduleMessageTailLock);
 const handleMessageScroll = () => {
   if (state.userScrolled) {
+    messageScrollIntentVersion += 1;
+    messageUserInteracting = true;
+    settleMessageInteraction();
     state.followMessageTail = messageBottomDistance(messageScrollMetrics()) < 100;
   }
   if (
@@ -5037,9 +5135,12 @@ const handleMessageScroll = () => {
     state.hasMore
   )
     run(loadOlder);
+  updateTurnNavigation();
 };
 $("messages").onscroll = handleMessageScroll;
 window.addEventListener("scroll", handleMessageScroll, { passive: true });
+$("previousTurnBtn").onclick = () => scrollToAdjacentTurn("up");
+$("nextTurnBtn").onclick = () => scrollToAdjacentTurn("down");
 $("messages").addEventListener("pointerdown", () => setThreadHeaderExpanded(false), {
   passive: true,
 });

@@ -200,6 +200,24 @@
             Select a session to inspect its conversation.
           </div>
         </div>
+        <nav class="turn-navigation" id="turnNavigation" aria-label="Turn navigation" hidden>
+          <button
+            id="previousTurnBtn"
+            type="button"
+            data-i18n-aria-label="previousTurn"
+            aria-label="Previous turn"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6" /></svg>
+          </button>
+          <button
+            id="nextTurnBtn"
+            type="button"
+            data-i18n-aria-label="nextTurn"
+            aria-label="Next turn"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+        </nav>
         <div class="composer">
           <div class="outbox-tray" id="outboxTray" aria-live="polite" hidden></div>
           <div class="composer-status" id="composerStatus" hidden>
