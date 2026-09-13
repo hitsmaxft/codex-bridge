@@ -938,7 +938,9 @@ function taskEventNode(overview, runState, threadId) {
       running = runState === "active" && (activeToolName === tool.name || !toolFinished(tool));
     row.className = "task-event-tool";
     icon.className = `tool-icon ${toolIconClass(tool.name)}`;
-    text.textContent = `${toolActionText(tool.name, running)} ${toolSummaryPreview(tool)}`.trim();
+    text.textContent =
+      activityToolTitle(tool, knownThread(threadId)) ||
+      `${toolActionText(tool.name, running)} ${toolSummaryPreview(tool)}`.trim();
     row.append(icon, text);
     body.appendChild(row);
   } else if (runState === "active") {
@@ -2506,11 +2508,12 @@ function toolGroupNode(message, keepRunning = false) {
   icon.className = `tool-icon ${toolIconClass(latest.name)}`;
   icon.title = latest.name;
   const editedFiles = tools.reduce((total, tool) => total + (tool.file_count || 0), 0);
+  const activityTitle = activityToolTitle(latest, state.current);
   label.className = "tool-summary-label";
   label.textContent = running
     ? [
-        toolActionText(latest.name, true),
-        toolSummaryPreview(latest),
+        activityTitle || toolActionText(latest.name, true),
+        activityTitle ? "" : toolSummaryPreview(latest),
         tools.length > 1 ? `+${tools.length - 1}` : "",
       ]
         .filter(Boolean)
@@ -2622,6 +2625,7 @@ function toolFinished(tool) {
 }
 function toolIconClass(name) {
   if (["exec", "exec_command"].includes(name)) return "exec_command";
+  if (["wait", "wait_agent"].includes(name)) return "agent";
   return ["apply_patch", "write_stdin", "web_search"].includes(name) ? name : "other";
 }
 function toolActionText(name, running) {

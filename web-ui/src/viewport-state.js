@@ -55,5 +55,5 @@ export function activityToolTitle(tool, currentThread) {
   const currentName =
       tool.activity_sender_id === currentThread?.id ? currentThread?.title?.trim() : "",
     agentName = tool.activity_label?.trim() || currentName || "subagent";
-  return `wait (${agentName})`;
+  return agentName;
 }

@@ -2127,6 +2127,10 @@ main.history-fullscreen .fullscreen-exit-icon {
 .tool-icon.web_search::before {
   content: "⌕";
 }
+.tool-icon.agent::before {
+  content: "🤖";
+  font-size: 11px;
+}
 .tool-icon.other::before {
   content: "◆";
 }

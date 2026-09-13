@@ -7652,11 +7652,9 @@ fn tool_preview(tool: &ThreadToolCall) -> String {
         return "等待输出".to_owned();
     }
     if matches!(tool.name.as_str(), "wait" | "wait_agent") {
-        return format!(
-            "wait ({})",
-            tool.activity_label()
-                .unwrap_or_else(|| "subagent".to_owned())
-        );
+        return tool
+            .activity_label()
+            .unwrap_or_else(|| "subagent".to_owned());
     }
     if tool.name == "exec_command" {
         let command = structured_command_actions(tool)
@@ -9888,7 +9886,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         }))
         .unwrap();
         let compact = compact_tool_summary(&tool, 0);
-        assert_eq!(compact["preview"], "wait (Atlas)");
+        assert_eq!(compact["preview"], "Atlas");
         assert_eq!(compact["activity_key"], "wait:agent-a");
         assert_eq!(compact["activity_label"], "Atlas");
         assert_eq!(compact["activity_sender_id"], "parent");

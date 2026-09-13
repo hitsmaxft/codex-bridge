@@ -1012,9 +1012,10 @@ test("async tool activities keep only their latest snapshot across turns", () =>
       { name: "wait", activity_sender_id: "agent-a" },
       { id: "agent-a", title: "layout-review" },
     ),
-    "wait (layout-review)",
+    "layout-review",
   );
-  assert.equal(activityToolTitle({ name: "wait", activity_label: "Atlas" }, null), "wait (Atlas)");
+  assert.equal(activityToolTitle({ name: "wait", activity_label: "Atlas" }, null), "Atlas");
+  assert.equal(activityToolTitle({ name: "wait" }, null), "subagent");
 });
 
 test("conversation exposes floating previous and next turn controls", async () => {
