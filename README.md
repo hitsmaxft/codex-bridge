@@ -29,16 +29,17 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.2.10 · 2026-09-11
+### v0.3.0 · 2026-09-13
 
-- **One managed writer:** an advisory lock prevents two Bridge daemons from managing app-servers
-  against the same Codex history store.
-- **Safe installation from Codex:** macOS and Linux installers detect an active private stdio
-  app-server, finish installing service definitions, and defer startup instead of risking overlap.
-- **Runtime conflict containment:** Bridge monitors for a later stdio writer, stops only its own
-  managed child, reports the conflict, and resumes after the other writer exits.
+- **A session control surface:** inspect task goals, run statistics, runtime components, workspace
+  files, and structured tool activity without leaving the conversation.
+- **Fast long-session return:** open the latest bounded message window immediately, hydrate older
+  turns only on demand, and keep the mobile viewport anchored while live output grows.
+- **Reliable conversation controls:** refresh or collapse the current conversation, enter a
+  composer-free reading view, and reconcile text or image Steer submissions with history exactly
+  once.
 
-See the [latest release notes](docs/releases/v0.2.10.md) or the
+See the [latest release notes](docs/releases/v0.3.0.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI

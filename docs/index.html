@@ -1219,55 +1219,55 @@
         </p>
         <div class="release">
           <div class="release-date">
-            2026-09-11
-            <span class="zh">v0.2.10 正式版</span
-            ><span class="en">v0.2.10 release</span>
+            2026-09-13
+            <span class="zh">v0.3.0 正式版</span
+            ><span class="en">v0.3.0 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">同一历史目录只有一个 Writer</span
-                ><span class="en">One writer per history store</span>
+                <span class="zh">会话控制台</span
+                ><span class="en">A session control surface</span>
               </h3>
               <p class="zh">
-                按 CODEX_HOME 加锁，阻止两个 Bridge 同时管理会写入同一历史的
-                app-server。
+                在对话旁查看目标、运行统计、服务状态、工作区文件与结构化工具活动。
               </p>
               <p class="en">
-                A CODEX_HOME-scoped lock prevents two Bridge daemons from
-                managing app-servers against the same history.
+                Inspect goals, run statistics, services, workspace files, and
+                structured tool activity beside the conversation.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">安装时主动避让</span
-                ><span class="en">Safe installation from Codex</span>
+                <span class="zh">长会话快速回切</span
+                ><span class="en">Fast long-session return</span>
               </h3>
               <p class="zh">
-                在 Codex 会话内安装时检测私有 stdio app-server，完成安装但延迟启动服务。
+                首屏直接显示最新消息，旧 turn
+                按需展开；移动端实时输出保持稳定锚点。
               </p>
               <p class="en">
-                Installers detect a private stdio app-server, finish setup, and
-                defer service startup instead of overlapping writers.
+                Open the latest bounded window immediately, hydrate older turns
+                on demand, and keep live mobile output anchored.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">运行时冲突熔断</span
-                ><span class="en">Runtime conflict containment</span>
+                <span class="zh">可靠的对话控制</span
+                ><span class="en">Reliable conversation controls</span>
               </h3>
               <p class="zh">
-                后续发现 stdio writer 时只停止 Bridge 自己的子进程，并在状态面板报告原因。
+                支持刷新、全部折叠、全屏阅读，并让文字或图片跟进与正式历史准确交接。
               </p>
               <p class="en">
-                A later stdio writer stops only Bridge's managed child and
-                surfaces the reason in component status.
+                Refresh, collapse, or read full-screen while text and image
+                Steer submissions reconcile with history exactly once.
               </p>
             </article>
           </div>
         </div>
         <div class="release-history">
-          <a href="releases/v0.2.10.md">
+          <a href="releases/v0.3.0.md">
             <span
               ><span class="zh">查看完整发布说明</span
               ><span class="en">Read the complete release notes</span></span

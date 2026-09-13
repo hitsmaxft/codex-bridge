@@ -1697,6 +1697,11 @@ enum ManagedAppServerCommand {
     },
 }
 
+type PendingRepairReply = (
+    std::sync::mpsc::SyncSender<Result<RolloutOrdinalRepair, String>>,
+    Result<RolloutOrdinalRepair, String>,
+);
+
 #[derive(Clone)]
 struct ManagedAppServerControl {
     commands: mpsc::UnboundedSender<ManagedAppServerCommand>,
@@ -1746,7 +1751,7 @@ fn listening_app_server_pids(ps_output: &str, program: &Path, socket: &Path) -> 
             let matches_program = programs
                 .iter()
                 .any(|program| command.starts_with(&format!("{program} ")));
-            let app_server = arguments.iter().any(|argument| *argument == "app-server");
+            let app_server = arguments.contains(&"app-server");
             let listens_here = arguments
                 .iter()
                 .any(|argument| *argument == format!("--listen={endpoint}"))
@@ -2044,10 +2049,7 @@ async fn supervise_managed_app_server(
 ) {
     let mut restart_count = 0_u64;
     let mut backoff = Duration::from_millis(500);
-    let mut pending_reply: Option<(
-        std::sync::mpsc::SyncSender<Result<RolloutOrdinalRepair, String>>,
-        Result<RolloutOrdinalRepair, String>,
-    )> = None;
+    let mut pending_reply: Option<PendingRepairReply> = None;
     while !*shutdown.borrow() {
         if let Some(message) = stdio_app_server_conflict(&spec.program) {
             status_tx.send_replace(ManagedProcessStatus {
