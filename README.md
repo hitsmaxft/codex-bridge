@@ -31,13 +31,14 @@ still use the account and network configured by Codex itself.
 
 ### v0.3.0 · 2026-09-13
 
-- **A session control surface:** inspect task goals, run statistics, runtime components, workspace
-  files, and structured tool activity without leaving the conversation.
-- **Fast long-session return:** open the latest bounded message window immediately, hydrate older
-  turns only on demand, and keep the mobile viewport anchored while live output grows.
-- **Reliable conversation controls:** refresh or collapse the current conversation, enter a
-  composer-free reading view, and reconcile text or image Steer submissions with history exactly
-  once.
+- **Codex-aligned session control:** manage goals, active turns, models, Queue/Steer, run statistics,
+  files, and structured tool activity from one typed interface.
+- **New reading and exploration tools:** switch to a composer-free history view, collapse or refresh
+  the conversation, preview workspace files, zoom images, and turn selected text into a temporary
+  focused conversation.
+- **Long-session workspace:** open the newest bounded window immediately, expand full turns on
+  demand, and keep task overview and runtime architecture available without loading an entire
+  rollout into the browser.
 
 See the [latest release notes](docs/releases/v0.3.0.md) or the
 [complete release history](docs/releases/).
