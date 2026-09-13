@@ -176,6 +176,3 @@ The Web UI and CLI share typed bridge requests. Rollout files provide durable re
 operations use the selected app-server endpoint. Commands never choose a write target by file
 modification time. See [`docs/codexctl.md`](docs/codexctl.md) for command semantics and current
 implementation limits.
-
-Protocol v35 pages Web UI history by turn: completed turns arrive as bounded summary stubs, while
-only the tail of an active turn is sent initially. Expanding a stub fetches that turn's full messages.

@@ -318,29 +318,6 @@ pub struct MessagePage {
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TurnMessageGroup {
-    pub turn_id: Option<String>,
-    pub start: usize,
-    pub end: usize,
-    pub completed: bool,
-    pub omitted_before: Option<usize>,
-    pub messages: Vec<(usize, ThreadMessage)>,
-    pub started_at: Option<String>,
-    pub ended_at: Option<String>,
-    pub tool_calls: usize,
-    pub total_tokens: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TurnMessagePage {
-    pub groups: Vec<TurnMessageGroup>,
-    pub start: usize,
-    pub end: usize,
-    pub total: usize,
-    pub has_more: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageReadProfile {
     pub cache: &'static str,
@@ -854,137 +831,6 @@ impl SessionStore {
         )))
     }
 
-    pub fn read_turn_message_page_profiled(
-        &self,
-        thread_id: &str,
-        before: Option<usize>,
-        limit: usize,
-        active_tail_limit: usize,
-    ) -> Result<Option<(ThreadSummary, TurnMessagePage, MessageReadProfile)>> {
-        let Some(summary) = self.find_thread(thread_id)? else {
-            return Ok(None);
-        };
-        if summary.rollout_path.as_os_str().is_empty() {
-            return Ok(Some((
-                summary,
-                TurnMessagePage {
-                    groups: Vec::new(),
-                    start: 0,
-                    end: 0,
-                    total: 0,
-                    has_more: false,
-                },
-                MessageReadProfile {
-                    cache: "empty",
-                    rollout_bytes: 0,
-                    ordinal_repair_required: false,
-                    statistics: ThreadStatistics::default(),
-                },
-            )));
-        }
-        let (messages, profile) = self.messages_for_path_profiled(&summary.rollout_path)?;
-        let total = messages.len();
-        let end = before.unwrap_or(total).min(total);
-        if end == 0 {
-            return Ok(Some((
-                summary,
-                TurnMessagePage {
-                    groups: Vec::new(),
-                    start: 0,
-                    end: 0,
-                    total,
-                    has_more: false,
-                },
-                profile,
-            )));
-        }
-
-        let mut bounds = Vec::new();
-        let mut group_start = 0;
-        while group_start < end {
-            let turn_id = messages[group_start].turn_id.clone();
-            let mut group_end = group_start + 1;
-            if turn_id.is_some() {
-                while group_end < total
-                    && (messages[group_end].turn_id.is_none()
-                        || messages[group_end].turn_id == turn_id)
-                {
-                    group_end += 1;
-                }
-            }
-            bounds.push((group_start, group_end.min(end), group_end, turn_id));
-            group_start = group_end.min(end);
-        }
-        let selected_start = bounds.len().saturating_sub(limit.max(1));
-        let mut groups = Vec::with_capacity(bounds.len() - selected_start);
-        for &(start, visible_end, global_end, ref turn_id) in &bounds[selected_start..] {
-            let completed = messages[start..global_end].iter().any(|message| {
-                message.phase.as_deref() == Some("final_answer")
-                    || message.content.iter().any(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("codex_bridge_turn_usage")
-                    })
-            }) || global_end < total;
-            let summarize = completed && turn_id.is_some();
-            let message_start = if summarize {
-                visible_end
-            } else if turn_id.is_none() {
-                start
-            } else {
-                visible_end
-                    .saturating_sub(active_tail_limit.max(1))
-                    .max(start)
-            };
-            let omitted_before = (message_start > start).then_some(message_start);
-            let group_messages = messages[message_start..visible_end]
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(offset, message)| (message_start + offset, message))
-                .collect();
-            let full_group = &messages[start..global_end];
-            let total_tokens = full_group
-                .iter()
-                .flat_map(|message| &message.content)
-                .find_map(|item| {
-                    (item.get("type").and_then(Value::as_str) == Some("codex_bridge_turn_usage"))
-                        .then(|| {
-                            item.get("total_tokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0)
-                        })
-                })
-                .unwrap_or(0);
-            groups.push(TurnMessageGroup {
-                turn_id: turn_id.clone(),
-                start,
-                end: visible_end,
-                completed,
-                omitted_before,
-                messages: group_messages,
-                started_at: full_group
-                    .first()
-                    .and_then(|message| message.timestamp.clone()),
-                ended_at: full_group
-                    .last()
-                    .and_then(|message| message.timestamp.clone()),
-                tool_calls: full_group.iter().map(|message| message.tools.len()).sum(),
-                total_tokens,
-            });
-        }
-        let start = groups.first().map_or(end, |group| group.start);
-        Ok(Some((
-            summary,
-            TurnMessagePage {
-                groups,
-                start,
-                end,
-                total,
-                has_more: start > 0,
-            },
-            profile,
-        )))
-    }
-
     pub fn message_cache_mode(&self, thread_id: &str) -> Result<(&'static str, u64)> {
         let Some(summary) = self.find_thread(thread_id)? else {
             return Ok(("missing", 0));
@@ -1056,20 +902,14 @@ impl SessionStore {
             return Ok(Some(Vec::new()));
         }
         let messages = self.messages_for_path(&summary.rollout_path)?;
-        let mut indexed = Vec::new();
-        let mut collecting = false;
-        for (index, message) in messages.iter().enumerate() {
-            if let Some(message_turn_id) = message.turn_id.as_deref() {
-                if collecting && message_turn_id != turn_id {
-                    break;
-                }
-                collecting = message_turn_id == turn_id;
-            }
-            if collecting {
-                indexed.push((index, message.clone()));
-            }
-        }
-        Ok(Some(indexed))
+        Ok(Some(
+            messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.turn_id.as_deref() == Some(turn_id))
+                .map(|(index, message)| (index, message.clone()))
+                .collect(),
+        ))
     }
 
     pub fn read_message(
@@ -3286,105 +3126,6 @@ mod tests {
             warm_elapsed <= WARM_BASELINE,
             "large-session cached first page took {warm_elapsed:?}, baseline is {WARM_BASELINE:?}"
         );
-
-        let (_, turn_page, _) = store
-            .read_turn_message_page_profiled("thread-large-session", None, 8, 8)
-            .unwrap()
-            .unwrap();
-        assert_eq!(turn_page.groups.len(), 8);
-        assert!(turn_page.groups.iter().all(|group| group.completed));
-        assert!(turn_page
-            .groups
-            .iter()
-            .all(|group| group.messages.is_empty()));
-        assert!(turn_page.groups.iter().all(|group| group.tool_calls == 1));
-        assert_eq!(turn_page.end, turn_page.total);
-        assert!(turn_page.has_more);
-        let turn_page_bytes = serde_json::to_vec(&turn_page).unwrap().len();
-        assert!(
-            turn_page_bytes <= 32 * 1024,
-            "turn-summary first-page payload is {turn_page_bytes} bytes"
-        );
-        let hydrated = store
-            .read_turn_messages("thread-large-session", "turn-511")
-            .unwrap()
-            .unwrap();
-        assert_eq!(hydrated.len(), 3);
-        assert!(hydrated
-            .iter()
-            .any(|(_, message)| message.turn_id.is_none()));
-    }
-
-    #[test]
-    fn turn_page_summarizes_history_and_bounds_a_giant_active_turn() {
-        let fixture = Fixture::new();
-        let path = fixture
-            .path
-            .join("sessions/2026/08/30/rollout-giant-active-turn.jsonl");
-        let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
-        writeln!(
-            file,
-            r#"{{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{{"id":"thread-giant-active","cwd":"/tmp/project"}}}}"#
-        )
-        .unwrap();
-        for (turn_id, completed, messages) in [
-            ("turn-history", true, 3_usize),
-            ("turn-active", false, 64_usize),
-        ] {
-            writeln!(
-                file,
-                "{}",
-                json!({
-                    "timestamp": "2026-08-30T01:00:01Z",
-                    "type": "event_msg",
-                    "payload": {"type": "task_started", "turn_id": turn_id},
-                })
-            )
-            .unwrap();
-            for index in 0..messages {
-                let role = if index == 0 { "user" } else { "assistant" };
-                let phase = if completed && index + 1 == messages {
-                    Some("final_answer")
-                } else if role == "assistant" {
-                    Some("commentary")
-                } else {
-                    None
-                };
-                writeln!(
-                    file,
-                    "{}",
-                    json!({
-                        "timestamp": "2026-08-30T01:00:02Z",
-                        "type": "response_item",
-                        "payload": {
-                            "type": "message",
-                            "id": format!("{turn_id}-{index}"),
-                            "role": role,
-                            "phase": phase,
-                            "content": [{"type": if role == "user" { "input_text" } else { "output_text" }, "text": format!("message {index}")}],
-                            "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
-                        },
-                    })
-                )
-                .unwrap();
-            }
-        }
-        file.flush().unwrap();
-
-        let store = SessionStore::new(fixture.path.clone());
-        let (_, page, _) = store
-            .read_turn_message_page_profiled("thread-giant-active", None, 8, 8)
-            .unwrap()
-            .unwrap();
-        assert_eq!(page.groups.len(), 2);
-        assert!(page.groups[0].completed);
-        assert!(page.groups[0].messages.is_empty());
-        assert!(!page.groups[1].completed);
-        assert_eq!(page.groups[1].messages.len(), 8);
-        assert_eq!(page.groups[1].omitted_before, Some(59));
-        assert_eq!(page.total, 67);
-        assert_eq!(page.start, 0);
-        assert!(!page.has_more);
     }
 
     #[test]

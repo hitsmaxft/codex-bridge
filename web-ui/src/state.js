@@ -45,7 +45,6 @@ export const state = {
   expandedTurnIds: new Set(),
   hydratedTurns: new Map(),
   hydratingTurns: new Map(),
-  turnStubs: new Map(),
   openToken: 0,
   initialPageSize: 8,
   pageSize: 30,

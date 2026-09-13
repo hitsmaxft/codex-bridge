@@ -51,9 +51,7 @@ import {
 import {
   adjacentTurnIndex,
   documentOwnsMessageScroll,
-  mergeHydratedTurnSequence,
   messageBottomDistance,
-  messageRangesCoverPage,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
 } from "./viewport-state.js";
@@ -2665,8 +2663,6 @@ function groupedTurns(messages) {
   for (const message of messages) {
     let key = message.turn_id ? `turn:${message.turn_id}` : null;
     const previous = groups.at(-1);
-    if (!key && previous?.turnId && !(message.role === "user" && message.category === "user"))
-      key = previous.key;
     if (!key) {
       if (!previous || (message.role === "user" && previous.hasUser)) legacyTurn += 1;
       key = `legacy:${legacyTurn}`;
@@ -2693,12 +2689,9 @@ function turnUsageItem(group) {
 }
 
 function turnDuration(group) {
-  const summary = group.messages.find((message) => message.turn_stub)?.turn_stub,
-    times = (
-      summary ? [summary.started_at, summary.ended_at] : group.messages.map((m) => m.timestamp)
-    )
-      .map((timestamp) => Date.parse(timestamp))
-      .filter(Number.isFinite);
+  const times = group.messages
+    .map((message) => Date.parse(message.timestamp))
+    .filter(Number.isFinite);
   const seconds =
     times.length > 1
       ? Math.max(0, Math.round((Math.max(...times) - Math.min(...times)) / 1000))
@@ -2709,8 +2702,7 @@ function turnDuration(group) {
 }
 
 function turnSummaryText(group) {
-  const summary = group.messages.find((message) => message.turn_stub)?.turn_stub,
-    tools = group.messages.flatMap((message) => message.tools || []),
+  const tools = group.messages.flatMap((message) => message.tools || []),
     deferredTools = group.messages.reduce(
       (total, message) => total + (message.deferred_tool_count || 0),
       0,
@@ -2720,7 +2712,7 @@ function turnSummaryText(group) {
       group.messages.reduce((total, message) => total + (message.deferred_file_count || 0), 0);
   return tr("turnSummary", {
     duration: turnDuration(group),
-    tools: summary?.tool_count ?? tools.length + deferredTools,
+    tools: tools.length + deferredTools,
     files: files ? tr("turnEditedFiles", { count: files }) : "",
   });
 }
@@ -2794,16 +2786,10 @@ function preserveMessageElementPosition(element, change) {
 }
 
 function collapseExpandedMessages() {
-  const threadId = state.current?.id || "",
-    prefix = `${threadId}:`,
+  const prefix = `${state.current?.id || ""}:`,
     expanded = [...state.expandedTurnIds].filter((key) => key.startsWith(prefix));
   for (const key of expanded) state.expandedTurnIds.delete(key);
-  const turnPrefix = `${threadId}:turn:`,
-    turnIds = expanded
-      .filter((key) => key.startsWith(turnPrefix))
-      .map((key) => key.slice(turnPrefix.length));
-  const unloaded = replaceHydratedTurnsWithStubs(turnIds);
-  if (expanded.length || unloaded) renderVisibleMessages();
+  if (expanded.length) renderVisibleMessages();
   notify(
     tr(expanded.length ? "messagesCollapsed" : "noExpandedMessages", { count: expanded.length }),
   );
@@ -2811,14 +2797,6 @@ function collapseExpandedMessages() {
 }
 
 function layoutTurnGroup(section, group, messageNodes, completed) {
-  const hasTurnStub = group.messages.some((message) => message.turn_stub);
-  if (hasTurnStub) {
-    section.className = "turn-group lazy";
-    section.dataset.turnKey = group.key;
-    for (const node of messageNodes) node.hidden = false;
-    reconcileChildren(section, messageNodes);
-    return;
-  }
   const finalPosition = group.messages.findLastIndex(
       (message) => message.role === "assistant" && message.phase === "final_answer",
     ),
@@ -2895,7 +2873,6 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       });
       return;
     }
-    if (expanded && group.turnId && restoreTurnStub(group.turnId, section)) return;
     preserveMessageElementPosition(finalNode, () => {
       if (expanded) state.expandedTurnIds.delete(expansionKey);
       else state.expandedTurnIds.add(expansionKey);
@@ -2917,58 +2894,10 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
 }
 
 function messageNode(m, keepToolsRunning = false) {
-  const box = document.createElement(m.turn_stub ? "button" : "article");
+  const box = document.createElement("article");
   box.className = `message ${m.category || m.role || ""}`;
   box.dataset.messageIndex = String(m.message_index);
   if (m.turn_id) box.dataset.turnId = m.turn_id;
-  if (m.turn_stub) {
-    box.type = "button";
-    box.classList.add("turn-stub");
-    const summary = document.createElement("span"),
-      detail = document.createElement("span"),
-      group = { messages: [m] };
-    summary.className = "turn-stub-title";
-    summary.textContent = tr(
-      m.turn_stub.kind === "prefix" ? "loadTurnPrefix" : "expandTurnSummary",
-      { count: m.turn_stub.message_count },
-    );
-    detail.className = "turn-stub-detail";
-    detail.textContent = turnSummaryText(group);
-    if (m.turn_stub.total_tokens)
-      detail.textContent += ` · ${tr("turnTokens", { count: tokenCountText(m.turn_stub.total_tokens) })}`;
-    box.append(summary, detail);
-    box.onclick = () => {
-      const beforeTop = box.getBoundingClientRect().top,
-        beforeScroll = messageScrollMetrics().top,
-        expansionKey = `${state.current?.id || ""}:turn:${m.turn_id}`;
-      box.disabled = true;
-      run(async () => {
-        try {
-          await hydrateTurn(m.turn_id);
-          state.expandedTurnIds.add(expansionKey);
-          renderVisibleMessages();
-          const section = [...$("messages").querySelectorAll(":scope > .turn-group")].find(
-            (candidate) => candidate.dataset.turnKey === `turn:${m.turn_id}`,
-          );
-          if (section)
-            setMessageScrollTop(
-              scrollTopForViewportAnchor(
-                beforeScroll,
-                beforeTop,
-                section.getBoundingClientRect().top,
-              ),
-            );
-        } finally {
-          if (box.isConnected) box.disabled = false;
-        }
-      });
-    };
-    renderedMessageState.set(box, {
-      signature: JSON.stringify(m),
-      keepToolsRunning,
-    });
-    return box;
-  }
   const head = document.createElement("div");
   head.className = "message-head";
   const a = document.createElement("span"),
@@ -3401,60 +3330,16 @@ function reportMessagesRendered(result, renderStarted) {
 function hydratedTurnKey(threadId, turnId) {
   return `${threadId}:${turnId}`;
 }
-function rememberTurnStubs(messages, threadId = state.current?.id) {
-  if (!threadId) return;
-  for (const message of messages || []) {
-    if (message.turn_stub && message.turn_id)
-      state.turnStubs.set(hydratedTurnKey(threadId, message.turn_id), message);
-  }
-}
-function replaceHydratedTurnsWithStubs(turnIds) {
-  const threadId = state.current?.id,
-    wanted = new Set(turnIds || []),
-    inserted = new Set();
-  if (!threadId || !wanted.size) return 0;
-  state.visibleMessages = state.visibleMessages.flatMap((message) => {
-    if (!wanted.has(message.turn_id)) return [message];
-    if (inserted.has(message.turn_id)) return [];
-    const key = hydratedTurnKey(threadId, message.turn_id),
-      stub = state.turnStubs.get(key);
-    if (!stub) return [message];
-    inserted.add(message.turn_id);
-    return [stub];
-  });
-  for (const turnId of inserted) {
-    const key = hydratedTurnKey(threadId, turnId);
-    state.hydratedTurns.delete(key);
-    state.hydratingTurns.delete(key);
-    state.expandedTurnIds.delete(`${threadId}:turn:${turnId}`);
-  }
-  return inserted.size;
-}
-function restoreTurnStub(turnId, anchorElement = null) {
-  const threadId = state.current?.id,
-    key = threadId ? hydratedTurnKey(threadId, turnId) : null,
-    stub = key ? state.turnStubs.get(key) : null;
-  if (!threadId || !stub) return false;
-  const beforeTop = anchorElement?.getBoundingClientRect().top,
-    beforeScroll = messageScrollMetrics().top;
-  if (!replaceHydratedTurnsWithStubs([turnId])) return false;
-  renderVisibleMessages();
-  if (Number.isFinite(beforeTop)) {
-    const section = [...$("messages").querySelectorAll(":scope > .turn-group")].find(
-      (candidate) => candidate.dataset.turnKey === `turn:${turnId}`,
-    );
-    if (section)
-      setMessageScrollTop(
-        scrollTopForViewportAnchor(beforeScroll, beforeTop, section.getBoundingClientRect().top),
-      );
-  }
-  return true;
-}
 function mergeHydratedTurnMessages(messages, threadId = state.current?.id) {
   if (!threadId) return messages;
-  return mergeHydratedTurnSequence(messages, (turnId) =>
-    state.hydratedTurns.get(hydratedTurnKey(threadId, turnId)),
-  );
+  return messages.map((message) => {
+    if (!message.turn_id) return message;
+    return (
+      state.hydratedTurns
+        .get(hydratedTurnKey(threadId, message.turn_id))
+        ?.get(message.message_index) || message
+    );
+  });
 }
 function renderVisibleMessages() {
   if (!state.current) return;
@@ -3519,12 +3404,13 @@ function isValidMessagePage(result, { latest = false, expectedEnd = null } = {})
     page.start < 0 ||
     page.start > page.end ||
     page.end > page.total ||
+    page.end - page.start !== messages.length ||
     page.before !== page.start ||
     (latest && page.end !== page.total) ||
     (expectedEnd !== null && page.end !== expectedEnd)
   )
     return false;
-  return messageRangesCoverPage(messages, page);
+  return messages.every((message, offset) => message.message_index === page.start + offset);
 }
 function requireMessagePage(result, options) {
   if (!isValidMessagePage(result, options)) throw new Error(tr("historyOutOfSync"));
@@ -4332,7 +4218,6 @@ async function openThread(
   }
   renderRepairHint(r.repair_required);
   renderThreadStatistics(r.statistics);
-  rememberTurnStubs(r.messages, thread.id);
   r.messages = mergeHydratedTurnMessages(r.messages, thread.id);
   state.pending = mergePendingResponse(pendingResult?.messages || state.pending, true, r.messages);
   state.messageCache.set(thread.id, r);
@@ -4386,9 +4271,6 @@ function clearCurrentSessionMessageCaches(threadId) {
   for (const key of [...state.hydratingTurns.keys()]) {
     if (key.startsWith(prefix)) state.hydratingTurns.delete(key);
   }
-  for (const key of [...state.turnStubs.keys()]) {
-    if (key.startsWith(prefix)) state.turnStubs.delete(key);
-  }
   state.visibleMessages = [];
   state.before = null;
   state.hasMore = false;
@@ -4441,7 +4323,6 @@ async function loadOlder() {
   state.hasMore = r.page.has_more;
   state.historyStart = r.page.start;
   state.historyTotal = Math.max(state.historyTotal ?? 0, r.page.total);
-  rememberTurnStubs(r.messages, threadId);
   r.messages = mergeHydratedTurnMessages(r.messages, threadId);
   state.visibleMessages = [...r.messages, ...state.visibleMessages];
   const activeToolMessage = state.activeTurnId

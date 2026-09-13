@@ -734,7 +734,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 35,
+            "protocol_version": 34,
             "capabilities": {
                 "audio_transcription": {
                     "enabled": true,
@@ -1350,7 +1350,7 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 35);
+        assert_eq!(response["result"]["protocol_version"], 34);
     }
 
     #[test]

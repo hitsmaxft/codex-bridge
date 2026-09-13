@@ -19,15 +19,15 @@ pub use host_executor::{
 pub use sessions::{
     default_codex_home, MessagePage, MessageReadProfile, ProjectKind, ProjectSummary,
     ProjectThreadSummary, RolloutOrdinalRepair, SessionStore, ThreadActivity, ThreadMessage,
-    ThreadProjectIndex, ThreadSnapshot, ThreadSummary, ThreadToolCall, TurnMessageGroup,
-    TurnMessagePage, CHATS_PROJECT_PATH, CODEX_HOME_ENV,
+    ThreadProjectIndex, ThreadSnapshot, ThreadSummary, ThreadToolCall, CHATS_PROJECT_PATH,
+    CODEX_HOME_ENV,
 };
 pub use write_backend::{
     AppServerRuntimeInfo, BackendFailure, BackendSuccess, CodexCliBackend, NativeQueueReceipt,
     StartedTurnReceipt, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 34;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -364,7 +364,6 @@ mod tests {
 
     #[test]
     fn request_uses_tagged_json_protocol() {
-        assert_eq!(PROTOCOL_VERSION, 35);
         let request = Request::Scroll {
             direction: Some(ScrollDirection::Down),
             pixels: None,

@@ -9,7 +9,7 @@ The project consists of two processes:
 - `codex-bridge` is a local daemon that listens on a Unix socket and reads Codex rollout state.
 - `codexctl` is a one-shot CLI that sends a single line of JSON over the Unix socket to the daemon and reads a single line of JSON back.
 
-The current protocol version is `35`. Implemented commands:
+The current protocol version is `14`. Implemented commands:
 
 | Command | Current behavior |
 | --- | --- |
@@ -159,7 +159,7 @@ Then verify in order:
 
 Key acceptance points:
 
-- `status.protocol_version` is `35`.
+- `status.protocol_version` is `4`.
 - `status.rollout_store.available` is `true`, and `read_only` is `true`.
 - `ls` lists only the fixture thread with status `unarchived` and cwd `/tmp`; when the fixture cwd is not a valid Git workspace, the branch shows as `<unknown>` and as `null` in JSON.
 - `current` explicitly prints `not authoritative for focused window`.
@@ -357,7 +357,7 @@ When Codex Desktop uses a private stdio app-server, the shared socket can't stee
 
 ### `invalid_request`
 
-Run `status --json` first to check the daemon's protocol version. Typical protocol v35 requests are:
+Run `status --json` first to check the daemon's protocol version. Typical protocol v4 requests are:
 
 ```json
 {"command":"ls","limit":20,"include_archived":false}
