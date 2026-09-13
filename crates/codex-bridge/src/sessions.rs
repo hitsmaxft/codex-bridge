@@ -1802,6 +1802,10 @@ fn read_rollout_summary_mode(
                 string_field(payload, "timestamp").or_else(|| string_field(&record, "timestamp"));
             source = string_field(payload, "source");
 
+            if require_subagent {
+                break;
+            }
+
             if id.as_ref().is_some_and(|id| {
                 titles
                     .get(id)
