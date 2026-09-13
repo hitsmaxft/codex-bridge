@@ -27,8 +27,8 @@ use codex_bridge::{
     default_codex_home, default_socket_path, BackendFailure, ClientPerformanceSample,
     CodexCliBackend, ComposerAttachment, HostExecFailure, HostExecutor, Request, Response,
     RolloutOrdinalRepair, SessionStore, ThreadMessage, ThreadProjectIndex, ThreadSummary,
-    ThreadToolCall, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV, CHATS_PROJECT_PATH,
-    CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
+    ThreadToolCall, TurnMessageGroup, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV,
+    CHATS_PROJECT_PATH, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
@@ -67,6 +67,8 @@ const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
 const MAX_PERFORMANCE_EVENTS: usize = 128;
 const MAX_APP_SERVER_TOOL_PAGES: usize = 8;
+const WEB_ACTIVE_TURN_TAIL_MESSAGES: usize = 8;
+const MAX_INLINE_MESSAGE_TEXT_BYTES: usize = 64 * 1024;
 #[cfg(test)]
 static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -5573,10 +5575,11 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 );
             }
             let started = Instant::now();
-            let read = session_store.read_message_page_profiled(
+            let read = session_store.read_turn_message_page_profiled(
                 &thread_id,
                 before.map(|value| value as usize),
                 limit as usize,
+                WEB_ACTIVE_TURN_TAIL_MESSAGES,
             );
             let (cache_mode, rollout_bytes) = read
                 .as_ref()
@@ -5587,18 +5590,31 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 });
             let response = match read {
                 Ok(Some((thread, mut page, profile))) => {
-                    let tool_source = match app_server_tools_for_messages(
-                        write_backend,
-                        app_server_tools,
-                        &thread_id,
-                        &page.messages,
-                    ) {
-                        Ok(tools) if overlay_app_server_tools(&mut page.messages, &tools) > 0 => {
-                            "app_server_items"
+                    let mut tool_source = "rollout_jsonl";
+                    for group in &mut page.groups {
+                        if group.messages.is_empty() {
+                            continue;
                         }
-                        _ => "rollout_jsonl",
-                    };
-                    let messages = compact_web_message_page(&page.messages, page.start);
+                        let mut messages = group
+                            .messages
+                            .iter()
+                            .map(|(_, message)| message.clone())
+                            .collect::<Vec<_>>();
+                        if let Ok(tools) = app_server_tools_for_messages(
+                            write_backend,
+                            app_server_tools,
+                            &thread_id,
+                            &messages,
+                        ) {
+                            if overlay_app_server_tools(&mut messages, &tools) > 0 {
+                                tool_source = "app_server_items";
+                            }
+                        }
+                        for ((_, target), source) in group.messages.iter_mut().zip(messages) {
+                            *target = source;
+                        }
+                    }
+                    let messages = compact_turn_message_page(&page.groups);
                     Response::success(json!({
                         "source": "rollout_jsonl",
                         "tool_source": tool_source,
@@ -5674,7 +5690,13 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     let messages = messages
                         .iter()
                         .zip(indices)
-                        .map(|(message, index)| compact_web_message(message, index))
+                        .map(|(message, index)| {
+                            let mut compact = compact_web_message(message, index);
+                            if compact["turn_id"].is_null() {
+                                compact["turn_id"] = json!(turn_id.clone());
+                            }
+                            compact
+                        })
                         .collect::<Vec<_>>();
                     Response::success(json!({
                         "source": "rollout_jsonl",
@@ -7433,6 +7455,14 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
                     message_index,
                     content_index,
                 ));
+            } else if text.len() > MAX_INLINE_MESSAGE_TEXT_BYTES {
+                content.push(lazy_content_summary(
+                    "Large message content",
+                    item,
+                    message_index,
+                    content_index,
+                ));
+                has_visible_text = true;
             } else {
                 content.push(json!({"kind": "text", "text": text}));
                 has_visible_text = true;
@@ -7476,6 +7506,7 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
     })
 }
 
+#[cfg(test)]
 fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Value> {
     let mut compact = messages
         .iter()
@@ -7545,6 +7576,57 @@ fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Val
             }
         }
         group_start = group_end;
+    }
+    compact
+}
+
+fn compact_turn_stub(group: &TurnMessageGroup, start: usize, end: usize, kind: &str) -> Value {
+    json!({
+        "timestamp": group.ended_at,
+        "id": format!("turn-stub:{}:{start}:{end}", group.turn_id.as_deref().unwrap_or("legacy")),
+        "turn_id": group.turn_id,
+        "role": "assistant",
+        "phase": "turn_summary",
+        "category": "turn_summary",
+        "message_index": start,
+        "content": [],
+        "tools": [],
+        "deferred": true,
+        "turn_stub": {
+            "kind": kind,
+            "start": start,
+            "end": end,
+            "message_count": end.saturating_sub(start),
+            "completed": group.completed,
+            "started_at": group.started_at,
+            "ended_at": group.ended_at,
+            "tool_count": group.tool_calls,
+            "total_tokens": group.total_tokens,
+        }
+    })
+}
+
+fn compact_turn_message_page(groups: &[TurnMessageGroup]) -> Vec<Value> {
+    let mut compact = Vec::new();
+    for group in groups {
+        if group.messages.is_empty() && group.completed && group.turn_id.is_some() {
+            compact.push(compact_turn_stub(group, group.start, group.end, "complete"));
+            continue;
+        }
+        if let Some(message_start) = group.omitted_before {
+            compact.push(compact_turn_stub(
+                group,
+                group.start,
+                message_start,
+                "prefix",
+            ));
+        }
+        compact.extend(
+            group
+                .messages
+                .iter()
+                .map(|(index, message)| compact_web_message(message, *index)),
+        );
     }
     compact
 }
@@ -9723,6 +9805,27 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn giant_message_text_is_loaded_only_after_explicit_expansion() {
+        let text = "x".repeat(MAX_INLINE_MESSAGE_TEXT_BYTES + 1);
+        let message = ThreadMessage {
+            timestamp: None,
+            id: Some("giant-message".into()),
+            turn_id: Some("turn-active".into()),
+            role: "assistant".into(),
+            phase: Some("commentary".into()),
+            content: vec![json!({"type":"output_text","text":text})],
+            tools: Vec::new(),
+        };
+
+        let compact = compact_web_message(&message, 17);
+        assert_eq!(compact["content"][0]["kind"], "context");
+        assert_eq!(compact["content"][0]["label"], "Large message content");
+        assert_eq!(compact["content"][0]["message_index"], 17);
+        assert!(compact["content"][0]["bytes"].as_u64().unwrap() > 64 * 1024);
+        assert!(!serde_json::to_string(&compact).unwrap().contains(&text));
+    }
+
+    #[test]
     fn completed_turn_page_defers_intermediate_content_and_tools() {
         let messages = vec![
             ThreadMessage {
@@ -9768,6 +9871,61 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact[1]["deferred"], true);
         assert_eq!(compact[1]["deferred_tool_count"], 1);
         assert_eq!(compact[2]["content"][0]["text"], "Done.");
+    }
+
+    #[test]
+    fn turn_message_page_serializes_one_stub_per_history_turn_and_a_bounded_active_tail() {
+        let active_messages = (98..100)
+            .map(|index| {
+                (
+                    index,
+                    ThreadMessage {
+                        timestamp: Some("2026-08-30T01:00:02Z".into()),
+                        id: Some(format!("active-{index}")),
+                        turn_id: Some("turn-active".into()),
+                        role: "assistant".into(),
+                        phase: Some("commentary".into()),
+                        content: vec![json!({"type":"output_text","text":format!("tail {index}")})],
+                        tools: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let groups = vec![
+            TurnMessageGroup {
+                turn_id: Some("turn-history".into()),
+                start: 0,
+                end: 40,
+                completed: true,
+                omitted_before: None,
+                messages: Vec::new(),
+                started_at: Some("2026-08-30T00:59:00Z".into()),
+                ended_at: Some("2026-08-30T01:00:00Z".into()),
+                tool_calls: 25,
+                total_tokens: 12_000,
+            },
+            TurnMessageGroup {
+                turn_id: Some("turn-active".into()),
+                start: 40,
+                end: 100,
+                completed: false,
+                omitted_before: Some(98),
+                messages: active_messages,
+                started_at: Some("2026-08-30T01:00:01Z".into()),
+                ended_at: Some("2026-08-30T01:00:02Z".into()),
+                tool_calls: 0,
+                total_tokens: 0,
+            },
+        ];
+
+        let compact = compact_turn_message_page(&groups);
+        assert_eq!(compact.len(), 4);
+        assert_eq!(compact[0]["turn_stub"]["kind"], "complete");
+        assert_eq!(compact[0]["turn_stub"]["message_count"], 40);
+        assert_eq!(compact[1]["turn_stub"]["kind"], "prefix");
+        assert_eq!(compact[1]["turn_stub"]["message_count"], 58);
+        assert_eq!(compact[2]["message_index"], 98);
+        assert_eq!(compact[3]["message_index"], 99);
     }
 
     #[test]

@@ -1364,6 +1364,34 @@ main.history-fullscreen .fullscreen-exit-icon {
 .turn-group {
   position: relative;
 }
+.turn-group.lazy {
+  content-visibility: auto;
+  contain-intrinsic-block-size: 72px;
+}
+.turn-stub {
+  display: grid;
+  width: 100%;
+  padding: 11px 13px;
+  gap: 4px;
+  text-align: left;
+  border: 1px solid color-mix(in srgb, var(--line) 76%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel2) 82%, transparent);
+  color: var(--fg);
+}
+.turn-stub:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--line));
+}
+.turn-stub:disabled {
+  opacity: 0.65;
+}
+.turn-stub-title {
+  font-weight: 650;
+}
+.turn-stub-detail {
+  color: var(--muted);
+  font-size: 12px;
+}
 .turn-group > .message[hidden] {
   display: none;
 }
