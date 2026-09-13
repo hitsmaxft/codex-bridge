@@ -7609,8 +7609,18 @@ fn compact_turn_stub(group: &TurnMessageGroup, start: usize, end: usize, kind: &
 fn compact_turn_message_page(groups: &[TurnMessageGroup]) -> Vec<Value> {
     let mut compact = Vec::new();
     for group in groups {
-        if group.messages.is_empty() && group.completed && group.turn_id.is_some() {
-            compact.push(compact_turn_stub(group, group.start, group.end, "complete"));
+        if group.completed && group.turn_id.is_some() {
+            let mut cursor = group.start;
+            for (index, message) in &group.messages {
+                if *index > cursor {
+                    compact.push(compact_turn_stub(group, cursor, *index, "complete"));
+                }
+                compact.push(compact_web_message(message, *index));
+                cursor = index.saturating_add(1);
+            }
+            if cursor < group.end {
+                compact.push(compact_turn_stub(group, cursor, group.end, "complete"));
+            }
             continue;
         }
         if let Some(message_start) = group.omitted_before {
@@ -9898,7 +9908,32 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 end: 40,
                 completed: true,
                 omitted_before: None,
-                messages: Vec::new(),
+                messages: vec![
+                    (
+                        0,
+                        ThreadMessage {
+                            timestamp: Some("2026-08-30T00:59:00Z".into()),
+                            id: Some("history-user".into()),
+                            turn_id: Some("turn-history".into()),
+                            role: "user".into(),
+                            phase: None,
+                            content: vec![json!({"type":"input_text","text":"Question"})],
+                            tools: Vec::new(),
+                        },
+                    ),
+                    (
+                        39,
+                        ThreadMessage {
+                            timestamp: Some("2026-08-30T01:00:00Z".into()),
+                            id: Some("history-final".into()),
+                            turn_id: Some("turn-history".into()),
+                            role: "assistant".into(),
+                            phase: Some("final_answer".into()),
+                            content: vec![json!({"type":"output_text","text":"Answer"})],
+                            tools: Vec::new(),
+                        },
+                    ),
+                ],
                 started_at: Some("2026-08-30T00:59:00Z".into()),
                 ended_at: Some("2026-08-30T01:00:00Z".into()),
                 tool_calls: 25,
@@ -9919,13 +9954,15 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         ];
 
         let compact = compact_turn_message_page(&groups);
-        assert_eq!(compact.len(), 4);
-        assert_eq!(compact[0]["turn_stub"]["kind"], "complete");
-        assert_eq!(compact[0]["turn_stub"]["message_count"], 40);
-        assert_eq!(compact[1]["turn_stub"]["kind"], "prefix");
-        assert_eq!(compact[1]["turn_stub"]["message_count"], 58);
-        assert_eq!(compact[2]["message_index"], 98);
-        assert_eq!(compact[3]["message_index"], 99);
+        assert_eq!(compact.len(), 6);
+        assert_eq!(compact[0]["content"][0]["text"], "Question");
+        assert_eq!(compact[1]["turn_stub"]["kind"], "complete");
+        assert_eq!(compact[1]["turn_stub"]["message_count"], 38);
+        assert_eq!(compact[2]["content"][0]["text"], "Answer");
+        assert_eq!(compact[3]["turn_stub"]["kind"], "prefix");
+        assert_eq!(compact[3]["turn_stub"]["message_count"], 58);
+        assert_eq!(compact[4]["message_index"], 98);
+        assert_eq!(compact[5]["message_index"], 99);
     }
 
     #[test]

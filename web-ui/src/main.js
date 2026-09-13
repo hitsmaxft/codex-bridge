@@ -56,6 +56,7 @@ import {
   messageRangesCoverPage,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
+  turnSummarySequences,
 } from "./viewport-state.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
 const restoredExpandedProjects = storedExpandedProjects(window.localStorage);
@@ -3403,10 +3404,8 @@ function hydratedTurnKey(threadId, turnId) {
 }
 function rememberTurnStubs(messages, threadId = state.current?.id) {
   if (!threadId) return;
-  for (const message of messages || []) {
-    if (message.turn_stub && message.turn_id)
-      state.turnStubs.set(hydratedTurnKey(threadId, message.turn_id), message);
-  }
+  for (const [turnId, summary] of turnSummarySequences(messages))
+    state.turnStubs.set(hydratedTurnKey(threadId, turnId), summary);
 }
 function replaceHydratedTurnsWithStubs(turnIds) {
   const threadId = state.current?.id,
@@ -3417,10 +3416,10 @@ function replaceHydratedTurnsWithStubs(turnIds) {
     if (!wanted.has(message.turn_id)) return [message];
     if (inserted.has(message.turn_id)) return [];
     const key = hydratedTurnKey(threadId, message.turn_id),
-      stub = state.turnStubs.get(key);
-    if (!stub) return [message];
+      summary = state.turnStubs.get(key);
+    if (!summary?.length) return [message];
     inserted.add(message.turn_id);
-    return [stub];
+    return summary;
   });
   for (const turnId of inserted) {
     const key = hydratedTurnKey(threadId, turnId);
@@ -3433,8 +3432,8 @@ function replaceHydratedTurnsWithStubs(turnIds) {
 function restoreTurnStub(turnId, anchorElement = null) {
   const threadId = state.current?.id,
     key = threadId ? hydratedTurnKey(threadId, turnId) : null,
-    stub = key ? state.turnStubs.get(key) : null;
-  if (!threadId || !stub) return false;
+    summary = key ? state.turnStubs.get(key) : null;
+  if (!threadId || !summary?.length) return false;
   const beforeTop = anchorElement?.getBoundingClientRect().top,
     beforeScroll = messageScrollMetrics().top;
   if (!replaceHydratedTurnsWithStubs([turnId])) return false;
