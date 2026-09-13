@@ -49,8 +49,10 @@ import {
   watchSystemTheme,
 } from "./state.js";
 import {
+  activityToolTitle,
   adjacentTurnIndex,
   documentOwnsMessageScroll,
+  latestActivityMessages,
   messageBottomDistance,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
@@ -2640,6 +2642,8 @@ function toolSummaryPreview(tool) {
 function localizedToolPreview(tool) {
   const preview = tool.preview || tool.name;
   if (tool.name === "write_stdin") return tr("waitingOutput");
+  const activityTitle = activityToolTitle(tool, state.current);
+  if (activityTitle) return activityTitle;
   if (tool.name === "web_search") {
     const match = preview.replace(/^搜索\s+/, "").match(/^(.*) 等 (\d+) 项$/);
     return match
@@ -2972,7 +2976,8 @@ function preserveLoadedToolDetails(previous, next) {
 }
 
 function reconcileMessageNodes(root, response, activeToolMessage) {
-  const existing = new Map(
+  const messages = latestActivityMessages(response.messages),
+    existing = new Map(
       [...root.querySelectorAll(".message[data-message-index]")].map((message) => [
         message.dataset.messageIndex,
         message,
@@ -2987,10 +2992,10 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
       ]),
     );
   if (response.page.has_more) nodes.push(root.querySelector(":scope > .older") || olderButton());
-  for (const message of response.messages) {
+  for (const message of messages) {
     const key = String(message.message_index),
       previous = existing.get(key),
-      keepToolsRunning = message === activeToolMessage,
+      keepToolsRunning = message.message_index === activeToolMessage?.message_index,
       previousState = previous ? renderedMessageState.get(previous) : null,
       signature = JSON.stringify(message);
     if (
@@ -3005,7 +3010,7 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
     if (previous) preserveLoadedToolDetails(previous, next);
     messageNodes.set(key, next);
   }
-  const turns = groupedTurns(response.messages);
+  const turns = groupedTurns(messages);
   for (const [turnIndex, turn] of turns.entries()) {
     const section = turnSections.get(turn.key) || document.createElement("section"),
       members = turn.messages.map((message) => messageNodes.get(String(message.message_index))),
@@ -3018,7 +3023,7 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
     layoutTurnGroup(section, turn, members, completed);
     nodes.push(section);
   }
-  if (!response.messages.length) {
+  if (!messages.length) {
     const empty = root.querySelector(":scope > .empty") || document.createElement("div");
     empty.className = "empty";
     empty.textContent = tr("noMessages");

@@ -4680,7 +4680,7 @@ fn app_server_tools_for_messages(
             .get(thread_id)
             .filter(|entry| wanted.is_subset(&entry.known_message_ids))
         {
-            return Ok(wanted
+            let cached = wanted
                 .iter()
                 .filter_map(|id| {
                     entry
@@ -4689,7 +4689,14 @@ fn app_server_tools_for_messages(
                         .cloned()
                         .map(|tools| (id.clone(), tools))
                 })
-                .collect());
+                .collect::<HashMap<_, _>>();
+            if !cached
+                .values()
+                .flatten()
+                .any(|tool| tool.activity_key().is_some())
+            {
+                return Ok(cached);
+            }
         }
     }
 
@@ -4699,6 +4706,7 @@ fn app_server_tools_for_messages(
     let mut seen_cursors = HashSet::new();
     let mut pending_tools = Vec::<ThreadToolCall>::new();
     let mut current_turn = None::<String>;
+    let mut latest_activities = HashSet::<String>::new();
     for _ in 0..MAX_APP_SERVER_TOOL_PAGES {
         let result = write_backend.app_server_rpc(
             "thread/items/list",
@@ -4741,6 +4749,11 @@ fn app_server_tools_for_messages(
                 continue;
             }
             if let Some(tool) = typed_thread_tool(item) {
+                if let Some(key) = tool.activity_key() {
+                    if !latest_activities.insert(key) {
+                        continue;
+                    }
+                }
                 pending_tools.push(tool);
             }
         }
@@ -7584,6 +7597,9 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
         "command_action_count": command_actions.map(<[Value]>::len),
         "command_actions_parallel": command_actions
             .is_some_and(|actions| actions.len() > 1 && command_actions_are_parallel(tool)),
+        "activity_key": tool.activity_key(),
+        "activity_label": tool.activity_label(),
+        "activity_sender_id": tool.activity_sender_id(),
     })
 }
 
@@ -7634,6 +7650,13 @@ fn compact_tool_bytes(tool: &ThreadToolCall) -> usize {
 fn tool_preview(tool: &ThreadToolCall) -> String {
     if tool.name == "write_stdin" {
         return "等待输出".to_owned();
+    }
+    if matches!(tool.name.as_str(), "wait" | "wait_agent") {
+        return format!(
+            "wait ({})",
+            tool.activity_label()
+                .unwrap_or_else(|| "subagent".to_owned())
+        );
     }
     if tool.name == "exec_command" {
         let command = structured_command_actions(tool)
@@ -9845,6 +9868,30 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact["command_action_count"], 2);
         assert_eq!(compact["command_actions_parallel"], false);
         assert_eq!(structured_command_actions(&tool).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn wait_activity_uses_the_agent_nickname_in_its_compact_title() {
+        let tool = typed_thread_tool(&json!({
+            "type":"collabAgentToolCall",
+            "id":"wait-1",
+            "tool":"wait",
+            "status":"completed",
+            "senderThreadId":"parent",
+            "receiverThreadIds":["agent-a"],
+            "receiverAgents":[{
+                "threadId":"agent-a",
+                "agentNickname":"Atlas",
+                "agentRole":"worker"
+            }],
+            "agentsStates":{"agent-a":{"status":"completed"}}
+        }))
+        .unwrap();
+        let compact = compact_tool_summary(&tool, 0);
+        assert_eq!(compact["preview"], "wait (Atlas)");
+        assert_eq!(compact["activity_key"], "wait:agent-a");
+        assert_eq!(compact["activity_label"], "Atlas");
+        assert_eq!(compact["activity_sender_id"], "parent");
     }
 
     #[test]

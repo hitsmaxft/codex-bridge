@@ -38,8 +38,10 @@ import {
   storedSessionId,
 } from "../src/session-route.js";
 import {
+  activityToolTitle,
   adjacentTurnIndex,
   documentOwnsMessageScroll,
+  latestActivityMessages,
   messageBottomDistance,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
@@ -969,6 +971,50 @@ test("turn navigation selects the nearest turn start in either direction", () =>
   assert.equal(adjacentTurnIndex([50, 420], 50, "up"), -1);
   assert.equal(adjacentTurnIndex([50, 420], 50, "down"), 1);
   assert.equal(adjacentTurnIndex(tops, 50, "sideways"), -1);
+});
+
+test("async tool activities keep only their latest snapshot across turns", () => {
+  const messages = [
+      {
+        message_index: 1,
+        turn_id: "turn-1",
+        tools: [
+          { name: "wait", activity_key: "wait:agent-a" },
+          { name: "write_stdin", activity_key: "write_stdin:7" },
+        ],
+      },
+      {
+        message_index: 8,
+        turn_id: "turn-2",
+        tools: [{ name: "wait", activity_key: "wait:agent-a" }],
+      },
+      {
+        message_index: 12,
+        turn_id: "turn-3",
+        tools: [
+          { name: "write_stdin", activity_key: "write_stdin:7" },
+          { name: "write_stdin", activity_key: "write_stdin:9" },
+        ],
+      },
+    ],
+    visible = latestActivityMessages(messages);
+  assert.deepEqual(visible[0].tools, []);
+  assert.deepEqual(
+    visible[1].tools.map((tool) => tool.name),
+    ["wait"],
+  );
+  assert.deepEqual(
+    visible[2].tools.map((tool) => tool.activity_key),
+    ["write_stdin:7", "write_stdin:9"],
+  );
+  assert.equal(
+    activityToolTitle(
+      { name: "wait", activity_sender_id: "agent-a" },
+      { id: "agent-a", title: "layout-review" },
+    ),
+    "wait (layout-review)",
+  );
+  assert.equal(activityToolTitle({ name: "wait", activity_label: "Atlas" }, null), "wait (Atlas)");
 });
 
 test("conversation exposes floating previous and next turn controls", async () => {

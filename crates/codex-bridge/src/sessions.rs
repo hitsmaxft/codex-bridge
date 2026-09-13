@@ -147,6 +147,149 @@ pub struct ThreadToolCall {
     pub has_image: bool,
 }
 
+impl ThreadToolCall {
+    fn decoded_input(&self) -> Value {
+        let mut value = self.input.clone();
+        if let Some(encoded) = value.as_str() {
+            value = serde_json::from_str(encoded).unwrap_or(value);
+        }
+        if let Some(encoded) = value.get("request").and_then(Value::as_str) {
+            if let Ok(decoded) = serde_json::from_str(encoded) {
+                value = decoded;
+            }
+        }
+        value
+    }
+
+    pub fn activity_key(&self) -> Option<String> {
+        let input = self.decoded_input();
+        match self.name.as_str() {
+            "write_stdin" => {
+                let session = input
+                    .get("session_id")
+                    .or_else(|| input.pointer("/arguments/session_id"))
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "default".to_owned());
+                Some(format!("write_stdin:{session}"))
+            }
+            "wait" | "wait_agent" => {
+                let mut targets = input
+                    .get("receiverThreadIds")
+                    .or_else(|| input.get("receiver_thread_ids"))
+                    .or_else(|| input.pointer("/arguments/targets"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if targets.is_empty() {
+                    targets.extend(
+                        input
+                            .get("agentsStates")
+                            .or_else(|| input.get("agents_states"))
+                            .and_then(Value::as_object)
+                            .into_iter()
+                            .flat_map(|states| states.keys().cloned()),
+                    );
+                }
+                targets.sort();
+                targets.dedup();
+                Some(format!("wait:{}", targets.join(",")))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn activity_label(&self) -> Option<String> {
+        if !matches!(self.name.as_str(), "wait" | "wait_agent") {
+            return None;
+        }
+        let input = self.decoded_input();
+        let mut labels = input
+            .get("receiverAgents")
+            .or_else(|| input.get("receiver_agents"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|agent| {
+                agent
+                    .get("agentNickname")
+                    .or_else(|| agent.get("agent_nickname"))
+                    .or_else(|| agent.get("agentRole"))
+                    .or_else(|| agent.get("agent_role"))
+                    .and_then(Value::as_str)
+            })
+            .filter(|label| !label.trim().is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if labels.is_empty() {
+            labels.extend(
+                input
+                    .pointer("/arguments/targets")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|target| !target.trim().is_empty() && !target.contains('-'))
+                    .map(str::to_owned),
+            );
+        }
+        labels.sort();
+        labels.dedup();
+        (!labels.is_empty()).then(|| labels.join(", "))
+    }
+
+    pub fn activity_sender_id(&self) -> Option<String> {
+        let input = self.decoded_input();
+        input
+            .get("senderThreadId")
+            .or_else(|| input.get("sender_thread_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+}
+
+fn latest_tool_activity_positions(
+    all_messages: &[ThreadMessage],
+) -> HashMap<String, (usize, usize)> {
+    let mut latest = HashMap::<String, (usize, usize)>::new();
+    for (message_index, message) in all_messages.iter().enumerate() {
+        for (tool_index, tool) in message.tools.iter().enumerate() {
+            if let Some(key) = tool.activity_key() {
+                latest.insert(key, (message_index, tool_index));
+            }
+        }
+    }
+    latest
+}
+
+fn retain_message_tool_activities(
+    message: &mut ThreadMessage,
+    message_index: usize,
+    latest: &HashMap<String, (usize, usize)>,
+) {
+    let mut tool_index = 0;
+    message.tools.retain(|tool| {
+        let keep = tool
+            .activity_key()
+            .is_none_or(|key| latest.get(&key) == Some(&(message_index, tool_index)));
+        tool_index += 1;
+        keep
+    });
+}
+
+fn retain_latest_tool_activities(
+    all_messages: &[ThreadMessage],
+    page_messages: &mut [ThreadMessage],
+    page_start: usize,
+) {
+    let latest = latest_tool_activity_positions(all_messages);
+    for (offset, message) in page_messages.iter_mut().enumerate() {
+        retain_message_tool_activities(message, page_start + offset, &latest);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectSummary {
     pub path: PathBuf,
@@ -818,10 +961,12 @@ impl SessionStore {
         let total = messages.len();
         let end = before.unwrap_or(total).min(total);
         let start = end.saturating_sub(limit);
+        let mut page_messages = messages[start..end].to_vec();
+        retain_latest_tool_activities(&messages, &mut page_messages, start);
         Ok(Some((
             summary,
             MessagePage {
-                messages: messages[start..end].to_vec(),
+                messages: page_messages,
                 start,
                 end,
                 total,
@@ -902,14 +1047,17 @@ impl SessionStore {
             return Ok(Some(Vec::new()));
         }
         let messages = self.messages_for_path(&summary.rollout_path)?;
-        Ok(Some(
-            messages
-                .iter()
-                .enumerate()
-                .filter(|(_, message)| message.turn_id.as_deref() == Some(turn_id))
-                .map(|(index, message)| (index, message.clone()))
-                .collect(),
-        ))
+        let latest = latest_tool_activity_positions(&messages);
+        let mut indexed = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.turn_id.as_deref() == Some(turn_id))
+            .map(|(index, message)| (index, message.clone()))
+            .collect::<Vec<_>>();
+        for (index, message) in &mut indexed {
+            retain_message_tool_activities(message, *index, &latest);
+        }
+        Ok(Some(indexed))
     }
 
     pub fn read_message(
@@ -3242,6 +3390,62 @@ mod tests {
         assert_eq!(
             modes.iter().filter(|mode| **mode == "memory_hit").count(),
             3
+        );
+    }
+
+    #[test]
+    fn activity_tools_keep_only_the_latest_snapshot_across_message_pages() {
+        let activity = |call_id: &str, name: &str, input: Value| ThreadToolCall {
+            call_id: call_id.to_owned(),
+            name: name.to_owned(),
+            status: "completed".to_owned(),
+            input,
+            output: None,
+            has_image: false,
+        };
+        let mut messages = vec![
+            ThreadMessage {
+                timestamp: None,
+                id: Some("old".into()),
+                turn_id: Some("turn-1".into()),
+                role: "assistant".into(),
+                phase: Some("commentary".into()),
+                content: Vec::new(),
+                tools: vec![
+                    activity("wait-old", "wait", json!({"receiverThreadIds":["agent-a"]})),
+                    activity("stdin-old", "write_stdin", json!({"session_id":7})),
+                ],
+            },
+            ThreadMessage {
+                timestamp: None,
+                id: Some("new".into()),
+                turn_id: Some("turn-2".into()),
+                role: "assistant".into(),
+                phase: Some("commentary".into()),
+                content: Vec::new(),
+                tools: vec![
+                    activity("wait-new", "wait", json!({"receiverThreadIds":["agent-a"]})),
+                    activity("stdin-new", "write_stdin", json!({"session_id":7})),
+                    activity("stdin-other", "write_stdin", json!({"session_id":9})),
+                ],
+            },
+        ];
+
+        let all_messages = messages.clone();
+        let mut older_page = vec![messages[0].clone()];
+        retain_latest_tool_activities(&all_messages, &mut older_page, 0);
+        assert!(older_page[0].tools.is_empty());
+
+        retain_latest_tool_activities(&all_messages, &mut messages, 0);
+        assert!(messages[0].tools.is_empty());
+        assert_eq!(messages[1].tools.len(), 3);
+        assert_eq!(
+            messages[1].tools[0].activity_key().as_deref(),
+            Some("wait:agent-a")
+        );
+        assert_eq!(
+            messages[1].tools[1].activity_key().as_deref(),
+            Some("write_stdin:7")
         );
     }
 
