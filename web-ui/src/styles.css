@@ -1625,6 +1625,40 @@ main.history-fullscreen .fullscreen-exit-icon {
 .message.assistant .message-head {
   display: none;
 }
+.assistant-output {
+  position: relative;
+}
+.assistant-output.collapse-candidate,
+.assistant-output.collapsible:not(.expanded) {
+  max-height: 16em;
+  overflow: hidden;
+}
+.assistant-output.collapsible:not(.expanded)::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 3.2em;
+  background: linear-gradient(transparent, var(--panel));
+  content: "";
+  pointer-events: none;
+}
+.message-detail-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 30px;
+  margin: 6px 0 4px;
+  padding: 4px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 650;
+}
+.message-detail-toggle[hidden] {
+  display: none;
+}
 .turn-meta-line {
   min-width: 0;
   margin-top: 3px;

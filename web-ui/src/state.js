@@ -43,6 +43,7 @@ export const state = {
   messageCache: new SessionMessageCache(3),
   visibleMessages: [],
   expandedTurnIds: new Set(),
+  expandedLongMessageIds: new Set(),
   hydratedTurns: new Map(),
   hydratingTurns: new Map(),
   openToken: 0,

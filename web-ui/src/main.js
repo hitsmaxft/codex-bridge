@@ -16,6 +16,7 @@ import { goalToggleState } from "./goal-state.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import { memoryCitationModel } from "./memory-citations.js";
+import { shouldCollapseAssistantOutput, toolFileList } from "./message-presentation.js";
 import { pendingInputSummary, reconcilePendingMessages } from "./pending-state.js";
 import {
   browserNotificationState,
@@ -2754,6 +2755,7 @@ function toolGroupNode(message, keepRunning = false, threadId = state.current?.i
   icon.className = `tool-icon ${toolIconClass(latest.name)}`;
   icon.title = latest.name;
   const editedFiles = tools.reduce((total, tool) => total + (tool.file_count || 0), 0);
+  const editedFileList = toolFileList(tools, state.current?.cwd);
   const activityTitle = activityToolTitle(latest, state.current);
   label.className = "tool-summary-label";
   label.textContent = activityTitle
@@ -2769,11 +2771,13 @@ function toolGroupNode(message, keepRunning = false, threadId = state.current?.i
       : [
           tr("ranTools"),
           tr("toolCount", { count: tools.length }),
-          editedFiles ? tr("editedFiles", { count: editedFiles }) : "",
+          editedFileList || (editedFiles ? tr("editedFiles", { count: editedFiles }) : ""),
         ]
           .filter(Boolean)
           .join(" ");
-  label.title = running ? latest.preview || latest.name : label.textContent;
+  label.title =
+    toolFileList(tools, state.current?.cwd, 8) ||
+    (running ? latest.preview || latest.name : label.textContent);
   summary.append(icon, label);
   if (activityTitle && activityThreadIds(latest).length > 0) {
     summary.classList.add("subagent-link");
@@ -2913,6 +2917,8 @@ function localizedToolPreview(tool) {
       : preview.replace(/^搜索\s+/, "");
   }
   if (tool.name === "apply_patch") {
+    const files = toolFileList([tool], state.current?.cwd);
+    if (files) return files;
     if (tool.file_count > 1) return tr("filesShort", { count: tool.file_count });
     return preview.replace(/^已(?:编辑|新建|删除|移动)\s+/, "");
   }
@@ -3055,12 +3061,13 @@ function preserveMessageElementPosition(element, change) {
 
 function collapseExpandedMessages() {
   const prefix = `${state.current?.id || ""}:`,
-    expanded = [...state.expandedTurnIds].filter((key) => key.startsWith(prefix));
-  for (const key of expanded) state.expandedTurnIds.delete(key);
-  if (expanded.length) renderVisibleMessages();
-  notify(
-    tr(expanded.length ? "messagesCollapsed" : "noExpandedMessages", { count: expanded.length }),
-  );
+    expandedTurns = [...state.expandedTurnIds].filter((key) => key.startsWith(prefix)),
+    expandedMessages = [...state.expandedLongMessageIds].filter((key) => key.startsWith(prefix));
+  for (const key of expandedTurns) state.expandedTurnIds.delete(key);
+  for (const key of expandedMessages) state.expandedLongMessageIds.delete(key);
+  const expandedCount = expandedTurns.length + expandedMessages.length;
+  if (expandedCount) renderVisibleMessages();
+  notify(tr(expandedCount ? "messagesCollapsed" : "noExpandedMessages", { count: expandedCount }));
   closePanels();
 }
 
@@ -3195,7 +3202,12 @@ function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) 
     ),
     usageItems = content.filter((item) => item.kind === "turn_usage"),
     memoryItems = content.filter((item) => item.kind === "memory_citation");
-  for (const item of ordinaryItems) body.appendChild(contentNode(item, threadId));
+  const assistantOutput = m.role === "assistant" ? document.createElement("div") : body;
+  if (m.role === "assistant") {
+    assistantOutput.className = "assistant-output collapse-candidate";
+    body.appendChild(assistantOutput);
+  }
+  for (const item of ordinaryItems) assistantOutput.appendChild(contentNode(item, threadId));
   const copyText = content
     .filter((item) => item.kind === "text" && typeof item.text === "string")
     .map((item) => item.text)
@@ -3215,6 +3227,24 @@ function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) 
   } else if (copy) body.appendChild(copy);
   for (const item of usageItems) body.appendChild(contentNode(item, threadId));
   if (memoryItems.length) body.appendChild(memoryCitationNode(memoryItems));
+  if (m.role === "assistant" && ordinaryItems.length) {
+    const toggle = document.createElement("button"),
+      expansionKey = `${threadId || ""}:${m.message_index}`;
+    toggle.type = "button";
+    toggle.className = "message-detail-toggle";
+    toggle.hidden = true;
+    toggle.onclick = () => {
+      const expanded = state.expandedLongMessageIds.has(expansionKey),
+        anchor = expanded ? toggle : box;
+      preserveMessageElementPosition(anchor, () => {
+        if (expanded) state.expandedLongMessageIds.delete(expansionKey);
+        else state.expandedLongMessageIds.add(expansionKey);
+        syncLongAssistantMessage(box);
+      });
+    };
+    body.appendChild(toggle);
+    box.dataset.longMessageKey = expansionKey;
+  }
   if (head.childNodes.length) box.appendChild(head);
   box.appendChild(body);
   renderedMessageState.set(box, {
@@ -3222,6 +3252,26 @@ function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) 
     keepToolsRunning,
   });
   return box;
+}
+
+function syncLongAssistantMessage(message) {
+  const output = message.querySelector(":scope > .message-body > .assistant-output"),
+    toggle = message.querySelector(":scope > .message-body > .message-detail-toggle"),
+    key = message.dataset.longMessageKey;
+  if (!output || !toggle || !key) return;
+  const long = shouldCollapseAssistantOutput(output.scrollHeight, messageScrollMetrics().client),
+    expanded = long && state.expandedLongMessageIds.has(key);
+  output.classList.toggle("collapsible", long);
+  output.classList.toggle("expanded", expanded);
+  output.classList.remove("collapse-candidate");
+  toggle.hidden = !long;
+  toggle.textContent = tr(expanded ? "collapseMessageDetails" : "expandMessageDetails");
+  toggle.setAttribute("aria-expanded", String(expanded));
+}
+
+function syncLongAssistantMessages(root = $("messages")) {
+  for (const message of root.querySelectorAll(".message[data-long-message-key]"))
+    syncLongAssistantMessage(message);
 }
 
 function preserveLoadedToolDetails(previous, next) {
@@ -3313,6 +3363,7 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
     cursor.remove();
     cursor = next;
   }
+  requestAnimationFrame(() => syncLongAssistantMessages(root));
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
@@ -5381,6 +5432,7 @@ window.addEventListener(
   "resize",
   () => {
     resizeComposerAfterViewportChange();
+    syncLongAssistantMessages();
     scheduleMessageTailLock();
   },
   { passive: true },
@@ -5429,16 +5481,23 @@ $("messages").addEventListener("wheel", markUserMessageScroll, { passive: true }
 $("messages").addEventListener(
   "load",
   (event) => {
-    if (event.target instanceof HTMLImageElement) scheduleMessageTailLock();
+    if (event.target instanceof HTMLImageElement) {
+      syncLongAssistantMessages();
+      scheduleMessageTailLock();
+    }
   },
   true,
 );
 const messageLayoutMutationObserver = new MutationObserver(() => {
+  syncLongAssistantMessages();
   scheduleMessageTailLock();
   updateTurnNavigation();
 });
 messageLayoutMutationObserver.observe($("messages"), { childList: true, subtree: true });
-document.fonts?.ready.then(scheduleMessageTailLock);
+document.fonts?.ready.then(() => {
+  syncLongAssistantMessages();
+  scheduleMessageTailLock();
+});
 const handleMessageScroll = () => {
   if (state.userScrolled) {
     messageScrollIntentVersion += 1;

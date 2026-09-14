@@ -7732,6 +7732,22 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
     let file_count = changes
         .map(<[Value]>::len)
         .or_else(|| raw_patch.map(|patch| apply_patch_paths(patch).len()));
+    let file_paths = changes
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(|change| change.get("path").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| {
+            raw_patch.map(|patch| {
+                apply_patch_paths(patch)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        });
     json!({
         "tool_index": tool_index,
         "name": tool.name,
@@ -7743,6 +7759,7 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
         "additions": patch_stats.map(|stats| stats.0),
         "deletions": patch_stats.map(|stats| stats.1),
         "file_count": file_count,
+        "file_paths": file_paths,
         "command_action_count": command_actions.map(<[Value]>::len),
         "command_actions_parallel": command_actions
             .is_some_and(|actions| actions.len() > 1 && command_actions_are_parallel(tool)),
@@ -10146,6 +10163,27 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact["file_count"], 1);
         assert_eq!(compact["name"], "apply_patch");
         assert_eq!(tool.input["changes"][0]["path"], "/tmp/src/sessions.rs");
+    }
+
+    #[test]
+    fn multi_file_change_summary_exposes_paths_without_eager_tool_details() {
+        let tool = typed_thread_tool(&json!({
+            "type":"fileChange",
+            "id":"patch-many",
+            "status":"completed",
+            "changes":[
+                {"path":"src/ui/main.js","kind":{"type":"update"},"diff":"+one"},
+                {"path":"web-ui/src/styles.css","kind":{"type":"update"},"diff":"+two"}
+            ]
+        }))
+        .unwrap();
+        let compact = compact_tool_summary(&tool, 0);
+        assert_eq!(compact["file_count"], 2);
+        assert_eq!(
+            compact["file_paths"],
+            json!(["src/ui/main.js", "web-ui/src/styles.css"])
+        );
+        assert!(compact.get("display_input").is_none());
     }
 
     #[test]
