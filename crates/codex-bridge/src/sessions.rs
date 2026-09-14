@@ -2151,6 +2151,34 @@ fn update_turn_metadata(
                 statistics.reasoning_output_tokens = usage.reasoning_output_tokens;
             }
         }
+        Some("item_completed")
+            if payload
+                .pointer("/item/type")
+                .and_then(Value::as_str)
+                .is_some_and(|item_type| item_type.eq_ignore_ascii_case("contextCompaction")) =>
+        {
+            let item_id = string_field(&payload["item"], "id");
+            if item_id.as_ref().is_some_and(|id| {
+                messages
+                    .iter()
+                    .any(|message| message.id.as_ref() == Some(id))
+            }) {
+                return;
+            }
+            messages.push(ThreadMessage {
+                timestamp: string_field(record, "timestamp"),
+                id: item_id,
+                turn_id: string_field(payload, "turn_id").or_else(|| pending.turn_id.clone()),
+                role: "system".to_owned(),
+                phase: Some("context_compaction".to_owned()),
+                content: vec![json!({
+                    "type": "codex_bridge_context_compaction",
+                    "started_at_ms": payload.get("started_at_ms").and_then(Value::as_u64),
+                    "completed_at_ms": payload.get("completed_at_ms").and_then(Value::as_u64),
+                })],
+                tools: Vec::new(),
+            });
+        }
         Some("task_complete" | "turn_aborted") => {
             if payload.get("type").and_then(Value::as_str) == Some("task_complete") {
                 statistics.completed_turns = statistics.completed_turns.saturating_add(1);
@@ -3045,6 +3073,40 @@ mod tests {
             100
         );
         assert_eq!(model_context_window, Some(258400));
+    }
+
+    #[test]
+    fn completed_context_compaction_becomes_a_special_turn_message() {
+        let mut messages = Vec::new();
+        let mut pending = PendingTurnMetadata {
+            turn_id: Some("turn-compact".to_owned()),
+            ..PendingTurnMetadata::default()
+        };
+        update_turn_metadata(
+            &json!({
+                "timestamp":"2026-09-14T00:00:10Z",
+                "payload":{
+                    "type":"item_completed",
+                    "turn_id":"turn-compact",
+                    "item":{"type":"ContextCompaction","id":"compact-1"},
+                    "started_at_ms":1_000,
+                    "completed_at_ms":10_000
+                }
+            }),
+            &mut messages,
+            &mut pending,
+            &mut ThreadStatistics::default(),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id.as_deref(), Some("compact-1"));
+        assert_eq!(messages[0].turn_id.as_deref(), Some("turn-compact"));
+        assert_eq!(messages[0].phase.as_deref(), Some("context_compaction"));
+        assert_eq!(
+            messages[0].content[0]["type"],
+            "codex_bridge_context_compaction"
+        );
+        assert_eq!(messages[0].content[0]["completed_at_ms"], 10_000);
     }
 
     struct Fixture {
@@ -3957,6 +4019,17 @@ text(await tools.web__run({search_query:[{q:"Codex app-server"}],response_length
         assert_eq!(tools[1].input["query"], "Codex app-server");
         assert_eq!(tools[0].call_id, "call-wrapper:0");
         assert_eq!(tools[1].call_id, "call-wrapper:1");
+    }
+
+    #[test]
+    fn wrapped_view_image_keeps_its_specific_tool_name() {
+        let script = r#"const r = await tools.view_image({path:"/workspace/board.png",detail:"original"}); image(r.image_url);"#;
+        let tools = parse_wrapped_tool_calls("call-image", "completed", script).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "view_image");
+        assert!(tools[0].input["request"]
+            .as_str()
+            .is_some_and(|request| request.contains("/workspace/board.png")));
     }
 
     #[test]

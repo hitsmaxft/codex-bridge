@@ -1458,10 +1458,24 @@ test("long assistant output collapses by viewport with controls at the message b
   assert.match(source, /shouldCollapseAssistantOutput\(output\.scrollHeight/);
   assert.match(stylesheet, /max-height:\s*16em/);
   assert.match(source, /body\.appendChild\(toggle\)/);
+  assert.ok(
+    source.indexOf("body.appendChild(toggle)") < source.indexOf("const copyText = content"),
+    "the disclosure belongs directly below the response, before tool activity",
+  );
   assert.match(source, /preserveMessageElementPosition\(anchor/);
   assert.match(stylesheet, /\.assistant-output\.collapsible:not\(\.expanded\)/);
+  assert.match(stylesheet, /\.message-detail-toggle\s*\{[^}]*border-radius:\s*999px/s);
   assert.match(translations, /expandMessageDetails:\s*"展开详情"/);
   assert.match(translations, /collapseMessageDetails:\s*"收起"/);
+});
+
+test("view image uses an image tool icon", async () => {
+  const [source, stylesheet] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+  assert.match(source, /"web_search", "view_image"/);
+  assert.match(stylesheet, /\.tool-icon\.view_image::before/);
 });
 
 test("multi-file tool summaries show compact relative file paths", async () => {
@@ -1481,6 +1495,19 @@ test("multi-file tool summaries show compact relative file paths", async () => {
   );
   assert.match(source, /editedFileList \|\| \(editedFiles/);
   assert.match(source, /toolFileList\(tools, state\.current\?\.cwd\)/);
+});
+
+test("context compaction renders as a persistent special message", async () => {
+  const [source, stylesheet, translations] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+    readFile(new URL("../src/i18n.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(source, /item\.kind === "context_compaction"/);
+  assert.match(source, /category === "compaction"/);
+  assert.match(source, /visibleLeadingNodes/);
+  assert.match(stylesheet, /\.context-compaction-notice/);
+  assert.match(translations, /contextCompactionComplete:\s*"上下文已压缩"/);
 });
 
 test("queued messages expose withdraw and convert-to-steer actions", async () => {

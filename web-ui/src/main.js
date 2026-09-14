@@ -2556,6 +2556,30 @@ function appendContextValue(details, value, label) {
 }
 function contentNode(item, threadId = state.current?.id) {
   if (item.kind === "text") return markdownNode(item.text, markdownOptions(threadId));
+  if (item.kind === "context_compaction") {
+    const notice = document.createElement("div"),
+      icon = document.createElement("span"),
+      label = document.createElement("span"),
+      started = Number(item.started_at_ms),
+      completed = Number(item.completed_at_ms),
+      seconds =
+        Number.isFinite(started) && Number.isFinite(completed) && completed >= started
+          ? Math.max(1, Math.round((completed - started) / 1000))
+          : null;
+    notice.className = "context-compaction-notice";
+    icon.className = "context-compaction-icon";
+    icon.textContent = "↻";
+    icon.setAttribute("aria-hidden", "true");
+    label.textContent = tr("contextCompactionComplete");
+    notice.append(icon, label);
+    if (seconds !== null) {
+      const duration = document.createElement("span");
+      duration.className = "context-compaction-duration";
+      duration.textContent = tr("contextCompactionDuration", { seconds });
+      notice.appendChild(duration);
+    }
+    return notice;
+  }
   if (item.kind === "turn_usage") {
     const node = turnMetaNode(turnTokenUsageText(item));
     node.classList.add("turn-token-usage");
@@ -2888,7 +2912,7 @@ function toolFinished(tool) {
 function toolIconClass(name) {
   if (["exec", "exec_command"].includes(name)) return "exec_command";
   if (["wait", "wait_agent"].includes(name)) return "agent";
-  return ["apply_patch", "write_stdin", "web_search"].includes(name) ? name : "other";
+  return ["apply_patch", "write_stdin", "web_search", "view_image"].includes(name) ? name : "other";
 }
 function toolActionText(name, running) {
   if (running) {
@@ -3082,7 +3106,15 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       (node, index) =>
         group.messages[index].role === "user" && group.messages[index].category === "user",
     ),
-    hiddenNodes = messageNodes.filter((node) => node !== finalNode && !userNodes.includes(node)),
+    persistentNodes = messageNodes.filter(
+      (node, index) => group.messages[index].category === "compaction",
+    ),
+    visibleLeadingNodes = messageNodes.filter(
+      (node) => userNodes.includes(node) || persistentNodes.includes(node),
+    ),
+    hiddenNodes = messageNodes.filter(
+      (node) => node !== finalNode && !visibleLeadingNodes.includes(node),
+    ),
     hasFinalTools = Boolean(finalIndex >= 0 && group.messages[finalIndex].tools?.length),
     hasDeferred = group.messages.some((message) => message.deferred),
     usage = turnUsageItem(group),
@@ -3166,7 +3198,9 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   section.classList.toggle("collapsed", !expanded);
   section.classList.toggle("expanded", expanded);
   for (const node of messageNodes) node.hidden = !expanded && hiddenNodes.includes(node);
-  const leading = expanded ? messageNodes.filter((node) => node !== finalNode) : userNodes;
+  const leading = expanded
+    ? messageNodes.filter((node) => node !== finalNode)
+    : visibleLeadingNodes;
   reconcileChildren(section, [
     ...leading,
     foldBlock,
@@ -3208,6 +3242,24 @@ function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) 
     body.appendChild(assistantOutput);
   }
   for (const item of ordinaryItems) assistantOutput.appendChild(contentNode(item, threadId));
+  if (m.role === "assistant" && ordinaryItems.length) {
+    const toggle = document.createElement("button"),
+      expansionKey = `${threadId || ""}:${m.message_index}`;
+    toggle.type = "button";
+    toggle.className = "message-detail-toggle";
+    toggle.hidden = true;
+    toggle.onclick = () => {
+      const expanded = state.expandedLongMessageIds.has(expansionKey),
+        anchor = expanded ? toggle : box;
+      preserveMessageElementPosition(anchor, () => {
+        if (expanded) state.expandedLongMessageIds.delete(expansionKey);
+        else state.expandedLongMessageIds.add(expansionKey);
+        syncLongAssistantMessage(box);
+      });
+    };
+    body.appendChild(toggle);
+    box.dataset.longMessageKey = expansionKey;
+  }
   const copyText = content
     .filter((item) => item.kind === "text" && typeof item.text === "string")
     .map((item) => item.text)
@@ -3227,24 +3279,6 @@ function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) 
   } else if (copy) body.appendChild(copy);
   for (const item of usageItems) body.appendChild(contentNode(item, threadId));
   if (memoryItems.length) body.appendChild(memoryCitationNode(memoryItems));
-  if (m.role === "assistant" && ordinaryItems.length) {
-    const toggle = document.createElement("button"),
-      expansionKey = `${threadId || ""}:${m.message_index}`;
-    toggle.type = "button";
-    toggle.className = "message-detail-toggle";
-    toggle.hidden = true;
-    toggle.onclick = () => {
-      const expanded = state.expandedLongMessageIds.has(expansionKey),
-        anchor = expanded ? toggle : box;
-      preserveMessageElementPosition(anchor, () => {
-        if (expanded) state.expandedLongMessageIds.delete(expansionKey);
-        else state.expandedLongMessageIds.add(expansionKey);
-        syncLongAssistantMessage(box);
-      });
-    };
-    body.appendChild(toggle);
-    box.dataset.longMessageKey = expansionKey;
-  }
   if (head.childNodes.length) box.appendChild(head);
   box.appendChild(body);
   renderedMessageState.set(box, {

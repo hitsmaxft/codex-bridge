@@ -4639,7 +4639,9 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
         status,
         input: Value::Object(input),
         output: (!output.is_empty()).then_some(Value::Object(output)),
-        has_image: false,
+        // ImageView identifies its image by path, so it remains an image tool
+        // even when app-server does not attach image bytes to the item.
+        has_image: item_type == "imageView",
     })
 }
 
@@ -7516,6 +7518,16 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
             continue;
         }
 
+        if item_type == "codex_bridge_context_compaction" {
+            content.push(json!({
+                "kind": "context_compaction",
+                "started_at_ms": item.get("started_at_ms"),
+                "completed_at_ms": item.get("completed_at_ms"),
+            }));
+            content_index += 1;
+            continue;
+        }
+
         if let Some(text) = text {
             if let Some(objective) = goal_objective(text) {
                 if !objective.trim().is_empty() {
@@ -7615,9 +7627,10 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
         content_index += 1;
     }
 
-    let category = match message.role.as_str() {
-        "user" if has_visible_text => "user",
-        "assistant" => "assistant",
+    let category = match (message.role.as_str(), message.phase.as_deref()) {
+        (_, Some("context_compaction")) => "compaction",
+        ("user", _) if has_visible_text => "user",
+        ("assistant", _) => "assistant",
         _ => "context",
     };
     json!({
@@ -7681,7 +7694,9 @@ fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Val
                 let index = group_start + relative_index;
                 let visible_user = message.role == "user"
                     && compact_message.get("category").and_then(Value::as_str) == Some("user");
-                let keep_content = visible_user || final_offset == Some(index);
+                let persistent_event =
+                    compact_message.get("category").and_then(Value::as_str) == Some("compaction");
+                let keep_content = visible_user || persistent_event || final_offset == Some(index);
                 let tool_count = compact_message
                     .get("tools")
                     .and_then(Value::as_array)
@@ -9960,6 +9975,49 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn context_compaction_stays_visible_in_a_deferred_completed_turn() {
+        let messages = vec![
+            ThreadMessage {
+                timestamp: None,
+                id: Some("user".into()),
+                turn_id: Some("turn-compact".into()),
+                role: "user".into(),
+                phase: None,
+                content: vec![json!({"type":"input_text","text":"Continue."})],
+                tools: Vec::new(),
+            },
+            ThreadMessage {
+                timestamp: None,
+                id: Some("compact-1".into()),
+                turn_id: Some("turn-compact".into()),
+                role: "system".into(),
+                phase: Some("context_compaction".into()),
+                content: vec![json!({
+                    "type":"codex_bridge_context_compaction",
+                    "started_at_ms":1_000,
+                    "completed_at_ms":10_000
+                })],
+                tools: Vec::new(),
+            },
+            ThreadMessage {
+                timestamp: None,
+                id: Some("final".into()),
+                turn_id: Some("turn-compact".into()),
+                role: "assistant".into(),
+                phase: Some("final_answer".into()),
+                content: vec![json!({"type":"output_text","text":"Done."})],
+                tools: Vec::new(),
+            },
+        ];
+
+        let compact = compact_web_message_page(&messages, 20);
+        assert_eq!(compact[1]["category"], "compaction");
+        assert_eq!(compact[1]["content"][0]["kind"], "context_compaction");
+        assert_eq!(compact[1]["content"][0]["completed_at_ms"], 10_000);
+        assert!(compact[1].get("deferred").is_none());
+    }
+
+    #[test]
     fn completed_turn_page_defers_image_tools() {
         let messages = vec![
             ThreadMessage {
@@ -10012,6 +10070,22 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(tool.input["command"], "git status --short");
         assert_eq!(tool.output.as_ref().unwrap()["aggregatedOutput"], "clean");
         assert_eq!(tool_preview(&tool), "git status --short");
+    }
+
+    #[test]
+    fn app_server_image_view_is_marked_as_an_image_tool() {
+        let tool = typed_thread_tool(&json!({
+            "type":"imageView",
+            "id":"image-1",
+            "path":"file:///workspace/board.png",
+            "status":"completed"
+        }))
+        .unwrap();
+        assert_eq!(tool.name, "view_image");
+        assert!(tool.has_image);
+
+        let compact = compact_tool_summary(&tool, 0);
+        assert_eq!(compact["has_image"], true);
     }
 
     #[test]
