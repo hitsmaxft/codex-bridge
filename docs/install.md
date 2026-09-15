@@ -5,10 +5,16 @@ Vite frontend, installs the Rust binaries with Cargo, writes
 `~/.config/codex-bridge/config.toml`, and installs one launchd or systemd user service. It never
 requires `sudo` and does not modify the signed Codex Desktop application.
 
-| Platform                 | Mode         | App-server                     | User service manager | Adapter          |
-| ------------------------ | ------------ | ------------------------------ | -------------------- | ---------------- |
-| macOS with Codex Desktop | `desktop`    | Bundled in `ChatGPT.app`       | launchd user agent   | `ws-unix-bridge` |
-| Linux without Desktop    | `standalone` | Open-source `codex app-server` | systemd user service | Not needed       |
+| Platform                  | Mode         | App-server                     | User service manager | Adapter          |
+| ------------------------- | ------------ | ------------------------------ | -------------------- | ---------------- |
+| macOS (recommended)       | `standalone` | Separately installed `codex`   | launchd user agent   | Not needed       |
+| Linux                     | `standalone` | Separately installed `codex`   | systemd user service | Not needed       |
+| macOS Desktop integration | `desktop`    | Bundled in `ChatGPT.app`       | launchd user agent   | `ws-unix-bridge` |
+
+Standalone is the default recommendation even when ChatGPT/Codex Desktop is installed. It avoids
+App bundle version changes, private runtime configuration, launch-environment interposition, and
+process-lifecycle conflicts. Both app-servers may read the same rollout store; per-session writer
+ownership prevents concurrent writes, and the Web UI exposes an explicit handoff described below.
 
 The bridge reads its runtime choices from the config file and can supervise the selected
 app-server itself. In macOS desktop mode it can also supervise `ws-unix-bridge` and publish the
@@ -22,8 +28,9 @@ Requirements:
 
 - current stable Rust and Cargo;
 - Node.js and npm for the one-time frontend build;
-- macOS: `/Applications/ChatGPT.app` with its bundled `codex` executable;
-- Linux: a standalone `codex` on `PATH` whose `app-server --help` supports a Unix listener.
+- macOS and Linux: a standalone `codex` on `PATH` whose `app-server --help` supports a Unix
+  listener;
+- optional macOS Desktop mode: `/Applications/ChatGPT.app` with its bundled `codex` executable.
 
 Clone the repository and run the platform installer as the target user:
 
@@ -31,8 +38,11 @@ Clone the repository and run the platform installer as the target user:
 git clone https://github.com/hitsmaxft/codex-bridge.git
 cd codex-bridge
 
-# macOS with Codex Desktop
+# macOS standalone (recommended and the script default)
 ./scripts/install-macos.sh
+
+# macOS App bundle interposition (advanced opt-in)
+./scripts/install-macos.sh --desktop
 
 # Linux with standalone Codex
 ./scripts/install-linux.sh
@@ -43,7 +53,8 @@ a private password file but prints only its path. Pass `--no-start` to install f
 loading or enabling services:
 
 ```sh
-./scripts/install-macos.sh --web-ui
+./scripts/install-macos.sh --standalone --web-ui
+./scripts/install-macos.sh --desktop --web-ui --no-start
 ./scripts/install-linux.sh --web-ui --no-start
 ```
 
@@ -55,8 +66,8 @@ Both scripts:
 4. preserve an existing config file instead of overwriting local changes;
 5. install and optionally start user-owned services.
 
-The macOS script also installs `ws-unix-bridge`. The Linux script deliberately does not install or
-start the Desktop adapter.
+The macOS script installs `ws-unix-bridge` only with `--desktop`. Standalone mode deliberately does
+not install or start the Desktop adapter.
 
 ## Configuration
 
@@ -64,9 +75,9 @@ The default path is `${XDG_CONFIG_HOME:-$HOME/.config}/codex-bridge/config.toml`
 [`../config.example.toml`](../config.example.toml) when configuring manually.
 
 ```toml
-mode = "desktop" # auto, desktop, or standalone
-codex_bin = "/Applications/ChatGPT.app/Contents/Resources/codex"
-app_server_socket = "~/.codex-bridge/bundled-app-server.sock"
+mode = "standalone" # recommended; desktop is advanced opt-in
+codex_bin = "~/.cargo/bin/codex"
+app_server_socket = "~/.codex-bridge/codex-app-server.sock"
 app_server_thread_cache = 3
 
 [web_ui]
@@ -79,7 +90,7 @@ public_origins = []
 
 [services]
 manage_app_server = true
-desktop_interposition = true
+desktop_interposition = false
 ws_bridge_listen = "127.0.0.1:18790"
 ws_bridge_bin = "~/.cargo/bin/ws-unix-bridge"
 
@@ -146,23 +157,39 @@ The macOS installer also verifies both the LaunchAgent label and the control soc
 returns error 5 immediately after unloading an older service, the installer enables the per-user
 label, retries bootstrap when necessary, and waits for `codexctl status` before reporting success.
 
-### Exclusive rollout writer safety
+### Per-session writer ownership and handoff
 
-All app-servers that use the same `CODEX_HOME` can write the same rollout history. Bundled and
-standalone releases may reject each other, but two copies of the same release do not consistently
-take a shared writer lock. Never run a private stdio app-server and the Bridge-managed listener at
-the same time.
+All app-servers using the same `CODEX_HOME` see the same rollout history, but only one app-server
+may own a given thread's active writer. Opening a thread in the Web UI asks Bridge's app-server to
+`thread/resume` it. The resulting states are explicit:
 
-The macOS installer inspects the selected `codex` executable before starting the user service. It
-defers startup only when a stdio app-server—either without `--listen` or with the newer explicit
-`--listen stdio://` form—is a direct child of the Codex/ChatGPT Desktop process. Short-lived stdio
-servers created by Computer Use, tests, terminals, or another app-server are ignored and do not
-interrupt Bridge's managed listener. A Desktop-owned conflict commonly appears when installation
-runs from an active Desktop session:
+- **Owned here:** normal write controls are enabled. **Tools → Release session lock** sends
+  `thread/unsubscribe`, allowing Desktop or another app-server to resume the thread.
+- **Used elsewhere:** an `already has an active writer` response leaves history readable, shows a
+  title-bar warning, and disables direct session writes. Composer submissions may still be added to
+  the app-server queue; `thread/queue/add` does not resume the thread or acquire its writer.
+- **Released here:** the Web UI stays read-only and ordinary refresh/reconnect does not silently
+  reacquire the writer. Queue input remains available without ownership. Use **Acquire session
+  lock** explicitly when the other app-server is done.
+- **Unavailable:** history remains readable, but write controls stay disabled until ownership can
+  be established.
+
+Do not release a session while its turn is running. The Web UI disables release during an active
+turn so the owning app-server can finish without losing its event subscription.
+
+This session-level mechanism does not make every historical Codex build safe for arbitrary
+concurrent rollout writes. Keep Bridge on the standalone runtime it was configured and tested
+with; do not point it at the executable inside `ChatGPT.app` while declaring standalone mode.
+
+The macOS installer verifies that standalone mode resolves a `codex` executable outside
+`ChatGPT.app`; use `--desktop` when App bundle integration is intentional. Before starting a
+managed app-server it also refuses a conflicting stdio writer instead of terminating it. In
+desktop mode, conflict detection is limited to a private stdio app-server directly owned by the
+Desktop process. A conflict can be handled without losing the current turn:
 
 ```sh
-./scripts/install-macos.sh --web-ui --no-start
-# Finish the current turn, fully quit Codex Desktop, then start the LaunchAgent.
+./scripts/install-macos.sh --standalone --web-ui --no-start
+# Finish the current turn, exit the conflicting Codex process, then start the LaunchAgent.
 ```
 
 Linux has no Desktop parent to distinguish, so it retains the stricter executable-based rule for
@@ -255,14 +282,27 @@ public_origins = ["https://codex.example.com"]
 Unauthenticated Web UI startup is rejected on non-loopback addresses. A direct LAN bind should
 retain bridge authentication, and cross-network access should use TLS or a VPN.
 
-## macOS Desktop topology
+## macOS standalone topology (recommended)
+
+The default macOS installer creates a launchd service for Bridge and its managed standalone
+app-server. It does not set Desktop environment variables, install the adapter, or modify/restart
+ChatGPT. Verify it with:
+
+```sh
+test -S "$HOME/.codex-bridge/codex-app-server.sock"
+launchctl print "gui/$(id -u)/local.codex-bridge.daemon"
+codexctl status
+```
+
+## macOS Desktop topology (advanced opt-in)
 
 The installer creates one file, `~/Library/LaunchAgents/local.codex-bridge.daemon.plist`, which
 starts the bridge with only `--config`. The daemon owns the bundled app-server and WS adapter child
 processes and writes their diagnostics to its log under
 `${XDG_STATE_HOME:-$HOME/.local/state}/codex-bridge`. All files are owned by the current user.
 
-Fully quit ChatGPT before installation or before changing this topology. After installation,
+Select this topology with `./scripts/install-macos.sh --desktop`. Fully quit ChatGPT before
+installation or before changing this topology. After installation,
 relaunch it so the new process inherits:
 
 ```text

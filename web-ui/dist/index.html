@@ -7,8 +7,8 @@
       content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
     />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=8adabf4887c5"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=86cbd5115a06">
+    <script type="module" crossorigin src="/assets/app.js?v=a59f2caf79f3"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=9a190336d2d4">
   </head>
   <body>
     <div class="app">
@@ -124,6 +124,7 @@
             >
               Choose a session
             </h2>
+            <span class="writer-lock-notice" id="writerLockNotice" hidden></span>
             <button
               id="repairHintBtn"
               class="repair-hint"
@@ -407,6 +408,7 @@
           <div class="tool-row">
             <button id="renameThreadBtn" data-i18n="renameCurrent">Rename session</button>
             <button id="collapseMessagesBtn" data-i18n="collapseMessages">Collapse messages</button>
+            <button id="writerLockBtn" type="button" hidden>Release session lock</button>
             <button class="danger" id="archiveThreadBtn" data-i18n="archiveCurrent">
               Archive current session
             </button>

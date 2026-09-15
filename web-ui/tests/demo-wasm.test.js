@@ -532,6 +532,23 @@ test("session hash routes to the requested demo session", async () => {
   assert.equal(sessionIdFromHash("#unrelated=value"), null);
 });
 
+test("startup loads a routed session independently from project and pin discovery", async () => {
+  const source = await readFile(mainScriptPath, "utf8"),
+    initialFlow = source.slice(
+      source.indexOf("async function loadInitialView"),
+      source.indexOf("async function loadPins"),
+    ),
+    projectsFlow = source.slice(
+      source.indexOf("async function loadProjects"),
+      source.indexOf("async function loadInitialView"),
+    );
+  assert.match(initialFlow, /const sessionRequest = openSessionById/);
+  assert.match(initialFlow, /projectsRequest = loadProjects\(\{ restoreSession: false \}\)/);
+  assert.ok(initialFlow.indexOf("sessionRequest") < initialFlow.indexOf("await projectsRequest"));
+  assert.doesNotMatch(projectsFlow, /Promise\.all\(\[[\s\S]*loadPins\(\)/);
+  assert.match(projectsFlow, /void loadPins\(\)\.then/);
+});
+
 test("an empty hash restores the last opened session", () => {
   const values = new Map();
   const storage = {
@@ -903,11 +920,12 @@ test("local workspace files open in a typed preview before download", async () =
   const preview = await readFile(new URL("../src/file-preview.js", import.meta.url), "utf8");
   const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
   const stylesheet = await readFile(stylesheetPath, "utf8");
-  assert.match(api, /fetch\("\/api\/file-preview"/);
+  assert.match(api, /fetchWithTimeout\(\s*"\/api\/file-preview"/);
   assert.match(markdown, /options\.requestLocalFilePreview/);
   assert.doesNotMatch(markdown, /link\.href = "#"/);
   assert.match(markdown, /link\.role = "button"/);
-  assert.match(source, /filePreview\.open\(preview, position\)/);
+  assert.match(source, /import\("\.\/file-preview\.js"\)/);
+  assert.match(source, /controller\.open\(preview, position\)/);
   assert.match(preview, /new EditorView/);
   assert.match(preview, /EditorState\.readOnly\.of\(true\)/);
   assert.match(preview, /EditorView\.scrollIntoView\(anchor/);
@@ -1374,6 +1392,12 @@ test("session return renders the latest batch before any older history", async (
   );
   assert.equal(openFlow.match(/fetchMessages\(/g)?.length, 1);
   assert.match(openFlow, /fetchMessages\(null, state\.initialPageSize\)/);
+  assert.match(openFlow, /await yieldToBrowser\(\)/);
+  assert.match(openFlow, /const messagesRequest = fetchMessages/);
+  assert.match(openFlow, /auxiliaryRequest = Promise\.all/);
+  assert.match(openFlow, /r = await messagesRequest/);
+  assert.match(openFlow, /void auxiliaryRequest\.then/);
+  assert.ok(openFlow.indexOf("r = await messagesRequest") < openFlow.indexOf("void auxiliaryRequest.then"));
   assert.match(stateSource, /initialPageSize: 8,[\s\S]*pageSize: 30/);
   assert.match(source, /state\.messageSyncPhase === "loading"/);
   assert.match(source, /validCached \|\| !changedThread \? "reconnecting" : "loading"/);
@@ -1387,6 +1411,13 @@ test("session return renders the latest batch before any older history", async (
   assert.match(stylesheet, /\.message-tail-spinner[\s\S]*animation: message-tail-spin/);
   assert.match(translations, /reconnectingMessages:/);
   assert.doesNotMatch(translations, /catchingUpMessages:|waitingForModelOutput:/);
+});
+
+test("initial session loading does not wait for an animation frame", async () => {
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8"),
+    yieldBody = source.match(/function yieldToBrowser\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.match(yieldBody, /setTimeout\(resolve, 0\)/);
+  assert.doesNotMatch(yieldBody, /requestAnimationFrame/);
 });
 
 test("token usage joins the turn fold while memory stays on the final response", async () => {
@@ -1463,6 +1494,7 @@ test("long assistant output collapses by viewport with controls at the message b
     "the disclosure belongs directly below the response, before tool activity",
   );
   assert.match(source, /preserveMessageElementPosition\(anchor/);
+  assert.match(source, /if \(toggle\.textContent !== label\) toggle\.textContent = label/);
   assert.match(stylesheet, /\.assistant-output\.collapsible:not\(\.expanded\)/);
   assert.match(stylesheet, /\.message-detail-toggle\s*\{[^}]*border-radius:\s*999px/s);
   assert.match(translations, /expandMessageDetails:\s*"展开详情"/);
@@ -1508,6 +1540,37 @@ test("context compaction renders as a persistent special message", async () => {
   assert.match(source, /visibleLeadingNodes/);
   assert.match(stylesheet, /\.context-compaction-notice/);
   assert.match(translations, /contextCompactionComplete:\s*"上下文已压缩"/);
+});
+
+test("session writer ownership drives read-only UI and explicit release", async () => {
+  const client = await demoClient();
+  const watch = result(await client({ command: "thread_watch", thread_id: "demo-active" }));
+  assert.equal(watch.writer_lock.state, "owned");
+  assert.equal(watch.writer_lock.read_only, false);
+  const released = result(
+    await client({ command: "thread_writer_release", thread_id: "demo-active" }),
+  );
+  assert.equal(released.writer_lock.state, "released");
+  assert.equal(released.writer_lock.read_only, true);
+
+  const [source, html, stylesheet, translations] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(indexPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+    readFile(new URL("../src/i18n.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(html, /id="writerLockNotice"/);
+  assert.match(html, /id="writerLockBtn"/);
+  assert.match(source, /command: releasing \? "thread_writer_release" : "thread_writer_acquire"/);
+  assert.match(source, /stateName === "external"\s*\? "sessionInUse"/);
+  assert.match(source, /readOnly = !currentThreadWritable\(\)/);
+  assert.match(source, /function currentThreadQueueable\(\)/);
+  assert.match(source, /submit\.disabled =[^;]*!queueable/);
+  assert.match(source, /if \(name === "steer" && !currentThreadWritable\(\)\) name = "send"/);
+  assert.match(source, /queueOnlyPlaceholder/);
+  assert.match(stylesheet, /\.composer-shell\.read-only/);
+  assert.match(translations, /sessionInUse:\s*"会话已被其他 app-server 使用 · 只读"/);
+  assert.match(translations, /queueWithoutLockAria:\s*"加入 queue，不获取会话锁"/);
 });
 
 test("queued messages expose withdraw and convert-to-steer actions", async () => {

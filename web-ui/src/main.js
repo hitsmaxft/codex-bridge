@@ -11,7 +11,6 @@ import {
   subscribeEvents,
   timeText,
 } from "./api.js";
-import { createFilePreviewController } from "./file-preview.js";
 import { goalToggleState } from "./goal-state.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
@@ -528,15 +527,16 @@ function renderGoalPanel() {
   const toggle = $("goalToggleBtn"),
     { canPause, canResume } = goalToggleState(status);
   toggle.hidden = !canPause && !canResume;
-  toggle.disabled = state.goalBusy;
+  toggle.disabled = state.goalBusy || !currentThreadWritable();
   toggle.textContent = tr(canPause ? "pauseGoal" : "resumeGoal");
-  $("goalEditBtn").disabled = state.goalBusy;
+  $("goalEditBtn").disabled = state.goalBusy || !currentThreadWritable();
   $("goalActionHelp").textContent = tr(
     canPause ? "pauseGoalHelp" : canResume ? "resumeGoalHelp" : "goalReadOnlyHelp",
   );
 }
 async function setThreadGoal(change, successKey) {
   if (!state.current || !state.threadGoal || state.goalBusy) return;
+  requireCurrentThreadWriter();
   const threadId = state.current.id;
   state.goalBusy = true;
   renderGoalPanel();
@@ -562,6 +562,7 @@ function setGoalPanelCollapsed(collapsed) {
 }
 function openGoalEditDialog() {
   if (!state.threadGoal) return;
+  requireCurrentThreadWriter();
   $("goalObjectiveInput").value = state.threadGoal.objective || "";
   $("goalEditDialog").hidden = false;
   requestAnimationFrame(() => $("goalObjectiveInput").focus());
@@ -588,11 +589,18 @@ async function toggleLanguage() {
   await loadStatus();
   if (state.current) await openThread(state.current, { quiet: true });
 }
-async function loadProjects() {
-  const [r] = await Promise.all([
-    command({ command: "projects", include_archived: $("archived").checked }, false),
-    loadPins(),
-  ]);
+async function openDefaultProjectThread() {
+  if (!state.projects.length) return;
+  const project = state.projects[0];
+  if (!state.expandedPreferenceSaved) setProjectExpanded(project.path, true);
+  const threads = await loadProjectThreads(project);
+  if (threads.length) await openThread(threads[0], { replaceHash: true });
+}
+async function loadProjects({ restoreSession = true } = {}) {
+  const r = await command(
+    { command: "projects", include_archived: $("archived").checked },
+    false,
+  );
   state.projects = r.projects || [];
   state.projectThreads.clear();
   state.projectLoadGeneration += 1;
@@ -605,7 +613,8 @@ async function loadProjects() {
   }
   if (removedStalePath && state.expandedPreferenceSaved) rememberExpandedProjects();
   renderProjects();
-  if (!state.current) {
+  void loadPins().then(() => renderProjects());
+  if (!state.current && restoreSession) {
     const hashedId = sessionIdFromHash(window.location.hash),
       requestedId = hashedId || storedSessionId(window.localStorage);
     if (requestedId) {
@@ -620,13 +629,29 @@ async function loadProjects() {
         state.current = null;
       }
     }
-    if (state.projects.length) {
-      const project = state.projects[0];
-      if (!state.expandedPreferenceSaved) setProjectExpanded(project.path, true);
-      const threads = await loadProjectThreads(project);
-      if (threads.length) await openThread(threads[0], { replaceHash: true });
-    }
+    await openDefaultProjectThread();
   }
+  preloadExpandedProjectThreads();
+}
+async function loadInitialView() {
+  const hashedId = sessionIdFromHash(window.location.hash),
+    requestedId = hashedId || storedSessionId(window.localStorage);
+  if (!requestedId) return loadProjects();
+  const sessionRequest = openSessionById(requestedId, {
+      fromHash: Boolean(hashedId),
+      replaceHash: !hashedId,
+    }),
+    projectsRequest = loadProjects({ restoreSession: false });
+  try {
+    await sessionRequest;
+  } catch {
+    await projectsRequest;
+    if (!state.current) await openDefaultProjectThread();
+    preloadExpandedProjectThreads();
+    return;
+  }
+  await projectsRequest;
+  if (state.current?.id === requestedId) await revealSessionProject(state.current);
   preloadExpandedProjectThreads();
 }
 async function loadPins() {
@@ -1509,7 +1534,7 @@ function syncVoiceCapability() {
     capability = audioTranscriptionCapability(),
     unavailable = !capability?.enabled || !browserAudioAvailable(),
     submitting = document.querySelector(".composer-shell")?.classList.contains("submitting"),
-    busy = submitting || voiceTranscribing;
+    busy = submitting || voiceTranscribing || !currentThreadQueueable();
   button.classList.toggle("unavailable", unavailable);
   button.disabled = unavailable || busy;
   $("audioInput").disabled = unavailable || busy;
@@ -2502,18 +2527,32 @@ function makeInspectableImage(img) {
   return img;
 }
 
-const filePreview = createFilePreviewController({
-  root: $("filePreviewDialog"),
-  title: $("filePreviewTitle"),
-  meta: $("filePreviewMeta"),
-  body: $("filePreviewBody"),
-  closeButton: $("filePreviewClose"),
-  downloadButton: $("filePreviewDownload"),
-  modeButton: $("filePreviewMode"),
-  translate: tr,
-  renderMarkdown: (source) => markdownNode(source, markdownOptions(state.current?.id)),
-  inspectImage: openImageViewer,
-});
+let filePreview = null,
+  filePreviewRequest = null;
+async function getFilePreview() {
+  if (filePreview) return filePreview;
+  filePreviewRequest ||= import("./file-preview.js")
+    .then(({ createFilePreviewController }) =>
+      createFilePreviewController({
+        root: $("filePreviewDialog"),
+        title: $("filePreviewTitle"),
+        meta: $("filePreviewMeta"),
+        body: $("filePreviewBody"),
+        closeButton: $("filePreviewClose"),
+        downloadButton: $("filePreviewDownload"),
+        modeButton: $("filePreviewMode"),
+        translate: tr,
+        renderMarkdown: (source) => markdownNode(source, markdownOptions(state.current?.id)),
+        inspectImage: openImageViewer,
+      }),
+    )
+    .catch((error) => {
+      filePreviewRequest = null;
+      throw error;
+    });
+  filePreview = await filePreviewRequest;
+  return filePreview;
+}
 
 function appendContextValue(details, value, label) {
   const values = Array.isArray(value) ? value : [value];
@@ -2630,7 +2669,8 @@ function markdownOptions(threadId) {
     requestLocalFilePreview: async (path, position) => {
       if (!threadId) throw new Error(tr("chooseSessionError"));
       const preview = await requestFilePreview(threadId, path);
-      filePreview.open(preview, position);
+      const controller = await getFilePreview();
+      controller.open(preview, position);
     },
     onError: (error) => notify(error.message, true),
   };
@@ -3299,7 +3339,11 @@ function syncLongAssistantMessage(message) {
   output.classList.toggle("expanded", expanded);
   output.classList.remove("collapse-candidate");
   toggle.hidden = !long;
-  toggle.textContent = tr(expanded ? "collapseMessageDetails" : "expandMessageDetails");
+  const label = tr(expanded ? "collapseMessageDetails" : "expandMessageDetails");
+  // This function is called from the message MutationObserver. Replacing the
+  // text node unconditionally would trigger that observer again forever and
+  // lock the browser main thread immediately after the first message page.
+  if (toggle.textContent !== label) toggle.textContent = label;
   toggle.setAttribute("aria-expanded", String(expanded));
 }
 
@@ -3480,7 +3524,8 @@ function pendingNode(entry) {
       entry.action === "queue" &&
       entry.status === "queued" &&
       nativeQueue &&
-      !hasAttachmentSummary
+      !hasAttachmentSummary &&
+      currentThreadWritable()
     ) {
       const convert = document.createElement("button");
       convert.type = "button";
@@ -3567,7 +3612,7 @@ async function deletePending(entry, button) {
     $("messageText").value = text;
     resizeComposerTextarea();
     saveDraft(entry.thread_id, text, true);
-    setSendMode(r.message_action === "queue" ? "send" : "steer", false);
+    setSendMode(r.message_action === "queue" || !currentThreadWritable() ? "send" : "steer", false);
     state.pending = state.pending.filter(
       (item) => item.id !== entry.id || item.thread_id !== entry.thread_id,
     );
@@ -3581,6 +3626,7 @@ async function deletePending(entry, button) {
 }
 async function convertPendingToSteer(entry, button) {
   if (state.current?.id !== entry.thread_id) throw new Error(tr("pendingWrongSession"));
+  requireCurrentThreadWriter();
   button.disabled = true;
   const activity = await refreshActivity();
   if (!activity?.activity.active_turn_id) {
@@ -3915,6 +3961,7 @@ function showActivity() {
           : tr("modelRunning");
   el.classList.toggle("active", active);
   document.querySelector(".composer-shell").classList.toggle("agent-active", active);
+  if (state.threadWriterLock?.state === "owned") $("writerLockBtn").disabled = active;
   syncSubmitAction();
   el.textContent = active
     ? state.pendingChanges
@@ -3979,7 +4026,7 @@ async function refreshComposerStatus() {
     ? [state.composerModel, state.composerEffort].filter(Boolean).join(" · ")
     : tr("selectModel");
   $("modelPickerBtn").title = state.composerModel ? effort.textContent : tr("selectModelHelp");
-  $("modelPickerBtn").disabled = false;
+  $("modelPickerBtn").disabled = !currentThreadWritable();
   $("composerStatus").hidden = !state.current;
   renderPending();
 }
@@ -4089,6 +4136,7 @@ async function toggleModelPicker() {
 }
 async function applyThreadSettings() {
   if (!state.current) throw new Error(tr("chooseSessionError"));
+  requireCurrentThreadWriter();
   const threadId = state.current.id,
     model = $("modelSelect").value,
     effort = $("effortSelect").value;
@@ -4430,12 +4478,21 @@ function syncFocusedComposerViewport() {
 function syncComposerPlaceholder() {
   const textarea = $("messageText"),
     shell = document.querySelector(".composer-shell"),
+    queueOnly = currentThreadQueueable() && !currentThreadWritable(),
     compact =
       usesDocumentMessageScroll() &&
       !textarea.value &&
       document.activeElement !== textarea &&
       !shell.classList.contains("input-focused");
-  textarea.placeholder = tr(compact ? "messagePlaceholderCompact" : "messagePlaceholder");
+  textarea.placeholder = tr(
+    queueOnly
+      ? compact
+        ? "queueOnlyPlaceholderCompact"
+        : "queueOnlyPlaceholder"
+      : compact
+        ? "messagePlaceholderCompact"
+        : "messagePlaceholder",
+  );
 }
 function settleHorizontalPosition() {
   requestAnimationFrame(() => {
@@ -4498,6 +4555,13 @@ function restoreMessageView(view) {
     else scrollMessagesToBottom("auto");
   } else scrollMessagesToBottom("auto");
 }
+function yieldToBrowser() {
+  // A backgrounded or newly restored mobile tab may suspend animation frames
+  // indefinitely.  This yield is on the critical path before the first
+  // messages request, so use a task boundary that still runs when rAF is
+  // throttled rather than making session startup depend on a paint callback.
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 async function openThread(
   thread,
   {
@@ -4522,6 +4586,7 @@ async function openThread(
       state.referenceDrafts.set(state.current.id, state.composerReference);
   }
   state.current = thread;
+  if (changedThread) applyThreadWriterLock({ state: "checking", read_only: true, reason: null });
   syncTemporaryForCurrent();
   if (changedThread) {
     state.threadGoal = null;
@@ -4586,19 +4651,25 @@ async function openThread(
       renderMessageTailStatus();
     }
   }
-  let r, pendingResult, goalResult;
-  try {
-    [r, , , pendingResult, goalResult] = await Promise.all([
-      fetchMessages(null, state.initialPageSize),
-      refreshActivity(),
-      demoMode
-        ? Promise.resolve()
-        : command({ command: "thread_watch", thread_id: thread.id }, false)
-            .then((watch) => updateThreadLiveFromStatus(thread.id, watch.thread?.status))
-            .catch(() => {}),
+  await yieldToBrowser();
+  if (token !== state.openToken) return;
+  const messagesRequest = fetchMessages(null, state.initialPageSize),
+    auxiliaryRequest = Promise.all([
+      refreshActivity().catch(() => null),
+      command({ command: "thread_watch", thread_id: thread.id }, false)
+        .then((watch) => {
+          updateThreadLiveFromStatus(thread.id, watch.thread?.status);
+          return watch;
+        })
+        .catch((error) => ({
+          writer_lock: { state: "unavailable", read_only: true, reason: error.message },
+        })),
       command({ command: "pending_messages", thread_id: thread.id }, false).catch(() => null),
       command({ command: "thread_goal_get", thread_id: thread.id }, false).catch(() => undefined),
     ]);
+  let r;
+  try {
+    r = await messagesRequest;
   } catch (error) {
     if (token === state.openToken) setMessageSyncPhase(null);
     throw error;
@@ -4614,10 +4685,9 @@ async function openThread(
   renderRepairHint(r.repair_required);
   renderThreadStatistics(mergeThreadStatistics(r.statistics));
   r.messages = mergeHydratedTurnMessages(r.messages, thread.id);
-  state.pending = mergePendingResponse(pendingResult?.messages || state.pending, true, r.messages);
+  state.pending = mergePendingResponse(state.pending, true, r.messages);
   state.messageCache.set(thread.id, r);
   state.current = { ...thread, ...r.thread };
-  if (goalResult) state.threadGoal = goalResult.goal || null;
   renderGoalPanel();
   rememberSessionId(window.localStorage, state.current.id);
   if (writeHash) updateSessionHash(state.current.id, replaceHash);
@@ -4650,8 +4720,22 @@ async function openThread(
   state.lastMessageRefresh = Date.now();
   setMessageSyncPhase(null);
   showActivity();
-  await refreshWorkspaceDiff(true);
   if (!quiet) settleHorizontalPosition();
+  void auxiliaryRequest.then(([, watchResult, pendingResult, goalResult]) => {
+    if (token !== state.openToken || state.current?.id !== thread.id) return;
+    applyThreadWriterLock(watchResult?.writer_lock);
+    state.pending = mergePendingResponse(
+      pendingResult?.messages || state.pending,
+      true,
+      r.messages,
+    );
+    if (goalResult) state.threadGoal = goalResult.goal || null;
+    renderPending();
+    renderGoalPanel();
+    renderVisibleMessages();
+    showActivity();
+  });
+  void refreshWorkspaceDiff(true).catch(() => {});
 }
 async function refreshThread() {
   if (!state.current) return notify(tr("chooseSessionError"), true);
@@ -4741,14 +4825,73 @@ function targetRequest(name, extra = {}) {
   if (!state.current) throw new Error(tr("chooseSessionError"));
   return { command: name, thread_id: state.current.id, ...extra };
 }
+function currentThreadWritable() {
+  return Boolean(state.current && state.threadWriterLock?.state === "owned");
+}
+function currentThreadQueueable() {
+  return Boolean(
+    state.current && ["owned", "external", "released"].includes(state.threadWriterLock?.state),
+  );
+}
+function requireCurrentThreadWriter() {
+  if (!currentThreadWritable()) throw new Error(tr("sessionReadOnly"));
+}
+function applyThreadWriterLock(lock) {
+  const normalized = lock || {
+    state: "unavailable",
+    read_only: true,
+    reason: null,
+  };
+  state.threadWriterLock = normalized;
+  const notice = $("writerLockNotice"),
+    button = $("writerLockBtn"),
+    stateName = normalized.state || "unavailable",
+    noticeKey =
+      stateName === "external"
+        ? "sessionInUse"
+        : stateName === "released"
+          ? "sessionLockReleased"
+          : "sessionLockUnavailable";
+  notice.hidden = !state.current || stateName === "owned" || stateName === "checking";
+  notice.textContent = notice.hidden ? "" : tr(noticeKey);
+  notice.title = normalized.reason || notice.textContent;
+  button.hidden = !state.current || ["checking", "unavailable"].includes(stateName);
+  button.disabled =
+    stateName === "checking" || (stateName === "owned" && Boolean(state.activeTurnId));
+  button.dataset.action = stateName === "owned" ? "release" : "acquire";
+  button.textContent = tr(
+    stateName === "owned"
+      ? "releaseSessionLock"
+      : stateName === "external"
+        ? "retrySessionLock"
+        : "acquireSessionLock",
+  );
+  const readOnly = !currentThreadWritable();
+  document.querySelector(".composer-shell").classList.toggle("read-only", readOnly);
+  if (readOnly && $("sendMode").value === "steer") setSendMode("send", true);
+  for (const id of [
+    "renameThreadBtn",
+    "archiveThreadBtn",
+    "repairOrdinalsBtn",
+    "modelPickerBtn",
+    "goalEditBtn",
+    "goalToggleBtn",
+  ]) {
+    const control = $(id);
+    if (control) control.disabled = readOnly;
+  }
+  syncVoiceCapability();
+  syncSubmitAction();
+}
 function setComposerSubmitting(active) {
   state.composerSubmitting = active;
   const shell = document.querySelector(".composer-shell");
   shell.classList.toggle("submitting", active);
   $("messageText").disabled = active;
-  $("sendModeToggle").disabled = active;
-  $("attachBtn").disabled = active;
-  $("imageInput").disabled = active;
+  $("messageText").readOnly = !currentThreadQueueable();
+  $("sendModeToggle").disabled = active || !currentThreadWritable();
+  $("attachBtn").disabled = active || !currentThreadQueueable();
+  $("imageInput").disabled = active || !currentThreadQueueable();
   syncVoiceCapability();
   syncSubmitAction();
 }
@@ -4765,13 +4908,20 @@ function syncSubmitAction() {
   stop.setAttribute("aria-label", stop.title);
   stop.setAttribute("aria-hidden", String(!stopReady));
   stop.tabIndex = stopReady ? 0 : -1;
-  stop.disabled = state.interrupting;
-  submit.disabled = state.composerSubmitting || state.interrupting;
-  submit.title = tr("submitAria");
+  const writable = currentThreadWritable(),
+    queueable = currentThreadQueueable();
+  $("messageText").readOnly = !queueable;
+  $("sendModeToggle").disabled = state.composerSubmitting || !writable;
+  $("attachBtn").disabled = state.composerSubmitting || !queueable;
+  $("imageInput").disabled = state.composerSubmitting || !queueable;
+  stop.disabled = state.interrupting || !writable;
+  submit.disabled = state.composerSubmitting || state.interrupting || !queueable;
+  submit.title = tr(queueable && !writable ? "queueWithoutLockAria" : "submitAria");
   submit.setAttribute("aria-label", submit.title);
   syncComposerPlaceholder();
 }
 async function interruptCurrentRun({ confirm = true, requireActive = false } = {}) {
+  requireCurrentThreadWriter();
   const interruptedTurnId = state.activeTurnId;
   if ((requireActive && !interruptedTurnId) || state.interrupting) return;
   const pendingCount = state.pending.filter(
@@ -4803,6 +4953,7 @@ async function interruptCurrentRun({ confirm = true, requireActive = false } = {
 }
 async function continuePendingQueue() {
   if (!state.current) throw new Error(tr("chooseSessionError"));
+  requireCurrentThreadWriter();
   const threadId = state.current.id,
     entry = state.pending.find(
       (pending) =>
@@ -4854,6 +5005,7 @@ async function write(name) {
     }
     return;
   }
+  if (name === "steer" && !currentThreadWritable()) name = "send";
   const threadId = state.current.id,
     submissionId = newSubmissionId();
   let action = name === "steer" ? "steer" : "queue";
@@ -5011,9 +5163,29 @@ $("submitBtn").onclick = () => run(() => write($("sendMode").value));
 $("stopBtn").onclick = () => run(() => interruptCurrentRun({ requireActive: true }));
 $("interruptBtn").onclick = () => run(() => interruptCurrentRun());
 $("mobileInterruptBtn").onclick = () => $("interruptBtn").click();
+$("writerLockBtn").onclick = () =>
+  run(async () => {
+    if (!state.current) throw new Error(tr("chooseSessionError"));
+    const threadId = state.current.id,
+      releasing = state.threadWriterLock?.state === "owned";
+    if (releasing && !window.confirm(tr("releaseSessionLockConfirm"))) return;
+    const result = await command(
+      {
+        command: releasing ? "thread_writer_release" : "thread_writer_acquire",
+        thread_id: threadId,
+      },
+      false,
+    );
+    if (state.current?.id !== threadId) return;
+    applyThreadWriterLock(result.writer_lock);
+    if (result.writer_lock?.state === "owned") notify(tr("sessionLockAcquiredToast"));
+    else if (result.writer_lock?.state === "released") notify(tr("sessionLockReleasedToast"));
+    else notify(tr("sessionLockStillUsed"), true);
+  });
 $("renameThreadBtn").onclick = () =>
   run(async () => {
     if (!state.current) throw new Error(tr("chooseSessionError"));
+    requireCurrentThreadWriter();
     const currentName = state.current.title || "";
     const entered = window.prompt(tr("renamePrompt"), currentName);
     if (entered === null) return;
@@ -5031,11 +5203,14 @@ $("renameThreadBtn").onclick = () =>
 $("archiveThreadBtn").onclick = () =>
   run(async () => {
     if (!state.current) throw new Error(tr("chooseSessionError"));
+    requireCurrentThreadWriter();
     const threadId = state.current.id,
       title = state.current.title || threadId;
     if (!window.confirm(tr("archiveConfirm", { title }))) return;
     await command({ command: "thread_archive", thread_id: threadId }, false);
     state.current = null;
+    state.threadWriterLock = null;
+    applyThreadWriterLock(null);
     state.threadGoal = null;
     renderGoalPanel();
     state.activeTurnId = null;
@@ -5061,6 +5236,7 @@ $("archiveThreadBtn").onclick = () =>
 $("repairOrdinalsBtn").onclick = () =>
   run(async () => {
     if (!state.current) throw new Error(tr("chooseSessionError"));
+    requireCurrentThreadWriter();
     if (!window.confirm(tr("repairOrdinalsConfirm"))) return;
     const button = $("repairOrdinalsBtn"),
       threadId = state.current.id;
@@ -5491,7 +5667,7 @@ document.addEventListener("click", (event) => {
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (imageViewer.root && !imageViewer.root.hidden) closeImageViewer();
-  else if (filePreview.isOpen()) filePreview.close();
+  else if (filePreview?.isOpen()) filePreview.close();
   else if (!$("tasksDialog").hidden) closeTasksDialog();
   else if (!$("createDialog").hidden) closeCreateDialog();
   else if (isHistoryFullscreen()) setHistoryFullscreen(false);
@@ -5593,8 +5769,7 @@ watchSystemTheme();
 run(async () => {
   await authenticate();
   subscribeEvents(handleBridgeEvent);
-  await loadStatus();
-  await loadProjects();
+  await Promise.all([loadStatus(), loadInitialView()]);
 });
 setInterval(() => {
   if (!state.eventStreamConnected) pollActivity().catch(() => {});

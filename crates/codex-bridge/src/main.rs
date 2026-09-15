@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{get, post};
@@ -27,8 +27,8 @@ use codex_bridge::{
     default_codex_home, default_socket_path, BackendFailure, ClientPerformanceSample,
     CodexCliBackend, ComposerAttachment, HostExecFailure, HostExecutor, Request, Response,
     RolloutOrdinalRepair, SessionStore, ThreadMessage, ThreadProjectIndex, ThreadSummary,
-    ThreadToolCall, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV, CHATS_PROJECT_PATH,
-    CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
+    ThreadToolCall, ThreadWriterState, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV,
+    CHATS_PROJECT_PATH, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
@@ -63,6 +63,7 @@ const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/c
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
 const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
 const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
+const WEB_FILE_PREVIEW_JS: &str = include_str!("../../../web-ui/dist/assets/file-preview.js");
 const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
 const MAX_PERFORMANCE_EVENTS: usize = 128;
@@ -3249,6 +3250,7 @@ fn web_router(state: WebState) -> Router {
         .route("/", get(web_index))
         .route("/assets/app.js", get(web_app_js))
         .route("/assets/app.css", get(web_app_css))
+        .route("/assets/file-preview.js", get(web_file_preview_js))
         .route("/api/auth", get(web_auth_check))
         .route("/api/file-ticket", post(web_file_ticket))
         .route("/api/file", get(web_file_download))
@@ -3261,20 +3263,51 @@ fn web_router(state: WebState) -> Router {
 }
 
 async fn web_index(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
-    web_asset_response(&state, &headers, WEB_INDEX, "text/html; charset=utf-8")
+    web_asset_response(
+        &state,
+        &headers,
+        WEB_INDEX,
+        "text/html; charset=utf-8",
+        "private, no-cache",
+    )
 }
 
-async fn web_app_js(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+async fn web_app_js(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> HttpResponse {
     web_asset_response(
         &state,
         &headers,
         WEB_APP_JS,
         "text/javascript; charset=utf-8",
+        web_asset_cache_control(query.as_deref()),
     )
 }
 
-async fn web_app_css(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
-    web_asset_response(&state, &headers, WEB_APP_CSS, "text/css; charset=utf-8")
+async fn web_app_css(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> HttpResponse {
+    web_asset_response(
+        &state,
+        &headers,
+        WEB_APP_CSS,
+        "text/css; charset=utf-8",
+        web_asset_cache_control(query.as_deref()),
+    )
+}
+
+async fn web_file_preview_js(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    web_asset_response(
+        &state,
+        &headers,
+        WEB_FILE_PREVIEW_JS,
+        "text/javascript; charset=utf-8",
+        "private, no-cache",
+    )
 }
 
 async fn web_auth_check(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
@@ -3767,6 +3800,7 @@ fn web_asset_response(
     headers: &HeaderMap,
     body: &'static str,
     content_type: &'static str,
+    cache_control: &'static str,
 ) -> HttpResponse {
     let auth = state.auth.as_deref();
     let basic_authenticated = auth.is_some_and(|auth| basic_auth_allowed(headers, auth));
@@ -3782,12 +3816,25 @@ fn web_asset_response(
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+        HeaderValue::from_static(cache_control),
     );
     if let Some(auth) = auth.filter(|_| basic_authenticated) {
         set_web_session_cookie(&mut response, headers, auth, &state.public_origins);
     }
     response
+}
+
+fn web_asset_cache_control(query: Option<&str>) -> &'static str {
+    let versioned = query
+        .and_then(|query| query.strip_prefix("v="))
+        .is_some_and(|version| {
+            version.len() == 12 && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if versioned {
+        "private, max-age=31536000, immutable"
+    } else {
+        "private, no-cache"
+    }
 }
 
 async fn web_command(
@@ -5515,6 +5562,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "pending message and thread identifiers must be non-empty and bounded",
                 );
             }
+            if let Err(response) = require_owned_thread_writer(write_backend, &thread_id) {
+                return response;
+            }
             if let Err(response) =
                 resolve_write_target(Some(thread_id.clone()), session_store, selected_thread)
             {
@@ -5950,6 +6000,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
         },
         Request::ThreadWatch { thread_id } => match write_backend.watch_thread(&thread_id) {
             Ok(subscription) => {
+                let writer_state = write_backend.thread_writer_state(&thread_id);
                 let thread = if subscription.pointer("/thread/status").is_some() {
                     Ok(subscription)
                 } else {
@@ -5961,17 +6012,83 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 match thread {
                     Ok(thread) => Response::success(json!({
                         "thread_id": thread_id,
-                        "subscribed": true,
+                        "subscribed": writer_state == ThreadWriterState::Owned,
+                        "writer_lock": thread_writer_lock_value(writer_state, None),
                         "thread": {
                             "id": thread.pointer("/thread/id").and_then(Value::as_str),
                             "status": thread.pointer("/thread/status").cloned(),
                         },
                     })),
-                    Err(error) => write_backend_error(error),
+                    Err(error) => Response::success(json!({
+                        "thread_id": thread_id,
+                        "subscribed": writer_state == ThreadWriterState::Owned,
+                        "writer_lock": thread_writer_lock_value(writer_state, Some(&error.message)),
+                        "thread": null,
+                    })),
                 }
             }
-            Err(error) => write_backend_error(error),
+            Err(error) => {
+                let writer_state = match write_backend.thread_writer_state(&thread_id) {
+                    ThreadWriterState::Unknown => ThreadWriterState::Unavailable,
+                    state => state,
+                };
+                Response::success(json!({
+                    "thread_id": thread_id,
+                    "subscribed": false,
+                    "writer_lock": thread_writer_lock_value(writer_state, Some(&error.message)),
+                    "thread": null,
+                }))
+            }
         },
+        Request::ThreadWriterRelease { thread_id } => {
+            if let Err(response) =
+                resolve_read_target(Some(thread_id.clone()), session_store, selected_thread)
+            {
+                return response;
+            }
+            if write_backend
+                .app_server_rpc(
+                    "thread/read",
+                    json!({"threadId": thread_id, "includeTurns": false}),
+                )
+                .is_ok_and(|thread| thread_result_is_active(&thread))
+            {
+                return Response::error(
+                    "thread_writer_active",
+                    "cannot release the session writer while its turn is active",
+                );
+            }
+            match write_backend.release_thread(&thread_id) {
+                Ok(_) => Response::success(json!({
+                    "thread_id": thread_id,
+                    "writer_lock": thread_writer_lock_value(ThreadWriterState::Released, None),
+                })),
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::ThreadWriterAcquire { thread_id } => {
+            if let Err(response) =
+                resolve_read_target(Some(thread_id.clone()), session_store, selected_thread)
+            {
+                return response;
+            }
+            match write_backend.acquire_thread(&thread_id) {
+                Ok(_) => Response::success(json!({
+                    "thread_id": thread_id,
+                    "writer_lock": thread_writer_lock_value(ThreadWriterState::Owned, None),
+                })),
+                Err(error) => {
+                    let writer_state = match write_backend.thread_writer_state(&thread_id) {
+                        ThreadWriterState::Unknown => ThreadWriterState::Unavailable,
+                        state => state,
+                    };
+                    Response::success(json!({
+                        "thread_id": thread_id,
+                        "writer_lock": thread_writer_lock_value(writer_state, Some(&error.message)),
+                    }))
+                }
+            }
+        }
         Request::ComposerStatus { thread_id } => {
             let thread = write_backend
                 .app_server_rpc(
@@ -6085,6 +6202,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     Ok(resolved) => resolved,
                     Err(response) => return response,
                 };
+            if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
+                return response;
+            }
             let mut params = serde_json::Map::from_iter([(
                 "threadId".to_owned(),
                 Value::String(resolved.thread.id.clone()),
@@ -6498,6 +6618,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             model,
             effort,
         } => {
+            if let Err(response) = require_owned_thread_writer(write_backend, &thread_id) {
+                return response;
+            }
             if model.is_empty() || model.len() > 128 || effort.is_empty() || effort.len() > 32 {
                 return Response::error(
                     "invalid_request",
@@ -6542,6 +6665,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     Ok(resolved) => resolved,
                     Err(response) => return response,
                 };
+            if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
+                return response;
+            }
             match write_backend.app_server_rpc(
                 "thread/name/set",
                 json!({"threadId": resolved.thread.id, "name": name}),
@@ -6566,6 +6692,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     Ok(resolved) => resolved,
                     Err(response) => return response,
                 };
+            if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
+                return response;
+            }
             match write_backend
                 .app_server_rpc("thread/archive", json!({"threadId": resolved.thread.id}))
             {
@@ -6781,7 +6910,11 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
-            if resolved.thread.rollout_path.as_os_str().is_empty() {
+            let starts_if_idle = matches!(
+                write_backend.thread_writer_state(&resolved.thread.id),
+                ThreadWriterState::Owned | ThreadWriterState::Unknown
+            );
+            if starts_if_idle && resolved.thread.rollout_path.as_os_str().is_empty() {
                 return start_empty_thread_turn(
                     session_store,
                     write_backend,
@@ -6818,7 +6951,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "replayed": true,
                 }));
             }
-            match write_backend.queue_message(&resolved.thread.id, &input, &pending_id) {
+            let queue_result = if starts_if_idle {
+                write_backend.queue_message(&resolved.thread.id, &input, &pending_id)
+            } else {
+                write_backend.queue_message_without_start(&resolved.thread.id, &input, &pending_id)
+            };
+            match queue_result {
                 Ok(receipt) => {
                     pending_messages
                         .finish_queue(&pending_id, receipt.queued_submission_id.clone());
@@ -6843,7 +6981,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                             && (error.message.contains("requires experimentalApi")
                                 || error.message.contains("Method not found")
                                 || error.message.contains("does not support thread/queue/add")));
-                    if compatible_fallback && attachments.is_empty() {
+                    if starts_if_idle && compatible_fallback && attachments.is_empty() {
                         match write_backend.queue_message_via_cli(&resolved.thread.id, &text) {
                             Ok(backend) => {
                                 pending_messages.finish(&pending_id, "queued", None);
@@ -6888,6 +7026,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
+            if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
+                return response;
+            }
             if resolved.thread.rollout_path.as_os_str().is_empty() {
                 return start_empty_thread_turn(
                     session_store,
@@ -7038,6 +7179,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
+            if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
+                return response;
+            }
             // App-server notifications can reach the Web UI before the matching
             // rollout line is flushed. Prefer the turn observed by the client,
             // while retaining rollout lookup for CLI and older clients.
@@ -8201,6 +8345,35 @@ fn user_request_from_file_wrapper(text: &str) -> Option<&str> {
 
 fn write_backend_error(error: BackendFailure) -> Response {
     Response::error(error.code, error.message)
+}
+
+fn thread_writer_lock_value(state: ThreadWriterState, reason: Option<&str>) -> Value {
+    json!({
+        "state": state,
+        "read_only": state != ThreadWriterState::Owned,
+        "reason": reason,
+    })
+}
+
+fn require_owned_thread_writer(
+    write_backend: &CodexCliBackend,
+    thread_id: &str,
+) -> Result<(), Response> {
+    match write_backend.thread_writer_state(thread_id) {
+        ThreadWriterState::External => Err(Response::error(
+            "thread_writer_external",
+            "the session is read-only because another app-server owns its active writer",
+        )),
+        ThreadWriterState::Released => Err(Response::error(
+            "thread_writer_released",
+            "the session is read-only because its writer was released from this app-server",
+        )),
+        ThreadWriterState::Unavailable => Err(Response::error(
+            "thread_writer_unavailable",
+            "the session is read-only because its writer state is unavailable",
+        )),
+        ThreadWriterState::Unknown | ThreadWriterState::Owned => Ok(()),
+    }
 }
 
 fn host_exec_error(error: HostExecFailure) -> Response {
@@ -9693,6 +9866,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(WEB_INDEX.contains("/assets/app.css"));
         assert!(WEB_INDEX.contains("/assets/app.js?v="));
         assert!(WEB_INDEX.contains("/assets/app.css?v="));
+        assert!(WEB_APP_JS.contains("./file-preview.js"));
+        assert!(WEB_FILE_PREVIEW_JS.contains("createFilePreviewController"));
 
         let source = concat!(
             include_str!("../../../web-ui/index.html"),
@@ -9846,6 +10021,23 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(!source.contains("max-height: min(52dvh, 480px)"));
         assert!(!source.contains("sessionStorage"));
         assert!(!source.contains("state.delivery"));
+    }
+
+    #[test]
+    fn versioned_web_assets_are_browser_cached_without_caching_bare_urls() {
+        assert_eq!(
+            web_asset_cache_control(Some("v=0123456789ab")),
+            "private, max-age=31536000, immutable"
+        );
+        assert_eq!(web_asset_cache_control(None), "private, no-cache");
+        assert_eq!(
+            web_asset_cache_control(Some("v=not-a-hash")),
+            "private, no-cache"
+        );
+        assert_eq!(
+            web_asset_cache_control(Some("v=0123456789ab&extra=1")),
+            "private, no-cache"
+        );
     }
 
     #[test]

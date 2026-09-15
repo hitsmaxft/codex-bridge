@@ -1175,6 +1175,31 @@ main {
   position: relative;
   min-width: 0;
 }
+.writer-lock-notice {
+  display: inline-flex;
+  max-width: min(420px, 48vw);
+  margin-left: 7px;
+  padding: 2px 7px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--warning, #d49a35) 46%, var(--line));
+  border-radius: 999px;
+  color: var(--warning, #d49a35);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.writer-lock-notice[hidden] {
+  display: none;
+}
+.composer-shell.read-only {
+  border-color: color-mix(in srgb, var(--warning, #d49a35) 36%, var(--line));
+}
+.composer-shell.read-only textarea {
+  cursor: text;
+}
 .repair-hint {
   display: inline-grid;
   width: 22px;
@@ -3776,6 +3801,22 @@ label.caption {
     cursor: pointer;
     font-size: 15px;
     line-height: 18px;
+  }
+  .writer-lock-notice {
+    display: flex;
+    max-width: 62vw;
+    width: max-content;
+    margin: 2px 0 0;
+    padding: 0;
+    overflow: hidden;
+    border: 0;
+    border-radius: 0;
+    font-size: 9px;
+    line-height: 11px;
+    text-overflow: ellipsis;
+  }
+  .writer-lock-notice[hidden] {
+    display: none;
   }
   .compact-meta {
     display: block;

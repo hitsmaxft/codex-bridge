@@ -1,6 +1,6 @@
-# auto preserves the legacy behavior. Installations should normally choose
-# desktop on macOS with Codex Desktop, or standalone for an external app-server.
-mode = "auto"
+# Standalone is the recommended deployment on macOS and Linux. It avoids App
+# bundle/runtime coupling. Use desktop only for explicit Desktop interposition.
+mode = "standalone"
 
 # Paths may be absolute or start with ~/.
 # socket = "~/.codex-bridge/control.sock"

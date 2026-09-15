@@ -29,18 +29,16 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.0 · 2026-09-13
+### v0.3.1 · 2026-09-15
 
-- **Codex-aligned session control:** manage goals, active turns, models, Queue/Steer, run statistics,
-  files, and structured tool activity from one typed interface.
-- **New reading and exploration tools:** switch to a composer-free history view, collapse or refresh
-  the conversation, preview workspace files, zoom images, and turn selected text into a temporary
-  focused conversation.
-- **Long-session workspace:** open the newest bounded window immediately, expand full turns on
-  demand, and keep task overview and runtime architecture available without loading an entire
-  rollout into the browser.
+- **Safe multi-app session handoff:** open externally owned sessions read-only, keep Queue input
+  available without taking ownership, and release or reacquire Bridge's per-session writer lock.
+- **Live session telemetry:** see in-progress turn tokens, cache usage and hit rate, tool counts,
+  compact polling activity, and linked subagent conversations directly in the session workspace.
+- **Focused mobile reading:** collapse long assistant replies and completed turns, navigate between
+  turns, inspect image and file activity, and load the newest bounded history window responsively.
 
-See the [latest release notes](docs/releases/v0.3.0.md) or the
+See the [latest release notes](docs/releases/v0.3.1.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
@@ -66,9 +64,27 @@ anonymous file endpoint or depend on Basic Auth being forwarded by a navigation.
 
 ## How it connects
 
-There are two supported deployment shapes.
+There are two supported deployment shapes. **Use standalone mode by default**, including on macOS.
+It keeps Bridge on an independently installed Codex CLI/app-server and avoids coupling the service
+to a changing App bundle, Desktop launch environment, and private bundled runtime. Desktop
+interposition remains an advanced opt-in compatibility mode.
 
-### Codex Desktop on macOS
+### Standalone Codex (recommended)
+
+```text
+standalone codex app-server ── Unix WebSocket ── codex-bridge daemon ── Web UI / codexctl
+                                                        │
+                                                   rollout store
+```
+
+Bridge supervises the standalone app-server on its Unix socket. Codex Desktop may remain installed
+and independent. If Desktop or another app-server already owns a session writer, the Web UI opens
+that session read-only and marks it as in use. Queueing remains available in this state and does not
+acquire the writer; direct send, steer, interrupt, and session mutations remain disabled. For a
+writer owned by Bridge, use **Tools → Release session lock** before opening the same session in
+Desktop.
+
+### Codex Desktop interposition on macOS (advanced)
 
 ```text
 Codex Desktop ── TCP WebSocket ── ws-unix-bridge ── Unix WebSocket ── app-server
@@ -79,7 +95,7 @@ Codex Desktop ── TCP WebSocket ── ws-unix-bridge ── Unix WebSocket �
                                              Web UI / codexctl
 ```
 
-The app-server executable comes from `ChatGPT.app`. In the installed desktop mode,
+The app-server executable comes from `ChatGPT.app`. In explicit desktop mode,
 `codex-bridge` supervises both that process and the loopback adapter, then publishes
 `CODEX_APP_SERVER_WS_URL` through the user's launchd environment. launchd only has to keep the one
 bridge daemon alive. This transport interposition is local and does not patch or re-sign the app
@@ -87,18 +103,6 @@ bundle. Bridge owns the managed app-server lifecycle so session maintenance can 
 repair a rollout atomically, and restart it without a competing process. The managed Desktop app-server also
 starts with a disabled `mcp_servers.codex_app` base entry; Desktop can then send its incremental
 `enabled_tools` configuration and resume an existing thread directly, without a Web UI preload.
-
-### Standalone Codex, including Linux
-
-```text
-standalone codex app-server ── Unix WebSocket ── codex-bridge daemon ── Web UI / codexctl
-                                                        │
-                                                   rollout store
-```
-
-In the installed standalone mode, `codex-bridge` supervises the open-source app-server on its Unix
-socket. Without Codex Desktop there is no Desktop connection to intercept, so `ws-unix-bridge` is
-unnecessary.
 
 See [Installation and service setup](docs/install.md) for global Cargo installation, launchd and
 systemd examples, optional Web UI configuration, validation, and rollback.
@@ -119,7 +123,8 @@ The user-level installers build the embedded frontend, install the required Carg
 `~/.config/codex-bridge/config.toml`, and start the appropriate user services without `sudo`:
 
 ```sh
-./scripts/install-macos.sh --web-ui  # Codex Desktop + launchd
+./scripts/install-macos.sh --web-ui  # standalone Codex + launchd (recommended)
+./scripts/install-macos.sh --desktop --web-ui  # optional App bundle interposition
 ./scripts/install-linux.sh --web-ui  # standalone app-server + systemd --user
 ```
 

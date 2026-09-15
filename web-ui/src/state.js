@@ -35,6 +35,7 @@ export const state = {
   expanded: new Set(),
   expandedPreferenceSaved: false,
   current: null,
+  threadWriterLock: null,
   creatingProject: null,
   threadCreationJobs: new Map(),
   before: null,

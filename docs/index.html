@@ -1219,56 +1219,54 @@
         </p>
         <div class="release">
           <div class="release-date">
-            2026-09-13
-            <span class="zh">v0.3.0 正式版</span
-            ><span class="en">v0.3.0 release</span>
+            2026-09-15
+            <span class="zh">v0.3.1 正式版</span
+            ><span class="en">v0.3.1 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">对齐 Codex 会话能力</span
-                ><span class="en">Codex-aligned session control</span>
+                <span class="zh">安全的多端会话接力</span
+                ><span class="en">Safe multi-app session handoff</span>
               </h3>
               <p class="zh">
-                在一个类型化界面中管理
-                Goal、运行状态、模型、Queue/Steer、文件与工具活动。
+                外部占用的会话以只读模式打开，Queue 无需抢锁，并可显式释放或重新获取会话写锁。
               </p>
               <p class="en">
-                Manage goals, runs, models, Queue/Steer, files, and structured
-                tool activity from one typed interface.
+                Open externally owned sessions read-only, keep Queue available,
+                and explicitly release or reacquire the writer lock.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">新的阅读与探索工具</span
-                ><span class="en">New reading and exploration tools</span>
+                <span class="zh">实时 Codex 活动</span
+                ><span class="en">Live Codex activity</span>
               </h3>
               <p class="zh">
-                全屏阅读、全部折叠、主动刷新、文件预览、图片缩放，并从选中文本开启临时对话。
+                提前显示 turn token 与缓存命中率，合并轮询活动，并可直接打开命名子 agent 对话。
               </p>
               <p class="en">
-                Read full-screen, collapse or refresh, preview files, zoom
-                images, and start a temporary conversation from selected text.
+                See live turn tokens and cache hit rate, compact polling
+                activity, and open named subagent conversations.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">面向长会话的工作区</span
-                ><span class="en">A long-session workspace</span>
+                <span class="zh">移动端长会话阅读</span
+                ><span class="en">Long-session mobile reading</span>
               </h3>
               <p class="zh">
-                最新消息窗口即时打开，完整 turn
-                按需展开，同时保留任务概览与运行架构视图。
+                长回复与完整 turn 按需展开，悬浮按钮切换相邻 turn，并保持最新消息窗口快速可用。
               </p>
               <p class="en">
-                Open the newest message window immediately, expand full turns on
-                demand, and retain task overview and runtime architecture.
+                Expand long replies and full turns on demand, navigate adjacent
+                turns, and keep the newest bounded history responsive.
               </p>
             </article>
           </div>
         </div>
         <div class="release-history">
-          <a href="releases/v0.3.0.md">
+          <a href="releases/v0.3.1.md">
             <span
               ><span class="zh">查看完整发布说明</span
               ><span class="en">Read the complete release notes</span></span

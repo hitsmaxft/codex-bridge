@@ -24,10 +24,10 @@ pub use sessions::{
 };
 pub use write_backend::{
     AppServerRuntimeInfo, BackendFailure, BackendSuccess, CodexCliBackend, NativeQueueReceipt,
-    StartedTurnReceipt, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
+    StartedTurnReceipt, ThreadWriterState, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +78,12 @@ pub enum Request {
         thread_id: String,
     },
     ThreadWatch {
+        thread_id: String,
+    },
+    ThreadWriterRelease {
+        thread_id: String,
+    },
+    ThreadWriterAcquire {
         thread_id: String,
     },
     ComposerStatus {
@@ -259,6 +265,8 @@ impl Request {
             Self::ToolContent { .. } => "tool_content",
             Self::ThreadActivity { .. } => "thread_activity",
             Self::ThreadWatch { .. } => "thread_watch",
+            Self::ThreadWriterRelease { .. } => "thread_writer_release",
+            Self::ThreadWriterAcquire { .. } => "thread_writer_acquire",
             Self::ComposerStatus { .. } => "composer_status",
             Self::ThreadGoalGet { .. } => "thread_goal_get",
             Self::ThreadGoalSet { .. } => "thread_goal_set",

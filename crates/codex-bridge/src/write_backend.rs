@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::unix::fs::FileTypeExt;
@@ -58,6 +58,10 @@ enum AppServerCommand {
         thread_id: String,
         response: std_mpsc::SyncSender<Result<Value, BackendFailure>>,
     },
+    ReleaseThread {
+        thread_id: String,
+        response: std_mpsc::SyncSender<Result<Value, BackendFailure>>,
+    },
     ForgetThread {
         thread_id: String,
     },
@@ -68,6 +72,17 @@ struct AppServerSession {
     commands: std_mpsc::Sender<AppServerCommand>,
     events: broadcast::Sender<Value>,
     runtime: Arc<RwLock<AppServerRuntimeInfo>>,
+    writer_states: Arc<RwLock<HashMap<String, ThreadWriterState>>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadWriterState {
+    Unknown,
+    Owned,
+    External,
+    Released,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +151,25 @@ impl CodexCliBackend {
         input: &[Value],
         client_user_message_id: &str,
     ) -> Result<NativeQueueReceipt, BackendFailure> {
+        self.queue_message_inner(thread_id, input, client_user_message_id, true)
+    }
+
+    pub fn queue_message_without_start(
+        &self,
+        thread_id: &str,
+        input: &[Value],
+        client_user_message_id: &str,
+    ) -> Result<NativeQueueReceipt, BackendFailure> {
+        self.queue_message_inner(thread_id, input, client_user_message_id, false)
+    }
+
+    fn queue_message_inner(
+        &self,
+        thread_id: &str,
+        input: &[Value],
+        client_user_message_id: &str,
+        start_if_idle: bool,
+    ) -> Result<NativeQueueReceipt, BackendFailure> {
         let result = self.app_server_rpc(
             "thread/queue/add",
             json!({
@@ -152,30 +186,33 @@ impl CodexCliBackend {
                 code: "app_server_protocol_error",
                 message: "thread/queue/add response has no queuedSubmission.id".to_owned(),
             })?;
-        let started_turn_id = self
-            .app_server_rpc(
-                "thread/read",
-                json!({"threadId": thread_id, "includeTurns": false}),
-            )
-            .ok()
-            .filter(|thread| !app_server_thread_is_active(thread))
-            .and_then(|_| {
+        let started_turn_id = start_if_idle
+            .then(|| {
                 self.app_server_rpc(
-                    "thread/queue/start",
-                    json!({
-                        "threadId": thread_id,
-                        "queuedSubmissionId": queued_submission_id,
-                    }),
+                    "thread/read",
+                    json!({"threadId": thread_id, "includeTurns": false}),
                 )
                 .ok()
+                .filter(|thread| !app_server_thread_is_active(thread))
+                .and_then(|_| {
+                    self.app_server_rpc(
+                        "thread/queue/start",
+                        json!({
+                            "threadId": thread_id,
+                            "queuedSubmissionId": queued_submission_id,
+                        }),
+                    )
+                    .ok()
+                })
+                .and_then(|result| {
+                    result
+                        .pointer("/turn/id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                })
             })
-            .and_then(|result| {
-                result
-                    .pointer("/turn/id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned)
-            });
+            .flatten();
         Ok(NativeQueueReceipt {
             backend: "app_server_queue".to_owned(),
             queued_submission_id: queued_submission_id.to_owned(),
@@ -224,7 +261,36 @@ impl CodexCliBackend {
             .app_server
             .as_ref()
             .ok_or_else(app_server_unavailable)?;
-        app_server.watch_thread(thread_id)
+        app_server.watch_thread(thread_id, false)
+    }
+
+    pub fn acquire_thread(&self, thread_id: &str) -> Result<Value, BackendFailure> {
+        let app_server = self
+            .app_server
+            .as_ref()
+            .ok_or_else(app_server_unavailable)?;
+        app_server.watch_thread(thread_id, true)
+    }
+
+    pub fn release_thread(&self, thread_id: &str) -> Result<Value, BackendFailure> {
+        let app_server = self
+            .app_server
+            .as_ref()
+            .ok_or_else(app_server_unavailable)?;
+        app_server.release_thread(thread_id)
+    }
+
+    pub fn thread_writer_state(&self, thread_id: &str) -> ThreadWriterState {
+        self.app_server
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .writer_states
+                    .read()
+                    .ok()
+                    .and_then(|states| states.get(thread_id).copied())
+            })
+            .unwrap_or(ThreadWriterState::Unknown)
     }
 
     pub fn forget_thread(&self, thread_id: &str) -> Result<(), BackendFailure> {
@@ -524,6 +590,8 @@ impl AppServerSession {
             user_agent: None,
         }));
         let worker_runtime = Arc::clone(&runtime);
+        let writer_states = Arc::new(RwLock::new(HashMap::new()));
+        let worker_writer_states = Arc::clone(&writer_states);
         thread::Builder::new()
             .name("codex-app-server".to_owned())
             .spawn(move || {
@@ -533,6 +601,7 @@ impl AppServerSession {
                     command_rx,
                     worker_events,
                     worker_runtime,
+                    worker_writer_states,
                 )
             })
             .expect("failed to start app-server connection worker");
@@ -540,6 +609,7 @@ impl AppServerSession {
             commands: command_tx,
             events,
             runtime,
+            writer_states,
         }
     }
 
@@ -563,7 +633,17 @@ impl AppServerSession {
             })?
     }
 
-    fn watch_thread(&self, thread_id: &str) -> Result<Value, BackendFailure> {
+    fn watch_thread(&self, thread_id: &str, force: bool) -> Result<Value, BackendFailure> {
+        if !force
+            && self
+                .writer_states
+                .read()
+                .ok()
+                .and_then(|states| states.get(thread_id).copied())
+                == Some(ThreadWriterState::Released)
+        {
+            return Ok(json!({"threadId": thread_id, "released": true}));
+        }
         let (response_tx, response_rx) = std_mpsc::sync_channel(1);
         self.commands
             .send(AppServerCommand::WatchThread {
@@ -579,6 +659,25 @@ impl AppServerSession {
             .map_err(|error| BackendFailure {
                 code: "app_server_timeout",
                 message: format!("failed waiting for app-server thread subscription: {error}"),
+            })?
+    }
+
+    fn release_thread(&self, thread_id: &str) -> Result<Value, BackendFailure> {
+        let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+        self.commands
+            .send(AppServerCommand::ReleaseThread {
+                thread_id: thread_id.to_owned(),
+                response: response_tx,
+            })
+            .map_err(|_| BackendFailure {
+                code: "app_server_unavailable",
+                message: "app-server connection worker stopped".to_owned(),
+            })?;
+        response_rx
+            .recv_timeout(RPC_TIMEOUT + Duration::from_secs(2))
+            .map_err(|error| BackendFailure {
+                code: "app_server_timeout",
+                message: format!("failed waiting for app-server thread release: {error}"),
             })?
     }
 
@@ -600,6 +699,7 @@ fn app_server_worker(
     commands: std_mpsc::Receiver<AppServerCommand>,
     events: broadcast::Sender<Value>,
     runtime: Arc<RwLock<AppServerRuntimeInfo>>,
+    writer_states: Arc<RwLock<HashMap<String, ThreadWriterState>>>,
 ) {
     let mut websocket = None;
     let mut next_request_id = 1_i64;
@@ -608,6 +708,9 @@ fn app_server_worker(
         match commands.recv_timeout(APP_SERVER_IDLE_POLL) {
             Ok(AppServerCommand::ForgetThread { thread_id }) => {
                 watched_threads.retain(|watched| watched != &thread_id);
+                if let Ok(mut states) = writer_states.write() {
+                    states.remove(&thread_id);
+                }
             }
             Ok(command) => {
                 if let Err(error) = ensure_app_server_connection(
@@ -620,7 +723,8 @@ fn app_server_worker(
                 ) {
                     match command {
                         AppServerCommand::Rpc { response, .. }
-                        | AppServerCommand::WatchThread { response, .. } => {
+                        | AppServerCommand::WatchThread { response, .. }
+                        | AppServerCommand::ReleaseThread { response, .. } => {
                             let _ = response.send(Err(error));
                         }
                         AppServerCommand::ForgetThread { .. } => unreachable!(),
@@ -640,7 +744,7 @@ fn app_server_worker(
                             params,
                             &events,
                         );
-                        if result.is_err() {
+                        if result.as_ref().is_err_and(backend_failure_disconnects) {
                             websocket = None;
                             emit_connection_event(&events, &runtime, "disconnected", None, None);
                         }
@@ -654,6 +758,11 @@ fn app_server_worker(
                         {
                             watched_threads.remove(index);
                             watched_threads.push_back(thread_id.clone());
+                            set_thread_writer_state(
+                                &writer_states,
+                                &thread_id,
+                                ThreadWriterState::Owned,
+                            );
                             let result = Ok(json!({"threadId": thread_id, "cached": true}));
                             let _ = response.send(result.clone());
                         } else {
@@ -665,6 +774,11 @@ fn app_server_worker(
                                 &events,
                             );
                             if result.is_ok() {
+                                set_thread_writer_state(
+                                    &writer_states,
+                                    &thread_id,
+                                    ThreadWriterState::Owned,
+                                );
                                 watched_threads.push_back(thread_id.clone());
                                 if watched_threads.len() > thread_cache_limit {
                                     if let Some(evicted) = watched_threads.pop_front() {
@@ -675,20 +789,66 @@ fn app_server_worker(
                                             json!({"threadId": evicted}),
                                             &events,
                                         );
+                                        if let Ok(mut states) = writer_states.write() {
+                                            states.remove(&evicted);
+                                        }
                                     }
                                 }
-                            } else {
-                                websocket = None;
-                                emit_connection_event(
-                                    &events,
-                                    &runtime,
-                                    "disconnected",
-                                    None,
-                                    None,
+                            } else if let Err(error) = &result {
+                                set_thread_writer_state(
+                                    &writer_states,
+                                    &thread_id,
+                                    if active_writer_conflict(error) {
+                                        ThreadWriterState::External
+                                    } else {
+                                        ThreadWriterState::Unavailable
+                                    },
                                 );
+                                if backend_failure_disconnects(error) {
+                                    websocket = None;
+                                    emit_connection_event(
+                                        &events,
+                                        &runtime,
+                                        "disconnected",
+                                        None,
+                                        Some(&error.message),
+                                    );
+                                }
                             }
                             let _ = response.send(result.clone());
                         }
+                    }
+                    AppServerCommand::ReleaseThread {
+                        thread_id,
+                        response,
+                    } => {
+                        if !watched_threads.iter().any(|watched| watched == &thread_id) {
+                            let _ = response.send(Err(BackendFailure {
+                                code: "thread_writer_not_owned",
+                                message: "this app-server does not own the session writer"
+                                    .to_owned(),
+                            }));
+                            continue;
+                        }
+                        let result = session_rpc(
+                            websocket.as_mut().expect("connection ensured"),
+                            &mut next_request_id,
+                            "thread/unsubscribe",
+                            json!({"threadId": thread_id}),
+                            &events,
+                        );
+                        if result.is_ok() {
+                            watched_threads.retain(|watched| watched != &thread_id);
+                            set_thread_writer_state(
+                                &writer_states,
+                                &thread_id,
+                                ThreadWriterState::Released,
+                            );
+                        } else if result.as_ref().is_err_and(backend_failure_disconnects) {
+                            websocket = None;
+                            emit_connection_event(&events, &runtime, "disconnected", None, None);
+                        }
+                        let _ = response.send(result);
                     }
                     AppServerCommand::ForgetThread { .. } => unreachable!(),
                 }
@@ -714,6 +874,28 @@ fn app_server_worker(
             }
         }
     }
+}
+
+fn set_thread_writer_state(
+    states: &RwLock<HashMap<String, ThreadWriterState>>,
+    thread_id: &str,
+    state: ThreadWriterState,
+) {
+    if let Ok(mut states) = states.write() {
+        states.insert(thread_id.to_owned(), state);
+    }
+}
+
+fn active_writer_conflict(error: &BackendFailure) -> bool {
+    error.code == "app_server_rejected"
+        && error.message.to_ascii_lowercase().contains("active writer")
+}
+
+fn backend_failure_disconnects(error: &BackendFailure) -> bool {
+    !matches!(
+        error.code,
+        "app_server_rejected" | "thread_writer_not_owned"
+    )
 }
 
 fn ensure_app_server_connection(
@@ -1245,6 +1427,7 @@ mod tests {
                 connected: true,
                 user_agent: None,
             })),
+            writer_states: Arc::new(RwLock::new(HashMap::new())),
         });
         let backend = CodexCliBackend {
             program: PathBuf::from("/unused/codex"),
@@ -1336,6 +1519,136 @@ mod tests {
     }
 
     #[test]
+    fn released_thread_stays_released_until_explicitly_reacquired() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "codex-thread-release-test-{}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let _initialized = read_json(&mut websocket);
+            let mut methods = Vec::new();
+            for _ in 0..3 {
+                let request = read_json(&mut websocket);
+                methods.push(request["method"].as_str().unwrap().to_owned());
+                websocket
+                    .send(Message::Text(
+                        json!({"id": request["id"], "result": {"thread": {"id":"thread-1"}}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
+            }
+            methods
+        });
+        let backend = CodexCliBackend::new_with_thread_cache(
+            PathBuf::from("/unused/codex"),
+            Some(sock_path.clone()),
+            3,
+        );
+        backend.watch_thread("thread-1").unwrap();
+        assert_eq!(
+            backend.thread_writer_state("thread-1"),
+            ThreadWriterState::Owned
+        );
+        backend.release_thread("thread-1").unwrap();
+        assert_eq!(
+            backend.thread_writer_state("thread-1"),
+            ThreadWriterState::Released
+        );
+        assert_eq!(backend.watch_thread("thread-1").unwrap()["released"], true);
+        backend.acquire_thread("thread-1").unwrap();
+        assert_eq!(
+            backend.thread_writer_state("thread-1"),
+            ThreadWriterState::Owned
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            ["thread/resume", "thread/unsubscribe", "thread/resume"]
+        );
+        std::fs::remove_file(&sock_path).unwrap();
+        std::fs::remove_dir(&sock_dir).unwrap();
+    }
+
+    #[test]
+    fn active_writer_conflict_is_read_only_without_dropping_the_connection() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "codex-thread-conflict-test-{}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let _initialized = read_json(&mut websocket);
+            let resume = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": resume["id"], "error": {"code": -32600, "message": "thread thread-1 already has an active writer"}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let probe = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": probe["id"], "result": {"data": []}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            [resume["method"].clone(), probe["method"].clone()]
+        });
+        let backend = CodexCliBackend::new_with_thread_cache(
+            PathBuf::from("/unused/codex"),
+            Some(sock_path.clone()),
+            3,
+        );
+        let error = backend.watch_thread("thread-1").unwrap_err();
+        assert!(active_writer_conflict(&error));
+        assert_eq!(
+            backend.thread_writer_state("thread-1"),
+            ThreadWriterState::External
+        );
+        assert_eq!(
+            backend
+                .app_server_rpc("thread/loaded/list", json!({}))
+                .unwrap()["data"],
+            json!([])
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            [json!("thread/resume"), json!("thread/loaded/list")]
+        );
+        std::fs::remove_file(&sock_path).unwrap();
+        std::fs::remove_dir(&sock_dir).unwrap();
+    }
+
+    #[test]
     fn native_queue_uses_stable_client_and_server_submission_ids() {
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let sock_dir = std::env::temp_dir().join(format!(
@@ -1413,6 +1726,62 @@ mod tests {
         assert_eq!(read["params"]["includeTurns"], false);
         assert_eq!(start["method"], "thread/queue/start");
         assert_eq!(start["params"]["queuedSubmissionId"], "server-queue-1");
+        std::fs::remove_file(&sock_path).unwrap();
+        std::fs::remove_dir(&sock_dir).unwrap();
+    }
+
+    #[test]
+    fn native_queue_without_start_does_not_touch_the_thread_writer() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "codex-native-queue-only-test-{}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let _initialized = read_json(&mut websocket);
+            let request = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": request["id"],
+                        "result": {"queuedSubmission": {"id": "server-queue-only-1"}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            request
+        });
+        let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(sock_path.clone()));
+        let receipt = backend
+            .queue_message_without_start(
+                "thread-1",
+                &[json!({"type":"text", "text":"queue only", "text_elements":[]})],
+                "browser-message-queue-only-1",
+            )
+            .unwrap();
+        assert_eq!(receipt.queued_submission_id, "server-queue-only-1");
+        assert_eq!(receipt.started_turn_id, None);
+        let request = server.join().unwrap();
+        assert_eq!(request["method"], "thread/queue/add");
+        assert_eq!(request["params"]["threadId"], "thread-1");
+        assert_eq!(
+            request["params"]["clientUserMessageId"],
+            "browser-message-queue-only-1"
+        );
         std::fs::remove_file(&sock_path).unwrap();
         std::fs::remove_dir(&sock_dir).unwrap();
     }

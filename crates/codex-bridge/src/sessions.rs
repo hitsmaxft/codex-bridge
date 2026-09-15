@@ -2025,6 +2025,7 @@ fn git_branch_for_cwd(cwd: &Path) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_rollout_messages_from(
     path: &Path,
     start: u64,
@@ -3040,30 +3041,31 @@ mod tests {
         let mut total_usage = None;
         let mut baseline = TokenUsageBreakdown::default();
         let mut model_context_window = None;
-        let mut apply = |record: Value| {
-            update_activity(
-                &record,
-                &mut active_turn_id,
-                &mut active_tools,
-                &mut total_usage,
-                &mut baseline,
-                &mut model_context_window,
+        {
+            let mut apply = |record: Value| {
+                update_activity(
+                    &record,
+                    &mut active_turn_id,
+                    &mut active_tools,
+                    &mut total_usage,
+                    &mut baseline,
+                    &mut model_context_window,
+                );
+            };
+            apply(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":50,"total_tokens":1050},
+                    "model_context_window":258400
+                }}}),
             );
-        };
-        apply(
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":50,"total_tokens":1050},
-                "model_context_window":258400
-            }}}),
-        );
-        apply(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}));
-        apply(
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"input_tokens":1200,"cached_input_tokens":900,"cache_write_input_tokens":12,"output_tokens":80,"reasoning_output_tokens":20,"total_tokens":1280},
-                "model_context_window":258400
-            }}}),
-        );
-        drop(apply);
+            apply(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}));
+            apply(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":1200,"cached_input_tokens":900,"cache_write_input_tokens":12,"output_tokens":80,"reasoning_output_tokens":20,"total_tokens":1280},
+                    "model_context_window":258400
+                }}}),
+            );
+        }
 
         assert_eq!(active_turn_id.as_deref(), Some("turn-2"));
         assert_eq!(total_usage.unwrap().total_tokens, 1280);

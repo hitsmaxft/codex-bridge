@@ -183,10 +183,15 @@ Since 0.147, threads have active-writer ownership. After Desktop has opened a th
 thread ... already has an active writer
 ```
 
-Also, the App has a problem of not releasing the writer in a timely manner.
+Bridge treats this as a per-session ownership result rather than a transport failure. The rollout
+remains readable, the Web UI labels the thread as used by another app-server, and all session write
+controls are disabled. A Bridge-owned thread can be handed off explicitly with
+`thread/unsubscribe` from **Tools → Release session lock**. A manually released thread is not
+silently resumed by polling or refresh; reacquisition is always explicit.
 
-The adopted architecture is one app-server process shared by Desktop and
-`codex-bridge`. It runs the `codex` binary bundled inside ChatGPT.app with an
+The recommended deployment is an independently installed standalone app-server managed by
+`codex-bridge`. Sharing the App bundle runtime with Desktop is an optional compatibility topology,
+not the default. In desktop mode it runs the `codex` binary bundled inside ChatGPT.app with an
 explicit Unix listener at `~/.codex-bridge/bundled-app-server.sock`. That Unix
 socket carries WebSocket: clients must first perform an HTTP Upgrade and then
 send JSON-RPC as WebSocket text frames; it is **not** a JSONL/raw Unix stream.

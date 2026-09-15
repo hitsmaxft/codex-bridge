@@ -925,7 +925,19 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             detail["tool_index"] = json!(tool_index);
             detail
         }
-        "thread_watch" => json!({"thread_id": thread_id, "subscribed": true}),
+        "thread_watch" => json!({
+            "thread_id": thread_id,
+            "subscribed": true,
+            "writer_lock": {"state":"owned", "read_only":false, "reason":null}
+        }),
+        "thread_writer_release" => json!({
+            "thread_id": thread_id,
+            "writer_lock": {"state":"released", "read_only":true, "reason":null}
+        }),
+        "thread_writer_acquire" => json!({
+            "thread_id": thread_id,
+            "writer_lock": {"state":"owned", "read_only":false, "reason":null}
+        }),
         "pending_messages" => state.pending_messages(),
         "pending_message_delete" => {
             let requested_id = request

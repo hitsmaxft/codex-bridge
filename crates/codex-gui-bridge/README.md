@@ -6,11 +6,13 @@ This crate contains two registered Desktop transports:
 - `codex-gui-bridge` is a shared-connection broker and app-server supervisor;
   `codex-gui` is its Unix-socket client.
 
-The deployed Desktop path uses `ws-unix-bridge` plus the app-server binary
+This document covers the optional Desktop-interposition path. The project-wide
+deployment default is a separate standalone app-server; see
+[`../../docs/install.md`](../../docs/install.md). When Desktop interposition is explicitly selected,
+it uses `ws-unix-bridge` plus the app-server binary
 bundled in ChatGPT.app. The former managed standalone daemon must not be used
 as an automatic Desktop fallback. A standalone app-server remains a supported
-topology when Desktop is not used; see
-[`../../docs/install.md`](../../docs/install.md). The broker remains
+topology independent of Desktop. The broker remains
 fixture-tested source code, but it is not the deployed transport.
 
 ## Adopted Architecture

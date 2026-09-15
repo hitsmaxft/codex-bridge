@@ -11,12 +11,29 @@ let eventStreamUnavailable = false;
 const eventListeners = new Set();
 const performanceBuckets = new Map();
 let performanceFlush = null;
+async function fetchWithTimeout(url, options, timeoutMs) {
+  if (!timeoutMs) return fetch(url, options);
+  const controller = new AbortController(),
+    timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`request timed out after ${timeoutMs} ms`);
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
 const authentication = createAuthenticationGate(async () => {
   if (demoMode) return;
-  const response = await fetch("/api/auth", {
-    credentials: "same-origin",
-    cache: "no-store",
-  });
+  const response = await fetchWithTimeout(
+    "/api/auth",
+    {
+      credentials: "same-origin",
+      cache: "no-store",
+    },
+    15_000,
+  );
   if (!response.ok) throw new Error(`authentication failed (${response.status})`);
 });
 
@@ -24,12 +41,16 @@ export const authenticate = () => authentication.wait();
 
 export async function createFileDownloadTicket(threadId, path) {
   await authenticate();
-  const response = await fetch("/api/file-ticket", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ thread_id: threadId, path }),
-  });
+  const response = await fetchWithTimeout(
+    "/api/file-ticket",
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId, path }),
+    },
+    30_000,
+  );
   if (response.status === 401) {
     const error = new Error("authentication expired; reload the page to sign in again");
     authentication.block(error);
@@ -42,12 +63,16 @@ export async function createFileDownloadTicket(threadId, path) {
 
 export async function requestFilePreview(threadId, path) {
   await authenticate();
-  const response = await fetch("/api/file-preview", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ thread_id: threadId, path }),
-  });
+  const response = await fetchWithTimeout(
+    "/api/file-preview",
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId, path }),
+    },
+    30_000,
+  );
   if (response.status === 401) {
     const error = new Error("authentication expired; reload the page to sign in again");
     authentication.block(error);
@@ -59,12 +84,12 @@ export async function requestFilePreview(threadId, path) {
 }
 
 async function sendCommand(request) {
+  await authenticate();
   if (demoMode) {
     demoClient ||= import("./demo-client.js");
     const client = await demoClient;
     return client.demoCommand(request);
   }
-  await authenticate();
   const response = await fetch("/api/command", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

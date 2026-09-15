@@ -4,12 +4,16 @@ set -eu
 enable_web_ui=false
 start_services=true
 start_suppressed=false
+runtime_mode=standalone
+runtime_mode_explicit=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --web-ui) enable_web_ui=true ;;
     --no-start) start_services=false ;;
+    --standalone) runtime_mode=standalone; runtime_mode_explicit=true ;;
+    --desktop) runtime_mode=desktop; runtime_mode_explicit=true ;;
     -h|--help)
-      echo "Usage: scripts/install-macos.sh [--web-ui] [--no-start]"
+      echo "Usage: scripts/install-macos.sh [--standalone|--desktop] [--web-ui] [--no-start]"
       exit 0
       ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -31,12 +35,39 @@ state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/codex-bridge
 launcher_dir=$HOME/Library/LaunchAgents
 desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex
 desktop_main=/Applications/ChatGPT.app/Contents/MacOS/ChatGPT
-app_server_socket=$runtime_dir/bundled-app-server.sock
 adapter_port=18790
 
-if [ ! -x "$desktop_codex" ]; then
-  echo "Codex Desktop runtime not found at $desktop_codex" >&2
-  exit 1
+if [ "$runtime_mode_explicit" = false ] && [ -f "$config_path" ]; then
+  configured_mode=$(sed -n 's/^[[:space:]]*mode[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_path" | head -n 1)
+  case "$configured_mode" in
+    desktop|standalone) runtime_mode=$configured_mode ;;
+  esac
+fi
+
+if [ "$runtime_mode" = desktop ]; then
+  codex_bin=$desktop_codex
+  app_server_socket=$runtime_dir/bundled-app-server.sock
+  desktop_interposition=true
+  if [ ! -x "$codex_bin" ]; then
+    echo "Codex Desktop runtime not found at $codex_bin" >&2
+    exit 1
+  fi
+else
+  codex_bin=$(command -v codex || true)
+  app_server_socket=$runtime_dir/codex-app-server.sock
+  desktop_interposition=false
+  if [ -z "$codex_bin" ]; then
+    echo "standalone codex executable was not found on PATH" >&2
+    echo "Install the standalone Codex CLI, or rerun with --desktop for App bundle integration." >&2
+    exit 1
+  fi
+  case "$codex_bin" in
+    /Applications/ChatGPT.app/*)
+      echo "the codex executable on PATH resolves inside ChatGPT.app, not to a standalone install" >&2
+      echo "Install the standalone Codex CLI, or rerun with --desktop for App bundle integration." >&2
+      exit 1
+      ;;
+  esac
 fi
 if [ "$enable_web_ui" = true ] && ! command -v openssl >/dev/null 2>&1; then
   echo "openssl is required with --web-ui" >&2
@@ -58,9 +89,11 @@ CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
   cargo install --locked --force --path "$repo_root/crates/codex-bridge"
 CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
   cargo install --locked --force --path "$repo_root/crates/codexctl"
-CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
-  cargo install --locked --force --path "$repo_root/crates/codex-gui-bridge" \
-  --bin ws-unix-bridge
+if [ "$runtime_mode" = desktop ]; then
+  CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
+    cargo install --locked --force --path "$repo_root/crates/codex-gui-bridge" \
+    --bin ws-unix-bridge
+fi
 
 web_password=$runtime_dir/web-ui-password
 if [ "$enable_web_ui" = true ] && [ ! -s "$web_password" ]; then
@@ -72,8 +105,8 @@ fi
 managed_by_bridge=false
 if [ ! -f "$config_path" ]; then
   cat >"$config_path" <<EOF
-mode = "desktop"
-codex_bin = "$desktop_codex"
+mode = "$runtime_mode"
+codex_bin = "$codex_bin"
 app_server_socket = "$app_server_socket"
 app_server_thread_cache = 3
 
@@ -87,7 +120,7 @@ public_origins = []
 
 [services]
 manage_app_server = true
-desktop_interposition = true
+desktop_interposition = $desktop_interposition
 ws_bridge_listen = "127.0.0.1:$adapter_port"
 ws_bridge_bin = "$cargo_bin_dir/ws-unix-bridge"
 EOF
@@ -101,7 +134,9 @@ else
 fi
 
 stdio_app_server_pids() {
-  ps -axo pid=,ppid=,command= | awk -v bin="$desktop_codex" -v desktop="$desktop_main" '
+  require_desktop_parent=0
+  if [ "$runtime_mode" = desktop ]; then require_desktop_parent=1; fi
+  ps -axo pid=,ppid=,command= | awk -v bin="$codex_bin" -v desktop="$desktop_main" -v require_parent="$require_desktop_parent" '
     {
       pid = $1; ppid = $2; $1 = ""; $2 = ""; sub(/^[[:space:]]+/, "");
       command[pid] = $0; parent[pid] = ppid;
@@ -110,7 +145,7 @@ stdio_app_server_pids() {
     END {
       for (pid in candidate) {
         parent_command = command[parent[pid]];
-        if (parent_command == desktop || index(parent_command, desktop " ") == 1) print pid;
+        if (!require_parent || parent_command == desktop || index(parent_command, desktop " ") == 1) print pid;
       }
     }
   '
@@ -118,8 +153,8 @@ stdio_app_server_pids() {
 if [ "$start_services" = true ] && [ "$managed_by_bridge" = true ]; then
   conflicting_pids=$(stdio_app_server_pids)
   if [ -n "$conflicting_pids" ]; then
-    echo "Refusing to start the managed bundled app-server while a private stdio app-server is running." >&2
-    echo "The service definition will be installed without loading it. Fully quit Codex/ChatGPT, then start local.codex-bridge.daemon." >&2
+    echo "Refusing to start the managed app-server while a conflicting stdio app-server is running." >&2
+    echo "The service definition will be installed without loading it. Finish the active turn, exit that Codex process, then start local.codex-bridge.daemon." >&2
     start_services=false
     start_suppressed=true
   fi
@@ -187,4 +222,8 @@ fi
 if [ "$enable_web_ui" = true ]; then
   echo "Web UI: http://127.0.0.1:18791/ (password file: $web_password)"
 fi
-echo "Fully quit and relaunch ChatGPT so it inherits CODEX_APP_SERVER_WS_URL."
+if [ "$runtime_mode" = desktop ]; then
+  echo "Fully quit and relaunch ChatGPT so it inherits CODEX_APP_SERVER_WS_URL."
+else
+  echo "Installed the recommended standalone topology; Codex Desktop remains independent."
+fi
