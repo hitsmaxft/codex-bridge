@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read as _, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Query, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, Query, RawQuery, Request as AxumRequest, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -35,7 +36,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 
@@ -57,6 +58,7 @@ const MAX_DOWNLOAD_TICKETS: usize = 128;
 const WEB_SESSION_COOKIE: &str = "codex_bridge_session";
 const WEB_SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_WEB_UI_ADDR: &str = "127.0.0.1:18791";
+const DEFAULT_WEB_UI_NAME: &str = "Codex App Server WebUI";
 const DEFAULT_WS_BRIDGE_ADDR: &str = "127.0.0.1:18790";
 const DEFAULT_WHISPER_ADDR: &str = "127.0.0.1:18792";
 const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
@@ -135,6 +137,14 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     web_ui_password_file: Option<PathBuf>,
 
+    /// PEM certificate chain for direct Web UI HTTPS.
+    #[arg(long, value_name = "PATH", requires = "web_ui_tls_private_key_file")]
+    web_ui_tls_cert_file: Option<PathBuf>,
+
+    /// PEM private key for direct Web UI HTTPS.
+    #[arg(long, value_name = "PATH", requires = "web_ui_tls_cert_file")]
+    web_ui_tls_private_key_file: Option<PathBuf>,
+
     /// Disable Web UI authentication. Only allowed with a loopback listener.
     #[arg(long, conflicts_with = "web_ui_auth")]
     web_ui_no_auth: bool,
@@ -187,9 +197,12 @@ struct BridgeFileConfig {
 #[serde(deny_unknown_fields)]
 struct WebUiFileConfig {
     enabled: Option<bool>,
+    name: Option<String>,
     listen: Option<SocketAddr>,
     user: Option<String>,
     password_file: Option<PathBuf>,
+    tls_cert_file: Option<PathBuf>,
+    tls_private_key_file: Option<PathBuf>,
     no_auth: Option<bool>,
     public_origins: Option<Vec<String>>,
 }
@@ -231,9 +244,12 @@ struct RuntimeArgs {
     app_server_thread_cache: usize,
     host_exec_policy: Option<PathBuf>,
     web_ui: bool,
+    web_ui_name: String,
     web_ui_listen: SocketAddr,
     web_ui_user: String,
     web_ui_password_file: Option<PathBuf>,
+    web_ui_tls_cert_file: Option<PathBuf>,
+    web_ui_tls_private_key_file: Option<PathBuf>,
     web_ui_no_auth: bool,
     web_ui_public_origin: Vec<String>,
     manage_app_server: bool,
@@ -401,7 +417,9 @@ impl PerformanceLog {
 #[derive(Clone)]
 struct WebState {
     bridge: BridgeState,
+    app_name: Arc<str>,
     port: u16,
+    secure: bool,
     auth: Option<Arc<WebAuth>>,
     public_origins: Arc<Vec<WebOrigin>>,
     download_tickets: Arc<RwLock<HashMap<String, DownloadTicket>>>,
@@ -423,6 +441,10 @@ struct WebAuth {
 struct FileTicketRequest {
     thread_id: String,
     path: String,
+    #[serde(default)]
+    message_index: Option<usize>,
+    #[serde(default)]
+    tool_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1314,6 +1336,19 @@ fn mode_app_server_socket(mode: RuntimeMode) -> Option<PathBuf> {
 fn resolve_args(args: Args) -> Result<RuntimeArgs> {
     let (config_path, config) = read_bridge_config(&args)?;
     let mode = args.mode.or(config.mode).unwrap_or_default();
+    let web_ui_name = config
+        .web_ui
+        .name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(DEFAULT_WEB_UI_NAME)
+        .to_owned();
+    if web_ui_name.is_empty()
+        || web_ui_name.chars().count() > 128
+        || web_ui_name.chars().any(char::is_control)
+    {
+        bail!("web_ui.name must contain between 1 and 128 printable characters");
+    }
     let app_server_thread_cache = args
         .app_server_thread_cache
         .or(config.app_server_thread_cache)
@@ -1371,6 +1406,17 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         })
         .or(config.host_exec_policy)
         .map(expand_home_path);
+    let web_ui_tls_cert_file = args
+        .web_ui_tls_cert_file
+        .or(config.web_ui.tls_cert_file)
+        .map(expand_home_path);
+    let web_ui_tls_private_key_file = args
+        .web_ui_tls_private_key_file
+        .or(config.web_ui.tls_private_key_file)
+        .map(expand_home_path);
+    if web_ui_tls_cert_file.is_some() != web_ui_tls_private_key_file.is_some() {
+        bail!("web_ui.tls_cert_file and web_ui.tls_private_key_file must be configured together");
+    }
     let web_ui_public_origin = if args.web_ui_public_origin.is_empty() {
         config.web_ui.public_origins.unwrap_or_default()
     } else {
@@ -1468,6 +1514,7 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         } else {
             config.web_ui.enabled.unwrap_or(false)
         },
+        web_ui_name,
         web_ui_listen: args
             .web_ui_listen
             .or(config.web_ui.listen)
@@ -1484,6 +1531,8 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
             .web_ui_password_file
             .or(config.web_ui.password_file)
             .map(expand_home_path),
+        web_ui_tls_cert_file,
+        web_ui_tls_private_key_file,
         web_ui_no_auth: if args.web_ui_no_auth {
             true
         } else if args.web_ui_auth {
@@ -2826,6 +2875,7 @@ async fn main() -> Result<()> {
     let hot_cache_task = spawn_hot_session_cache(
         Arc::clone(&session_store),
         Arc::clone(&write_backend),
+        Arc::clone(&bridge_state.app_server_tools),
         session_run_states,
         args.app_server_thread_cache,
     );
@@ -2834,28 +2884,71 @@ async fn main() -> Result<()> {
 
     let (web_failure_tx, mut web_failure_rx) = mpsc::channel::<String>(1);
     let web_task = if args.web_ui {
-        let web_listener = TcpListener::bind(args.web_ui_listen)
-            .await
+        if args.web_ui_tls_cert_file.is_some() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+        let web_tls = match (
+            args.web_ui_tls_cert_file.as_deref(),
+            args.web_ui_tls_private_key_file.as_deref(),
+        ) {
+            (Some(cert), Some(key)) => Some(
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to load Web UI TLS certificate {} and private key {}",
+                            cert.display(),
+                            key.display()
+                        )
+                    })?,
+            ),
+            (None, None) => None,
+            _ => unreachable!("TLS certificate and private key were validated together"),
+        };
+        let web_listener = std::net::TcpListener::bind(args.web_ui_listen)
             .with_context(|| format!("failed to bind Web UI at {}", args.web_ui_listen))?;
+        web_listener
+            .set_nonblocking(true)
+            .context("failed to configure the Web UI listener")?;
         let web_addr = web_listener
             .local_addr()
             .context("failed to inspect Web UI listener")?;
         let web_state = WebState {
             bridge: bridge_state.clone(),
+            app_name: Arc::from(args.web_ui_name.clone()),
             port: web_addr.port(),
+            secure: web_tls.is_some(),
             auth: web_auth.map(Arc::new),
             public_origins: Arc::new(web_public_origins),
             download_tickets: Arc::new(RwLock::new(HashMap::new())),
         };
-        println!("codex-bridge Web UI listening on http://{web_addr}/");
-        Some(tokio::spawn(async move {
-            let result = axum::serve(web_listener, web_router(web_state)).await;
-            let message = match result {
-                Ok(()) => "Web UI server stopped unexpectedly".to_owned(),
-                Err(error) => format!("Web UI server failed: {error}"),
-            };
-            let _ = web_failure_tx.send(message).await;
-        }))
+        let scheme = if web_tls.is_some() { "https" } else { "http" };
+        println!("codex-bridge Web UI listening on {scheme}://{web_addr}/");
+        let router = web_router(web_state);
+        Some(if let Some(tls) = web_tls {
+            tokio::spawn(async move {
+                let result = match axum_server::from_tcp_rustls(web_listener, tls) {
+                    Ok(server) => server.serve(router.into_make_service()).await,
+                    Err(error) => Err(error),
+                };
+                let message = match result {
+                    Ok(()) => "Web UI HTTPS server stopped unexpectedly".to_owned(),
+                    Err(error) => format!("Web UI HTTPS server failed: {error}"),
+                };
+                let _ = web_failure_tx.send(message).await;
+            })
+        } else {
+            let web_listener = tokio::net::TcpListener::from_std(web_listener)
+                .context("failed to initialize the Web UI listener")?;
+            tokio::spawn(async move {
+                let result = axum::serve(web_listener, router).await;
+                let message = match result {
+                    Ok(()) => "Web UI server stopped unexpectedly".to_owned(),
+                    Err(error) => format!("Web UI server failed: {error}"),
+                };
+                let _ = web_failure_tx.send(message).await;
+            })
+        })
     } else {
         None
     };
@@ -2929,6 +3022,7 @@ fn validate_web_ui_auth_config(no_auth: bool, listen: SocketAddr) -> Result<()> 
 fn spawn_hot_session_cache(
     session_store: Arc<SessionStore>,
     write_backend: Arc<CodexCliBackend>,
+    app_server_tools: Arc<AppServerToolCache>,
     session_run_states: Arc<SessionRunStates>,
     pinned_limit: usize,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -2949,6 +3043,7 @@ fn spawn_hot_session_cache(
                     if session_run_states.apply_event(&event) {
                         write_backend.publish_bridge_event(thread_run_snapshot_event(&session_run_states));
                     }
+                    invalidate_app_server_tool_cache_for_event(&app_server_tools, &event);
                     let Some(thread_id) = app_server_event_thread_id(&event) else {
                         continue;
                     };
@@ -3009,6 +3104,19 @@ fn spawn_hot_session_cache(
             }
         }
     }))
+}
+
+fn invalidate_app_server_tool_cache_for_event(cache: &AppServerToolCache, event: &Value) {
+    let method = event.pointer("/message/method").and_then(Value::as_str);
+    if !method.is_some_and(|method| method.starts_with("item/") || method.starts_with("turn/")) {
+        return;
+    }
+    let Some(thread_id) = app_server_event_thread_id(event) else {
+        return;
+    };
+    if let Ok(mut threads) = cache.threads.write() {
+        threads.remove(&thread_id);
+    }
 }
 
 fn app_server_event_thread_id(event: &Value) -> Option<String> {
@@ -3259,14 +3367,28 @@ fn web_router(state: WebState) -> Router {
         .route("/api/command", post(web_command))
         .route("/api/events", get(web_events))
         .layer(DefaultBodyLimit::max(MAX_WEB_REQUEST_BYTES))
+        .layer(axum::middleware::from_fn(normalize_web_host))
         .with_state(state)
+}
+
+async fn normalize_web_host(mut request: AxumRequest, next: Next) -> HttpResponse {
+    if !request.headers().contains_key(header::HOST) {
+        let authority = request
+            .uri()
+            .authority()
+            .map(|authority| authority.as_str().to_owned());
+        if let Some(host) = authority.and_then(|authority| HeaderValue::from_str(&authority).ok()) {
+            request.headers_mut().insert(header::HOST, host);
+        }
+    }
+    next.run(request).await
 }
 
 async fn web_index(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
     web_asset_response(
         &state,
         &headers,
-        WEB_INDEX,
+        render_web_index(WEB_INDEX, &state.app_name),
         "text/html; charset=utf-8",
         "private, no-cache",
     )
@@ -3316,7 +3438,13 @@ async fn web_auth_check(State(state): State<WebState>, headers: HeaderMap) -> Ht
     if !web_auth_allowed(&headers, auth) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        false,
+        &state.public_origins,
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
@@ -3325,7 +3453,13 @@ async fn web_auth_check(State(state): State<WebState>, headers: HeaderMap) -> Ht
         HeaderValue::from_static("private, no-store"),
     );
     if let Some(auth) = auth.filter(|_| basic_authenticated) {
-        set_web_session_cookie(&mut response, &headers, auth, &state.public_origins);
+        set_web_session_cookie(
+            &mut response,
+            &headers,
+            auth,
+            state.secure,
+            &state.public_origins,
+        );
     }
     response
 }
@@ -3335,7 +3469,13 @@ async fn web_file_download(
     headers: HeaderMap,
     Query(query): Query<FileDownloadQuery>,
 ) -> HttpResponse {
-    if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        false,
+        &state.public_origins,
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let ticket = get_download_ticket(&state.download_tickets, &query.ticket);
@@ -3346,8 +3486,13 @@ async fn web_file_download(
         )
             .into_response();
     };
+    let write_backend = Arc::clone(&state.bridge.write_backend);
     let result = tokio::task::spawn_blocking(move || {
-        read_workspace_download(&ticket.workspace, ticket.path.to_string_lossy().as_ref())
+        read_workspace_download_with(
+            &ticket.workspace,
+            ticket.path.to_string_lossy().as_ref(),
+            |path| read_file_bytes(&write_backend, path),
+        )
     })
     .await;
     let (bytes, filename) = match result {
@@ -3407,7 +3552,13 @@ async fn web_file_preview_content(
     headers: HeaderMap,
     Query(query): Query<FileDownloadQuery>,
 ) -> HttpResponse {
-    if !web_headers_allowed(&headers, state.port, false, &state.public_origins) {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        false,
+        &state.public_origins,
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let Some(ticket) = get_download_ticket(&state.download_tickets, &query.ticket) else {
@@ -3417,8 +3568,13 @@ async fn web_file_preview_content(
         )
             .into_response();
     };
+    let write_backend = Arc::clone(&state.bridge.write_backend);
     let result = tokio::task::spawn_blocking(move || {
-        read_workspace_preview(&ticket.workspace, ticket.path.to_string_lossy().as_ref())
+        read_workspace_preview_with(
+            &ticket.workspace,
+            ticket.path.to_string_lossy().as_ref(),
+            |path| read_file_bytes(&write_backend, path),
+        )
     })
     .await;
     let preview = match result {
@@ -3483,7 +3639,13 @@ async fn web_file_ticket(
     if !web_auth_allowed(&headers, state.auth.as_deref()) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        true,
+        &state.public_origins,
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     if body.len() > MAX_WEB_REQUEST_BYTES {
@@ -3552,7 +3714,13 @@ async fn web_file_preview(
     if !web_auth_allowed(&headers, state.auth.as_deref()) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        true,
+        &state.public_origins,
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let request = match serde_json::from_slice::<FileTicketRequest>(&body) {
@@ -3560,13 +3728,58 @@ async fn web_file_preview(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request").into_response(),
     };
     let store = Arc::clone(&state.bridge.session_store);
+    let write_backend = Arc::clone(&state.bridge.write_backend);
     let resolved = tokio::task::spawn_blocking(move || {
         let thread = store
             .find_thread(&request.thread_id)
             .map_err(|_| FileDownloadFailure::ThreadNotFound)?
             .ok_or(FileDownloadFailure::ThreadNotFound)?;
-        let preview = read_workspace_preview(&thread.cwd, &request.path)?;
-        Ok::<_, FileDownloadFailure>((thread.cwd, preview))
+        match read_workspace_preview_with(&thread.cwd, &request.path, |path| {
+            read_file_bytes(&write_backend, path)
+        }) {
+            Ok(preview) => Ok((thread.cwd, preview)),
+            Err(FileDownloadFailure::OutsideWorkspace) => {
+                match read_tmp_image_preview_with(&request.path, |path| {
+                    read_file_bytes(&write_backend, path)
+                }) {
+                    Ok(preview) => return Ok(preview),
+                    Err(FileDownloadFailure::OutsideWorkspace) => {}
+                    Err(error) => return Err(error),
+                }
+                let (Some(message_index), Some(tool_index)) =
+                    (request.message_index, request.tool_index)
+                else {
+                    return Err(FileDownloadFailure::OutsideWorkspace);
+                };
+                let message = store
+                    .read_message(&request.thread_id, message_index)
+                    .map_err(|_| FileDownloadFailure::FileNotFound)?
+                    .ok_or(FileDownloadFailure::FileNotFound)?;
+                let tool = message
+                    .tools
+                    .get(tool_index)
+                    .ok_or(FileDownloadFailure::FileNotFound)?;
+                if !tool_authorizes_image_path(tool, &request.path) {
+                    return Err(FileDownloadFailure::OutsideWorkspace);
+                }
+                let path = fs::canonicalize(&request.path)
+                    .map_err(|_| FileDownloadFailure::FileNotFound)?;
+                let workspace = path
+                    .parent()
+                    .ok_or(FileDownloadFailure::FileNotFound)?
+                    .to_path_buf();
+                let preview = read_workspace_preview_with(
+                    &workspace,
+                    path.to_string_lossy().as_ref(),
+                    |path| read_file_bytes(&write_backend, path),
+                )?;
+                if preview.kind != "image" {
+                    return Err(FileDownloadFailure::ReadFailed);
+                }
+                Ok((workspace, preview))
+            }
+            Err(error) => Err(error),
+        }
     })
     .await;
     let (workspace, preview) = match resolved {
@@ -3617,6 +3830,15 @@ async fn web_file_preview(
     response
 }
 
+fn tool_authorizes_image_path(tool: &ThreadToolCall, requested: &str) -> bool {
+    tool.name == "view_image"
+        && tool
+            .input
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path == requested)
+}
+
 fn issue_download_ticket(
     tickets: &RwLock<HashMap<String, DownloadTicket>>,
     workspace: PathBuf,
@@ -3648,6 +3870,7 @@ fn issue_download_ticket(
     Ok(token)
 }
 
+#[derive(Debug)]
 struct WorkspacePreview {
     kind: &'static str,
     filename: String,
@@ -3658,12 +3881,26 @@ struct WorkspacePreview {
     content: Option<String>,
 }
 
+#[cfg(test)]
 fn read_workspace_preview(
     workspace: &Path,
     requested: &str,
 ) -> std::result::Result<WorkspacePreview, FileDownloadFailure> {
+    read_workspace_preview_with(workspace, requested, |path| {
+        fs::read(path).map_err(|_| FileDownloadFailure::ReadFailed)
+    })
+}
+
+fn read_workspace_preview_with(
+    workspace: &Path,
+    requested: &str,
+    read: impl FnOnce(&Path) -> std::result::Result<Vec<u8>, FileDownloadFailure>,
+) -> std::result::Result<WorkspacePreview, FileDownloadFailure> {
     let (path, filename, size) = resolve_workspace_download(workspace, requested)?;
-    let bytes = fs::read(&path).map_err(|_| FileDownloadFailure::ReadFailed)?;
+    let bytes = read(&path)?;
+    if bytes.len() as u64 >= MAX_DOWNLOAD_BYTES {
+        return Err(FileDownloadFailure::TooLarge);
+    }
     let detected = infer::get(&bytes).map(|kind| kind.mime_type());
     let safe_image = detected.filter(|mime| {
         matches!(
@@ -3677,6 +3914,7 @@ fn read_workspace_preview(
         .unwrap_or_default()
         .to_ascii_lowercase();
     let markdown = matches!(extension.as_str(), "md" | "markdown" | "mdown" | "mkd");
+    let html = matches!(extension.as_str(), "html" | "htm" | "xhtml");
     let text = std::str::from_utf8(&bytes)
         .ok()
         .filter(|content| !content.contains('\0'))
@@ -3685,9 +3923,17 @@ fn read_workspace_preview(
         ("image", mime.to_owned(), None)
     } else if let Some(content) = text {
         (
-            if markdown { "markdown" } else { "text" },
+            if markdown {
+                "markdown"
+            } else if html {
+                "html"
+            } else {
+                "text"
+            },
             if markdown {
                 "text/markdown; charset=utf-8"
+            } else if html {
+                "text/html; charset=utf-8"
             } else {
                 "text/plain; charset=utf-8"
             }
@@ -3712,16 +3958,77 @@ fn read_workspace_preview(
     })
 }
 
+#[cfg(test)]
+fn read_tmp_image_preview(
+    requested: &str,
+) -> std::result::Result<(PathBuf, WorkspacePreview), FileDownloadFailure> {
+    read_tmp_image_preview_with(requested, |path| {
+        fs::read(path).map_err(|_| FileDownloadFailure::ReadFailed)
+    })
+}
+
+fn read_tmp_image_preview_with(
+    requested: &str,
+    read: impl FnOnce(&Path) -> std::result::Result<Vec<u8>, FileDownloadFailure>,
+) -> std::result::Result<(PathBuf, WorkspacePreview), FileDownloadFailure> {
+    if !Path::new(requested).is_absolute() {
+        return Err(FileDownloadFailure::OutsideWorkspace);
+    }
+    let tmp = fs::canonicalize("/tmp").map_err(|_| FileDownloadFailure::FileNotFound)?;
+    let path = fs::canonicalize(requested).map_err(|_| FileDownloadFailure::FileNotFound)?;
+    if !path.starts_with(&tmp) {
+        return Err(FileDownloadFailure::OutsideWorkspace);
+    }
+    let preview = read_workspace_preview_with(&tmp, path.to_string_lossy().as_ref(), read)?;
+    if preview.kind != "image" {
+        return Err(FileDownloadFailure::ReadFailed);
+    }
+    Ok((tmp, preview))
+}
+
+#[cfg(test)]
 fn read_workspace_download(
     workspace: &Path,
     requested: &str,
 ) -> std::result::Result<(Vec<u8>, String), FileDownloadFailure> {
+    read_workspace_download_with(workspace, requested, |path| {
+        fs::read(path).map_err(|_| FileDownloadFailure::ReadFailed)
+    })
+}
+
+fn read_workspace_download_with(
+    workspace: &Path,
+    requested: &str,
+    read: impl FnOnce(&Path) -> std::result::Result<Vec<u8>, FileDownloadFailure>,
+) -> std::result::Result<(Vec<u8>, String), FileDownloadFailure> {
     let (candidate, filename, _) = resolve_workspace_download(workspace, requested)?;
-    let bytes = fs::read(&candidate).map_err(|_| FileDownloadFailure::ReadFailed)?;
+    let bytes = read(&candidate)?;
     if bytes.len() as u64 >= MAX_DOWNLOAD_BYTES {
         return Err(FileDownloadFailure::TooLarge);
     }
     Ok((bytes, filename))
+}
+
+fn read_file_bytes(
+    write_backend: &CodexCliBackend,
+    path: &Path,
+) -> std::result::Result<Vec<u8>, FileDownloadFailure> {
+    if write_backend.app_server_socket().is_none() {
+        return fs::read(path).map_err(|_| FileDownloadFailure::ReadFailed);
+    }
+    let result = write_backend
+        .app_server_rpc(
+            "fs/readFile",
+            json!({"path": path.to_string_lossy().as_ref()}),
+        )
+        .map_err(|_| FileDownloadFailure::ReadFailed)?;
+    let encoded = result
+        .get("dataBase64")
+        .and_then(Value::as_str)
+        .ok_or(FileDownloadFailure::ReadFailed)?;
+    BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|_| FileDownloadFailure::ReadFailed)
 }
 
 fn resolve_workspace_download(
@@ -3739,9 +4046,10 @@ fn resolve_workspace_download(
         workspace.join(requested)
     };
     let candidate = fs::canonicalize(candidate).map_err(|_| FileDownloadFailure::FileNotFound)?;
-    if !download_roots(&workspace)
-        .iter()
-        .any(|root| candidate.starts_with(root))
+    if !candidate.starts_with(&workspace)
+        && !download_roots(&workspace)
+            .iter()
+            .any(|root| candidate.starts_with(root))
     {
         return Err(FileDownloadFailure::OutsideWorkspace);
     }
@@ -3770,18 +4078,44 @@ fn resolve_workspace_download(
 
 fn download_roots(workspace: &Path) -> Vec<PathBuf> {
     let mut roots = vec![workspace.to_path_buf()];
-    let Ok(output) = Command::new("git")
+    let Ok(mut child) = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .env("GIT_EXTERNAL_DIFF", "")
-        .output()
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .spawn()
     else {
         return roots;
     };
-    if !output.status.success() {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return roots;
+            }
+        }
+    };
+    if !status.success() {
         return roots;
     }
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let mut output = Vec::new();
+    if child
+        .stdout
+        .take()
+        .is_none_or(|mut stdout| stdout.read_to_end(&mut output).is_err())
+    {
+        return roots;
+    }
+    for line in String::from_utf8_lossy(&output).lines() {
         let Some(path) = line.strip_prefix("worktree ") else {
             continue;
         };
@@ -3795,10 +4129,29 @@ fn download_roots(workspace: &Path) -> Vec<PathBuf> {
     roots
 }
 
+fn render_web_index(template: &str, app_name: &str) -> String {
+    template.replace(DEFAULT_WEB_UI_NAME, &escape_html_text(app_name))
+}
+
+fn escape_html_text(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for character in input.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 fn web_asset_response(
     state: &WebState,
     headers: &HeaderMap,
-    body: &'static str,
+    body: impl IntoResponse,
     content_type: &'static str,
     cache_control: &'static str,
 ) -> HttpResponse {
@@ -3807,7 +4160,13 @@ fn web_asset_response(
     if !web_auth_allowed(headers, auth) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(headers, state.port, false, &state.public_origins) {
+    if !web_headers_allowed(
+        headers,
+        state.port,
+        state.secure,
+        false,
+        &state.public_origins,
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let mut response = body.into_response();
@@ -3819,7 +4178,13 @@ fn web_asset_response(
         HeaderValue::from_static(cache_control),
     );
     if let Some(auth) = auth.filter(|_| basic_authenticated) {
-        set_web_session_cookie(&mut response, headers, auth, &state.public_origins);
+        set_web_session_cookie(
+            &mut response,
+            headers,
+            auth,
+            state.secure,
+            &state.public_origins,
+        );
     }
     response
 }
@@ -3845,7 +4210,13 @@ async fn web_command(
     if !web_auth_allowed(&headers, state.auth.as_deref()) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        true,
+        &state.public_origins,
+    ) {
         return (
             StatusCode::FORBIDDEN,
             Json(Response::error(
@@ -3920,7 +4291,13 @@ async fn web_events(
     if !web_auth_allowed(&headers, state.auth.as_deref()) {
         return basic_auth_required();
     }
-    if !web_headers_allowed(&headers, state.port, true, &state.public_origins) {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        true,
+        &state.public_origins,
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let bridge = state.bridge.clone();
@@ -3947,9 +4324,13 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
     };
     if sender
         .send(AxumWsMessage::Text(
-            json!({"type": "bridge_event_stream", "status": "ready"})
-                .to_string()
-                .into(),
+            json!({
+                "type": "bridge_event_stream",
+                "status": "ready",
+                "sequence": backend.app_server_event_sequence().unwrap_or(0),
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .is_err()
@@ -4090,6 +4471,7 @@ fn active_loaded_thread_ids(
 fn web_headers_allowed(
     headers: &HeaderMap,
     port: u16,
+    secure: bool,
     require_origin: bool,
     public_origins: &[WebOrigin],
 ) -> bool {
@@ -4111,7 +4493,7 @@ fn web_headers_allowed(
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok());
     if require_origin
-        && origin.is_some_and(|origin| !web_origin_allowed(origin, port, public_origins))
+        && origin.is_some_and(|origin| !web_origin_allowed(origin, port, secure, public_origins))
     {
         return false;
     }
@@ -4134,11 +4516,11 @@ fn web_authority_allowed(authority: &str, port: u16) -> bool {
             .is_ok()
 }
 
-fn web_origin_allowed(origin: &str, port: u16, public_origins: &[WebOrigin]) -> bool {
+fn web_origin_allowed(origin: &str, port: u16, secure: bool, public_origins: &[WebOrigin]) -> bool {
     let Ok(uri) = origin.parse::<axum::http::Uri>() else {
         return false;
     };
-    let local = uri.scheme_str() == Some("http")
+    let local = uri.scheme_str() == Some(if secure { "https" } else { "http" })
         && uri
             .authority()
             .is_some_and(|authority| web_authority_allowed(authority.as_str(), port));
@@ -4217,16 +4599,18 @@ fn set_web_session_cookie(
     response: &mut HttpResponse,
     headers: &HeaderMap,
     auth: &WebAuth,
+    secure_transport: bool,
     public_origins: &[WebOrigin],
 ) {
-    let secure = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| {
-            public_origins
-                .iter()
-                .any(|origin| origin.authority.eq_ignore_ascii_case(host))
-        });
+    let secure = secure_transport
+        || headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|host| {
+                public_origins
+                    .iter()
+                    .any(|origin| origin.authority.eq_ignore_ascii_case(host))
+            });
     let value = format!(
         "{WEB_SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={WEB_SESSION_MAX_AGE_SECONDS}{}",
         auth.session_token,
@@ -4662,6 +5046,15 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
         .unwrap_or("completed")
         .to_owned();
     let mut input = item.as_object()?.clone();
+    if item_type == "imageView" {
+        if let Some(path) = input
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(normalize_local_image_path)
+        {
+            input.insert("path".to_owned(), Value::String(path));
+        }
+    }
     let mut output = serde_json::Map::new();
     input.remove("id");
     input.remove("status");
@@ -4690,6 +5083,34 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
         // even when app-server does not attach image bytes to the item.
         has_image: item_type == "imageView",
     })
+}
+
+fn normalize_local_image_path(value: &str) -> Option<String> {
+    let Some(encoded) = value.strip_prefix("file://") else {
+        return Some(value.to_owned());
+    };
+    if !encoded.starts_with('/') {
+        return None;
+    }
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = bytes
+                .get(index + 1)
+                .and_then(|value| (*value as char).to_digit(16))?;
+            let low = bytes
+                .get(index + 2)
+                .and_then(|value| (*value as char).to_digit(16))?;
+            decoded.push(((high << 4) | low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn subagent_activity_identity(
@@ -6478,6 +6899,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 prepared.cwd.clone(),
                 fallback_thread["title"].as_str().map(str::to_owned),
                 fallback_thread["updated_at_ms"].as_u64().unwrap_or(0),
+                canonical_project.is_none(),
             );
             if let Ok(mut selected) = selected_thread.write() {
                 *selected = Some(thread_id.clone());
@@ -6694,6 +7116,23 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 };
             if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
                 return response;
+            }
+            if resolved.thread.rollout_path.as_os_str().is_empty() {
+                let _ = write_backend.release_thread(&resolved.thread.id);
+                let _ = write_backend.forget_thread(&resolved.thread.id);
+                session_store.remove_ephemeral_thread(&resolved.thread.id);
+                session_store.invalidate_summary_cache();
+                if let Ok(mut selected) = selected_thread.write() {
+                    if selected.as_deref() == Some(resolved.thread.id.as_str()) {
+                        *selected = None;
+                    }
+                }
+                return Response::success(json!({
+                    "action": "thread_archive",
+                    "status": "discarded_empty",
+                    "thread_id": resolved.thread.id,
+                    "backend": "bridge_ephemeral_thread",
+                }));
             }
             match write_backend
                 .app_server_rpc("thread/archive", json!({"threadId": resolved.thread.id}))
@@ -7841,27 +8280,27 @@ fn compact_web_message_page(messages: &[ThreadMessage], start: usize) -> Vec<Val
                 let persistent_event =
                     compact_message.get("category").and_then(Value::as_str) == Some("compaction");
                 let keep_content = visible_user || persistent_event || final_offset == Some(index);
-                let tool_count = compact_message
+                let tools = compact_message
                     .get("tools")
                     .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
-                let file_count = compact_message
-                    .get("tools")
-                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let (visible_media_tools, deferred_tools): (Vec<_>, Vec<_>) = tools
                     .into_iter()
-                    .flatten()
+                    .partition(|tool| tool.get("has_image").and_then(Value::as_bool) == Some(true));
+                let deferred_tool_count = deferred_tools.len();
+                let deferred_file_count = deferred_tools
+                    .iter()
                     .filter_map(|tool| tool.get("file_count").and_then(Value::as_u64))
                     .sum::<u64>();
                 if !keep_content {
                     compact_message["content"] = json!([]);
                 }
-                if tool_count > 0 {
-                    compact_message["tools"] = json!([]);
-                }
-                if !keep_content || tool_count > 0 {
+                compact_message["tools"] = Value::Array(visible_media_tools);
+                if !keep_content || deferred_tool_count > 0 {
                     compact_message["deferred"] = json!(true);
-                    compact_message["deferred_tool_count"] = json!(tool_count);
-                    compact_message["deferred_file_count"] = json!(file_count);
+                    compact_message["deferred_tool_count"] = json!(deferred_tool_count);
+                    compact_message["deferred_file_count"] = json!(deferred_file_count);
                 }
             }
         }
@@ -7907,13 +8346,18 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
                     .collect::<Vec<_>>()
             })
         });
+    let image_path = (tool.name == "view_image")
+        .then(|| tool.input.get("path").and_then(Value::as_str))
+        .flatten();
     json!({
         "tool_index": tool_index,
+        "call_id": tool.call_id,
         "name": tool.name,
         "status": tool.status,
         "preview": tool_preview(tool),
         "has_output": tool.output.is_some(),
         "has_image": tool.has_image || tool.output.as_ref().is_some_and(web_value_contains_image),
+        "image_path": image_path,
         "bytes": compact_tool_bytes(tool),
         "additions": patch_stats.map(|stats| stats.0),
         "deletions": patch_stats.map(|stats| stats.1),
@@ -8588,6 +9032,11 @@ mod tests {
         fs::write(workspace.join("notes.log"), "first\nsecond\n").unwrap();
         fs::write(workspace.join("app.js"), "export const ready = true;\n").unwrap();
         fs::write(
+            workspace.join("preview.html"),
+            "<!doctype html><title>Preview</title><h1>Hello</h1>\n",
+        )
+        .unwrap();
+        fs::write(
             workspace.join("pixel.png"),
             [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
         )
@@ -8608,6 +9057,13 @@ mod tests {
         assert_eq!(
             javascript.content.as_deref(),
             Some("export const ready = true;\n")
+        );
+        let html = read_workspace_preview(&workspace, "preview.html").unwrap();
+        assert_eq!(html.kind, "html");
+        assert_eq!(html.mime_type, "text/html; charset=utf-8");
+        assert_eq!(
+            html.content.as_deref(),
+            Some("<!doctype html><title>Preview</title><h1>Hello</h1>\n")
         );
         let image = read_workspace_preview(&workspace, "pixel.png").unwrap();
         assert_eq!(image.kind, "image");
@@ -8922,9 +9378,12 @@ app_server_thread_cache = 7
 
 [web_ui]
 enabled = true
+name = "Codex on Test Host"
 listen = "127.0.0.1:19091"
 user = "remote"
 no_auth = true
+tls_cert_file = "~/bridge-cert.pem"
+tls_private_key_file = "~/bridge-key.pem"
 public_origins = ["https://codex.example.com"]
 
 [services]
@@ -8943,9 +9402,18 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(resolved.config_path.as_deref(), Some(config_path.as_path()));
         assert_eq!(resolved.app_server_thread_cache, 7);
         assert!(resolved.web_ui);
+        assert_eq!(resolved.web_ui_name, "Codex on Test Host");
         assert_eq!(resolved.web_ui_listen, "127.0.0.1:19091".parse().unwrap());
         assert_eq!(resolved.web_ui_user, "remote");
         assert!(resolved.web_ui_no_auth);
+        assert!(resolved
+            .web_ui_tls_cert_file
+            .as_deref()
+            .is_some_and(|path| path.ends_with("bridge-cert.pem")));
+        assert!(resolved
+            .web_ui_tls_private_key_file
+            .as_deref()
+            .is_some_and(|path| path.ends_with("bridge-key.pem")));
         assert_eq!(resolved.web_ui_public_origin, ["https://codex.example.com"]);
         assert!(resolved.manage_app_server);
         assert!(!resolved.desktop_interposition);
@@ -8989,6 +9457,37 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(resolved.web_ui_listen, "127.0.0.1:19092".parse().unwrap());
         assert!(!resolved.web_ui);
         assert!(!resolved.web_ui_no_auth);
+        assert_eq!(resolved.web_ui_name, DEFAULT_WEB_UI_NAME);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_web_ui_name_is_escaped_in_the_document_title_and_brand() {
+        let rendered = render_web_index(WEB_INDEX, "Codex <Lab> & Friends");
+        assert_eq!(
+            rendered.matches("Codex &lt;Lab&gt; &amp; Friends").count(),
+            2
+        );
+        assert!(!rendered.contains("Codex <Lab> & Friends"));
+        assert!(!rendered.contains(DEFAULT_WEB_UI_NAME));
+    }
+
+    #[test]
+    fn web_ui_tls_requires_a_certificate_and_private_key_pair() {
+        let root = unique_test_dir("bridge-config-tls-pair");
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            "[web_ui]\ntls_private_key_file = \"~/bridge-key.pem\"\n",
+        )
+        .unwrap();
+        let args =
+            Args::try_parse_from(["codex-bridge", "--config", config_path.to_str().unwrap()])
+                .unwrap();
+        let error = resolve_args(args).unwrap_err().to_string();
+        assert!(error.contains("tls_cert_file"));
+        assert!(error.contains("tls_private_key_file"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9410,23 +9909,42 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     #[test]
     fn web_ui_rejects_cross_origin_browser_requests() {
         let public = vec![parse_public_web_origin("https://codex.example.com").unwrap()];
-        assert!(web_origin_allowed("http://127.0.0.1:47653", 47653, &public));
+        assert!(web_origin_allowed(
+            "http://127.0.0.1:47653",
+            47653,
+            false,
+            &public
+        ));
         assert!(web_origin_allowed(
             "http://192.0.2.20:47653",
             47653,
+            false,
             &public
         ));
         assert!(web_origin_allowed(
             "https://codex.example.com",
             47653,
+            false,
             &public
         ));
         assert!(!web_origin_allowed(
             "https://localhost:47653",
             47653,
+            false,
             &public
         ));
-        assert!(!web_origin_allowed("https://example.com", 47653, &public));
+        assert!(web_origin_allowed(
+            "https://localhost:47653",
+            47653,
+            true,
+            &public
+        ));
+        assert!(!web_origin_allowed(
+            "https://example.com",
+            47653,
+            false,
+            &public
+        ));
     }
 
     #[test]
@@ -9499,6 +10017,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             &mut response,
             &headers,
             &auth,
+            false,
             &[WebOrigin {
                 scheme: "https".to_owned(),
                 authority: "codex.example.com".to_owned(),
@@ -9515,6 +10034,16 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Max-Age=604800"));
         assert!(cookie.ends_with("; Secure"));
+
+        let mut direct_tls = StatusCode::NO_CONTENT.into_response();
+        set_web_session_cookie(&mut direct_tls, &HeaderMap::new(), &auth, true, &[]);
+        assert!(direct_tls
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("; Secure"));
     }
 
     #[test]
@@ -9787,6 +10316,29 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .as_deref(),
             Some("thread-2")
         );
+    }
+
+    #[test]
+    fn live_item_events_invalidate_the_thread_tool_snapshot() {
+        let cache = AppServerToolCache::default();
+        cache.threads.write().unwrap().insert(
+            "thread-1".to_owned(),
+            CachedAppServerTools {
+                known_message_ids: HashSet::from(["message-1".to_owned()]),
+                tools: HashMap::new(),
+            },
+        );
+        invalidate_app_server_tool_cache_for_event(
+            &cache,
+            &json!({
+                "type": "app_server",
+                "message": {
+                    "method": "item/completed",
+                    "params": {"threadId": "thread-1", "item": {"type": "commandExecution"}}
+                }
+            }),
+        );
+        assert!(!cache.threads.read().unwrap().contains_key("thread-1"));
     }
 
     #[test]
@@ -10085,6 +10637,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         };
         let compact = compact_web_message(&message, 5);
         let encoded = serde_json::to_string(&compact).unwrap();
+        assert_eq!(compact["tools"][0]["call_id"], "exec-1");
         assert_eq!(compact["tools"][0]["name"], "exec_command");
         assert_eq!(compact["tools"][0]["preview"], "git status --short");
         assert_eq!(compact["tools"][0]["tool_index"], 0);
@@ -10115,7 +10668,69 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         let compact = compact_web_message(&message, 5);
         let encoded = serde_json::to_string(&compact).unwrap();
         assert_eq!(compact["tools"][0]["has_image"], true);
+        assert_eq!(compact["tools"][0]["image_path"], "/workspace/image.png");
         assert!(!encoded.contains("private-image-data"));
+    }
+
+    #[test]
+    fn external_preview_requires_the_exact_recorded_view_image_path() {
+        let tool = ThreadToolCall {
+            call_id: "image-1".into(),
+            name: "view_image".into(),
+            status: "completed".into(),
+            input: json!({"path":"/other-workspace/image.png"}),
+            output: None,
+            has_image: true,
+        };
+        assert!(tool_authorizes_image_path(
+            &tool,
+            "/other-workspace/image.png"
+        ));
+        assert!(!tool_authorizes_image_path(&tool, "/etc/passwd"));
+    }
+
+    #[test]
+    fn tmp_preview_accepts_only_images_below_the_size_limit() {
+        let sequence = NEXT_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = Path::new("/tmp").join(format!(
+            "codex-bridge-tmp-preview-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("preview.png");
+        let text = root.join("notes.txt");
+        let oversized = root.join("oversized.png");
+        fs::write(
+            &image,
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+        )
+        .unwrap();
+        fs::write(&text, "not an image\n").unwrap();
+        let oversized_file = fs::File::create(&oversized).unwrap();
+        oversized_file.set_len(MAX_DOWNLOAD_BYTES).unwrap();
+
+        let (workspace, preview) = read_tmp_image_preview(image.to_str().unwrap()).unwrap();
+        assert_eq!(workspace, fs::canonicalize("/tmp").unwrap());
+        assert_eq!(preview.kind, "image");
+        assert_eq!(preview.mime_type, "image/png");
+        assert_eq!(
+            read_tmp_image_preview(text.to_str().unwrap()).unwrap_err(),
+            FileDownloadFailure::ReadFailed
+        );
+        assert_eq!(
+            read_tmp_image_preview(oversized.to_str().unwrap()).unwrap_err(),
+            FileDownloadFailure::TooLarge
+        );
+        assert_eq!(
+            read_tmp_image_preview(env!("CARGO_MANIFEST_DIR")).unwrap_err(),
+            FileDownloadFailure::OutsideWorkspace
+        );
+        assert_eq!(
+            read_tmp_image_preview("../../tmp/preview.png").unwrap_err(),
+            FileDownloadFailure::OutsideWorkspace
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -10210,7 +10825,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
-    fn completed_turn_page_defers_image_tools() {
+    fn completed_turn_page_keeps_image_tool_summaries_visible() {
         let messages = vec![
             ThreadMessage {
                 timestamp: None,
@@ -10239,9 +10854,11 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             },
         ];
         let compact = compact_web_message_page(&messages, 4);
-        assert_eq!(compact[0]["tools"], json!([]));
+        assert_eq!(compact[0]["tools"][0]["call_id"], "image-1");
+        assert_eq!(compact[0]["tools"][0]["has_image"], true);
+        assert_eq!(compact[0]["tools"][0]["image_path"], "/workspace/image.png");
         assert_eq!(compact[0]["deferred"], true);
-        assert_eq!(compact[0]["deferred_tool_count"], 1);
+        assert_eq!(compact[0]["deferred_tool_count"], 0);
     }
 
     #[test]
@@ -10275,9 +10892,11 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         .unwrap();
         assert_eq!(tool.name, "view_image");
         assert!(tool.has_image);
+        assert_eq!(tool.input["path"], "/workspace/board.png");
 
         let compact = compact_tool_summary(&tool, 0);
         assert_eq!(compact["has_image"], true);
+        assert_eq!(compact["image_path"], "/workspace/board.png");
     }
 
     #[test]

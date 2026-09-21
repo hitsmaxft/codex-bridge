@@ -96,6 +96,7 @@ pub struct SessionStore {
     git_branch_cache: GitBranchCache,
     summary_cache: Arc<Mutex<Option<SummaryCache>>>,
     ephemeral_threads: Arc<Mutex<HashMap<String, ThreadSummary>>>,
+    ephemeral_chat_threads: Arc<Mutex<HashSet<String>>>,
     message_cache: Arc<Mutex<HashMap<PathBuf, CachedMessages>>>,
     message_load_locks: Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
     activity_cache: Arc<Mutex<HashMap<PathBuf, CachedActivity>>>,
@@ -611,6 +612,8 @@ pub struct ThreadActivity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_token_usage: Option<TokenUsageBreakdown>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_token_usage: Option<TokenUsageBreakdown>,
@@ -641,6 +644,7 @@ impl SessionStore {
             git_branch_cache: Arc::new(Mutex::new(HashMap::new())),
             summary_cache: Arc::new(Mutex::new(None)),
             ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
+            ephemeral_chat_threads: Arc::new(Mutex::new(HashSet::new())),
             message_cache: Arc::new(Mutex::new(HashMap::new())),
             message_load_locks: Arc::new(Mutex::new(HashMap::new())),
             activity_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -700,12 +704,13 @@ impl SessionStore {
         cwd: PathBuf,
         title: Option<String>,
         updated_at_ms: u64,
+        is_chat: bool,
     ) {
         if let Ok(mut threads) = self.ephemeral_threads.lock() {
             threads.insert(
                 id.clone(),
                 ThreadSummary {
-                    id,
+                    id: id.clone(),
                     title,
                     cwd,
                     git_branch: None,
@@ -716,6 +721,11 @@ impl SessionStore {
                     rollout_path: PathBuf::new(),
                 },
             );
+        }
+        if is_chat {
+            if let Ok(mut threads) = self.ephemeral_chat_threads.lock() {
+                threads.insert(id);
+            }
         }
     }
 
@@ -729,6 +739,9 @@ impl SessionStore {
 
     pub fn remove_ephemeral_thread(&self, thread_id: &str) {
         if let Ok(mut threads) = self.ephemeral_threads.lock() {
+            threads.remove(thread_id);
+        }
+        if let Ok(mut threads) = self.ephemeral_chat_threads.lock() {
             threads.remove(thread_id);
         }
     }
@@ -756,10 +769,39 @@ impl SessionStore {
     }
 
     pub fn find_thread(&self, thread_id: &str) -> Result<Option<ThreadSummary>> {
-        let mut thread = self
-            .cached_threads(true)?
-            .into_iter()
-            .find(|thread| thread.id == thread_id);
+        // An exact lookup should not turn an expired list-cache TTL into a full
+        // rollout rescan. Thread identity and cwd are immutable rollout
+        // metadata, so a stale list entry is still suitable for detail and file
+        // authorization requests. Newly started threads are covered by the
+        // ephemeral index. On a genuine miss, inspect only rollout filenames
+        // matching this id instead of parsing every thread to rebuild the list.
+        let mut thread = self.summary_cache.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()?
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .cloned()
+        });
+        if thread.is_none() {
+            thread = self
+                .ephemeral_threads
+                .lock()
+                .ok()
+                .and_then(|threads| threads.get(thread_id).cloned());
+        }
+        if thread.is_none() {
+            thread = self.find_rollout_thread(thread_id, false)?;
+        }
+        if thread.is_none() {
+            // Preserve compatibility with imported or test rollouts whose
+            // filename does not contain the thread id. Native Codex rollouts
+            // use the id in the filename and stay on the targeted fast path.
+            thread = self
+                .cached_threads(true)?
+                .into_iter()
+                .find(|thread| thread.id == thread_id);
+        }
         if let Some(thread) = &mut thread {
             populate_git_branches(std::slice::from_mut(thread), &self.git_branch_cache);
         }
@@ -767,6 +809,14 @@ impl SessionStore {
     }
 
     pub fn find_subagent_thread(&self, thread_id: &str) -> Result<Option<ThreadSummary>> {
+        self.find_rollout_thread(thread_id, true)
+    }
+
+    fn find_rollout_thread(
+        &self,
+        thread_id: &str,
+        require_subagent: bool,
+    ) -> Result<Option<ThreadSummary>> {
         if thread_id.is_empty() || thread_id.len() > 256 {
             return Ok(None);
         }
@@ -774,18 +824,25 @@ impl SessionStore {
         let mut files = Vec::new();
         collect_rollout_files(&self.codex_home.join("sessions"), false, &mut files)?;
         collect_rollout_files(&self.codex_home.join("archived_sessions"), true, &mut files)?;
+        let mut found: Option<ThreadSummary> = None;
         for (path, archived) in files.into_iter().filter(|(path, _)| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.contains(thread_id))
         }) {
-            if let Some(summary) = read_rollout_summary_mode(&path, archived, &titles, true)?
-                .filter(|summary| summary.id == thread_id)
+            if let Some(summary) =
+                read_rollout_summary_mode(&path, archived, &titles, require_subagent)?
+                    .filter(|summary| summary.id == thread_id)
             {
-                return Ok(Some(summary));
+                if found
+                    .as_ref()
+                    .is_none_or(|existing| existing.updated_at_ms < summary.updated_at_ms)
+                {
+                    found = Some(summary);
+                }
             }
         }
-        Ok(None)
+        Ok(found)
     }
 
     pub fn composer_settings(&self, thread_id: &str) -> Result<(Option<String>, Option<String>)> {
@@ -837,14 +894,7 @@ impl SessionStore {
         let threads = self.cached_threads(include_archived)?;
         let mut projects = HashMap::<PathBuf, ProjectSummary>::new();
         for thread in threads {
-            let (path, name, kind) = project_index.map_or_else(
-                || {
-                    let path = project_root_for_cwd(&thread.cwd);
-                    let name = project_name(&path);
-                    (path, name, ProjectKind::Project)
-                },
-                |index| index.group_for_thread(&thread),
-            );
+            let (path, name, kind) = self.group_for_thread(&thread, project_index);
             let entry = projects
                 .entry(path.clone())
                 .or_insert_with(|| ProjectSummary {
@@ -926,12 +976,7 @@ impl SessionStore {
         let mut threads = self
             .cached_threads(include_archived)?
             .into_iter()
-            .filter(|thread| {
-                project_index.map_or_else(
-                    || project_root_for_cwd(&thread.cwd) == project_path,
-                    |index| index.group_for_thread(thread).0 == project_path,
-                )
-            })
+            .filter(|thread| self.group_for_thread(thread, project_index).0 == project_path)
             .collect::<Vec<_>>();
         let pinned_ranks = pinned_thread_ids
             .iter()
@@ -1008,6 +1053,32 @@ impl SessionStore {
                 .then_with(|| right.id.cmp(&left.id))
         });
         threads
+    }
+
+    fn group_for_thread(
+        &self,
+        thread: &ThreadSummary,
+        project_index: Option<&ThreadProjectIndex>,
+    ) -> (PathBuf, String, ProjectKind) {
+        if self
+            .ephemeral_chat_threads
+            .lock()
+            .is_ok_and(|threads| threads.contains(&thread.id))
+        {
+            return (
+                PathBuf::from(CHATS_PROJECT_PATH),
+                "Chats".to_owned(),
+                ProjectKind::Chats,
+            );
+        }
+        project_index.map_or_else(
+            || {
+                let path = project_root_for_cwd(&thread.cwd);
+                let name = project_name(&path);
+                (path, name, ProjectKind::Project)
+            },
+            |index| index.group_for_thread(thread),
+        )
     }
 
     fn scan_threads(&self) -> Result<Vec<ThreadSummary>> {
@@ -1523,6 +1594,7 @@ impl SessionStore {
                 active_turn_id: None,
                 phase: None,
                 active_tool: None,
+                active_tool_call_id: None,
                 turn_token_usage: None,
                 thread_token_usage: None,
                 model_context_window: None,
@@ -2677,6 +2749,10 @@ fn read_thread_activity(
             active_turn_id: cached.active_turn_id.clone(),
             phase: activity_phase(&cached.active_turn_id, &cached.active_tools),
             active_tool: cached.active_tools.last().map(|(_, name)| name.clone()),
+            active_tool_call_id: cached
+                .active_tools
+                .last()
+                .map(|(call_id, _)| call_id.clone()),
             turn_token_usage: cached
                 .active_turn_id
                 .as_ref()
@@ -2763,6 +2839,7 @@ fn read_thread_activity(
         updated_at_ms,
         phase: activity_phase(&active_turn_id, &active_tools),
         active_tool: active_tools.last().map(|(_, name)| name.clone()),
+        active_tool_call_id: active_tools.last().map(|(call_id, _)| call_id.clone()),
         turn_token_usage: active_turn_id
             .as_ref()
             .and(total_usage)
@@ -3059,6 +3136,9 @@ mod tests {
                 }}}),
             );
             apply(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}));
+            apply(json!({"type":"response_item","payload":{
+                "type":"custom_tool_call","call_id":"call-live","name":"exec_command"
+            }}));
             apply(
                 json!({"type":"event_msg","payload":{"type":"token_count","info":{
                     "total_token_usage":{"input_tokens":1200,"cached_input_tokens":900,"cache_write_input_tokens":12,"output_tokens":80,"reasoning_output_tokens":20,"total_tokens":1280},
@@ -3068,6 +3148,10 @@ mod tests {
         }
 
         assert_eq!(active_turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(
+            active_tools.last(),
+            Some(&("call-live".to_owned(), "exec_command".to_owned()))
+        );
         assert_eq!(total_usage.unwrap().total_tokens, 1280);
         assert_eq!(total_usage.unwrap().since(baseline).total_tokens, 230);
         assert_eq!(
@@ -3203,6 +3287,57 @@ mod tests {
         assert_eq!(snapshot.messages[1].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(snapshot.thread.cwd, Path::new("/tmp/project"));
         assert_eq!(snapshot.thread.git_branch, None);
+    }
+
+    #[test]
+    fn exact_thread_lookup_reuses_an_expired_summary_entry() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-cached.jsonl",
+            &[r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-cached","cwd":"/tmp/project","source":"fixture"}}"#],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        assert_eq!(store.list_threads(false).unwrap().len(), 1);
+
+        let expired_at = Instant::now() - SUMMARY_CACHE_TTL - Duration::from_secs(1);
+        store
+            .summary_cache
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .refreshed_at = expired_at;
+
+        let thread = store.find_thread("thread-cached").unwrap().unwrap();
+        assert_eq!(thread.id, "thread-cached");
+        assert_eq!(
+            store
+                .summary_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .refreshed_at,
+            expired_at
+        );
+    }
+
+    #[test]
+    fn exact_thread_lookup_reads_only_the_matching_rollout_on_a_cold_cache() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-thread-direct.jsonl",
+            &[r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-direct","cwd":"/tmp/project","source":"fixture"}}"#],
+        );
+        fixture.write_rollout(
+            "rollout-unrelated.jsonl",
+            &[r#"{"timestamp":"2026-08-30T02:00:00Z","type":"session_meta","payload":{"id":"thread-unrelated","cwd":"/tmp/other","source":"fixture"}}"#],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+
+        let thread = store.find_thread("thread-direct").unwrap().unwrap();
+        assert_eq!(thread.id, "thread-direct");
+        assert!(store.summary_cache.lock().unwrap().is_none());
     }
 
     #[test]
@@ -3619,7 +3754,13 @@ mod tests {
         let workspace = fixture.path.join("project");
         fs::create_dir_all(&workspace).unwrap();
         let store = SessionStore::new(fixture.path.clone());
-        store.register_ephemeral_thread("thread-empty".to_owned(), workspace.clone(), None, 42);
+        store.register_ephemeral_thread(
+            "thread-empty".to_owned(),
+            workspace.clone(),
+            None,
+            42,
+            false,
+        );
 
         let (thread, page) = store
             .read_message_page("thread-empty", None, 30)
@@ -3635,6 +3776,30 @@ mod tests {
             .unwrap()
             .iter()
             .any(|project| project.path == thread.cwd));
+    }
+
+    #[test]
+    fn newly_started_chat_stays_in_chats_before_its_rollout_exists() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("chat-cwd");
+        fs::create_dir_all(&workspace).unwrap();
+        let store = SessionStore::new(fixture.path.clone());
+        store.register_ephemeral_thread("thread-empty-chat".to_owned(), workspace, None, 42, true);
+
+        let projects = store.list_projects(false).unwrap();
+        let chats = projects
+            .iter()
+            .find(|project| project.kind == ProjectKind::Chats)
+            .unwrap();
+        assert_eq!(chats.path, Path::new(CHATS_PROJECT_PATH));
+        assert_eq!(chats.thread_count, 1);
+
+        let (threads, available) = store
+            .list_project_threads(Path::new(CHATS_PROJECT_PATH), false, 0, 10, &[])
+            .unwrap();
+        assert_eq!(available, 1);
+        assert_eq!(threads[0].id, "thread-empty-chat");
+        assert!(!threads[0].archived);
     }
 
     #[test]

@@ -12,9 +12,14 @@ app_server_thread_cache = 3
 
 [web_ui]
 enabled = false
+# Optional browser title and top-left brand label.
+name = "Codex App Server WebUI"
 listen = "127.0.0.1:18791"
 user = "codex"
 # password_file = "~/.codex-bridge/web-ui-password"
+# Optional direct HTTPS. Configure the PEM certificate chain and private key together.
+# tls_cert_file = "~/.config/codex-bridge/tls/fullchain.pem"
+# tls_private_key_file = "~/.config/codex-bridge/tls/private-key.pem"
 no_auth = false
 public_origins = []
 

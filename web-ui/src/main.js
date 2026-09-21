@@ -49,16 +49,26 @@ import {
   watchSystemTheme,
 } from "./state.js";
 import {
+  activeToolGroupTarget,
   activityAgents,
   activityToolTitle,
   activityThreadIds,
   adjacentTurnIndex,
   documentOwnsMessageScroll,
   latestActivityMessages,
+  messageIdentity,
   messageBottomDistance,
+  messagePersistsWhenTurnCollapsed,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
+  toolGroupIdentity,
 } from "./viewport-state.js";
+import {
+  activeActivityOverlay,
+  activityOverlayConfirmed,
+  completedActivityOverlay,
+  mergeActivityProjection,
+} from "./thread-activity-state.js";
 document.documentElement.toggleAttribute("data-demo", demoMode);
 const restoredExpandedProjects = storedExpandedProjects(window.localStorage);
 if (restoredExpandedProjects !== null) {
@@ -597,10 +607,7 @@ async function openDefaultProjectThread() {
   if (threads.length) await openThread(threads[0], { replaceHash: true });
 }
 async function loadProjects({ restoreSession = true } = {}) {
-  const r = await command(
-    { command: "projects", include_archived: $("archived").checked },
-    false,
-  );
+  const r = await command({ command: "projects", include_archived: $("archived").checked }, false);
   state.projects = r.projects || [];
   state.projectThreads.clear();
   state.projectLoadGeneration += 1;
@@ -2231,6 +2238,12 @@ function turnTokenUsageText(item) {
     hitRate: cacheHitPercent(item).toFixed(1),
   });
 }
+function liveTurnTokenUsageText(item) {
+  return tr("liveTurnTokenUsage", {
+    total: tokenCountText(item?.total_tokens),
+    hitRate: cacheHitPercent(item).toFixed(0),
+  });
+}
 function memoryCitationNode(items) {
   const model = memoryCitationModel(items),
     details = document.createElement("details"),
@@ -2297,6 +2310,11 @@ function resetImageZoom() {
   imageViewer.scale = 1;
   imageViewer.x = imageViewer.y = 0;
   renderImageTransform();
+}
+
+function preventPageGestureWhileViewingImage(event) {
+  if (!imageViewer.root || imageViewer.root.hidden) return;
+  if (event.type.startsWith("gesture") || event.touches?.length > 1) event.preventDefault();
 }
 
 function lockPageZoomForImageViewer() {
@@ -2384,9 +2402,17 @@ function ensureImageViewer() {
   root.onclick = (event) => {
     if (event.target === root) closeImageViewer();
   };
-  const preventBrowserZoom = (event) => event.preventDefault();
   for (const eventName of ["gesturestart", "gesturechange", "gestureend"]) {
-    root.addEventListener(eventName, preventBrowserZoom, { passive: false });
+    document.addEventListener(eventName, preventPageGestureWhileViewingImage, {
+      capture: true,
+      passive: false,
+    });
+  }
+  for (const eventName of ["touchstart", "touchmove"]) {
+    document.addEventListener(eventName, preventPageGestureWhileViewingImage, {
+      capture: true,
+      passive: false,
+    });
   }
   root.addEventListener(
     "wheel",
@@ -2664,6 +2690,43 @@ function contentNode(item, threadId = state.current?.id) {
   };
   return details;
 }
+const markdownImagePreviewCache = new Map();
+function markdownImagePreviewNode(threadId, path, label) {
+  if (!threadId) return null;
+  const frame = document.createElement("span"),
+    status = document.createElement("span"),
+    cacheKey = `${threadId}:${path}`;
+  frame.className = "markdown-image-preview";
+  status.className = "tool-image-preview-status";
+  status.textContent = tr("loading");
+  frame.appendChild(status);
+  let previewRequest = markdownImagePreviewCache.get(cacheKey);
+  if (!previewRequest) {
+    previewRequest = requestFilePreview(threadId, path).catch((error) => {
+      markdownImagePreviewCache.delete(cacheKey);
+      throw error;
+    });
+    markdownImagePreviewCache.set(cacheKey, previewRequest);
+  }
+  previewRequest
+    .then((preview) => {
+      if (!frame.isConnected) return;
+      if (preview.kind !== "image" || !preview.preview_url)
+        throw new Error(tr("filePreviewUnsupported"));
+      const img = document.createElement("img");
+      img.src = preview.preview_url;
+      img.alt = label || preview.name || path.split("/").at(-1) || tr("toolResultImage");
+      img.loading = "lazy";
+      frame.replaceChildren(makeInspectableImage(img));
+    })
+    .catch((error) => {
+      if (!frame.isConnected) return;
+      status.textContent = error.message;
+      status.classList.add("error");
+    });
+  return frame;
+}
+
 function markdownOptions(threadId) {
   return {
     requestLocalFilePreview: async (path, position) => {
@@ -2672,6 +2735,7 @@ function markdownOptions(threadId) {
       const controller = await getFilePreview();
       controller.open(preview, position);
     },
+    localImagePreviewNode: (path, label) => markdownImagePreviewNode(threadId, path, label),
     onError: (error) => notify(error.message, true),
   };
 }
@@ -2726,6 +2790,43 @@ function appendToolValue(parent, value) {
     pre.textContent = raw === null ? toolValueText(part) : raw;
     parent.appendChild(pre);
   }
+}
+const toolImagePreviewCache = new Map();
+function toolImagePreviewNode(tool, threadId) {
+  if (tool.name !== "view_image" || typeof tool.image_path !== "string" || !threadId) return null;
+  const frame = document.createElement("figure"),
+    status = document.createElement("span"),
+    cacheKey = `${threadId}:${tool.image_path}`;
+  frame.className = "tool-image-preview";
+  status.className = "tool-image-preview-status";
+  status.textContent = tr("loading");
+  frame.appendChild(status);
+  let previewRequest = toolImagePreviewCache.get(cacheKey);
+  if (!previewRequest) {
+    previewRequest = requestFilePreview(threadId, tool.image_path, {
+      message_index: tool.message_index,
+      tool_index: tool.tool_index,
+    }).catch((error) => {
+      toolImagePreviewCache.delete(cacheKey);
+      throw error;
+    });
+    toolImagePreviewCache.set(cacheKey, previewRequest);
+  }
+  previewRequest
+    .then((preview) => {
+      if (!frame.isConnected || preview.kind !== "image" || !preview.preview_url) return;
+      const img = document.createElement("img");
+      img.src = preview.preview_url;
+      img.alt = preview.name || tool.image_path.split("/").at(-1) || tr("toolResultImage");
+      img.loading = "lazy";
+      frame.replaceChildren(makeInspectableImage(img));
+    })
+    .catch((error) => {
+      if (!frame.isConnected) return;
+      status.textContent = error.message;
+      status.classList.add("error");
+    });
+  return frame;
 }
 function appendPatchDiff(parent, patch, label = "Diff") {
   const card = document.createElement("div"),
@@ -2802,18 +2903,31 @@ function appendCommandActions(parent, input) {
 }
 const renderedMessageState = new WeakMap();
 
-function toolGroupNode(message, keepRunning = false, threadId = state.current?.id) {
+function toolGroupNode(
+  message,
+  activeToolCallId = null,
+  threadId = state.current?.id,
+  liveTool = null,
+  turnRunning = false,
+) {
   const tools = message.tools || [];
-  if (!tools.length) return null;
-  const group = document.createElement("details");
+  if (!tools.length && !liveTool) return null;
+  const group = document.createElement("details"),
+    groupKey = toolGroupIdentity(threadId, message, liveTool);
   group.className = "tool-group";
+  group.dataset.toolGroupKey = groupKey;
+  group.open = state.expandedToolGroupIds.has(groupKey);
   const hasImage = tools.some((tool) => tool.has_image);
-  const runningTool = tools.findLast((tool) => !toolFinished(tool)),
+  const matchedRunningTool = activeToolCallId
+      ? tools.findLast((tool) => tool.call_id === activeToolCallId)
+      : null,
+    runningTool = matchedRunningTool || liveTool,
     latest = runningTool || tools.at(-1),
     summary = document.createElement("summary"),
     icon = document.createElement("span"),
     label = document.createElement("span"),
-    running = Boolean(runningTool) || keepRunning;
+    running = Boolean(runningTool) || turnRunning,
+    priorToolCount = tools.length - (matchedRunningTool ? 1 : 0);
   summary.className = "tool-group-summary";
   summary.classList.toggle("running", running);
   icon.className = `tool-icon ${toolIconClass(latest.name)}`;
@@ -2825,13 +2939,15 @@ function toolGroupNode(message, keepRunning = false, threadId = state.current?.i
   label.textContent = activityTitle
     ? activityTitle
     : running
-      ? [
-          activityTitle || toolActionText(latest.name, true),
-          activityTitle ? "" : toolSummaryPreview(latest),
-          tools.length > 1 ? `+${tools.length - 1}` : "",
-        ]
-          .filter(Boolean)
-          .join(" ")
+      ? runningTool
+        ? [
+            activityTitle || toolActionText(latest.name, true),
+            activityTitle ? "" : toolSummaryPreview(latest),
+            priorToolCount ? `+${priorToolCount}` : "",
+          ]
+            .filter(Boolean)
+            .join(" ")
+        : [tr("running"), tr("toolCount", { count: tools.length })].join(" · ")
       : [
           tr("ranTools"),
           tr("toolCount", { count: tools.length }),
@@ -2852,6 +2968,11 @@ function toolGroupNode(message, keepRunning = false, threadId = state.current?.i
       event.stopPropagation();
       run(() => openSubagentConversation(latest));
     };
+  } else {
+    summary.onclick = () => {
+      if (group.open) state.expandedToolGroupIds.delete(groupKey);
+      else state.expandedToolGroupIds.add(groupKey);
+    };
   }
   if (hasImage) summary.appendChild(toolImageIndicator());
   group.appendChild(summary);
@@ -2860,7 +2981,11 @@ function toolGroupNode(message, keepRunning = false, threadId = state.current?.i
   for (const [toolPosition, tool] of tools.entries()) {
     const detail = document.createElement("details");
     detail.className = "tool-call";
-    detail.dataset.toolIndex = String(tool.tool_index ?? toolPosition);
+    const sourceMessageIndex = tool.message_index ?? message.message_index,
+      sourceToolIndex = tool.tool_index ?? toolPosition,
+      disclosureKey = `${threadId || ""}:${sourceMessageIndex}:${sourceToolIndex}`;
+    detail.dataset.toolKey = `${sourceMessageIndex}:${sourceToolIndex}`;
+    detail.open = state.expandedToolCallIds.has(disclosureKey);
     const head = document.createElement("summary"),
       icon = document.createElement("span"),
       preview = document.createElement("span"),
@@ -2885,6 +3010,10 @@ function toolGroupNode(message, keepRunning = false, threadId = state.current?.i
     if (tool.has_image) head.appendChild(toolImageIndicator());
     head.appendChild(status);
     detail.appendChild(head);
+    head.onclick = () => {
+      if (detail.open) state.expandedToolCallIds.delete(disclosureKey);
+      else state.expandedToolCallIds.add(disclosureKey);
+    };
     detail.ontoggle = () => {
       if (!detail.open || detail.dataset.loaded) return;
       detail.dataset.loaded = "1";
@@ -2897,8 +3026,8 @@ function toolGroupNode(message, keepRunning = false, threadId = state.current?.i
           {
             command: "tool_content",
             thread_id: threadId,
-            message_index: message.message_index,
-            tool_index: tool.tool_index,
+            message_index: sourceMessageIndex,
+            tool_index: sourceToolIndex,
           },
           false,
         );
@@ -3126,10 +3255,18 @@ function preserveMessageElementPosition(element, change) {
 function collapseExpandedMessages() {
   const prefix = `${state.current?.id || ""}:`,
     expandedTurns = [...state.expandedTurnIds].filter((key) => key.startsWith(prefix)),
-    expandedMessages = [...state.expandedLongMessageIds].filter((key) => key.startsWith(prefix));
+    expandedMessages = [...state.expandedLongMessageIds].filter((key) => key.startsWith(prefix)),
+    expandedToolGroups = [...state.expandedToolGroupIds].filter((key) => key.startsWith(prefix)),
+    expandedToolCalls = [...state.expandedToolCallIds].filter((key) => key.startsWith(prefix));
   for (const key of expandedTurns) state.expandedTurnIds.delete(key);
   for (const key of expandedMessages) state.expandedLongMessageIds.delete(key);
-  const expandedCount = expandedTurns.length + expandedMessages.length;
+  for (const key of expandedToolGroups) state.expandedToolGroupIds.delete(key);
+  for (const key of expandedToolCalls) state.expandedToolCallIds.delete(key);
+  const expandedCount =
+    expandedTurns.length +
+    expandedMessages.length +
+    expandedToolGroups.length +
+    expandedToolCalls.length;
   if (expandedCount) renderVisibleMessages();
   notify(tr(expandedCount ? "messagesCollapsed" : "noExpandedMessages", { count: expandedCount }));
   closePanels();
@@ -3146,8 +3283,8 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       (node, index) =>
         group.messages[index].role === "user" && group.messages[index].category === "user",
     ),
-    persistentNodes = messageNodes.filter(
-      (node, index) => group.messages[index].category === "compaction",
+    persistentNodes = messageNodes.filter((node, index) =>
+      messagePersistsWhenTurnCollapsed(group.messages[index]),
     ),
     visibleLeadingNodes = messageNodes.filter(
       (node) => userNodes.includes(node) || persistentNodes.includes(node),
@@ -3175,7 +3312,7 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       : null;
     if (liveUsage) {
       liveUsage.className = "turn-live-usage turn-meta-line";
-      liveUsage.textContent = tr("liveTurnTokenUsage", { usage: turnTokenUsageText(usage) });
+      liveUsage.textContent = liveTurnTokenUsageText(usage);
     }
     reconcileChildren(section, liveUsage ? [...messageNodes, liveUsage] : messageNodes);
     return;
@@ -3249,9 +3386,16 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   ]);
 }
 
-function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) {
+function messageNode(
+  m,
+  activeToolCallId = null,
+  threadId = state.current?.id,
+  liveTool = null,
+  turnRunning = false,
+) {
   const box = document.createElement("article");
   box.className = `message ${m.category || m.role || ""}`;
+  box.dataset.messageKey = messageIdentity(m);
   box.dataset.messageIndex = String(m.message_index);
   if (m.turn_id) box.dataset.turnId = m.turn_id;
   const head = document.createElement("div");
@@ -3305,7 +3449,7 @@ function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) 
     .map((item) => item.text)
     .join("\n\n");
   const copy = copyText ? messageCopyButton(copyText) : null,
-    tools = toolGroupNode(m, keepToolsRunning, threadId);
+    tools = toolGroupNode(m, activeToolCallId, threadId, liveTool, turnRunning);
   if (tools) {
     const toolRow = document.createElement("div");
     toolRow.className = "message-tool-row";
@@ -3316,6 +3460,20 @@ function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) 
       toolRow.appendChild(copy);
     }
     body.appendChild(toolRow);
+    const imagePreviews = (m.tools || [])
+      .map((tool) =>
+        toolImagePreviewNode(
+          { ...tool, message_index: tool.message_index ?? m.message_index },
+          threadId,
+        ),
+      )
+      .filter(Boolean);
+    if (imagePreviews.length) {
+      const previewList = document.createElement("div");
+      previewList.className = "tool-image-preview-list";
+      previewList.append(...imagePreviews);
+      body.appendChild(previewList);
+    }
   } else if (copy) body.appendChild(copy);
   for (const item of usageItems) body.appendChild(contentNode(item, threadId));
   if (memoryItems.length) body.appendChild(memoryCitationNode(memoryItems));
@@ -3323,7 +3481,7 @@ function messageNode(m, keepToolsRunning = false, threadId = state.current?.id) 
   box.appendChild(body);
   renderedMessageState.set(box, {
     signature: JSON.stringify(m),
-    keepToolsRunning,
+    activeToolCallId,
   });
   return box;
 }
@@ -3352,21 +3510,31 @@ function syncLongAssistantMessages(root = $("messages")) {
     syncLongAssistantMessage(message);
 }
 
-function preserveLoadedToolDetails(previous, next) {
-  const previousGroup = previous.querySelector(".tool-group"),
-    nextGroup = next.querySelector(".tool-group");
-  if (!previousGroup || !nextGroup) return;
-  nextGroup.open = previousGroup.open;
-  const previousTools = new Map(
-    [...previousGroup.querySelectorAll(".tool-call")].map((detail) => [
-      detail.dataset.toolIndex,
-      detail,
-    ]),
+function loadedToolDetails(root) {
+  return new Map(
+    [...root.querySelectorAll(".tool-call")].map((detail) => [detail.dataset.toolKey, detail]),
   );
-  for (const detail of nextGroup.querySelectorAll(".tool-call")) {
-    const previousDetail = previousTools.get(detail.dataset.toolIndex);
+}
+
+function openToolGroupKeys(root) {
+  return new Set(
+    [...root.querySelectorAll(".tool-group[open]")].map((group) => group.dataset.toolGroupKey),
+  );
+}
+
+function preserveToolDisclosure(previousGroups, previousTools, next) {
+  for (const group of next.querySelectorAll(".tool-group")) {
+    if (!previousGroups.has(group.dataset.toolGroupKey)) continue;
+    group.open = true;
+    state.expandedToolGroupIds.add(group.dataset.toolGroupKey);
+  }
+  for (const detail of next.querySelectorAll(".tool-call")) {
+    const previousDetail = previousTools.get(detail.dataset.toolKey);
     if (!previousDetail) continue;
     detail.open = previousDetail.open;
+    const disclosureKey = `${state.current?.id || ""}:${detail.dataset.toolKey}`;
+    if (detail.open) state.expandedToolCallIds.add(disclosureKey);
+    else state.expandedToolCallIds.delete(disclosureKey);
     const loadedBody = previousDetail.querySelector(":scope > .tool-detail");
     if (!loadedBody) continue;
     detail.dataset.loaded = "1";
@@ -3374,11 +3542,25 @@ function preserveLoadedToolDetails(previous, next) {
   }
 }
 
-function reconcileMessageNodes(root, response, activeToolMessage) {
-  const messages = latestActivityMessages(response.messages),
+function reconcileMessageNodes(root, response) {
+  const sourceMessages = latestActivityMessages(response.messages),
+    activeToolCallId = state.activityPhase === "tool" ? state.activeToolCallId : null,
+    activeTarget = activeToolGroupTarget(sourceMessages, state.activeTurnId, activeToolCallId),
+    matchedLiveTool = activeToolCallId
+      ? activeTarget?.tools?.findLast((tool) => tool.call_id === activeToolCallId)
+      : null,
+    liveTool =
+      activeTarget && state.activityPhase === "tool" && !matchedLiveTool
+        ? {
+            call_id: activeToolCallId,
+            name: state.activeTool || "tool",
+            status: "running",
+          }
+        : null,
+    messages = sourceMessages,
     existing = new Map(
-      [...root.querySelectorAll(".message[data-message-index]")].map((message) => [
-        message.dataset.messageIndex,
+      [...root.querySelectorAll(".message[data-message-key]")].map((message) => [
+        message.dataset.messageKey,
         message,
       ]),
     ),
@@ -3389,30 +3571,44 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
         section.dataset.turnKey,
         section,
       ]),
-    );
+    ),
+    previousToolGroups = openToolGroupKeys(root),
+    previousToolDetails = loadedToolDetails(root);
+  let activeTurnSection = null;
   if (response.page.has_more) nodes.push(root.querySelector(":scope > .older") || olderButton());
   for (const message of messages) {
-    const key = String(message.message_index),
+    const key = messageIdentity(message),
       previous = existing.get(key),
-      keepToolsRunning = message.message_index === activeToolMessage?.message_index,
+      messageActiveToolCallId =
+        message.message_index === activeTarget?.message_index
+          ? activeToolCallId || `active-turn:${state.activeTurnId}`
+          : null,
+      messageLiveTool = message.message_index === activeTarget?.message_index ? liveTool : null,
+      messageTurnRunning = message.message_index === activeTarget?.message_index,
       previousState = previous ? renderedMessageState.get(previous) : null,
       signature = JSON.stringify(message);
     if (
       previous &&
       previousState?.signature === signature &&
-      previousState.keepToolsRunning === keepToolsRunning
+      previousState.activeToolCallId === messageActiveToolCallId
     ) {
       messageNodes.set(key, previous);
       continue;
     }
-    const next = messageNode(message, keepToolsRunning);
-    if (previous) preserveLoadedToolDetails(previous, next);
+    const next = messageNode(
+      message,
+      messageActiveToolCallId,
+      state.current?.id,
+      messageLiveTool,
+      messageTurnRunning,
+    );
+    preserveToolDisclosure(previousToolGroups, previousToolDetails, next);
     messageNodes.set(key, next);
   }
   const turns = groupedTurns(messages);
   for (const [turnIndex, turn] of turns.entries()) {
     const section = turnSections.get(turn.key) || document.createElement("section"),
-      members = turn.messages.map((message) => messageNodes.get(String(message.message_index))),
+      members = turn.messages.map((message) => messageNodes.get(messageIdentity(message))),
       completed =
         turn.turnId !== state.activeTurnId &&
         (turn.messages.some(
@@ -3420,7 +3616,17 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
         ) ||
           turnIndex < turns.length - 1);
     layoutTurnGroup(section, turn, members, completed);
+    if (turn.turnId === state.activeTurnId) activeTurnSection = section;
     nodes.push(section);
+  }
+  if (state.activeTurnId && state.activityPhase === "tool" && !activeTarget) {
+    const liveTool = liveToolActivityNode(root);
+    if (activeTurnSection) {
+      activeTurnSection.insertBefore(
+        liveTool,
+        activeTurnSection.querySelector(":scope > .turn-live-usage"),
+      );
+    } else nodes.push(liveTool);
   }
   if (!messages.length) {
     const empty = root.querySelector(":scope > .empty") || document.createElement("div");
@@ -3442,6 +3648,68 @@ function reconcileMessageNodes(root, response, activeToolMessage) {
     cursor = next;
   }
   requestAnimationFrame(() => syncLongAssistantMessages(root));
+}
+
+function liveToolActivityNode(root = $("messages")) {
+  const node = root.querySelector(".live-tool-activity") || document.createElement("article"),
+    body = document.createElement("div"),
+    row = document.createElement("div"),
+    summary = document.createElement("div"),
+    icon = document.createElement("span"),
+    label = document.createElement("span"),
+    name = state.activeTool || "tool";
+  node.className = "message assistant live-tool-activity";
+  node.dataset.callId = state.activeToolCallId || "";
+  body.className = "message-body";
+  row.className = "message-tool-row";
+  summary.className = "tool-group-summary running live-tool-summary";
+  summary.setAttribute("role", "status");
+  summary.setAttribute("aria-live", "polite");
+  icon.className = `tool-icon ${toolIconClass(name)}`;
+  icon.title = name;
+  label.className = "tool-summary-label";
+  label.textContent = `${toolActionText(name, true)} ${name}`.trim();
+  summary.append(icon, label);
+  row.appendChild(summary);
+  body.appendChild(row);
+  while (node.firstChild) node.firstChild.remove();
+  node.appendChild(body);
+  return node;
+}
+
+function activeToolMessage(messages = state.visibleMessages) {
+  if (!state.activeTurnId || state.activityPhase !== "tool") return null;
+  const visible = latestActivityMessages(messages);
+  for (let messageIndex = visible.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = visible[messageIndex];
+    for (let toolIndex = (message.tools || []).length - 1; toolIndex >= 0; toolIndex -= 1) {
+      const tool = message.tools[toolIndex];
+      if (state.activeToolCallId) {
+        if (tool.call_id === state.activeToolCallId) return { message, tool };
+      } else if (!toolFinished(tool) && (!state.activeTool || tool.name === state.activeTool)) {
+        return { message, tool };
+      }
+    }
+  }
+  return null;
+}
+
+function appServerItemTool(item) {
+  const type = item?.type,
+    names = {
+      commandExecution: "exec_command",
+      fileChange: "apply_patch",
+      webSearch: "web_search",
+      imageView: "view_image",
+    };
+  let name = names[type] || null;
+  if (type === "mcpToolCall")
+    name = [item.server, item.tool].filter(Boolean).join(".") || "mcp_tool";
+  else if (type === "dynamicToolCall")
+    name = [item.namespace, item.tool].filter(Boolean).join(".") || "dynamic_tool";
+  else if (type === "collabAgentToolCall") name = item.tool || "collab_agent";
+  if (!name) return null;
+  return { id: item.id || null, name };
 }
 function pendingNode(entry) {
   const box = document.createElement("article");
@@ -3750,22 +4018,15 @@ function mergeHydratedTurnMessages(messages, threadId = state.current?.id) {
 }
 function renderVisibleMessages() {
   if (!state.current) return;
-  const activeToolMessage = state.activeTurnId
-    ? state.visibleMessages.findLast((message) => message.tools?.length)
-    : null;
-  reconcileMessageNodes(
-    $("messages"),
-    {
-      messages: state.visibleMessages,
-      page: {
-        start: state.historyStart ?? 0,
-        end: state.historyEnd ?? state.visibleMessages.length,
-        total: state.historyTotal ?? state.visibleMessages.length,
-        has_more: state.hasMore,
-      },
+  reconcileMessageNodes($("messages"), {
+    messages: state.visibleMessages,
+    page: {
+      start: state.historyStart ?? 0,
+      end: state.historyEnd ?? state.visibleMessages.length,
+      total: state.historyTotal ?? state.visibleMessages.length,
+      has_more: state.hasMore,
     },
-    activeToolMessage,
-  );
+  });
 }
 async function hydrateTurn(turnId, { render = false } = {}) {
   const threadId = state.current?.id;
@@ -4152,14 +4413,38 @@ async function refreshActivity() {
     r = await command({ command: "thread_activity", thread_id: threadId }, false);
   if (state.current?.id !== threadId) return null;
   const activity = r.activity,
-    previous = state.activityFileLen;
+    previous = state.activityFileLen,
+    previousPhase = state.activityPhase,
+    previousToolCallId = state.activeToolCallId;
   state.activityFileLen = activity.file_len;
+  const authoritativeActive = state.authoritativeThreadActive.get(threadId),
+    effectiveActivity =
+      authoritativeActive === false
+        ? {
+            ...activity,
+            active_turn_id: null,
+            phase: null,
+            active_tool: null,
+            active_tool_call_id: null,
+          }
+        : activity;
+  if (activityOverlayConfirmed(state.liveActivityOverlay, effectiveActivity)) {
+    state.liveActivityOverlay = null;
+  }
+  const projection = mergeActivityProjection(effectiveActivity, state.liveActivityOverlay);
   state.activeTurnId = effectiveActiveTurnId(
-    activity.active_turn_id,
-    state.authoritativeThreadActive.get(threadId),
+    projection.activeTurnId,
+    authoritativeActive,
+    state.activeTurnId,
   );
-  state.activityPhase = activity.phase || null;
-  state.activeTool = activity.active_tool || null;
+  state.activityPhase = projection.activityPhase;
+  state.activeTool = projection.activeTool;
+  state.activeToolCallId = projection.activeToolCallId;
+  if (previousPhase !== state.activityPhase || previousToolCallId !== state.activeToolCallId) {
+    const followTail = shouldFollowMessageTail(state.followMessageTail, messageScrollMetrics());
+    renderVisibleMessages();
+    if (followTail) requestAnimationFrame(scheduleMessageTailLock);
+  }
   state.modelContextWindow = Number(activity.model_context_window || 0) || null;
   if (activity.thread_token_usage) {
     if (state.activeTurnId && activity.turn_token_usage)
@@ -4344,8 +4629,35 @@ function handleBridgeEvent(event) {
     renderProjects();
     if (threadId === state.current?.id) {
       state.activeTurnId = params.turn?.id || state.activeTurnId;
+      state.liveActivityOverlay = activeActivityOverlay(state.activeTurnId, "model");
       state.turnUsageBaseline = normalizeTokenUsage(state.threadStatistics);
       state.liveTurnUsage = null;
+      showActivity();
+    }
+  } else if (method === "item/started" && threadId === state.current?.id) {
+    const liveTool = appServerItemTool(params.item);
+    if (liveTool) {
+      state.liveAppServerTool = liveTool;
+      state.authoritativeThreadActive.set(threadId, true);
+      state.activeTurnId = params.turnId || state.activeTurnId;
+      state.activityPhase = "tool";
+      state.activeTool = liveTool.name;
+      state.activeToolCallId = liveTool.id;
+      state.liveActivityOverlay = activeActivityOverlay(state.activeTurnId, "tool", liveTool);
+      const followTail = shouldFollowMessageTail(state.followMessageTail, messageScrollMetrics());
+      renderVisibleMessages();
+      showActivity();
+      if (followTail) requestAnimationFrame(scheduleMessageTailLock);
+    }
+  } else if (method === "item/completed" && threadId === state.current?.id) {
+    const completedTool = appServerItemTool(params.item);
+    if (completedTool && state.liveAppServerTool?.id === completedTool.id) {
+      state.liveAppServerTool = null;
+      state.activityPhase = "model";
+      state.activeTool = null;
+      state.activeToolCallId = null;
+      state.liveActivityOverlay = activeActivityOverlay(state.activeTurnId, "model");
+      renderVisibleMessages();
       showActivity();
     }
   } else if (method === "thread/tokenUsage/updated" && threadId === state.current?.id) {
@@ -4372,7 +4684,12 @@ function handleBridgeEvent(event) {
     notifyTurnFinished(threadId, runState, params.turn?.id);
     renderProjects();
     if (threadId === state.current?.id && completionIsCurrent) {
+      state.liveAppServerTool = null;
       state.activeTurnId = null;
+      state.activityPhase = null;
+      state.activeTool = null;
+      state.activeToolCallId = null;
+      state.liveActivityOverlay = completedActivityOverlay();
       showActivity();
     }
   }
@@ -4407,9 +4724,12 @@ function updateThreadLiveFromStatus(threadId, status) {
       setThreadRunState(threadId, "completed");
     }
     if (threadId === state.current?.id) {
+      state.liveAppServerTool = null;
       state.activeTurnId = null;
       state.activityPhase = null;
       state.activeTool = null;
+      state.activeToolCallId = null;
+      state.liveActivityOverlay = completedActivityOverlay();
       if ($("sendMode").value === "steer") setSendMode("send", true);
       showActivity();
     }
@@ -4601,6 +4921,9 @@ async function openThread(
     state.activeTurnId = null;
     state.activityPhase = null;
     state.activeTool = null;
+    state.activeToolCallId = null;
+    state.liveAppServerTool = null;
+    state.liveActivityOverlay = null;
     state.pendingChanges = false;
     state.repairRequired = false;
     state.threadStatistics = null;
@@ -4691,9 +5014,6 @@ async function openThread(
   renderGoalPanel();
   rememberSessionId(window.localStorage, state.current.id);
   if (writeHash) updateSessionHash(state.current.id, replaceHash);
-  const activeToolMessage = state.activeTurnId
-    ? r.messages.findLast((message) => message.tools?.length)
-    : null;
   const preservedHasMore = state.hasMore,
     olderMessages = state.visibleMessages.filter((message) => message.message_index < r.page.start),
     visibleResponse = {
@@ -4702,11 +5022,12 @@ async function openThread(
       page: { ...r.page, has_more: olderMessages.length ? preservedHasMore : r.page.has_more },
     };
   state.visibleMessages = visibleResponse.messages;
+  const activeTool = activeToolMessage(visibleResponse.messages);
   if (messageView?.anchorTurnKey && !messageView.atBottom) {
     state.expandedTurnIds.add(`${thread.id}:${messageView.anchorTurnKey}`);
   }
   const renderStarted = performance.now();
-  reconcileMessageNodes(root, visibleResponse, activeToolMessage);
+  reconcileMessageNodes(root, visibleResponse, activeTool);
   applyMessagePageState(r);
   if (olderMessages.length) {
     state.historyStart = olderMessages[0].message_index;
@@ -4804,9 +5125,7 @@ async function loadOlder() {
   state.historyTotal = Math.max(state.historyTotal ?? 0, r.page.total);
   r.messages = mergeHydratedTurnMessages(r.messages, threadId);
   state.visibleMessages = [...r.messages, ...state.visibleMessages];
-  const activeToolMessage = state.activeTurnId
-    ? state.visibleMessages.findLast((message) => message.tools?.length)
-    : null;
+  const activeTool = activeToolMessage();
   const renderStarted = performance.now();
   reconcileMessageNodes(
     root,
@@ -4815,7 +5134,7 @@ async function loadOlder() {
       messages: state.visibleMessages,
       page: { ...r.page, start: state.historyStart, end: state.historyEnd },
     },
-    activeToolMessage,
+    activeTool,
   );
   reportMessagesRendered(r, renderStarted);
   const newHeight = messageScrollMetrics().height;

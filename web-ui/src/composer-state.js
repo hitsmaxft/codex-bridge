@@ -2,8 +2,9 @@ export function shouldOfferStop({ activeTurnId }) {
   return Boolean(activeTurnId);
 }
 
-export function effectiveActiveTurnId(rolloutTurnId, authoritativeActive) {
-  return authoritativeActive === false ? null : rolloutTurnId || null;
+export function effectiveActiveTurnId(rolloutTurnId, authoritativeActive, currentTurnId = null) {
+  if (authoritativeActive === false) return null;
+  return rolloutTurnId || (authoritativeActive === true ? currentTurnId : null) || null;
 }
 
 export function completionMatchesActiveTurn(activeTurnId, completedTurnId) {

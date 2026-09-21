@@ -82,9 +82,13 @@ app_server_thread_cache = 3
 
 [web_ui]
 enabled = true
+name = "Codex on Home Server"
 listen = "127.0.0.1:18791"
 user = "codex"
 password_file = "~/.codex-bridge/web-ui-password"
+# Optional direct HTTPS; both PEM files are required when either is set.
+# tls_cert_file = "~/.config/codex-bridge/tls/fullchain.pem"
+# tls_private_key_file = "~/.config/codex-bridge/tls/private-key.pem"
 no_auth = false
 public_origins = []
 
@@ -102,6 +106,9 @@ HTTP_PROXY = "http://127.0.0.1:7897"
 
 Paths in the TOML file may be absolute or start with `~/`. Unknown fields and invalid values stop
 startup with the config filename in the error instead of being ignored.
+
+`web_ui.name` customizes both the browser title and the brand label in the top-left corner. It is
+display-only and does not change authentication, host validation, or the public URL.
 
 Configuration precedence is:
 
@@ -281,6 +288,26 @@ public_origins = ["https://codex.example.com"]
 
 Unauthenticated Web UI startup is rejected on non-loopback addresses. A direct LAN bind should
 retain bridge authentication, and cross-network access should use TLS or a VPN.
+
+For direct HTTPS without a reverse proxy, configure a PEM certificate chain and its unencrypted
+PEM private key together:
+
+```toml
+[web_ui]
+enabled = true
+listen = "0.0.0.0:18791"
+user = "codex"
+password_file = "~/.codex-bridge/web-ui-password"
+tls_cert_file = "~/.config/codex-bridge/tls/fullchain.pem"
+tls_private_key_file = "~/.config/codex-bridge/tls/private-key.pem"
+public_origins = ["https://codex.example.com:18791"]
+```
+
+The equivalent command-line options are `--web-ui-tls-cert-file` and
+`--web-ui-tls-private-key-file`. Supplying only one file is an error. The bridge validates the
+certificate/key pair before serving and marks its authentication cookie `Secure`; restart the
+bridge after replacing either file. Keep reverse-proxy deployments on their existing HTTP
+loopback listener unless end-to-end TLS to the bridge is specifically required.
 
 ## macOS standalone topology (recommended)
 

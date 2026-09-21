@@ -29,6 +29,14 @@ Run the Vite production build before compiling or packaging `codex-bridge`, beca
 embeds files from `web-ui/dist` at compile time. For a deployed release, rebuild the daemon only
 after that sequence, then restart it and verify both `codexctl status` and the HTTP endpoint.
 
+## Web UI streaming behavior
+
+Follow [`docs/web-ui-streaming.md`](docs/web-ui-streaming.md) for message, turn, activity, tool, and
+viewport reconciliation. In particular, snapshot refreshes and live events are updates to one
+logical timeline: preserve stable identities and user-controlled disclosure, focus, and scroll
+state instead of rebuilding visible UI from each payload. Add a regression whenever a streaming
+change can affect these invariants.
+
 ## Privacy before publication
 
 - Before every commit or push, scan tracked and staged files for real usernames, absolute home

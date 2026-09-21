@@ -1,4 +1,5 @@
 import { createAuthenticationGate } from "./auth-gate.js";
+import { createEventSequenceTracker } from "./event-sequence.js";
 
 export const $ = (id) => document.getElementById(id);
 
@@ -9,6 +10,7 @@ let eventRetryTimer;
 let eventRetryDelay = 500;
 let eventStreamUnavailable = false;
 const eventListeners = new Set();
+const eventSequence = createEventSequenceTracker();
 const performanceBuckets = new Map();
 let performanceFlush = null;
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -61,7 +63,7 @@ export async function createFileDownloadTicket(threadId, path) {
   return response.json();
 }
 
-export async function requestFilePreview(threadId, path) {
+export async function requestFilePreview(threadId, path, toolReference = null) {
   await authenticate();
   const response = await fetchWithTimeout(
     "/api/file-preview",
@@ -69,7 +71,7 @@ export async function requestFilePreview(threadId, path) {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ thread_id: threadId, path }),
+      body: JSON.stringify({ thread_id: threadId, path, ...(toolReference || {}) }),
     },
     30_000,
   );
@@ -220,10 +222,13 @@ async function connectEventStream() {
   eventSocket.onmessage = (message) => {
     try {
       const event = JSON.parse(message.data);
+      const observation = eventSequence.observe(event);
+      if (!observation.accept) return;
       if (event.type === "bridge_app_server_connection" && event.status === "unavailable") {
         eventStreamUnavailable = true;
       }
       emitEvent(event);
+      if (observation.gap) emitEvent(observation.gap);
     } catch {
       // Ignore malformed event frames; the polling path remains available for recovery.
     }

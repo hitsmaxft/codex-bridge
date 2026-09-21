@@ -20,6 +20,35 @@ export function documentOwnsMessageScroll({ mobile, fullscreen }) {
   return Boolean(mobile) && !Boolean(fullscreen);
 }
 
+export function messageIdentity(message) {
+  const id = typeof message?.id === "string" ? message.id.trim() : "";
+  return id ? `id:${id}` : `index:${message?.message_index ?? "unknown"}`;
+}
+
+export function toolGroupIdentity(threadId, message, liveTool = null) {
+  // A message-level tool group grows by appending calls while a turn runs. Its
+  // first call is the stable anchor; using the newest call would rename the
+  // group on every incremental update and discard the user's open state.
+  // A live-only placeholder has no snapshotted calls yet, so use its call ID
+  // until that same first call appears in the snapshot.
+  const tool = message?.tools?.[0] || liveTool || null,
+    activityKey = typeof tool?.activity_key === "string" ? tool.activity_key.trim() : "",
+    callId = typeof (tool?.call_id || tool?.id) === "string" ? tool.call_id || tool.id : "",
+    identity = activityKey
+      ? `activity:${activityKey}`
+      : callId
+        ? `call:${callId}`
+        : messageIdentity(message);
+  return `${threadId || ""}:${identity}`;
+}
+
+export function messagePersistsWhenTurnCollapsed(message) {
+  return (
+    message?.category === "compaction" ||
+    message?.tools?.some((tool) => Boolean(tool?.has_image)) === true
+  );
+}
+
 export function adjacentTurnIndex(turnTops, viewportTop, direction, tolerance = 6) {
   const top = Number(viewportTop),
     positions = Array.from(turnTops || [], Number);
@@ -48,6 +77,21 @@ export function latestActivityMessages(messages) {
       );
     return visible.length === tools.length ? message : { ...message, tools: visible };
   });
+}
+
+export function activeToolGroupTarget(messages, activeTurnId, activeToolCallId = null) {
+  if (!activeTurnId) return null;
+  const assistants = (messages || []).filter(
+    (message) => message.turn_id === activeTurnId && message.role === "assistant",
+  );
+  const matched = activeToolCallId
+    ? assistants.findLast((message) =>
+        message.tools?.some((tool) => tool.call_id === activeToolCallId),
+      )
+    : null;
+  return (
+    matched || assistants.findLast((message) => message.tools?.length) || assistants.at(-1) || null
+  );
 }
 
 export function activityToolTitle(tool, _currentThread) {

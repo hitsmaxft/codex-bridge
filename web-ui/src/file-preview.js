@@ -16,7 +16,7 @@ export function createFilePreviewController({
   let editor = null;
   let current = null;
   let currentPosition = null;
-  let markdownSource = false;
+  let sourceMode = false;
 
   const destroyEditor = () => {
     editor?.destroy();
@@ -54,16 +54,28 @@ export function createFilePreviewController({
   };
   const renderCurrent = () => {
     if (!current) return;
-    modeButton.hidden = current.kind !== "markdown";
-    modeButton.textContent = translate(markdownSource ? "renderMarkdown" : "showMarkdownSource");
-    if (current.kind === "markdown" && !markdownSource) {
+    const renderableSource = current.kind === "markdown" || current.kind === "html";
+    modeButton.hidden = !renderableSource;
+    modeButton.textContent = translate(sourceMode ? "renderMarkdown" : "showMarkdownSource");
+    if (current.kind === "markdown" && !sourceMode) {
       destroyEditor();
       const rendered = renderMarkdown(current.content || "");
       rendered.classList.add("file-preview-markdown");
       body.replaceChildren(rendered);
       return;
     }
-    if (current.kind === "text" || current.kind === "markdown") {
+    if (current.kind === "html" && !sourceMode) {
+      destroyEditor();
+      const frame = document.createElement("iframe");
+      frame.className = "file-preview-html";
+      frame.title = current.name;
+      frame.setAttribute("sandbox", "");
+      frame.referrerPolicy = "no-referrer";
+      frame.srcdoc = secureHtmlPreviewDocument(current.content || "");
+      body.replaceChildren(frame);
+      return;
+    }
+    if (["text", "markdown", "html"].includes(current.kind)) {
       renderText(current.content || "");
       return;
     }
@@ -92,7 +104,7 @@ export function createFilePreviewController({
   const open = (preview, position = null) => {
     current = preview;
     currentPosition = position;
-    markdownSource = false;
+    sourceMode = false;
     title.textContent = preview.name;
     meta.textContent = `${preview.mime_type} · ${formatBytes(preview.size)}`;
     root.hidden = false;
@@ -106,7 +118,7 @@ export function createFilePreviewController({
     if (event.target === root) close();
   };
   modeButton.onclick = () => {
-    markdownSource = !markdownSource;
+    sourceMode = !sourceMode;
     renderCurrent();
   };
   downloadButton.onclick = () => {
@@ -114,6 +126,21 @@ export function createFilePreviewController({
   };
 
   return { open, close, isOpen: () => !root.hidden };
+}
+
+function secureHtmlPreviewDocument(source) {
+  const policy = [
+    "default-src 'none'",
+    "script-src 'none'",
+    "style-src 'unsafe-inline'",
+    "img-src data: blob:",
+    "media-src data: blob:",
+    "font-src data:",
+    "connect-src 'none'",
+    "form-action 'none'",
+    "base-uri 'none'",
+  ].join("; ");
+  return `<meta http-equiv="Content-Security-Policy" content="${policy}">${source}`;
 }
 
 function formatBytes(bytes) {

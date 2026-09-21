@@ -445,7 +445,7 @@ const messages = {
     weeklyRemaining: "Weekly remaining {percent}%",
     turnTokenUsage:
       "Tokens {total} · input {input} · cached {cached} ({hitRate}%) · output {output}",
-    liveTurnTokenUsage: "Live · {usage}",
+    liveTurnTokenUsage: "Live · {total} tokens · {hitRate}% cached",
     memoryCitation: "{source}{note}",
     resetsAt: "Resets at {time}",
     selectModel: "Select model",
@@ -917,7 +917,7 @@ const messages = {
     bundledOnlyHelp: "Desktop 内置 app-server 使用私有连接；standalone fallback 已禁用",
     weeklyRemaining: "周剩余 {percent}%",
     turnTokenUsage: "Token {total} · 输入 {input} · 缓存 {cached}（{hitRate}%）· 输出 {output}",
-    liveTurnTokenUsage: "实时 · {usage}",
+    liveTurnTokenUsage: "实时 · {total} Token · 缓存 {hitRate}%",
     memoryCitation: "{source}{note}",
     resetsAt: "重置时间：{time}",
     selectModel: "选择模型",

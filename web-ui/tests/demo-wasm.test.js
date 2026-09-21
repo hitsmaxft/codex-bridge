@@ -17,9 +17,10 @@ import {
   showBrowserNotification,
 } from "../src/browser-notifications.js";
 import { createAuthenticationGate } from "../src/auth-gate.js";
+import { createEventSequenceTracker } from "../src/event-sequence.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { goalToggleState } from "../src/goal-state.js";
-import { localFilePath, localFileReference } from "../src/markdown.js";
+import { isLocalImagePath, localFilePath, localFileReference } from "../src/markdown.js";
 import { memoryCitationModel } from "../src/memory-citations.js";
 import {
   compactToolFilePath,
@@ -36,6 +37,12 @@ import {
 } from "../src/project-state.js";
 import { taskOverview } from "../src/task-overview.js";
 import {
+  activeActivityOverlay,
+  activityOverlayConfirmed,
+  completedActivityOverlay,
+  mergeActivityProjection,
+} from "../src/thread-activity-state.js";
+import {
   LAST_SESSION_STORAGE_KEY,
   rememberSessionId,
   sessionHash,
@@ -43,15 +50,19 @@ import {
   storedSessionId,
 } from "../src/session-route.js";
 import {
+  activeToolGroupTarget,
   activityAgents,
   activityToolTitle,
   activityThreadIds,
   adjacentTurnIndex,
   documentOwnsMessageScroll,
   latestActivityMessages,
+  messageIdentity,
   messageBottomDistance,
+  messagePersistsWhenTurnCollapsed,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
+  toolGroupIdentity,
 } from "../src/viewport-state.js";
 
 const wasmPath = new URL(
@@ -131,6 +142,75 @@ test("runtime architecture follows managed and selected voice backends", () => {
   });
   assert.equal(desktopLimited.wsBridge.phase, "standby");
   assert.equal(desktopLimited.wsBridge.labelKey, "componentLimited");
+});
+
+test("event sequence tracking rejects duplicates and requests scoped recovery after gaps", () => {
+  const tracker = createEventSequenceTracker();
+  assert.deepEqual(
+    tracker.observe({ type: "bridge_event_stream", status: "ready", sequence: 10 }),
+    { accept: true, gap: null },
+  );
+  assert.deepEqual(tracker.observe({ bridge_sequence: 11 }), { accept: true, gap: null });
+  assert.equal(tracker.observe({ bridge_sequence: 11 }).accept, false);
+  assert.deepEqual(tracker.observe({ bridge_sequence: 14 }).gap, {
+    type: "bridge_event_gap",
+    reason: "sequence_gap",
+    skipped: 2,
+    previous_sequence: 11,
+    sequence: 14,
+  });
+  assert.deepEqual(
+    tracker.observe({ type: "bridge_event_stream", status: "ready", sequence: 3 }).gap,
+    {
+      type: "bridge_event_gap",
+      reason: "sequence_reset",
+      skipped: 0,
+      previous_sequence: 14,
+      sequence: 3,
+    },
+  );
+  assert.deepEqual(tracker.observe({ bridge_sequence: 4 }), { accept: true, gap: null });
+});
+
+test("live activity overlays prevent delayed rollout snapshots from restoring stale tools", () => {
+  const running = activeActivityOverlay("turn-new", "tool", {
+    id: "call-new",
+    name: "apply_patch",
+  });
+  const oldSnapshot = {
+    active_turn_id: "turn-old",
+    phase: "tool",
+    active_tool: "exec_command",
+    active_tool_call_id: "call-old",
+  };
+  assert.equal(activityOverlayConfirmed(running, oldSnapshot), false);
+  assert.deepEqual(mergeActivityProjection(oldSnapshot, running), running);
+
+  const waitingForModel = activeActivityOverlay("turn-new", "model");
+  assert.equal(
+    activityOverlayConfirmed(waitingForModel, {
+      active_turn_id: "turn-new",
+      phase: "tool",
+      active_tool_call_id: "call-new",
+    }),
+    false,
+  );
+  assert.equal(
+    activityOverlayConfirmed(waitingForModel, {
+      active_turn_id: "turn-new",
+      phase: "model",
+      active_tool_call_id: null,
+    }),
+    true,
+  );
+  assert.equal(activityOverlayConfirmed(completedActivityOverlay(), oldSnapshot), false);
+  assert.equal(activityOverlayConfirmed(completedActivityOverlay(), {}), true);
+});
+
+test("authoritative active state retains the live turn until rollout catches up", () => {
+  assert.equal(effectiveActiveTurnId(null, true, "turn-live"), "turn-live");
+  assert.equal(effectiveActiveTurnId("turn-rollout", true, "turn-live"), "turn-rollout");
+  assert.equal(effectiveActiveTurnId("turn-rollout", false, "turn-live"), null);
 });
 
 test("managed app-server details expose restart and live transition notifications", async () => {
@@ -773,6 +853,9 @@ test("tool output images open in a zoomable viewer", async () => {
   const stylesheet = await readFile(stylesheetPath, "utf8");
   assert.match(source, /function makeInspectableImage\(img\)/);
   assert.match(source, /parent\.appendChild\(makeInspectableImage\(img\)\)/);
+  assert.match(source, /requestFilePreview\(threadId, tool\.image_path, \{/);
+  assert.match(source, /message_index: tool\.message_index/);
+  assert.match(source, /frame\.replaceChildren\(makeInspectableImage\(img\)\)/);
   assert.match(source, /function openImageViewer\(source, alt = "", trigger = null\)/);
   assert.match(source, /stage\.onwheel/);
   assert.match(source, /gesture\?\.kind === "pinch"/);
@@ -785,10 +868,17 @@ test("tool output images open in a zoomable viewer", async () => {
   assert.match(source, /gesture\.pointerType !== "mouse"/);
   assert.match(source, /imageViewer\.suppressDoubleClickUntil = now \+ 500/);
   assert.match(source, /stage\.onlostpointercapture = endPointer/);
+  assert.match(
+    source,
+    /document\.addEventListener\(eventName, preventPageGestureWhileViewingImage/,
+  );
+  assert.match(source, /event\.touches\?\.length > 1/);
   assert.match(source, /restorePageZoomAfterImageViewer\(\)/);
+  assert.match(stylesheet, /body\.image-viewer-open\s*\{[^}]*touch-action:\s*none;/s);
   assert.match(stylesheet, /\.image-viewer\s*\{[^}]*touch-action:\s*none;/s);
   assert.match(stylesheet, /\.image-viewer-stage\s*\{[^}]*touch-action:\s*none;/s);
   assert.match(stylesheet, /\.inspectable-image\s*\{[^}]*cursor:\s*zoom-in;/s);
+  assert.match(stylesheet, /\.tool-image-preview\s*\{[^}]*height:\s*clamp\(/s);
   assert.doesNotMatch(source, /group\.open = hasImage/);
   assert.doesNotMatch(source, /detail\.open = Boolean\(tool\.has_image\)/);
   assert.doesNotMatch(source, /hasToolImage|imageToolNodes/);
@@ -913,6 +1003,24 @@ test("local task file links resolve to workspace paths", () => {
   assert.equal(localFilePath("https://example.com/firmware.elf"), null);
 });
 
+test("final answer image tags render one inspectable image control", async () => {
+  assert.equal(isLocalImagePath("/Users/example/project/preview.png"), true);
+  assert.equal(isLocalImagePath("/Users/example/project/Preview.JPEG#L2"), true);
+  assert.equal(isLocalImagePath("/Users/example/project/notes.md"), false);
+  const source = await readFile(mainScriptPath, "utf8");
+  const markdown = await readFile(new URL("../src/markdown.js", import.meta.url), "utf8");
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  assert.match(markdown, /options\.localImagePreviewNode\?\./);
+  assert.match(markdown, /token\.startsWith\("!\["\)/);
+  const linkRenderer = markdown.match(/function appendLink[\s\S]*?\n}\n\nfunction appendImage/);
+  assert.ok(linkRenderer);
+  assert.doesNotMatch(linkRenderer[0], /appendLocalImagePreview\(parent/);
+  assert.match(source, /function markdownImagePreviewNode\(threadId, path, label\)/);
+  assert.match(source, /preview\.kind !== "image" \|\| !preview\.preview_url/);
+  assert.match(source, /frame\.replaceChildren\(makeInspectableImage\(img\)\)/);
+  assert.match(stylesheet, /\.markdown-image-preview\s*\{[^}]*height:\s*clamp\(/s);
+});
+
 test("local workspace files open in a typed preview before download", async () => {
   const source = await readFile(mainScriptPath, "utf8");
   const api = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
@@ -930,9 +1038,15 @@ test("local workspace files open in a typed preview before download", async () =
   assert.match(preview, /EditorState\.readOnly\.of\(true\)/);
   assert.match(preview, /EditorView\.scrollIntoView\(anchor/);
   assert.match(preview, /current\.kind === "markdown"/);
+  assert.match(preview, /current\.kind === "html"/);
   assert.match(preview, /current\.kind === "image"/);
+  assert.match(preview, /frame\.setAttribute\("sandbox", ""\)/);
+  assert.match(preview, /frame\.srcdoc = secureHtmlPreviewDocument/);
+  assert.match(preview, /"script-src 'none'"/);
+  assert.match(preview, /"connect-src 'none'"/);
   assert.match(html, /id="filePreviewDialog"/);
   assert.match(stylesheet, /\.file-preview-card\s*\{/);
+  assert.match(stylesheet, /\.file-preview-html\s*\{/);
 });
 
 test("interrupt requests carry the app-server turn observed by the UI", async () => {
@@ -975,6 +1089,101 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
   assert.doesNotMatch(reconcile, /replaceChildren/);
 });
 
+test("live tool progress follows the exact newest call instead of animating stale tools", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /mergeActivityProjection\(effectiveActivity, state\.liveActivityOverlay\)/);
+  assert.match(source, /tool\.call_id === state\.activeToolCallId/);
+  assert.match(source, /runningTool = matchedRunningTool \|\| liveTool/);
+  assert.match(source, /priorToolCount = tools\.length - \(matchedRunningTool \? 1 : 0\)/);
+  assert.match(source, /activeTarget = activeToolGroupTarget\(/);
+  assert.match(source, /messages = sourceMessages/);
+  assert.doesNotMatch(source, /activeTools[\s\S]*?\.flatMap/);
+  assert.match(
+    source,
+    /messageTurnRunning = message\.message_index === activeTarget\?\.message_index/,
+  );
+  assert.match(
+    source,
+    /detail\.dataset\.toolKey = `\$\{sourceMessageIndex\}:\$\{sourceToolIndex\}`/,
+  );
+  assert.match(source, /activeTurnSection\.insertBefore\([\s\S]*?turn-live-usage/);
+  assert.doesNotMatch(source, /nodes\.push\(liveToolActivityNode\(root\)\)/);
+  assert.match(source, /method === "item\/started"/);
+  assert.match(source, /state\.liveAppServerTool = liveTool/);
+  assert.match(source, /state\.activeToolCallId = liveTool\.id/);
+  assert.match(source, /method === "item\/completed"/);
+  const toolGroup = source.slice(
+    source.indexOf("function toolGroupNode"),
+    source.indexOf("function toolImageIndicator"),
+  );
+  assert.doesNotMatch(toolGroup, /findLast\(\(tool\) => !toolFinished\(tool\)\)/);
+});
+
+test("only the last tool group in a running turn receives live state", () => {
+  const firstGroup = {
+      message_index: 10,
+      turn_id: "turn-a",
+      role: "assistant",
+      tools: [{ call_id: "call-1", name: "exec_command" }],
+    },
+    commentary = {
+      message_index: 11,
+      turn_id: "turn-a",
+      role: "assistant",
+      tools: [],
+    },
+    lastGroup = {
+      message_index: 12,
+      turn_id: "turn-a",
+      role: "assistant",
+      tools: [{ call_id: "call-2", name: "apply_patch" }],
+    },
+    newestCommentary = {
+      message_index: 13,
+      turn_id: "turn-a",
+      role: "assistant",
+      tools: [],
+    },
+    messages = [firstGroup, commentary, lastGroup, newestCommentary];
+  assert.equal(activeToolGroupTarget(messages, "turn-a", "call-2"), lastGroup);
+  assert.equal(activeToolGroupTarget(messages, "turn-a", null), lastGroup);
+  assert.deepEqual(
+    firstGroup.tools.map((tool) => tool.call_id),
+    ["call-1"],
+  );
+  assert.deepEqual(
+    lastGroup.tools.map((tool) => tool.call_id),
+    ["call-2"],
+  );
+  assert.equal(
+    activeToolGroupTarget([commentary, newestCommentary], "turn-a", "call-3"),
+    newestCommentary,
+  );
+});
+
+test("streaming tool disclosure survives snapshot host changes", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const stateSource = await readFile(new URL("../src/state.js", import.meta.url), "utf8");
+  const specification = await readFile(
+    new URL("../../docs/web-ui-streaming.md", import.meta.url),
+    "utf8",
+  );
+  assert.match(stateSource, /expandedToolGroupIds: new Set\(\)/);
+  assert.match(stateSource, /expandedToolCallIds: new Set\(\)/);
+  assert.match(source, /groupKey = toolGroupIdentity\(threadId, message, liveTool\)/);
+  assert.match(source, /box\.dataset\.messageKey = messageIdentity\(m\)/);
+  assert.match(source, /group\.open = state\.expandedToolGroupIds\.has\(groupKey\)/);
+  assert.match(source, /if \(group\.open\) state\.expandedToolGroupIds\.delete\(groupKey\)/);
+  assert.match(source, /detail\.open = state\.expandedToolCallIds\.has\(disclosureKey\)/);
+  assert.match(source, /if \(detail\.open\) state\.expandedToolCallIds\.delete\(disclosureKey\)/);
+  assert.doesNotMatch(source, /ontoggle = \([^)]*\) => \{[\s\S]{0,160}expandedTool/);
+  assert.match(source, /previousToolGroups = openToolGroupKeys\(root\)/);
+  assert.match(source, /previousToolDetails = loadedToolDetails\(root\)/);
+  assert.match(source, /preserveToolDisclosure\(previousToolGroups, previousToolDetails, next\)/);
+  assert.match(specification, /User-controlled disclosure belongs to the logical entity/);
+  assert.match(specification, /preserve a visible message\/turn anchor/);
+});
+
 test("mobile tail following survives layout growth until the user scrolls away", () => {
   assert.equal(messageBottomDistance({ top: 900, height: 1500, client: 600 }), 0);
   assert.equal(messageBottomDistance({ top: 650, height: 1500, client: 600 }), 250);
@@ -987,6 +1196,62 @@ test("the real scroll owner changes for mobile history fullscreen", () => {
   assert.equal(documentOwnsMessageScroll({ mobile: false, fullscreen: false }), false);
   assert.equal(documentOwnsMessageScroll({ mobile: true, fullscreen: false }), true);
   assert.equal(documentOwnsMessageScroll({ mobile: true, fullscreen: true }), false);
+});
+
+test("timeline and tool group identities survive pagination and live host migration", () => {
+  assert.equal(messageIdentity({ id: "message-a", message_index: 40 }), "id:message-a");
+  assert.equal(messageIdentity({ message_index: 40 }), "index:40");
+  assert.equal(
+    toolGroupIdentity("thread-a", { message_index: 40, tools: [] }, { id: "call-a" }),
+    "thread-a:call:call-a",
+  );
+  assert.equal(
+    toolGroupIdentity("thread-a", {
+      id: "message-new-host",
+      message_index: 44,
+      tools: [{ call_id: "call-a" }],
+    }),
+    "thread-a:call:call-a",
+  );
+  assert.equal(
+    toolGroupIdentity("thread-a", {
+      id: "message-new-host",
+      message_index: 44,
+      tools: [{ call_id: "call-a" }, { call_id: "call-b" }, { call_id: "call-c" }],
+    }),
+    "thread-a:call:call-a",
+  );
+  assert.equal(
+    toolGroupIdentity(
+      "thread-a",
+      {
+        id: "message-new-host",
+        message_index: 44,
+        tools: [{ call_id: "call-a" }],
+      },
+      { call_id: "call-b", name: "exec_command" },
+    ),
+    "thread-a:call:call-a",
+  );
+  assert.equal(
+    toolGroupIdentity("thread-a", {
+      message_index: 55,
+      tools: [{ call_id: "wait-9", activity_key: "wait:agent-a" }],
+    }),
+    "thread-a:activity:wait:agent-a",
+  );
+});
+
+test("completed turns retain image messages while other history remains folded", () => {
+  assert.equal(
+    messagePersistsWhenTurnCollapsed({ tools: [{ name: "view_image", has_image: true }] }),
+    true,
+  );
+  assert.equal(messagePersistsWhenTurnCollapsed({ category: "compaction", tools: [] }), true);
+  assert.equal(
+    messagePersistsWhenTurnCollapsed({ tools: [{ name: "exec_command", has_image: false }] }),
+    false,
+  );
 });
 
 test("turn navigation selects the nearest turn start in either direction", () => {
@@ -1075,7 +1340,6 @@ test("subagent activity opens its original conversation in the temporary panel",
     /command: "subagent_messages", thread_id: threadId, before: null, limit: 30/,
   );
   assert.match(source, /messageNode\(message, false, temporary\.id\)/);
-  assert.match(source, /thread_id: threadId,[\s\S]*message_index: message\.message_index/);
   assert.match(source, /function prependSubagentMessages\(\)/);
   assert.match(source, /scheduleSubagentConversationRefresh/);
   assert.match(html, /id="temporaryComposer"/);
@@ -1310,6 +1574,7 @@ test("completed turns collapse by server turn id and preserve the full expansion
   const stylesheet = await readFile(stylesheetPath, "utf8");
   assert.match(stylesheet, /\.turn-fold::before\s*\{/);
   assert.doesNotMatch(stylesheet, /\.turn-fold::after\s*\{/);
+  assert.doesNotMatch(stylesheet, /\.turn-group\.expanded \.turn-fold::before\s*\{[^}]*margin-/s);
   assert.match(stylesheet, /\.turn-fold\s*\{[^}]*width:\s*fit-content;[^}]*justify-self:\s*start/s);
   assert.match(
     stylesheet,
@@ -1333,7 +1598,7 @@ test("completed turns collapse by server turn id and preserve the full expansion
   );
   assert.match(
     stylesheet,
-    /\.turn-group\.collapsed > \.turn-fold-block > \.turn-divider\s*\{[^}]*border-top-width:\s*2px;/s,
+    /\.turn-group\.collapsed > \.turn-fold-block > \.turn-divider\s*\{[^}]*border-top-width:\s*1px;[^}]*box-shadow:/s,
   );
   assert.match(
     stylesheet,
@@ -1397,7 +1662,9 @@ test("session return renders the latest batch before any older history", async (
   assert.match(openFlow, /auxiliaryRequest = Promise\.all/);
   assert.match(openFlow, /r = await messagesRequest/);
   assert.match(openFlow, /void auxiliaryRequest\.then/);
-  assert.ok(openFlow.indexOf("r = await messagesRequest") < openFlow.indexOf("void auxiliaryRequest.then"));
+  assert.ok(
+    openFlow.indexOf("r = await messagesRequest") < openFlow.indexOf("void auxiliaryRequest.then"),
+  );
   assert.match(stateSource, /initialPageSize: 8,[\s\S]*pageSize: 30/);
   assert.match(source, /state\.messageSyncPhase === "loading"/);
   assert.match(source, /validCached \|\| !changedThread \? "reconnecting" : "loading"/);
@@ -1448,7 +1715,8 @@ test("token usage joins the turn fold while memory stays on the final response",
   assert.match(source, /foldBlock\.replaceChildren\(fold, divider, tokenUsage\)/);
   assert.match(source, /activity\.turn_token_usage/);
   assert.match(source, /turn-live-usage/);
-  assert.match(source, /liveTurnTokenUsage/);
+  assert.match(source, /liveTurnTokenUsageText\(usage\)/);
+  assert.match(source, /hitRate: cacheHitPercent\(item\)\.toFixed\(0\)/);
 });
 
 test("message copy follows text before tools and completion metadata", async () => {
@@ -1536,7 +1804,8 @@ test("context compaction renders as a persistent special message", async () => {
     readFile(new URL("../src/i18n.js", import.meta.url), "utf8"),
   ]);
   assert.match(source, /item\.kind === "context_compaction"/);
-  assert.match(source, /category === "compaction"/);
+  assert.match(source, /messagePersistsWhenTurnCollapsed\(group\.messages\[index\]\)/);
+  assert.equal(messagePersistsWhenTurnCollapsed({ category: "compaction" }), true);
   assert.match(source, /visibleLeadingNodes/);
   assert.match(stylesheet, /\.context-compaction-notice/);
   assert.match(translations, /contextCompactionComplete:\s*"上下文已压缩"/);

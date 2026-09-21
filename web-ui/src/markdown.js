@@ -55,6 +55,21 @@ export function localFileReference(raw) {
 
 export const localFilePath = (raw) => localFileReference(raw)?.path || null;
 
+export function isLocalImagePath(path) {
+  return (
+    typeof path === "string" &&
+    /\.(?:avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(path.split(/[?#]/, 1)[0])
+  );
+}
+
+function appendLocalImagePreview(parent, label, fileReference, options) {
+  if (!fileReference || !isLocalImagePath(fileReference.path)) return false;
+  const preview = options.localImagePreviewNode?.(fileReference.path, label);
+  if (!preview) return false;
+  parent.appendChild(preview);
+  return true;
+}
+
 function appendLink(parent, label, target, options) {
   const link = document.createElement("a"),
     fileReference = localFileReference(target);
@@ -102,8 +117,15 @@ function appendLink(parent, label, target, options) {
   else parent.appendChild(document.createTextNode(label));
 }
 
+function appendImage(parent, label, target, options) {
+  const fileReference = localFileReference(target);
+  if (appendLocalImagePreview(parent, label, fileReference, options)) return;
+  appendLink(parent, label || target, target, options);
+}
+
 function appendInline(parent, text, options) {
-  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^\s)]+\)|https?:\/\/[^\s<>()]+)/g;
+  const pattern =
+    /(`[^`\n]+`|\*\*[^*\n]+\*\*|!?\[[^\]\n]*\]\((?:<[^>\n]+>|[^\s)]+)\)|https?:\/\/[^\s<>()]+)/g;
   let offset = 0;
   for (const match of text.matchAll(pattern)) {
     appendPlain(parent, text.slice(offset, match.index));
@@ -116,6 +138,9 @@ function appendInline(parent, text, options) {
       const strong = document.createElement("strong");
       strong.textContent = token.slice(2, -2);
       parent.appendChild(strong);
+    } else if (token.startsWith("![")) {
+      const parts = token.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+      appendImage(parent, parts[1], parts[2], options);
     } else if (token.startsWith("[")) {
       const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       appendLink(parent, parts[1], parts[2], options);

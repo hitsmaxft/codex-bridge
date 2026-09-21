@@ -241,6 +241,7 @@ impl DemoState {
             "content": [{"kind": "text", "text": text}],
             "tools": [{
                 "tool_index": 0,
+                "call_id": format!("demo-live-{message_index}"),
                 "name": tool_name,
                 "status": "running",
                 "preview": preview,
@@ -464,6 +465,9 @@ impl DemoState {
                 "active_turn_id": still_active.then_some("demo-turn-processing"),
                 "phase": still_active.then_some(if self.active_tool_message.is_some() { "tool" } else { "model" }),
                 "active_tool": still_active.then(|| self.active_scenario.map(Self::scenario_tool)).flatten(),
+                "active_tool_call_id": (still_active)
+                    .then(|| self.active_tool_message.map(|index| format!("demo-live-{index}")))
+                    .flatten(),
                 "file_len": self.file_len,
                 "updated_at_ms": 1_788_767_541_844_u64 + self.file_len,
             }

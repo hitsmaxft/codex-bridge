@@ -5,6 +5,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,9 +71,41 @@ enum AppServerCommand {
 #[derive(Debug)]
 struct AppServerSession {
     commands: std_mpsc::Sender<AppServerCommand>,
-    events: broadcast::Sender<Value>,
+    events: Arc<AppServerEventBus>,
     runtime: Arc<RwLock<AppServerRuntimeInfo>>,
     writer_states: Arc<RwLock<HashMap<String, ThreadWriterState>>>,
+}
+
+#[derive(Debug)]
+struct AppServerEventBus {
+    sender: broadcast::Sender<Value>,
+    sequence: AtomicU64,
+}
+
+impl AppServerEventBus {
+    fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender,
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<Value> {
+        self.sender.subscribe()
+    }
+
+    fn current_sequence(&self) -> u64 {
+        self.sequence.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, mut event: Value) -> bool {
+        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(object) = event.as_object_mut() {
+            object.insert("bridge_sequence".to_owned(), sequence.into());
+        }
+        self.sender.send(event).is_ok()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -307,10 +340,16 @@ impl CodexCliBackend {
             .map(|session| session.events.subscribe())
     }
 
+    pub fn app_server_event_sequence(&self) -> Option<u64> {
+        self.app_server
+            .as_ref()
+            .map(|session| session.events.current_sequence())
+    }
+
     pub fn publish_bridge_event(&self, event: Value) -> bool {
         self.app_server
             .as_ref()
-            .is_some_and(|session| session.events.send(event).is_ok())
+            .is_some_and(|session| session.events.publish(event))
     }
 
     pub fn app_server_runtime_info(&self) -> Option<AppServerRuntimeInfo> {
@@ -583,8 +622,8 @@ fn wait_for_realtime_transcript(
 impl AppServerSession {
     fn spawn(socket: PathBuf, thread_cache_limit: usize) -> Self {
         let (command_tx, command_rx) = std_mpsc::channel();
-        let (events, _) = broadcast::channel(APP_SERVER_EVENT_CAPACITY);
-        let worker_events = events.clone();
+        let events = Arc::new(AppServerEventBus::new(APP_SERVER_EVENT_CAPACITY));
+        let worker_events = Arc::clone(&events);
         let runtime = Arc::new(RwLock::new(AppServerRuntimeInfo {
             connected: false,
             user_agent: None,
@@ -697,7 +736,7 @@ fn app_server_worker(
     socket: PathBuf,
     thread_cache_limit: usize,
     commands: std_mpsc::Receiver<AppServerCommand>,
-    events: broadcast::Sender<Value>,
+    events: Arc<AppServerEventBus>,
     runtime: Arc<RwLock<AppServerRuntimeInfo>>,
     writer_states: Arc<RwLock<HashMap<String, ThreadWriterState>>>,
 ) {
@@ -737,6 +776,11 @@ fn app_server_worker(
                         params,
                         response,
                     } => {
+                        let remember_started_thread = method == "thread/start"
+                            && !params
+                                .get("ephemeral")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
                         let result = session_rpc(
                             websocket.as_mut().expect("connection ensured"),
                             &mut next_request_id,
@@ -744,6 +788,24 @@ fn app_server_worker(
                             params,
                             &events,
                         );
+                        if remember_started_thread {
+                            if let Some(thread_id) = result
+                                .as_ref()
+                                .ok()
+                                .and_then(|result| result.pointer("/thread/id"))
+                                .and_then(Value::as_str)
+                            {
+                                remember_owned_thread(
+                                    websocket.as_mut().expect("connection ensured"),
+                                    &mut next_request_id,
+                                    &mut watched_threads,
+                                    thread_cache_limit,
+                                    &writer_states,
+                                    &events,
+                                    thread_id,
+                                );
+                            }
+                        }
                         if result.as_ref().is_err_and(backend_failure_disconnects) {
                             websocket = None;
                             emit_connection_event(&events, &runtime, "disconnected", None, None);
@@ -886,6 +948,34 @@ fn set_thread_writer_state(
     }
 }
 
+fn remember_owned_thread(
+    websocket: &mut WebSocket<UnixStream>,
+    next_request_id: &mut i64,
+    watched_threads: &mut VecDeque<String>,
+    thread_cache_limit: usize,
+    writer_states: &RwLock<HashMap<String, ThreadWriterState>>,
+    events: &AppServerEventBus,
+    thread_id: &str,
+) {
+    watched_threads.retain(|watched| watched != thread_id);
+    watched_threads.push_back(thread_id.to_owned());
+    set_thread_writer_state(writer_states, thread_id, ThreadWriterState::Owned);
+    if watched_threads.len() > thread_cache_limit {
+        if let Some(evicted) = watched_threads.pop_front() {
+            let _ = session_rpc(
+                websocket,
+                next_request_id,
+                "thread/unsubscribe",
+                json!({"threadId": evicted}),
+                events,
+            );
+            if let Ok(mut states) = writer_states.write() {
+                states.remove(&evicted);
+            }
+        }
+    }
+}
+
 fn active_writer_conflict(error: &BackendFailure) -> bool {
     error.code == "app_server_rejected"
         && error.message.to_ascii_lowercase().contains("active writer")
@@ -903,7 +993,7 @@ fn ensure_app_server_connection(
     websocket: &mut Option<WebSocket<UnixStream>>,
     next_request_id: &mut i64,
     watched_threads: &VecDeque<String>,
-    events: &broadcast::Sender<Value>,
+    events: &AppServerEventBus,
     runtime: &Arc<RwLock<AppServerRuntimeInfo>>,
 ) -> Result<(), BackendFailure> {
     if websocket.is_some() {
@@ -1005,7 +1095,7 @@ fn session_rpc(
     next_request_id: &mut i64,
     method: &str,
     params: Value,
-    events: &broadcast::Sender<Value>,
+    events: &AppServerEventBus,
 ) -> Result<Value, BackendFailure> {
     let id = *next_request_id;
     *next_request_id = next_request_id.saturating_add(1);
@@ -1050,7 +1140,7 @@ fn session_rpc(
 
 fn read_app_server_message(
     websocket: &mut WebSocket<UnixStream>,
-    events: &broadcast::Sender<Value>,
+    events: &AppServerEventBus,
 ) -> Result<Option<Value>, BackendFailure> {
     let message = websocket
         .read()
@@ -1068,7 +1158,7 @@ fn read_app_server_message(
         } else {
             "app_server"
         };
-        let _ = events.send(json!({"type": event_type, "message": value}));
+        events.publish(json!({"type": event_type, "message": value}));
         Ok(None)
     } else {
         Ok(Some(value))
@@ -1076,7 +1166,7 @@ fn read_app_server_message(
 }
 
 fn emit_connection_event(
-    events: &broadcast::Sender<Value>,
+    events: &AppServerEventBus,
     runtime: &Arc<RwLock<AppServerRuntimeInfo>>,
     status: &str,
     user_agent: Option<&str>,
@@ -1088,7 +1178,7 @@ fn emit_connection_event(
             info.user_agent = user_agent.map(str::to_owned);
         }
     }
-    let _ = events.send(json!({
+    events.publish(json!({
         "type": "bridge_app_server_connection",
         "status": status,
         "user_agent": user_agent,
@@ -1419,7 +1509,7 @@ mod tests {
     #[test]
     fn bridge_events_share_the_persistent_app_server_broadcast() {
         let (commands, _command_rx) = std_mpsc::channel();
-        let (events, _) = broadcast::channel(4);
+        let events = Arc::new(AppServerEventBus::new(4));
         let session = Arc::new(AppServerSession {
             commands,
             events,
@@ -1439,10 +1529,10 @@ mod tests {
             "type": "bridge_thread_activity_snapshot",
             "active_thread_ids": ["thread-1"]
         })));
-        assert_eq!(
-            receiver.try_recv().unwrap()["active_thread_ids"][0],
-            "thread-1"
-        );
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event["active_thread_ids"][0], "thread-1");
+        assert_eq!(event["bridge_sequence"], 1);
+        assert_eq!(backend.app_server_event_sequence(), Some(1));
     }
 
     #[test]
@@ -1514,6 +1604,60 @@ mod tests {
         );
         assert_eq!(requests[4]["params"]["threadId"], "thread-1");
         assert_eq!(requests[5]["params"]["threadId"], "thread-2");
+        std::fs::remove_file(&sock_path).unwrap();
+        std::fs::remove_dir(&sock_dir).unwrap();
+    }
+
+    #[test]
+    fn newly_started_thread_is_owned_without_resuming_an_empty_rollout() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!(
+            "codex-thread-start-test-{}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock_path = sock_dir.join("bridge.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let _initialized = read_json(&mut websocket);
+            let start = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id": start["id"], "result": {"thread": {"id": "thread-empty"}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            start["method"].clone()
+        });
+        let backend = CodexCliBackend::new_with_thread_cache(
+            PathBuf::from("/unused/codex"),
+            Some(sock_path.clone()),
+            3,
+        );
+        let started = backend
+            .app_server_rpc("thread/start", json!({"cwd": "/tmp/project"}))
+            .unwrap();
+        assert_eq!(started["thread"]["id"], "thread-empty");
+        assert_eq!(
+            backend.thread_writer_state("thread-empty"),
+            ThreadWriterState::Owned
+        );
+        assert_eq!(
+            backend.watch_thread("thread-empty").unwrap()["cached"],
+            true
+        );
+        assert_eq!(server.join().unwrap(), "thread/start");
         std::fs::remove_file(&sock_path).unwrap();
         std::fs::remove_dir(&sock_dir).unwrap();
     }

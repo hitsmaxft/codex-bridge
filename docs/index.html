@@ -1219,54 +1219,54 @@
         </p>
         <div class="release">
           <div class="release-date">
-            2026-09-15
-            <span class="zh">v0.3.1 正式版</span
-            ><span class="en">v0.3.1 release</span>
+            2026-09-21
+            <span class="zh">v0.3.2 正式版</span
+            ><span class="en">v0.3.2 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">安全的多端会话接力</span
-                ><span class="en">Safe multi-app session handoff</span>
+                <span class="zh">稳定的实时消息流</span
+                ><span class="en">Stable live conversations</span>
               </h3>
               <p class="zh">
-                外部占用的会话以只读模式打开，Queue 无需抢锁，并可显式释放或重新获取会话写锁。
+                快照与 WebSocket 事件合并为同一运行态 turn，持续更新时保留展开状态、焦点与底部视口。
               </p>
               <p class="en">
-                Open externally owned sessions read-only, keep Queue available,
-                and explicitly release or reacquire the writer lock.
+                Reconcile snapshots and WebSocket events into one running turn
+                while preserving disclosure, focus, and the bottom viewport.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">实时 Codex 活动</span
-                ><span class="en">Live Codex activity</span>
+                <span class="zh">丰富的工作区产物</span
+                ><span class="en">Rich workspace artifacts</span>
               </h3>
               <p class="zh">
-                提前显示 turn token 与缓存命中率，合并轮询活动，并可直接打开命名子 agent 对话。
+                就地预览 HTML、文本、Markdown 与图片，下载受限文件，并将最终回复中的显式图片链接渲染为图片控件。
               </p>
               <p class="en">
-                See live turn tokens and cache hit rate, compact polling
-                activity, and open named subagent conversations.
+                Preview HTML, text, Markdown, and images, download bounded
+                files, and render explicit image links from final replies.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">移动端长会话阅读</span
-                ><span class="en">Long-session mobile reading</span>
+                <span class="zh">个性化自托管</span
+                ><span class="en">Personal self-hosting</span>
               </h3>
               <p class="zh">
-                长回复与完整 turn 按需展开，悬浮按钮切换相邻 turn，并保持最新消息窗口快速可用。
+                为每个实例配置独立名称，支持可选的直接 HTTPS，并保持远程与移动浏览体验流畅。
               </p>
               <p class="en">
-                Expand long replies and full turns on demand, navigate adjacent
-                turns, and keep the newest bounded history responsive.
+                Name each instance, enable optional direct HTTPS, and retain a
+                responsive mobile experience through remote access proxies.
               </p>
             </article>
           </div>
         </div>
         <div class="release-history">
-          <a href="releases/v0.3.1.md">
+          <a href="releases/v0.3.2.md">
             <span
               ><span class="zh">查看完整发布说明</span
               ><span class="en">Read the complete release notes</span></span

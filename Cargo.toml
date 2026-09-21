@@ -8,13 +8,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
@@ -29,4 +30,5 @@ getrandom = "0.3"
 infer = "0.22"
 toml = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 zhhz = "0.8.2"

@@ -29,16 +29,16 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.1 · 2026-09-15
+### v0.3.2 · 2026-09-21
 
-- **Safe multi-app session handoff:** open externally owned sessions read-only, keep Queue input
-  available without taking ownership, and release or reacquire Bridge's per-session writer lock.
-- **Live session telemetry:** see in-progress turn tokens, cache usage and hit rate, tool counts,
-  compact polling activity, and linked subagent conversations directly in the session workspace.
-- **Focused mobile reading:** collapse long assistant replies and completed turns, navigate between
-  turns, inspect image and file activity, and load the newest bounded history window responsively.
+- **Stable live conversations:** reconcile snapshots and WebSocket events into one running turn while
+  preserving expanded tools, focus, and the reader's bottom position as new activity arrives.
+- **Rich workspace artifacts:** preview HTML, text, Markdown, and images in place; download bounded
+  workspace files; and render explicit image links from final replies as image controls.
+- **Personal self-hosting:** give each Web UI instance its own browser and sidebar name, add optional
+  direct HTTPS, and keep the responsive experience usable through remote access proxies.
 
-See the [latest release notes](docs/releases/v0.3.1.md) or the
+See the [latest release notes](docs/releases/v0.3.2.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
