@@ -358,6 +358,17 @@ test("new session starts above pinned sessions and chooses from project history"
   assert.match(html, /id="createModeStep"[\s\S]*id="createCurrentBtn"/);
   assert.match(source, /function populateCreateProjectSelect/);
   assert.match(source, /function chooseCreateProject/);
+  assert.match(source, /function openProjectlessDraft\(\)/);
+  assert.match(source, /projectless_draft: true/);
+  assert.match(source, /async function materializeProjectlessDraft\(prompt\)/);
+  assert.match(
+    source,
+    /command: "thread_create",[\s\S]*project_path: null,[\s\S]*prompt: prompt \|\| null/,
+  );
+  assert.match(
+    source,
+    /if \(state\.current\.projectless_draft\)[\s\S]*materializeProjectlessDraft/,
+  );
   assert.doesNotMatch(source, /className = "project-add"/);
   assert.match(stylesheet, /\.session-create-button\s*\{[^}]*width:\s*100%;/s);
 });

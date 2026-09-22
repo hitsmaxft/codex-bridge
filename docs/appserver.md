@@ -177,6 +177,12 @@ Methods marked **experimental** only appear when the schema is generated with `-
 | `review/start`                                                                                                                 | Start a code review against a review target.                                                   |
 | `getConversationSummary`                                                                                                       | Compatibility endpoint for a compact conversation summary.                                     |
 
+The Web UI keeps a projectless Chat as a local draft until its first submission. It then creates
+`YYYY-MM-DD/<prompt-slug>` below `projectless_workspace_root` (default `~/Documents/Codex`), passes
+that generated directory explicitly as `thread/start.cwd`, and reconciles the draft into the
+returned thread identity before sending the turn. A project or managed worktree continues to use
+its selected cwd and is never routed through the projectless allocator.
+
 ### Native queue and goals
 
 | Interface                                                 | Purpose                                                         |

@@ -5,6 +5,8 @@ mode = "standalone"
 # Paths may be absolute or start with ~/.
 # socket = "~/.codex-bridge/control.sock"
 # codex_home = "~/.codex"
+# Generated Chat workspaces default to ~/Documents/Codex/YYYY-MM-DD/<prompt-slug>.
+# projectless_workspace_root = "~/Documents/Codex"
 # codex_bin = "/absolute/path/to/codex"
 # app_server_socket = "~/.codex-bridge/app-server.sock"
 app_server_thread_cache = 3

@@ -79,6 +79,7 @@ mode = "standalone" # recommended; desktop is advanced opt-in
 codex_bin = "~/.cargo/bin/codex"
 app_server_socket = "~/.codex-bridge/codex-app-server.sock"
 app_server_thread_cache = 3
+# projectless_workspace_root = "~/Documents/Codex"
 
 [web_ui]
 enabled = true
@@ -106,6 +107,11 @@ HTTP_PROXY = "http://127.0.0.1:7897"
 
 Paths in the TOML file may be absolute or start with `~/`. Unknown fields and invalid values stop
 startup with the config filename in the error instead of being ignored.
+
+Chats created without a selected project use `projectless_workspace_root`, defaulting to
+`~/Documents/Codex`. The first submitted prompt creates a native-compatible
+`YYYY-MM-DD/<prompt-slug>` workspace with `work/` and `outputs/` subdirectories. Project and
+worktree sessions continue to use their selected roots.
 
 `web_ui.name` customizes both the browser title and the brand label in the top-left corner. It is
 display-only and does not change authentication, host validation, or the public URL.

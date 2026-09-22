@@ -1455,6 +1455,52 @@ function closeCreateDialog() {
   $("createDialog").hidden = true;
   state.creatingProject = null;
 }
+function openProjectlessDraft() {
+  const previous = state.current,
+    id = `draft:${
+      typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    }`,
+    thread = {
+      id,
+      title: tr("newChat"),
+      cwd: "",
+      git_branch: null,
+      projectless_draft: true,
+      preferred_model: state.composerModel,
+    };
+  state.openToken += 1;
+  closePanels();
+  setThreadHeaderExpanded(false);
+  if (previous) {
+    saveDraft(previous.id, $("messageText").value, true);
+    state.attachmentDrafts.set(previous.id, state.composerAttachments);
+    if (state.composerReference) state.referenceDrafts.set(previous.id, state.composerReference);
+  }
+  state.current = thread;
+  resetThreadViewState(thread);
+  applyThreadWriterLock({ state: "owned", read_only: false, reason: null });
+  setSendMode("send", true);
+  syncTemporaryForCurrent();
+  state.userScrolled = false;
+  state.followMessageTail = true;
+  state.pending = [];
+  setMessageSyncPhase(null);
+  $("messages").replaceChildren();
+  $("threadTitle").textContent = tr("newChat");
+  $("threadCompactMeta").textContent = tr("chats");
+  $("threadMeta").textContent = tr("newChatHelp");
+  $("workspaceDiff").hidden = true;
+  renderRepairHint();
+  renderThreadStatistics();
+  renderPending();
+  renderProjects();
+  showActivity();
+  updateTurnNavigation();
+  window.history.pushState(null, "", `${window.location.pathname}${window.location.search}`);
+  $("messageText").focus();
+}
 async function createThread(worktree) {
   const project = state.creatingProject;
   if (!project) throw new Error(tr("chooseProject"));
@@ -1462,6 +1508,13 @@ async function createThread(worktree) {
   buttons.forEach((button) => (button.disabled = true));
   $("createProgress").textContent = worktree ? tr("creatingWorktree") : tr("creatingSession");
   try {
+    if (!worktree && project.kind === "chats") {
+      $("createDialog").hidden = true;
+      state.creatingProject = null;
+      openProjectlessDraft();
+      notify(tr("newChatReady"));
+      return;
+    }
     let r;
     if (worktree) {
       const started = await command(
@@ -1541,7 +1594,11 @@ function syncVoiceCapability() {
     capability = audioTranscriptionCapability(),
     unavailable = !capability?.enabled || !browserAudioAvailable(),
     submitting = document.querySelector(".composer-shell")?.classList.contains("submitting"),
-    busy = submitting || voiceTranscribing || !currentThreadQueueable();
+    busy =
+      submitting ||
+      voiceTranscribing ||
+      !currentThreadQueueable() ||
+      Boolean(state.current?.projectless_draft);
   button.classList.toggle("unavailable", unavailable);
   button.disabled = unavailable || busy;
   $("audioInput").disabled = unavailable || busy;
@@ -4246,6 +4303,17 @@ async function refreshComposerStatus() {
   const usage = $("usageState"),
     health = $("usageHealth"),
     effort = $("effortState");
+  if (state.current.projectless_draft) {
+    state.usageUnavailable = false;
+    usage.textContent = "";
+    health.hidden = true;
+    health.title = "";
+    effort.textContent = state.composerModel || "";
+    $("modelPickerBtn").disabled = true;
+    $("composerStatus").hidden = !state.composerModel;
+    renderPending();
+    return;
+  }
   if (!state.directAppServer && state.appServerMode === "desktop_bundled_only") {
     state.usageUnavailable = false;
     state.composerModel = null;
@@ -4358,7 +4426,7 @@ function renderWorkspaceDiff(summary) {
   });
 }
 async function refreshWorkspaceDiff(force = false) {
-  if (!state.current || state.workspaceDiffPolling) return;
+  if (!state.current || state.current.projectless_draft || state.workspaceDiffPolling) return;
   if (!force && Date.now() - state.lastWorkspaceDiffRefresh < 3000) return;
   const threadId = state.current.id,
     button = $("workspaceDiff");
@@ -4408,7 +4476,7 @@ async function applyThreadSettings() {
   notify(tr("switchedModel", { model, effort }));
 }
 async function refreshActivity() {
-  if (!state.current) return null;
+  if (!state.current || state.current.projectless_draft) return null;
   const threadId = state.current.id,
     r = await command({ command: "thread_activity", thread_id: threadId }, false);
   if (state.current?.id !== threadId) return null;
@@ -4469,7 +4537,7 @@ async function refreshActivity() {
   return { activity, changed: previous !== null && previous !== activity.file_len };
 }
 async function pollActivity() {
-  if (state.polling || !state.current) return;
+  if (state.polling || !state.current || state.current.projectless_draft) return;
   state.polling = true;
   try {
     const result = await refreshActivity();
@@ -4882,6 +4950,39 @@ function yieldToBrowser() {
   // throttled rather than making session startup depend on a paint callback.
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
+function resetThreadViewState(thread) {
+  state.threadGoal = null;
+  renderGoalPanel();
+  restoreComposerDraft($("messageText"), state.drafts.get(thread.id), true);
+  state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
+  renderComposerAttachments();
+  setComposerReference(state.referenceDrafts.get(thread.id) || null, false);
+  state.before = null;
+  state.hasMore = false;
+  state.activityFileLen = null;
+  state.activeTurnId = null;
+  state.activityPhase = null;
+  state.activeTool = null;
+  state.activeToolCallId = null;
+  state.liveAppServerTool = null;
+  state.liveActivityOverlay = null;
+  state.pendingChanges = false;
+  state.repairRequired = false;
+  state.threadStatistics = null;
+  state.liveTurnUsage = null;
+  state.turnUsageBaseline = null;
+  state.modelContextWindow = null;
+  state.lastMessageIndex = null;
+  state.visibleMessages = [];
+  state.hydratedTurns.clear();
+  state.hydratingTurns.clear();
+  state.historyStart = null;
+  state.historyEnd = null;
+  state.historyTotal = null;
+  state.lastWorkspaceDiffRefresh = 0;
+  $("composerStatus").hidden = true;
+  $("modelPicker").hidden = true;
+}
 async function openThread(
   thread,
   {
@@ -4908,39 +5009,7 @@ async function openThread(
   state.current = thread;
   if (changedThread) applyThreadWriterLock({ state: "checking", read_only: true, reason: null });
   syncTemporaryForCurrent();
-  if (changedThread) {
-    state.threadGoal = null;
-    renderGoalPanel();
-    restoreComposerDraft($("messageText"), state.drafts.get(thread.id), true);
-    state.composerAttachments = state.attachmentDrafts.get(thread.id) || [];
-    renderComposerAttachments();
-    setComposerReference(state.referenceDrafts.get(thread.id) || null, false);
-    state.before = null;
-    state.hasMore = false;
-    state.activityFileLen = null;
-    state.activeTurnId = null;
-    state.activityPhase = null;
-    state.activeTool = null;
-    state.activeToolCallId = null;
-    state.liveAppServerTool = null;
-    state.liveActivityOverlay = null;
-    state.pendingChanges = false;
-    state.repairRequired = false;
-    state.threadStatistics = null;
-    state.liveTurnUsage = null;
-    state.turnUsageBaseline = null;
-    state.modelContextWindow = null;
-    state.lastMessageIndex = null;
-    state.visibleMessages = [];
-    state.hydratedTurns.clear();
-    state.hydratingTurns.clear();
-    state.historyStart = null;
-    state.historyEnd = null;
-    state.historyTotal = null;
-    state.lastWorkspaceDiffRefresh = 0;
-    $("composerStatus").hidden = true;
-    $("modelPicker").hidden = true;
-  }
+  if (changedThread) resetThreadViewState(thread);
   refreshComposerStatus().catch(() => {});
   renderPending();
   if (!quiet) {
@@ -5060,6 +5129,7 @@ async function openThread(
 }
 async function refreshThread() {
   if (!state.current) return notify(tr("chooseSessionError"), true);
+  if (state.current.projectless_draft) return notify(tr("newChatReady"));
   return openThread(state.current, { reconnect: true });
 }
 function clearCurrentSessionMessageCaches(threadId) {
@@ -5081,6 +5151,7 @@ function clearCurrentSessionMessageCaches(threadId) {
 }
 async function refreshCurrentSessionFromTools() {
   if (!state.current) throw new Error(tr("chooseSessionError"));
+  if (state.current.projectless_draft) return notify(tr("newChatReady"));
   const thread = { ...state.current };
   closePanels();
   clearCurrentSessionMessageCaches(thread.id);
@@ -5145,11 +5216,15 @@ function targetRequest(name, extra = {}) {
   return { command: name, thread_id: state.current.id, ...extra };
 }
 function currentThreadWritable() {
-  return Boolean(state.current && state.threadWriterLock?.state === "owned");
+  return Boolean(
+    state.current && (state.current.projectless_draft || state.threadWriterLock?.state === "owned"),
+  );
 }
 function currentThreadQueueable() {
   return Boolean(
-    state.current && ["owned", "external", "released"].includes(state.threadWriterLock?.state),
+    state.current &&
+    (state.current.projectless_draft ||
+      ["owned", "external", "released"].includes(state.threadWriterLock?.state)),
   );
 }
 function requireCurrentThreadWriter() {
@@ -5171,10 +5246,11 @@ function applyThreadWriterLock(lock) {
         : stateName === "released"
           ? "sessionLockReleased"
           : "sessionLockUnavailable";
-  notice.hidden = !state.current || stateName === "owned" || stateName === "checking";
+  const draft = Boolean(state.current?.projectless_draft);
+  notice.hidden = !state.current || draft || stateName === "owned" || stateName === "checking";
   notice.textContent = notice.hidden ? "" : tr(noticeKey);
   notice.title = normalized.reason || notice.textContent;
-  button.hidden = !state.current || ["checking", "unavailable"].includes(stateName);
+  button.hidden = !state.current || draft || ["checking", "unavailable"].includes(stateName);
   button.disabled =
     stateName === "checking" || (stateName === "owned" && Boolean(state.activeTurnId));
   button.dataset.action = stateName === "owned" ? "release" : "acquire";
@@ -5197,7 +5273,7 @@ function applyThreadWriterLock(lock) {
     "goalToggleBtn",
   ]) {
     const control = $(id);
-    if (control) control.disabled = readOnly;
+    if (control) control.disabled = readOnly || draft;
   }
   syncVoiceCapability();
   syncSubmitAction();
@@ -5300,6 +5376,36 @@ function newSubmissionId() {
       : `${Date.now()}-${Math.random().toString(36).slice(2)}`
   }`;
 }
+async function materializeProjectlessDraft(prompt) {
+  const draftThread = state.current;
+  if (!draftThread?.projectless_draft) return draftThread;
+  const response = await command(
+      {
+        command: "thread_create",
+        project_path: null,
+        worktree: false,
+        model: draftThread.preferred_model || null,
+        prompt: prompt || null,
+      },
+      false,
+    ),
+    thread = { ...response.thread, project_path: response.project_path };
+  const savedDraft = state.drafts.get(draftThread.id);
+  state.drafts.delete(draftThread.id);
+  state.attachmentDrafts.delete(draftThread.id);
+  state.referenceDrafts.delete(draftThread.id);
+  if (savedDraft) state.drafts.set(thread.id, savedDraft);
+  persistDrafts();
+  state.current = thread;
+  applyThreadWriterLock({ state: "owned", read_only: false, reason: null });
+  $("threadTitle").textContent = thread.title || thread.id;
+  $("threadCompactMeta").textContent = thread.git_branch || tr("noBranch");
+  $("threadMeta").textContent =
+    `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
+  renderProjects();
+  void loadProjects().catch(() => {});
+  return thread;
+}
 async function write(name) {
   const draft = $("messageText").value,
     text = draft.trim(),
@@ -5323,6 +5429,15 @@ async function write(name) {
       setComposerSubmitting(false);
     }
     return;
+  }
+  if (state.current.projectless_draft) {
+    setComposerSubmitting(true);
+    try {
+      await materializeProjectlessDraft(text);
+    } catch (error) {
+      setComposerSubmitting(false);
+      throw error;
+    }
   }
   if (name === "steer" && !currentThreadWritable()) name = "send";
   const threadId = state.current.id,

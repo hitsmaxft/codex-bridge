@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
@@ -100,6 +100,10 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     codex_home: Option<PathBuf>,
 
+    /// Root used for generated projectless Chat workspaces.
+    #[arg(long, value_name = "PATH")]
+    projectless_workspace_root: Option<PathBuf>,
+
     /// Codex CLI executable used by write backends.
     #[arg(long, value_name = "PATH")]
     codex_bin: Option<PathBuf>,
@@ -183,6 +187,7 @@ struct BridgeFileConfig {
     mode: Option<RuntimeMode>,
     socket: Option<PathBuf>,
     codex_home: Option<PathBuf>,
+    projectless_workspace_root: Option<PathBuf>,
     codex_bin: Option<PathBuf>,
     app_server_socket: Option<PathBuf>,
     app_server_thread_cache: Option<usize>,
@@ -239,6 +244,7 @@ struct RuntimeArgs {
     socket: Option<PathBuf>,
     socket_uses_default: bool,
     codex_home: Option<PathBuf>,
+    projectless_workspace_root: Option<PathBuf>,
     codex_bin: Option<PathBuf>,
     app_server_socket: Option<PathBuf>,
     app_server_thread_cache: usize,
@@ -275,6 +281,7 @@ struct WhisperRuntimeConfig {
 struct BridgeState {
     socket_path: Arc<PathBuf>,
     session_store: Arc<SessionStore>,
+    projectless_workspace_root: Arc<PathBuf>,
     write_backend: Arc<CodexCliBackend>,
     host_executor: Arc<HostExecutor>,
     selected_thread: Arc<RwLock<Option<String>>>,
@@ -1373,6 +1380,10 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         })
         .or(config.codex_home)
         .map(expand_home_path);
+    let projectless_workspace_root = args
+        .projectless_workspace_root
+        .or(config.projectless_workspace_root)
+        .map(expand_home_path);
     let codex_bin = args
         .codex_bin
         .or_else(|| {
@@ -1503,6 +1514,7 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
         socket,
         socket_uses_default,
         codex_home,
+        projectless_workspace_root,
         codex_bin,
         app_server_socket,
         app_server_thread_cache,
@@ -2683,6 +2695,10 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => default_codex_home()?,
     };
+    let projectless_workspace_root = args
+        .projectless_workspace_root
+        .clone()
+        .unwrap_or_else(|| default_projectless_workspace_root(&codex_home));
     let codex_program = args
         .codex_bin
         .clone()
@@ -2849,6 +2865,7 @@ async fn main() -> Result<()> {
     let bridge_state = BridgeState {
         socket_path: Arc::clone(&socket_path),
         session_store: Arc::clone(&session_store),
+        projectless_workspace_root: Arc::new(projectless_workspace_root),
         write_backend: Arc::clone(&write_backend),
         host_executor,
         selected_thread,
@@ -4723,6 +4740,7 @@ fn composer_config_settings(response: &Value) -> (Option<String>, Option<String>
 struct PreparedThreadCwd {
     cwd: PathBuf,
     worktree: Option<CreatedWorktree>,
+    created_projectless: bool,
 }
 
 #[derive(Debug)]
@@ -4736,6 +4754,196 @@ struct CreatedWorktree {
 struct ThreadCreateFailure {
     code: &'static str,
     message: String,
+}
+
+fn default_projectless_workspace_root(codex_home: &Path) -> PathBuf {
+    let home_from_environment = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let home = home_from_environment.as_deref().unwrap_or_else(|| {
+        if codex_home.file_name().is_some_and(|name| name == ".codex") {
+            codex_home.parent().unwrap_or(codex_home)
+        } else {
+            codex_home
+        }
+    });
+    home.join("Documents").join("Codex")
+}
+
+fn projectless_thread_slug(prompt: Option<&str>) -> String {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for character in prompt.unwrap_or_default().chars() {
+        if character.is_ascii_alphanumeric() {
+            current.push(character.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+            if words.len() == 6 {
+                break;
+            }
+        }
+    }
+    if words.len() < 6 && !current.is_empty() {
+        words.push(current);
+    }
+    if words.is_empty() {
+        return "new-chat".to_owned();
+    }
+    let mut slug = words.join("-");
+    slug.truncate(80);
+    slug
+}
+
+fn local_date_directory_name() -> Result<String, ThreadCreateFailure> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ThreadCreateFailure {
+            code: "projectless_workspace_create_failed",
+            message: format!("cannot read the local clock: {error}"),
+        })?
+        .as_secs();
+    let timestamp = libc::time_t::try_from(seconds).map_err(|_| ThreadCreateFailure {
+        code: "projectless_workspace_create_failed",
+        message: "the local clock is outside the supported range".to_owned(),
+    })?;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::zeroed();
+    if unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) }.is_null() {
+        return Err(ThreadCreateFailure {
+            code: "projectless_workspace_create_failed",
+            message: "cannot convert the local clock into a calendar date".to_owned(),
+        });
+    }
+    let local = unsafe { local.assume_init() };
+    Ok(format!(
+        "{:04}-{:02}-{:02}",
+        local.tm_year + 1900,
+        local.tm_mon + 1,
+        local.tm_mday
+    ))
+}
+
+fn require_real_directory(path: &Path) -> Result<(), ThreadCreateFailure> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| ThreadCreateFailure {
+        code: "projectless_workspace_create_failed",
+        message: format!(
+            "cannot inspect projectless workspace {}: {error}",
+            path.display()
+        ),
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ThreadCreateFailure {
+            code: "projectless_workspace_create_failed",
+            message: format!(
+                "projectless workspace must be a real directory: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn prepare_projectless_thread_cwd_at(
+    workspace_root: &Path,
+    prompt: Option<&str>,
+    date_directory_name: &str,
+) -> Result<PreparedThreadCwd, ThreadCreateFailure> {
+    if !workspace_root.is_absolute() {
+        return Err(ThreadCreateFailure {
+            code: "projectless_workspace_create_failed",
+            message: "projectless workspace root must be absolute".to_owned(),
+        });
+    }
+    fs::create_dir_all(workspace_root).map_err(|error| ThreadCreateFailure {
+        code: "projectless_workspace_create_failed",
+        message: format!(
+            "cannot create projectless workspace root {}: {error}",
+            workspace_root.display()
+        ),
+    })?;
+    require_real_directory(workspace_root)?;
+    let date_directory = workspace_root.join(date_directory_name);
+    fs::create_dir_all(&date_directory).map_err(|error| ThreadCreateFailure {
+        code: "projectless_workspace_create_failed",
+        message: format!(
+            "cannot create projectless date directory {}: {error}",
+            date_directory.display()
+        ),
+    })?;
+    require_real_directory(&date_directory)?;
+
+    let slug = projectless_thread_slug(prompt);
+    let mut candidates = (0..100)
+        .map(|index| {
+            if index == 0 {
+                slug.clone()
+            } else {
+                format!("{slug}-{}", index + 1)
+            }
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..5 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| ThreadCreateFailure {
+            code: "projectless_workspace_create_failed",
+            message: format!("cannot allocate a projectless workspace suffix: {error}"),
+        })?;
+        candidates.push(format!(
+            "{slug}-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            random[0], random[1], random[2], random[3], random[4], random[5], random[6],
+            random[7], random[8], random[9], random[10], random[11], random[12], random[13],
+            random[14], random[15],
+        ));
+    }
+
+    for name in candidates {
+        let cwd = date_directory.join(name);
+        match fs::create_dir(&cwd) {
+            Ok(()) => {
+                let create_children = fs::create_dir(cwd.join("work"))
+                    .and_then(|()| fs::create_dir(cwd.join("outputs")));
+                if let Err(error) = create_children {
+                    let _ = fs::remove_dir_all(&cwd);
+                    return Err(ThreadCreateFailure {
+                        code: "projectless_workspace_create_failed",
+                        message: format!(
+                            "cannot prepare projectless workspace {}: {error}",
+                            cwd.display()
+                        ),
+                    });
+                }
+                return Ok(PreparedThreadCwd {
+                    cwd,
+                    worktree: None,
+                    created_projectless: true,
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(ThreadCreateFailure {
+                    code: "projectless_workspace_create_failed",
+                    message: format!(
+                        "cannot create projectless workspace in {}: {error}",
+                        date_directory.display()
+                    ),
+                })
+            }
+        }
+    }
+    Err(ThreadCreateFailure {
+        code: "projectless_workspace_create_failed",
+        message: format!(
+            "cannot allocate a unique projectless workspace in {}",
+            date_directory.display()
+        ),
+    })
+}
+
+fn prepare_projectless_thread_cwd(
+    workspace_root: &Path,
+    prompt: Option<&str>,
+) -> Result<PreparedThreadCwd, ThreadCreateFailure> {
+    let date_directory_name = local_date_directory_name()?;
+    prepare_projectless_thread_cwd_at(workspace_root, prompt, &date_directory_name)
 }
 
 fn prepare_thread_cwd(
@@ -4766,6 +4974,7 @@ fn prepare_thread_cwd(
         return Ok(PreparedThreadCwd {
             cwd: project_path,
             worktree: None,
+            created_projectless: false,
         });
     }
 
@@ -4858,6 +5067,7 @@ fn prepare_thread_cwd(
             root,
             allocation_dir,
         }),
+        created_projectless: false,
     })
 }
 
@@ -5770,6 +5980,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "mode": state.runtime_mode.as_str(),
                 "path": state.config_path.as_deref(),
                 "loaded": state.config_path.is_some(),
+                "projectless_workspace_root": state.projectless_workspace_root.as_path(),
             },
             "managed_services": managed_services_snapshot(state),
             "runtime_resources": runtime_resources_snapshot(state),
@@ -6714,6 +6925,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                             project_path: Some(project_path),
                             worktree: true,
                             model,
+                            prompt: None,
                         },
                         &worker_state,
                     );
@@ -6771,6 +6983,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             project_path,
             worktree,
             model,
+            prompt,
         } => {
             if model
                 .as_ref()
@@ -6836,19 +7049,16 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                         Err(error) => return Response::error(error.code, error.message),
                     }
                 }
-                None => PreparedThreadCwd {
-                    cwd: session_store
-                        .home()
-                        .parent()
-                        .unwrap_or(session_store.home())
-                        .to_path_buf(),
-                    worktree: None,
+                None => match prepare_projectless_thread_cwd(
+                    state.projectless_workspace_root.as_path(),
+                    prompt.as_deref(),
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Response::error(error.code, error.message),
                 },
             };
             let mut params = json!({});
-            if canonical_project.is_some() {
-                params["cwd"] = json!(prepared.cwd);
-            }
+            params["cwd"] = json!(prepared.cwd);
             if let Some(model) = model {
                 params["model"] = Value::String(model);
             }
@@ -6860,6 +7070,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Err(error) => {
                     let rollback_is_safe =
                         matches!(error.code, "app_server_unavailable" | "app_server_rejected");
+                    if prepared.created_projectless && rollback_is_safe {
+                        let _ = fs::remove_dir_all(&prepared.cwd);
+                    }
                     let message = match (&prepared.worktree, rollback_is_safe) {
                         (Some(created), true) => match remove_created_worktree(created) {
                             Some(cleanup) => format!(
@@ -6921,7 +7134,13 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "project_path": canonical_project
                     .as_ref()
                     .map_or_else(|| Value::String(CHATS_PROJECT_PATH.to_owned()), |path| json!(path)),
-                "location": if worktree { "worktree" } else { "current_directory" },
+                "location": if canonical_project.is_none() {
+                    "projectless"
+                } else if worktree {
+                    "worktree"
+                } else {
+                    "current_directory"
+                },
                 "worktree_path": prepared.worktree.as_ref().map(|created| &created.root),
                 "thread": stored_thread.unwrap_or(fallback_thread),
             }))
@@ -9197,6 +9416,63 @@ mod tests {
     }
 
     #[test]
+    fn projectless_thread_slug_matches_desktop_prompt_rules() {
+        assert_eq!(
+            projectless_thread_slug(Some("Deployment validation: reply only OK.")),
+            "deployment-validation-reply-only-ok"
+        );
+        assert_eq!(
+            projectless_thread_slug(Some("去项目目录下找到 rmk nrfmicro 的项目目录")),
+            "rmk-nrfmicro"
+        );
+        assert_eq!(projectless_thread_slug(Some("创建一个新会话")), "new-chat");
+        assert_eq!(projectless_thread_slug(None), "new-chat");
+    }
+
+    #[test]
+    fn projectless_thread_cwd_uses_date_slug_and_collision_suffix() {
+        let root = unique_test_dir("projectless-workspace");
+        let first = prepare_projectless_thread_cwd_at(
+            &root,
+            Some("Explain the release plan now"),
+            "2026-09-22",
+        )
+        .unwrap();
+        let second = prepare_projectless_thread_cwd_at(
+            &root,
+            Some("Explain the release plan now"),
+            "2026-09-22",
+        )
+        .unwrap();
+        assert_eq!(
+            first.cwd,
+            root.join("2026-09-22/explain-the-release-plan-now")
+        );
+        assert_eq!(
+            second.cwd,
+            root.join("2026-09-22/explain-the-release-plan-now-2")
+        );
+        for prepared in [&first, &second] {
+            assert!(prepared.created_projectless);
+            assert!(prepared.cwd.join("work").is_dir());
+            assert!(prepared.cwd.join("outputs").is_dir());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn projectless_workspace_defaults_next_to_dot_codex() {
+        let expected_home = env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/example"));
+        assert_eq!(
+            default_projectless_workspace_root(Path::new("/Users/example/.codex")),
+            expected_home.join("Documents/Codex")
+        );
+    }
+
+    #[test]
     fn thread_cwd_can_create_and_remove_an_isolated_git_worktree() {
         let root = unique_test_dir("worktree");
         let repository = root.join("source");
@@ -9375,6 +9651,7 @@ mod tests {
             r#"
 mode = "standalone"
 app_server_thread_cache = 7
+projectless_workspace_root = "~/Documents/Codex Chats"
 
 [web_ui]
 enabled = true
@@ -9401,6 +9678,10 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(matches!(resolved.mode, RuntimeMode::Standalone));
         assert_eq!(resolved.config_path.as_deref(), Some(config_path.as_path()));
         assert_eq!(resolved.app_server_thread_cache, 7);
+        assert!(resolved
+            .projectless_workspace_root
+            .as_deref()
+            .is_some_and(|path| path.ends_with("Documents/Codex Chats")));
         assert!(resolved.web_ui);
         assert_eq!(resolved.web_ui_name, "Codex on Test Host");
         assert_eq!(resolved.web_ui_listen, "127.0.0.1:19091".parse().unwrap());
@@ -10477,6 +10758,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         }
         assert!(source.contains("const targetPath = r.project_path"));
         assert!(!source.contains("r.worktree_path || r.project_path"));
+        assert!(source.contains("projectless_draft: true"));
+        assert!(source.contains("prompt: prompt || null"));
         for marker in [
             "id=\"rawRequest\"",
             "Any codex-bridge Request JSON",

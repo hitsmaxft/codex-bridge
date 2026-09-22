@@ -105,6 +105,8 @@ pub enum Request {
         project_path: Option<PathBuf>,
         worktree: bool,
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
     },
     ThreadCreateStart {
         project_path: PathBuf,
@@ -555,6 +557,7 @@ mod tests {
             project_path: Some(PathBuf::from("/tmp/project")),
             worktree: true,
             model: Some("gpt-test".into()),
+            prompt: None,
         })
         .unwrap();
         assert_eq!(create["command"], "thread_create");
@@ -566,9 +569,11 @@ mod tests {
             project_path: None,
             worktree: false,
             model: None,
+            prompt: Some("Explain the release plan".into()),
         })
         .unwrap();
         assert!(chat.get("project_path").is_none());
+        assert_eq!(chat["prompt"], "Explain the release plan");
 
         let create_start = serde_json::to_value(Request::ThreadCreateStart {
             project_path: PathBuf::from("/tmp/project"),
