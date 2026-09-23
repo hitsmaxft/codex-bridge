@@ -4,12 +4,14 @@ set -eu
 enable_web_ui=false
 start_services=true
 start_suppressed=false
+enable_whisper=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --web-ui) enable_web_ui=true ;;
     --no-start) start_services=false ;;
+    --whisper) enable_whisper=true ;;
     -h|--help)
-      echo "Usage: scripts/install-linux.sh [--web-ui] [--no-start]"
+      echo "Usage: scripts/install-linux.sh [--web-ui] [--whisper] [--no-start]"
       exit 0
       ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -31,6 +33,14 @@ private_dir=$HOME/.codex-bridge
 systemd_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
 codex_bin=$(command -v codex || true)
 app_server_socket=$runtime_dir/codex-app-server.sock
+if [ -f "$config_path" ] && awk '
+  /^\[services\.whisper\][[:space:]]*([#].*)?$/ { section = 1; next }
+  /^\[/ { section = 0 }
+  section && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true([[:space:]]*(#.*)?)?$/ { found = 1 }
+  END { exit !found }
+' "$config_path"; then
+  enable_whisper=true
+fi
 
 if [ -z "$codex_bin" ]; then
   echo "standalone codex executable was not found on PATH" >&2
@@ -52,8 +62,13 @@ chmod 700 "$config_dir" "$private_dir"
 
 npm --prefix "$repo_root/web-ui" ci
 npm --prefix "$repo_root/web-ui" run build
-CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
-  cargo install --locked --force --path "$repo_root/crates/codex-bridge"
+if [ "$enable_whisper" = true ]; then
+  CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
+    cargo install --locked --force --features whisper --path "$repo_root/crates/codex-bridge"
+else
+  CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
+    cargo install --locked --force --path "$repo_root/crates/codex-bridge"
+fi
 CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
   cargo install --locked --force --path "$repo_root/crates/codexctl"
 
@@ -122,12 +137,17 @@ RestartSec=2
 WantedBy=default.target
 EOF
 
+systemctl --user daemon-reload
 if [ "$start_services" = true ]; then
-  systemctl --user daemon-reload
   if [ "$managed_by_bridge" = true ]; then
     systemctl --user disable --now codex-app-server.service >/dev/null 2>&1 || true
   fi
-  systemctl --user enable --now codex-bridge.service
+  systemctl --user enable codex-bridge.service
+  if systemctl --user is-active --quiet codex-bridge.service; then
+    systemctl --user restart codex-bridge.service
+  else
+    systemctl --user start codex-bridge.service
+  fi
 fi
 
 echo "Installed user configuration: $config_path"

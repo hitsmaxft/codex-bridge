@@ -29,16 +29,17 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.2 · 2026-09-21
+### v0.3.3 · 2026-09-23
 
-- **Stable live conversations:** reconcile snapshots and WebSocket events into one running turn while
-  preserving expanded tools, focus, and the reader's bottom position as new activity arrives.
-- **Rich workspace artifacts:** preview HTML, text, Markdown, and images in place; download bounded
-  workspace files; and render explicit image links from final replies as image controls.
-- **Personal self-hosting:** give each Web UI instance its own browser and sidebar name, add optional
-  direct HTTPS, and keep the responsive experience usable through remote access proxies.
+- **Codex GUI visibility:** Settings checks the Desktop WebSocket launch environment and reports
+  directly owned stdio app-server processes after a Desktop update.
+- **Reliable local updates:** macOS and Linux installers deploy with `cargo install`, retain an
+  existing user service, and include Whisper automatically when its fallback is enabled.
+- **Projectless chats:** new chats receive a dated workspace with dedicated `work/` and `outputs/`
+  directories.
+- **Mobile archiving:** swipe a session row to reveal its archive action.
 
-See the [latest release notes](docs/releases/v0.3.2.md) or the
+See the [latest release notes](docs/releases/v0.3.3.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
@@ -132,6 +133,11 @@ The generated launchd/systemd bridge service contains only `codex-bridge --confi
 mode, managed app-server/adapter lifecycle, sockets, Web UI, authentication, and cache choices live
 in the TOML file rather than being duplicated across startup scripts. Existing argument-only and
 externally managed deployments remain supported.
+
+Rerun the same installer to update. It builds the frontend, uses `cargo install --locked --force`
+for the Bridge binaries, and restarts the existing user service. On macOS it retains an existing
+Bridge LaunchAgent label; an enabled Whisper fallback automatically includes the `whisper` feature.
+See [the update instructions](docs/install.md#updating) for details and `--no-start`.
 
 ## Quick check
 

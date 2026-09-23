@@ -62,12 +62,16 @@ Both scripts:
 
 1. run `npm ci` and build `web-ui/dist`;
 2. reuse the checkout's `target` directory with `CARGO_INCREMENTAL=0`;
-3. install `codex-bridge` and `codexctl` under `${CARGO_HOME:-$HOME/.cargo}/bin`;
+3. run `cargo install --locked --force` for `codex-bridge` and `codexctl` under
+   `${CARGO_HOME:-$HOME/.cargo}/bin` (plus `ws-unix-bridge` in macOS desktop mode);
 4. preserve an existing config file instead of overwriting local changes;
 5. install and optionally start user-owned services.
 
 The macOS script installs `ws-unix-bridge` only with `--desktop`. Standalone mode deliberately does
-not install or start the Desktop adapter.
+not install or start the Desktop adapter. Both installers detect an existing
+`[services.whisper].enabled = true` setting and include Cargo's `whisper` feature automatically;
+pass `--whisper` when preparing a new installation before enabling that setting. They reuse the
+checkout's shared `target` directory and do not deploy binaries from `target/release`.
 
 ## Configuration
 
@@ -163,8 +167,12 @@ Desktop/app-server capability handoff. The status panel reports this topology as
 limited instead of treating it as a startup failure.
 
 The Web UI status card reports each managed component's live state, restart count, listen endpoint,
-and most recent startup/exit error. The event WebSocket publishes a compact service snapshot every
-three seconds, so an open settings panel follows recovery without a page reload.
+and most recent startup/exit error. Its separate **Codex GUI** entry also checks whether the
+launchd WebSocket environment matches this Bridge, whether the local-daemon override conflicts
+with it, and whether Desktop directly launched a stdio app-server. This makes an update-reset
+launch path visible without exposing the environment variable's value or mistaking app-server
+helper descendants for the Desktop writer. The event WebSocket publishes a compact service
+snapshot every three seconds, so an open settings panel follows recovery without a page reload.
 
 The macOS installer also verifies both the LaunchAgent label and the control socket. If launchd
 returns error 5 immediately after unloading an older service, the installer enables the per-user
@@ -237,7 +245,7 @@ Build `codex-bridge` with the `whisper` feature and provide a `whisper-server` b
 multilingual whisper.cpp model:
 
 ```sh
-CARGO_INCREMENTAL=0 cargo install --locked --force \
+CARGO_TARGET_DIR="$PWD/target" CARGO_INCREMENTAL=0 cargo install --locked --force \
   --features whisper --path crates/codex-bridge
 ```
 
@@ -329,14 +337,19 @@ codexctl status
 
 ## macOS Desktop topology (advanced opt-in)
 
-The installer creates one file, `~/Library/LaunchAgents/local.codex-bridge.daemon.plist`, which
-starts the bridge with only `--config`. The daemon owns the bundled app-server and WS adapter child
-processes and writes their diagnostics to its log under
-`${XDG_STATE_HOME:-$HOME/.local/state}/codex-bridge`. All files are owned by the current user.
+The installer creates `~/Library/LaunchAgents/local.codex-bridge.daemon.plist` on a new setup.
+For an existing `com.lunghaa.codex-bridge` installation, it updates that same LaunchAgent instead
+of starting a second Bridge service. Its executable is the Cargo-installed
+`${CARGO_HOME:-$HOME/.cargo}/bin/codex-bridge`; the existing config and other LaunchAgent settings
+are retained. An
+old `ws_bridge_bin` value pointing to this checkout's `target/release/ws-unix-bridge` is changed
+to the Cargo-installed adapter, with a config backup. The daemon owns the bundled app-server and
+WS adapter child processes. New installs write diagnostics under
+`${XDG_STATE_HOME:-$HOME/.local/state}/codex-bridge`; existing LaunchAgents retain their configured
+log path. All files are owned by the current user.
 
-Select this topology with `./scripts/install-macos.sh --desktop`. Fully quit ChatGPT before
-installation or before changing this topology. After installation,
-relaunch it so the new process inherits:
+Select this topology with `./scripts/install-macos.sh --desktop`. When changing from standalone
+mode, fully quit ChatGPT before switching and relaunch it so the new process inherits:
 
 ```text
 CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:18790/rpc
@@ -348,14 +361,16 @@ Verify without relying on a window being open:
 launchctl getenv CODEX_APP_SERVER_WS_URL
 test -S "$HOME/.codex-bridge/bundled-app-server.sock"
 lsof -nP -iTCP:18790 -sTCP:LISTEN
-launchctl print "gui/$(id -u)/local.codex-bridge.daemon"
+launchctl print "gui/$(id -u)/local.codex-bridge.daemon" # or com.lunghaa.codex-bridge on existing installs
 codexctl status
 ```
 
-To restart after editing `config.toml`:
+To restart after editing `config.toml`, first identify the installed label with `launchctl print`.
+Avoid `kickstart -k` while the app-server owns a running turn. The installer uses a normal
+bootout/bootstrap cycle and Bridge adopts the healthy app-server socket:
 
 ```sh
-launchctl kickstart -k "gui/$(id -u)/local.codex-bridge.daemon"
+./scripts/install-macos.sh --desktop
 ```
 
 When upgrading from v0.2.4 or earlier, Bridge may initially detect an app-server left running by
@@ -371,7 +386,7 @@ To disable Desktop interposition while retaining installed files, fully quit Cha
 
 ```sh
 # Set desktop_interposition = false in config.toml, then restart the daemon.
-launchctl kickstart -k "gui/$(id -u)/local.codex-bridge.daemon"
+./scripts/install-macos.sh --desktop
 launchctl unsetenv CODEX_APP_SERVER_WS_URL
 launchctl unsetenv CODEX_APP_SERVER_USE_LOCAL_DAEMON
 ```
@@ -402,18 +417,23 @@ administrator-controlled lingering policy; the installer intentionally does not 
 
 ## Updating
 
-Pull the desired revision and rerun the same installer. It replaces installed binaries and service
-definitions but preserves `config.toml` and an existing Web UI password. Installer flags only
+Pull the desired revision and rerun the same installer. It rebuilds `web-ui/dist` before
+`cargo install --locked --force`, then restarts the existing user service so the installed binary
+actually runs. It preserves `config.toml` and an existing Web UI password. Installer flags only
 choose defaults when creating a config for the first time; edit the existing TOML to change Web UI
 or runtime settings:
 
 ```sh
 git pull --ff-only
-./scripts/install-macos.sh   # or install-linux.sh
+./scripts/install-macos.sh   # or install-linux.sh; existing mode is read from config.toml
 ```
 
-Confirm the effective startup selection in the service log. The bridge prints its mode and loaded
-config path before opening sockets.
+On macOS, the installer keeps the existing Bridge LaunchAgent label and settings, migrates only an
+old generated adapter path, and disables the old independent `com.lunghaa.ws-unix-bridge` service
+when Bridge manages the Desktop adapter. On Linux, rerunning the script restarts an active
+`codex-bridge.service`; `systemctl enable --now` alone does not load the newly installed binary.
+Use `--no-start` to prepare binaries and service files without restarting a running Bridge.
+Confirm the effective startup selection in the service log and check `codexctl status` afterward.
 
 For command semantics see [`codexctl.md`](codexctl.md). For app-server methods, compatibility, and
 debugging boundaries see [`appserver.md`](appserver.md) and [the debugging guide](../DEBUGGING.md).

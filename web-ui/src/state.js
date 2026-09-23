@@ -32,6 +32,7 @@ export const state = {
   pinnedIds: new Set(),
   pinnedThreads: [],
   pinBusy: new Set(),
+  archiveBusy: new Set(),
   expanded: new Set(),
   expandedPreferenceSaved: false,
   current: null,

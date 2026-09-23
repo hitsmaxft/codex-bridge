@@ -224,6 +224,18 @@ test("managed app-server details expose restart and live transition notification
   assert.match(translations, /appServerRecovered/);
 });
 
+test("Codex GUI component diagnoses missing WS setup and Desktop stdio fallback", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const translations = await readFile(new URL("../src/i18n.js", import.meta.url), "utf8");
+  assert.match(source, /renderCodexGuiService\(root, expanded, services\.codex_gui\)/);
+  assert.match(source, /service\.ws_environment_configured/);
+  assert.match(source, /service\.ws_environment_matches_expected/);
+  assert.match(source, /service\.stdio_app_server_count/);
+  assert.match(source, /expected && !configured && stdioCount > 0/);
+  assert.match(translations, /codexGuiMissingWsAndStdio/);
+  assert.match(translations, /codexGuiStdioWarning/);
+});
+
 test("authoritative idle suppresses a stale rollout turn", () => {
   assert.equal(effectiveActiveTurnId("stale-rollout-turn", false), null);
   assert.equal(effectiveActiveTurnId("live-turn", true), "live-turn");
@@ -377,6 +389,7 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   const command = await demoClient();
   const status = result(command({ command: "status" }));
   assert.equal(status.demo, true);
+  assert.equal(status.managed_services.codex_gui.stdio_app_server_count, 0);
   assert.equal(status.managed_services.app_server.status.running, true);
   assert.equal(status.managed_services.whisper.fallback, true);
   assert.equal(status.managed_services.whisper.simplify_chinese, false);
@@ -822,6 +835,29 @@ test("mobile right swipe opens Tasks without opening the session drawer", async 
   assert.ok(gesture);
   assert.match(gesture, /openTasksDialog\(\)/);
   assert.doesNotMatch(gesture, /sidebar"\)\.classList\.add\("open"\)/);
+});
+
+test("mobile session rows reveal a direct archive action with a right swipe", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  const translations = await readFile(new URL("../src/i18n.js", import.meta.url), "utf8");
+  assert.match(source, /const THREAD_ARCHIVE_SWIPE_WIDTH = 76/);
+  assert.match(source, /gesture\.startOffset \+ dx/);
+  assert.match(source, /gesture\.offset >= THREAD_ARCHIVE_SWIPE_WIDTH \* 0\.45/);
+  assert.match(
+    source,
+    /if \(performance\.now\(\) < suppressOpenUntil\) \{[\s\S]*?event\.stopPropagation\(\);[\s\S]*?return;[\s\S]*?if \(!row\.classList\.contains\("swipe-open"\)\) return;/,
+  );
+  assert.match(source, /archive\.className = "thread-archive-action"/);
+  assert.match(source, /run\(\(\) => archiveThread\(thread\)\)/);
+  assert.match(source, /async function archiveThread\(thread, \{ confirm = false \} = \{\}\)/);
+  assert.match(source, /command\(\{ command: "thread_archive", thread_id: threadId \}, false\)/);
+  assert.match(
+    stylesheet,
+    /@media \(max-width: 800px\)[\s\S]*?\.thread-archive-action\s*\{[\s\S]*?width: 76px;/,
+  );
+  assert.match(stylesheet, /translate3d\(var\(--thread-swipe-offset, 0px\), 0, 0\)/);
+  assert.match(translations, /archiveSession: "归档"/);
 });
 
 test("composer keeps images as attachments and transcribes voice into editable text", async () => {

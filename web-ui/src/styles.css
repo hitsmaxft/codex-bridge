@@ -1034,13 +1034,25 @@ aside {
   border-radius: 7px;
 }
 .thread-row {
+  position: relative;
+  overflow: hidden;
+  border-radius: 7px;
+}
+.thread-row-content {
+  position: relative;
+  z-index: 1;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 30px;
   align-items: center;
   gap: 2px;
+  min-width: 0;
+  background: var(--panel);
 }
-.thread-row.no-pin {
+.thread-row.no-pin .thread-row-content {
   grid-template-columns: minmax(0, 1fr);
+}
+.thread-archive-action {
+  display: none;
 }
 .thread-run-state {
   display: inline-block;
@@ -3664,6 +3676,34 @@ label.caption {
   display: none;
 }
 @media (max-width: 800px) {
+  .thread-row-content {
+    transform: translate3d(var(--thread-swipe-offset, 0px), 0, 0);
+    transition: transform 0.18s ease-out;
+    touch-action: pan-y;
+    will-change: transform;
+  }
+  .thread-row.swipe-dragging .thread-row-content {
+    transition: none;
+  }
+  .thread-archive-action {
+    position: absolute;
+    z-index: 0;
+    inset: 0 auto 0 0;
+    display: grid;
+    width: 76px;
+    min-height: 100%;
+    padding: 0 10px;
+    place-items: center;
+    border: 0;
+    border-radius: 7px 0 0 7px;
+    background: var(--danger);
+    color: #260907;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  html[data-theme="light"] .thread-archive-action {
+    color: #fff;
+  }
   .turn-fold-block {
     grid-template-columns: minmax(0, 1fr);
   }

@@ -748,6 +748,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 }
             },
             "managed_services": {
+                "codex_gui": {"available": false, "gui_running": false, "interposition_expected": false, "ws_environment_configured": false, "ws_environment_matches_expected": null, "local_daemon_environment_set": false, "stdio_app_server_count": 0, "inspection_error": null},
                 "app_server": {"enabled": true, "status": {"running": true, "restart_count": state.app_server_restart_count}},
                 "desktop_interposition": {"enabled": false, "listen": null, "capability": null, "max_frame_bytes": 67_108_864, "max_message_bytes": 67_108_864, "status": {"running": false, "restart_count": 0}},
                 "whisper": {"enabled": false, "fallback": true, "needed": false, "listen": null, "model": null, "language": null, "prompt": null, "simplify_chinese": false, "threads": null, "status": {"running": false, "restart_count": 0}}

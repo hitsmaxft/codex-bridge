@@ -277,6 +277,20 @@ struct WhisperRuntimeConfig {
     threads: Option<usize>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct CodexGuiStatus {
+    available: bool,
+    gui_running: bool,
+    interposition_expected: bool,
+    ws_environment_configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws_environment_matches_expected: Option<bool>,
+    local_daemon_environment_set: bool,
+    stdio_app_server_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inspection_error: Option<String>,
+}
+
 #[derive(Clone)]
 struct BridgeState {
     socket_path: Arc<PathBuf>,
@@ -301,6 +315,7 @@ struct BridgeState {
     whisper: Option<WhisperRuntimeConfig>,
     whisper_needed: Option<watch::Sender<bool>>,
     whisper_status: Option<watch::Receiver<ManagedProcessStatus>>,
+    codex_gui_status: Arc<RwLock<CodexGuiStatus>>,
     server_capabilities: Arc<RwLock<Value>>,
     performance: Arc<PerformanceLog>,
 }
@@ -1684,6 +1699,116 @@ fn stdio_app_server_pids(ps_output: &str, program: &Path) -> Vec<u32> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn desktop_gui_running(ps_output: &str, program: &Path) -> bool {
+    let Some(desktop_parent) = desktop_parent_program(program) else {
+        return false;
+    };
+    let desktop_parent = desktop_parent.to_string_lossy();
+    ps_output.lines().any(|line| {
+        let line = line.trim_start();
+        let Some(pid_end) = line.find(char::is_whitespace) else {
+            return false;
+        };
+        let rest = line[pid_end..].trim_start();
+        let Some(ppid_end) = rest.find(char::is_whitespace) else {
+            return false;
+        };
+        let command = rest[ppid_end..].trim_start();
+        command == desktop_parent || command.starts_with(&format!("{desktop_parent} "))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_environment_value(name: &str) -> Result<Option<String>> {
+    let output = Command::new("launchctl")
+        .args(["getenv", name])
+        .output()
+        .with_context(|| format!("failed to inspect launchctl {name}"))?;
+    if !output.status.success() {
+        bail!("launchctl getenv {name} exited with {}", output.status);
+    }
+    let value = String::from_utf8(output.stdout)
+        .with_context(|| format!("launchctl {name} is not UTF-8"))?;
+    Ok((!value.trim().is_empty()).then(|| value.trim().to_owned()))
+}
+
+fn inspect_codex_gui(expected_ws_url: Option<&str>) -> CodexGuiStatus {
+    #[cfg(target_os = "macos")]
+    {
+        let program = Path::new(DESKTOP_CODEX_PATH);
+        let mut status = CodexGuiStatus {
+            available: program.is_file(),
+            interposition_expected: expected_ws_url.is_some(),
+            ..CodexGuiStatus::default()
+        };
+        let mut errors = Vec::new();
+
+        match launchctl_environment_value("CODEX_APP_SERVER_WS_URL") {
+            Ok(value) => {
+                status.ws_environment_configured = value.is_some();
+                status.ws_environment_matches_expected =
+                    expected_ws_url.map(|expected| value.as_deref() == Some(expected));
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+        match launchctl_environment_value("CODEX_APP_SERVER_USE_LOCAL_DAEMON") {
+            Ok(value) => status.local_daemon_environment_set = value.is_some(),
+            Err(error) => errors.push(error.to_string()),
+        }
+
+        match Command::new("ps")
+            .args(["-axo", "pid=,ppid=,command="])
+            .env("LC_ALL", "C")
+            .output()
+        {
+            Ok(output) if output.status.success() => match String::from_utf8(output.stdout) {
+                Ok(processes) => {
+                    status.gui_running = desktop_gui_running(&processes, program);
+                    status.stdio_app_server_count =
+                        stdio_app_server_pids(&processes, program).len();
+                }
+                Err(error) => errors.push(format!("process list is not UTF-8: {error}")),
+            },
+            Ok(output) => errors.push(format!("process inspection exited with {}", output.status)),
+            Err(error) => errors.push(format!("failed to inspect Codex GUI processes: {error}")),
+        }
+        status.inspection_error = (!errors.is_empty()).then(|| errors.join("; "));
+        status
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        CodexGuiStatus {
+            interposition_expected: expected_ws_url.is_some(),
+            inspection_error: Some("Codex GUI inspection is available only on macOS".to_owned()),
+            ..CodexGuiStatus::default()
+        }
+    }
+}
+
+fn spawn_codex_gui_monitor(
+    status: Arc<RwLock<CodexGuiStatus>>,
+    expected_ws_url: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let expected_ws_url = expected_ws_url.clone();
+            let Ok(next) =
+                tokio::task::spawn_blocking(move || inspect_codex_gui(expected_ws_url.as_deref()))
+                    .await
+            else {
+                return;
+            };
+            if let Ok(mut current) = status.write() {
+                *current = next;
+            }
+        }
+    })
+}
+
 fn conflicting_stdio_app_servers(program: &Path) -> Result<Vec<u32>> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,ppid=,command="])
@@ -2550,10 +2675,24 @@ async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketStat
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
     };
-    if !metadata.file_type().is_socket() {
+    let is_symlink = metadata.file_type().is_symlink();
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "refusing to use managed socket path not owned by this user: {}",
+            path.display()
+        );
+    }
+    let socket_metadata = if is_symlink {
+        fs::metadata(path).with_context(|| {
+            format!("failed to inspect managed socket target {}", path.display())
+        })?
+    } else {
+        metadata
+    };
+    if !socket_metadata.file_type().is_socket() {
         bail!("refusing to replace non-socket path {}", path.display());
     }
-    if metadata.uid() != unsafe { libc::geteuid() } {
+    if socket_metadata.uid() != unsafe { libc::geteuid() } {
         bail!(
             "refusing to replace socket not owned by this user: {}",
             path.display()
@@ -2576,6 +2715,12 @@ async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketStat
         if attempt < 2 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+    if is_symlink {
+        bail!(
+            "refusing to remove inactive managed socket symlink {}",
+            path.display()
+        );
     }
     fs::remove_file(path)
         .with_context(|| format!("failed to remove stale socket {}", path.display()))?;
@@ -2855,6 +3000,12 @@ async fn main() -> Result<()> {
     let _socket_guard = SocketGuard::new(&socket_path)?;
 
     let socket_path = Arc::new(socket_path);
+    let expected_desktop_ws_url = args
+        .desktop_interposition
+        .then(|| format!("ws://{}/rpc", args.ws_bridge_listen));
+    let codex_gui_status = Arc::new(RwLock::new(inspect_codex_gui(
+        expected_desktop_ws_url.as_deref(),
+    )));
     let server_capabilities = Arc::new(RwLock::new(json!({
         "audio_transcription": {
             "enabled": false,
@@ -2885,9 +3036,11 @@ async fn main() -> Result<()> {
         whisper: args.whisper.clone(),
         whisper_needed,
         whisper_status,
+        codex_gui_status: Arc::clone(&codex_gui_status),
         server_capabilities,
         performance: Arc::new(PerformanceLog::default()),
     };
+    let codex_gui_monitor = spawn_codex_gui_monitor(codex_gui_status, expected_desktop_ws_url);
     let capability_monitor = spawn_capability_monitor(bridge_state.clone());
     let hot_cache_task = spawn_hot_session_cache(
         Arc::clone(&session_store),
@@ -3003,6 +3156,7 @@ async fn main() -> Result<()> {
     if let Some(hot_cache_task) = hot_cache_task {
         hot_cache_task.abort();
     }
+    codex_gui_monitor.abort();
     capability_monitor.abort();
     managed_shutdown_tx.send_replace(true);
     for task in managed_tasks {
@@ -5568,7 +5722,16 @@ fn managed_services_snapshot(state: &BridgeState) -> Value {
         .as_ref()
         .map(|status| status.borrow().clone())
         .unwrap_or(disabled);
+    let codex_gui = state
+        .codex_gui_status
+        .read()
+        .map(|status| status.clone())
+        .unwrap_or_else(|_| CodexGuiStatus {
+            inspection_error: Some("Codex GUI status is unavailable".to_owned()),
+            ..CodexGuiStatus::default()
+        });
     json!({
+        "codex_gui": codex_gui,
         "app_server": {
             "enabled": state.manage_app_server,
             "listen": state.write_backend.app_server_socket(),
@@ -9146,6 +9309,27 @@ mod tests {
 "#;
 
         assert_eq!(stdio_app_server_pids(processes, program), [11]);
+        assert!(desktop_gui_running(processes, program));
+    }
+
+    #[test]
+    fn codex_gui_status_does_not_expose_environment_values() {
+        let status = CodexGuiStatus {
+            available: true,
+            gui_running: true,
+            interposition_expected: true,
+            ws_environment_configured: true,
+            ws_environment_matches_expected: Some(false),
+            local_daemon_environment_set: false,
+            stdio_app_server_count: 1,
+            inspection_error: None,
+        };
+        let serialized = serde_json::to_value(status).unwrap();
+
+        assert_eq!(serialized["ws_environment_configured"], true);
+        assert_eq!(serialized["ws_environment_matches_expected"], false);
+        assert_eq!(serialized["stdio_app_server_count"], 1);
+        assert!(serialized.get("ws_environment_value").is_none());
     }
 
     #[test]
@@ -10036,6 +10220,30 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             ManagedSocketState::Vacant
         );
         assert!(!stale_socket.exists());
+
+        let target_socket = root.join("target.sock");
+        let linked_socket = root.join("linked.sock");
+        let target_listener = tokio::net::UnixListener::bind(&target_socket).unwrap();
+        std::os::unix::fs::symlink(&target_socket, &linked_socket).unwrap();
+        assert_eq!(
+            prepare_managed_process_socket(&linked_socket)
+                .await
+                .unwrap(),
+            ManagedSocketState::Active
+        );
+        drop(target_listener);
+        let error = prepare_managed_process_socket(&linked_socket)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refusing to remove inactive managed socket symlink"));
+        assert!(fs::symlink_metadata(&linked_socket)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_file(linked_socket).unwrap();
+        fs::remove_file(target_socket).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

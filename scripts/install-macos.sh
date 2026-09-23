@@ -6,14 +6,16 @@ start_services=true
 start_suppressed=false
 runtime_mode=standalone
 runtime_mode_explicit=false
+enable_whisper=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --web-ui) enable_web_ui=true ;;
     --no-start) start_services=false ;;
     --standalone) runtime_mode=standalone; runtime_mode_explicit=true ;;
     --desktop) runtime_mode=desktop; runtime_mode_explicit=true ;;
+    --whisper) enable_whisper=true ;;
     -h|--help)
-      echo "Usage: scripts/install-macos.sh [--standalone|--desktop] [--web-ui] [--no-start]"
+      echo "Usage: scripts/install-macos.sh [--standalone|--desktop] [--web-ui] [--whisper] [--no-start]"
       exit 0
       ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -36,12 +38,37 @@ launcher_dir=$HOME/Library/LaunchAgents
 desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex
 desktop_main=/Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 adapter_port=18790
+domain=gui/$(id -u)
+daemon_label=local.codex-bridge.daemon
+legacy_label=com.lunghaa.codex-bridge
+if [ -f "$launcher_dir/$legacy_label.plist" ] || launchctl print "$domain/$legacy_label" >/dev/null 2>&1; then
+  if [ -f "$launcher_dir/$daemon_label.plist" ] || launchctl print "$domain/$daemon_label" >/dev/null 2>&1; then
+    echo "Both Bridge LaunchAgents exist; resolve the duplicate before installing." >&2
+    exit 1
+  fi
+  daemon_label=$legacy_label
+fi
 
-if [ "$runtime_mode_explicit" = false ] && [ -f "$config_path" ]; then
+if [ -f "$config_path" ]; then
   configured_mode=$(sed -n 's/^[[:space:]]*mode[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_path" | head -n 1)
-  case "$configured_mode" in
-    desktop|standalone) runtime_mode=$configured_mode ;;
-  esac
+  if [ "$runtime_mode_explicit" = true ] && [ -n "$configured_mode" ] &&
+    [ "$runtime_mode" != "$configured_mode" ]; then
+    echo "Existing config selects $configured_mode; edit $config_path before changing runtime mode." >&2
+    exit 1
+  fi
+  if [ "$runtime_mode_explicit" = false ]; then
+    case "$configured_mode" in
+      desktop|standalone) runtime_mode=$configured_mode ;;
+    esac
+  fi
+fi
+if [ -f "$config_path" ] && awk '
+  /^\[services\.whisper\][[:space:]]*([#].*)?$/ { section = 1; next }
+  /^\[/ { section = 0 }
+  section && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true([[:space:]]*(#.*)?)?$/ { found = 1 }
+  END { exit !found }
+' "$config_path"; then
+  enable_whisper=true
 fi
 
 if [ "$runtime_mode" = desktop ]; then
@@ -85,14 +112,48 @@ chmod 700 "$config_dir" "$runtime_dir" "$state_dir"
 
 npm --prefix "$repo_root/web-ui" ci
 npm --prefix "$repo_root/web-ui" run build
-CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
-  cargo install --locked --force --path "$repo_root/crates/codex-bridge"
+if [ "$enable_whisper" = true ]; then
+  CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
+    cargo install --locked --force --features whisper --path "$repo_root/crates/codex-bridge"
+else
+  CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
+    cargo install --locked --force --path "$repo_root/crates/codex-bridge"
+fi
 CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
   cargo install --locked --force --path "$repo_root/crates/codexctl"
 if [ "$runtime_mode" = desktop ]; then
   CARGO_TARGET_DIR="$repo_root/target" CARGO_INCREMENTAL=0 \
     cargo install --locked --force --path "$repo_root/crates/codex-gui-bridge" \
     --bin ws-unix-bridge
+fi
+
+# Migrate only the old generated build-artifact path. Other local adapter
+# choices remain untouched.
+if [ "$runtime_mode" = desktop ] && [ -f "$config_path" ]; then
+  old_adapter=$repo_root/target/release/ws-unix-bridge
+  if awk -v old="$old_adapter" '
+    /^[[:space:]]*ws_bridge_bin[[:space:]]*=/ {
+      value = $0; sub(/^[^=]*=[[:space:]]*/, "", value)
+      sub(/[[:space:]]*(#.*)?$/, "", value)
+      if (value == "\"" old "\"") found = 1
+    }
+    END { exit !found }
+  ' "$config_path"; then
+    config_backup=$(mktemp "$config_path.before-cargo-install.XXXXXX")
+    cp -p "$config_path" "$config_backup"
+    config_updated=$(mktemp "$config_path.updated.XXXXXX")
+    awk -v old="$old_adapter" -v new="$cargo_bin_dir/ws-unix-bridge" '
+      /^[[:space:]]*ws_bridge_bin[[:space:]]*=/ {
+        value = $0; sub(/^[^=]*=[[:space:]]*/, "", value)
+        sub(/[[:space:]]*(#.*)?$/, "", value)
+        if (value == "\"" old "\"") sub(/"[^"]*"/, "\"" new "\"")
+      }
+      { print }
+    ' "$config_path" >"$config_updated"
+    chmod 600 "$config_updated"
+    mv "$config_updated" "$config_path"
+    echo "Updated ws_bridge_bin to the Cargo-installed adapter (backup: $config_backup)"
+  fi
 fi
 
 web_password=$runtime_dir/web-ui-password
@@ -160,12 +221,26 @@ if [ "$start_services" = true ] && [ "$managed_by_bridge" = true ]; then
   fi
 fi
 
-daemon_plist=$launcher_dir/local.codex-bridge.daemon.plist
-cat >"$daemon_plist" <<EOF
+daemon_plist=$launcher_dir/$daemon_label.plist
+if [ -f "$daemon_plist" ]; then
+  if [ "$(plutil -extract Label raw -o - "$daemon_plist")" != "$daemon_label" ] ||
+    [ "$(plutil -extract ProgramArguments.1 raw -o - "$daemon_plist")" != "--config" ] ||
+    [ "$(plutil -extract ProgramArguments.2 raw -o - "$daemon_plist")" != "$config_path" ]; then
+    echo "Existing LaunchAgent has unexpected arguments; inspect before updating: $daemon_plist" >&2
+    exit 1
+  fi
+  if [ "$(plutil -extract ProgramArguments.0 raw -o - "$daemon_plist")" != "$cargo_bin_dir/codex-bridge" ]; then
+    # plutil -replace on an array index inserts a new item on some macOS
+    # versions, leaving the old executable as an extra argument.
+    plutil -remove ProgramArguments.0 "$daemon_plist"
+    plutil -insert ProgramArguments.0 -string "$cargo_bin_dir/codex-bridge" "$daemon_plist"
+  fi
+else
+  cat >"$daemon_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>local.codex-bridge.daemon</string>
+  <key>Label</key><string>$daemon_label</string>
   <key>ProgramArguments</key><array>
     <string>$cargo_bin_dir/codex-bridge</string><string>--config</string><string>$config_path</string>
   </array>
@@ -174,16 +249,20 @@ cat >"$daemon_plist" <<EOF
   <key>StandardErrorPath</key><string>$state_dir/bridge.log</string>
 </dict></plist>
 EOF
+fi
 chmod 600 "$daemon_plist"
 plutil -lint "$daemon_plist"
 
 if [ "$start_services" = true ]; then
-  domain=gui/$(id -u)
-  daemon_service=$domain/local.codex-bridge.daemon
+  daemon_service=$domain/$daemon_label
   if [ "$managed_by_bridge" = true ]; then
     for label in desktop-env ws-adapter app-server; do
       launchctl bootout "$domain/local.codex-bridge.$label" >/dev/null 2>&1 || true
     done
+    if [ "$runtime_mode" = desktop ]; then
+      launchctl bootout "$domain/com.lunghaa.ws-unix-bridge" >/dev/null 2>&1 || true
+      launchctl disable "$domain/com.lunghaa.ws-unix-bridge"
+    fi
   fi
   launchctl bootout "$daemon_service" >/dev/null 2>&1 || true
   if ! launchctl bootstrap "$domain" "$daemon_plist"; then

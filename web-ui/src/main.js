@@ -177,6 +177,76 @@ function renderRuntimeResources() {
   root.appendChild(entry);
 }
 
+function renderCodexGuiService(root, expanded, service) {
+  if (!service) return;
+  const expected = Boolean(service.interposition_expected),
+    configured = Boolean(service.ws_environment_configured),
+    matches = service.ws_environment_matches_expected,
+    environmentReady = configured && matches !== false && !service.local_daemon_environment_set,
+    stdioCount = Number(service.stdio_app_server_count || 0),
+    inspectionFailed = Boolean(service.inspection_error),
+    needsAttention = expected && (inspectionFailed || !environmentReady || stdioCount > 0),
+    running = Boolean(service.gui_running),
+    limited = !needsAttention && running && stdioCount > 0,
+    entry = document.createElement("details"),
+    summary = document.createElement("summary"),
+    dot = document.createElement("span"),
+    name = document.createElement("span"),
+    value = document.createElement("span"),
+    detail = document.createElement("div");
+  entry.className = `component-entry${needsAttention ? " failed" : limited ? " limited" : running || (expected && environmentReady) ? " running" : ""}`;
+  entry.dataset.component = "codex-gui";
+  entry.open = expanded.has("codex-gui");
+  dot.className = "component-dot";
+  name.className = "component-name";
+  name.textContent = tr("codexGuiComponent");
+  value.className = "component-state";
+  value.textContent = !service.available
+    ? tr("componentUnavailable")
+    : needsAttention
+      ? tr("componentNeedsAttention")
+      : running
+        ? stdioCount > 0
+          ? tr("componentStdio")
+          : tr("componentRunning")
+        : expected && environmentReady
+          ? tr("componentReady")
+          : tr("componentStopped");
+  detail.className = "component-detail";
+  for (const text of [
+    running ? tr("codexGuiProcessRunning") : tr("codexGuiProcessStopped"),
+    !expected
+      ? configured
+        ? tr("codexGuiWsUnexpected")
+        : tr("codexGuiWsNotExpected")
+      : !configured
+        ? tr("codexGuiWsMissing")
+        : matches === false
+          ? tr("codexGuiWsMismatch")
+          : tr("codexGuiWsReady"),
+    service.local_daemon_environment_set
+      ? tr("codexGuiLocalDaemonSet")
+      : tr("codexGuiLocalDaemonUnset"),
+    stdioCount > 0 ? tr("codexGuiStdioDetected", { count: stdioCount }) : tr("codexGuiStdioNone"),
+    expected && !configured && stdioCount > 0
+      ? tr("codexGuiMissingWsAndStdio")
+      : expected && stdioCount > 0
+        ? tr("codexGuiStdioWarning")
+        : null,
+    service.inspection_error
+      ? tr("codexGuiInspectionError", { error: service.inspection_error })
+      : null,
+  ]) {
+    if (!text) continue;
+    const row = document.createElement("div");
+    row.textContent = text;
+    detail.appendChild(row);
+  }
+  summary.append(dot, name, value);
+  entry.append(summary, detail);
+  root.appendChild(entry);
+}
+
 function renderManagedServices() {
   const root = $("componentStatus"),
     services = state.managedServices;
@@ -201,6 +271,7 @@ function renderManagedServices() {
   heading.className = "component-status-title";
   heading.textContent = tr("managedComponents");
   root.appendChild(heading);
+  renderCodexGuiService(root, expanded, services.codex_gui);
   for (const [key, label, service] of [
     ["app-server", tr("appServerComponent"), services.app_server],
     ["ws-bridge", tr("wsBridgeComponent"), services.desktop_interposition],
@@ -1202,10 +1273,112 @@ function closeTasksDialog() {
   clearTimeout(tasksRefreshTimer);
   tasksRefreshTimer = null;
 }
+const THREAD_ARCHIVE_SWIPE_WIDTH = 76;
+let openThreadArchiveRow = null;
+function setThreadArchiveSwipe(row, open) {
+  const action = row.querySelector(".thread-archive-action");
+  row.classList.toggle("swipe-open", open);
+  row.style.setProperty("--thread-swipe-offset", `${open ? THREAD_ARCHIVE_SWIPE_WIDTH : 0}px`);
+  if (action) {
+    action.tabIndex = open ? 0 : -1;
+    action.setAttribute("aria-hidden", String(!open));
+  }
+  if (open) openThreadArchiveRow = row;
+  else if (openThreadArchiveRow === row) openThreadArchiveRow = null;
+}
+function closeThreadArchiveSwipe(except = null) {
+  if (!openThreadArchiveRow || openThreadArchiveRow === except) return;
+  setThreadArchiveSwipe(openThreadArchiveRow, false);
+}
+function bindThreadArchiveSwipe(row, content) {
+  let gesture = null,
+    suppressOpenUntil = 0;
+  row.addEventListener(
+    "touchstart",
+    (event) => {
+      if (!matchMedia("(max-width:800px)").matches || event.touches.length !== 1) return;
+      if (event.target.closest(".thread-archive-action")) return;
+      event.stopPropagation();
+      closeThreadArchiveSwipe(row);
+      const touch = event.touches[0],
+        startOffset = row.classList.contains("swipe-open") ? THREAD_ARCHIVE_SWIPE_WIDTH : 0;
+      gesture = {
+        x: touch.clientX,
+        y: touch.clientY,
+        horizontal: false,
+        startOffset,
+        offset: startOffset,
+      };
+    },
+    { passive: true },
+  );
+  row.addEventListener(
+    "touchmove",
+    (event) => {
+      if (!gesture || event.touches.length !== 1) return;
+      event.stopPropagation();
+      const touch = event.touches[0],
+        dx = touch.clientX - gesture.x,
+        dy = touch.clientY - gesture.y;
+      if (!gesture.horizontal && Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx) * 1.2) {
+        gesture = null;
+        return;
+      }
+      if (!gesture.horizontal && Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+        gesture.horizontal = true;
+        row.classList.add("swipe-dragging");
+      }
+      if (!gesture.horizontal) return;
+      event.preventDefault();
+      gesture.offset = Math.max(0, Math.min(THREAD_ARCHIVE_SWIPE_WIDTH, gesture.startOffset + dx));
+      row.style.setProperty("--thread-swipe-offset", `${gesture.offset}px`);
+    },
+    { passive: false },
+  );
+  const finish = (event) => {
+    if (!gesture) return;
+    event.stopPropagation();
+    row.classList.remove("swipe-dragging");
+    if (gesture.horizontal) {
+      suppressOpenUntil = performance.now() + 500;
+      setThreadArchiveSwipe(row, gesture.offset >= THREAD_ARCHIVE_SWIPE_WIDTH * 0.45);
+    }
+    gesture = null;
+  };
+  row.addEventListener("touchend", finish, { passive: true });
+  row.addEventListener(
+    "touchcancel",
+    (event) => {
+      if (!gesture) return;
+      event.stopPropagation();
+      row.classList.remove("swipe-dragging");
+      setThreadArchiveSwipe(row, gesture.startOffset > 0);
+      gesture = null;
+    },
+    { passive: true },
+  );
+  content.addEventListener(
+    "click",
+    (event) => {
+      if (performance.now() < suppressOpenUntil) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (!row.classList.contains("swipe-open")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setThreadArchiveSwipe(row, false);
+    },
+    true,
+  );
+}
 function threadRow(thread) {
   const row = document.createElement("div");
   row.className = `thread-row${state.pinAvailable && !thread.archived ? "" : " no-pin"}`;
-  const button = document.createElement("button");
+  const content = document.createElement("div"),
+    button = document.createElement("button");
+  content.className = "thread-row-content";
   button.className = "thread" + (state.current?.id === thread.id ? " active" : "");
   button.innerHTML = '<div class="thread-name"></div><div class="thread-meta"></div>';
   const name = document.createElement("span");
@@ -1230,7 +1403,7 @@ function threadRow(thread) {
   }
   button.children[1].textContent = `${thread.git_branch || tr("noBranch")} · ${timeText(thread.updated_at_ms, getLanguage() === "zh" ? "zh-CN" : "en")}${thread.archived ? ` · ${tr("archived")}` : ""}`;
   button.onclick = () => openThread(thread);
-  row.appendChild(button);
+  content.appendChild(button);
   if (state.pinAvailable && !thread.archived) {
     const pin = document.createElement("button"),
       label = tr(thread.pinned ? "unpinSession" : "pinSession");
@@ -1243,8 +1416,26 @@ function threadRow(thread) {
     pin.setAttribute("aria-pressed", String(Boolean(thread.pinned)));
     pin.disabled = state.pinBusy.has(thread.id);
     pin.onclick = () => run(() => toggleThreadPin(thread));
-    row.appendChild(pin);
+    content.appendChild(pin);
   }
+  if (!thread.archived) {
+    const archive = document.createElement("button");
+    archive.className = "thread-archive-action";
+    archive.type = "button";
+    archive.textContent = tr("archiveSession");
+    archive.title = tr("archiveSession");
+    archive.setAttribute("aria-label", `${tr("archiveSession")}: ${thread.title || thread.id}`);
+    archive.setAttribute("aria-hidden", "true");
+    archive.tabIndex = -1;
+    archive.disabled = state.archiveBusy.has(thread.id);
+    archive.onclick = (event) => {
+      event.stopPropagation();
+      run(() => archiveThread(thread));
+    };
+    row.appendChild(archive);
+    bindThreadArchiveSwipe(row, content);
+  }
+  row.appendChild(content);
   return row;
 }
 function pinnedProject(thread) {
@@ -1301,6 +1492,7 @@ async function openSessionById(threadId, { fromHash = false, replaceHash = false
 function renderProjects() {
   const q = $("search").value.trim().toLowerCase(),
     root = $("projects");
+  closeThreadArchiveSwipe();
   root.textContent = "";
   const pinned = state.pinnedThreads.filter((thread) => threadMatches(thread, q));
   const projects = state.projects.filter(
@@ -5634,38 +5826,55 @@ $("renameThreadBtn").onclick = () =>
     await loadProjects();
     notify(tr("sessionRenamed"));
   });
-$("archiveThreadBtn").onclick = () =>
-  run(async () => {
-    if (!state.current) throw new Error(tr("chooseSessionError"));
-    requireCurrentThreadWriter();
-    const threadId = state.current.id,
-      title = state.current.title || threadId;
-    if (!window.confirm(tr("archiveConfirm", { title }))) return;
+function clearArchivedCurrentThread(threadId) {
+  if (state.current?.id !== threadId) return;
+  state.openToken += 1;
+  state.current = null;
+  state.threadWriterLock = null;
+  applyThreadWriterLock(null);
+  state.threadGoal = null;
+  renderGoalPanel();
+  state.activeTurnId = null;
+  state.activeTool = null;
+  state.activityPhase = null;
+  state.messageCache.delete(threadId);
+  $("threadTitle").textContent = tr("chooseSession");
+  $("threadCompactMeta").textContent = "";
+  $("threadMeta").textContent = tr("archivedRemoved");
+  $("messages").innerHTML = `<div class="empty">${tr("loadingAnother")}</div>`;
+  $("messageText").value = "";
+  state.composerAttachments = [];
+  state.attachmentDrafts.delete(threadId);
+  state.composerReference = null;
+  state.referenceDrafts.delete(threadId);
+  renderComposerAttachments();
+  renderComposerReference();
+  resizeComposerTextarea();
+  renderPending();
+  closePanels();
+}
+async function archiveThread(thread, { confirm = false } = {}) {
+  const threadId = thread?.id;
+  if (!threadId || state.archiveBusy.has(threadId)) return;
+  if (state.current?.id === threadId) requireCurrentThreadWriter();
+  const title = thread.title || threadId;
+  if (confirm && !window.confirm(tr("archiveConfirm", { title }))) return;
+  state.archiveBusy.add(threadId);
+  renderProjects();
+  try {
     await command({ command: "thread_archive", thread_id: threadId }, false);
-    state.current = null;
-    state.threadWriterLock = null;
-    applyThreadWriterLock(null);
-    state.threadGoal = null;
-    renderGoalPanel();
-    state.activeTurnId = null;
-    state.activeTool = null;
-    state.activityPhase = null;
-    $("threadTitle").textContent = tr("chooseSession");
-    $("threadCompactMeta").textContent = "";
-    $("threadMeta").textContent = tr("archivedRemoved");
-    $("messages").innerHTML = `<div class="empty">${tr("loadingAnother")}</div>`;
-    $("messageText").value = "";
-    state.composerAttachments = [];
-    state.attachmentDrafts.delete(threadId);
-    state.composerReference = null;
-    state.referenceDrafts.delete(threadId);
-    renderComposerAttachments();
-    renderComposerReference();
-    resizeComposerTextarea();
-    renderPending();
-    closePanels();
+    clearArchivedCurrentThread(threadId);
     await loadProjects();
     notify(tr("sessionArchived"));
+  } finally {
+    state.archiveBusy.delete(threadId);
+    renderProjects();
+  }
+}
+$("archiveThreadBtn").onclick = () =>
+  run(() => {
+    if (!state.current) throw new Error(tr("chooseSessionError"));
+    return archiveThread(state.current, { confirm: true });
   });
 $("repairOrdinalsBtn").onclick = () =>
   run(async () => {
