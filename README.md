@@ -29,17 +29,13 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.3 · 2026-09-23
+### v0.3.4 · 2026-09-26
 
-- **Codex GUI visibility:** Settings checks the Desktop WebSocket launch environment and reports
-  directly owned stdio app-server processes after a Desktop update.
-- **Reliable local updates:** macOS and Linux installers deploy with `cargo install`, retain an
-  existing user service, and include Whisper automatically when its fallback is enabled.
-- **Projectless chats:** new chats receive a dated workspace with dedicated `work/` and `outputs/`
-  directories.
-- **Mobile archiving:** swipe a session row to reveal its archive action.
+- **Async clarification:** Codex questions appear in a floating, nonblocking card. Answers steer
+  into the originating running turn. Once it ends, the card explicitly offers a new turn.
+- **Recovery:** pending questions are restored from native app-server items when a session opens.
 
-See the [latest release notes](docs/releases/v0.3.3.md) or the
+See the [latest release notes](docs/releases/v0.3.4.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI

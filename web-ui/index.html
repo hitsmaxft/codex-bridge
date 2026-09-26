@@ -574,6 +574,44 @@
     >
       <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6" /></svg>
     </button>
+    <aside
+      class="question-float"
+      id="asyncQuestionPanel"
+      aria-labelledby="asyncQuestionTitle"
+      hidden
+    >
+      <header class="goal-head">
+        <div class="goal-heading">
+          <span class="goal-kicker" data-i18n="asyncQuestionKicker">Clarification</span>
+          <strong id="asyncQuestionTitle" data-i18n="asyncQuestionTitle"
+            >Codex has a question</strong
+          >
+        </div>
+        <button
+          id="asyncQuestionHideBtn"
+          class="goal-icon-button"
+          type="button"
+          data-i18n-aria-label="asyncQuestionHide"
+          aria-label="Hide question"
+        >
+          ×
+        </button>
+      </header>
+      <form id="asyncQuestionForm" class="question-form">
+        <div id="asyncQuestionFields"></div>
+        <p id="asyncQuestionState" class="question-state"></p>
+        <button id="asyncQuestionSubmitBtn" class="primary" type="submit"></button>
+      </form>
+    </aside>
+    <button
+      class="question-restore"
+      id="asyncQuestionRestoreBtn"
+      type="button"
+      data-i18n="asyncQuestionRestore"
+      hidden
+    >
+      Question
+    </button>
     <div class="selection-actions" id="selectionActions" role="toolbar" hidden>
       <button id="selectionCopyBtn" type="button" data-i18n="copy">Copy</button>
       <button id="selectionInsertBtn" type="button" data-i18n="insertConversation">Insert</button>

@@ -70,6 +70,7 @@ const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
 const MAX_PERFORMANCE_EVENTS: usize = 128;
 const MAX_APP_SERVER_TOOL_PAGES: usize = 8;
+const MAX_ASYNC_QUESTION_PAGES: usize = 8;
 #[cfg(test)]
 static NEXT_WORKTREE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -5533,6 +5534,93 @@ fn infer_wait_activity(item: &Value, subagent: Option<&(String, String)>) -> Opt
     Some(enriched)
 }
 
+fn async_question_reply_ids(item: &Value) -> Vec<String> {
+    if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+        return Vec::new();
+    }
+    let Some(content) = item.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter_map(|text| {
+            text.strip_prefix("<send_user_message_question_reply>\n")?
+                .split_once("\n</send_user_message_question_reply>")
+                .and_then(|(body, _)| serde_json::from_str::<Vec<Value>>(body).ok())
+        })
+        .flatten()
+        .filter_map(|reply| reply.get("questionItemId")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn list_async_questions(
+    write_backend: &CodexCliBackend,
+    thread_id: &str,
+) -> Result<Vec<Value>, BackendFailure> {
+    let mut cursor = None::<String>;
+    let mut seen_cursors = HashSet::new();
+    let mut questions = Vec::new();
+    let mut answered = HashSet::new();
+    for _ in 0..MAX_ASYNC_QUESTION_PAGES {
+        let result = write_backend.app_server_rpc(
+            "thread/items/list",
+            json!({"threadId": thread_id, "cursor": cursor, "limit": 100, "sortDirection": "desc"}),
+        )?;
+        let entries = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| BackendFailure {
+                code: "app_server_protocol_error",
+                message: "thread/items/list returned no item data".to_owned(),
+            })?;
+        for entry in entries {
+            let Some(item) = entry.get("item") else {
+                continue;
+            };
+            answered.extend(async_question_reply_ids(item));
+            if item.get("type").and_then(Value::as_str) != Some("agentMessage")
+                || item.get("delivery").and_then(Value::as_str) != Some("async")
+            {
+                continue;
+            }
+            let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(turn_id) = entry.get("turnId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(items) = item.get("questions").and_then(Value::as_array) else {
+                continue;
+            };
+            if !items.is_empty() {
+                questions.push(json!({"item_id": item_id, "turn_id": turn_id, "questions": items}));
+            }
+        }
+        let Some(next) = result.get("nextCursor").and_then(Value::as_str) else {
+            break;
+        };
+        if !seen_cursors.insert(next.to_owned()) {
+            break;
+        }
+        cursor = Some(next.to_owned());
+    }
+    questions.retain(|entry| {
+        let Some(item_id) = entry.get("item_id").and_then(Value::as_str) else {
+            return false;
+        };
+        let count = entry
+            .get("questions")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        (0..count).any(|index| {
+            let key = json!(["request_user_input_async", item_id, index]).to_string();
+            !answered.contains(&key)
+        })
+    });
+    Ok(questions)
+}
+
 fn app_server_tools_for_messages(
     write_backend: &CodexCliBackend,
     cache: &AppServerToolCache,
@@ -7919,6 +8007,91 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 }
             }
         }
+        Request::AsyncQuestions { thread_id } => {
+            match list_async_questions(write_backend, &thread_id) {
+                Ok(questions) => Response::success(json!({"questions": questions})),
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::AsyncQuestionReply {
+            thread_id,
+            item_id,
+            turn_id,
+            answers,
+            mode,
+        } => {
+            if let Err(response) = require_owned_thread_writer(write_backend, &thread_id) {
+                return response;
+            }
+            let questions = match list_async_questions(write_backend, &thread_id) {
+                Ok(questions) => questions,
+                Err(error) => return write_backend_error(error),
+            };
+            let Some(question) = questions.iter().find(|entry| {
+                entry.get("item_id").and_then(Value::as_str) == Some(item_id.as_str())
+                    && entry.get("turn_id").and_then(Value::as_str) == Some(turn_id.as_str())
+            }) else {
+                return Response::error(
+                    "question_not_pending",
+                    "This question is no longer pending",
+                );
+            };
+            let items = question["questions"]
+                .as_array()
+                .expect("validated questions array");
+            if answers.len() != items.len()
+                || answers
+                    .iter()
+                    .any(|answer| answer.trim().is_empty() || answer.len() > 16_000)
+            {
+                return Response::error(
+                    "invalid_answers",
+                    "Provide an answer of at most 16000 bytes to every question",
+                );
+            }
+            let replies = items.iter().enumerate().map(|(index, item)| json!({
+                "questionItemId": json!(["request_user_input_async", item_id, index]).to_string(),
+                "question": item.get("title").and_then(Value::as_str).unwrap_or(""),
+                "answer": answers[index],
+            })).collect::<Vec<_>>();
+            let reply_text = format!(
+                "<send_user_message_question_reply>\n{}\n</send_user_message_question_reply>",
+                Value::Array(replies)
+            );
+            let input = vec![json!({"type": "text", "text": reply_text})];
+            let active_turn = match session_store.active_turn_id(&thread_id) {
+                Ok(active) => active,
+                Err(error) => return backend_error(error),
+            };
+            match mode.as_str() {
+                "steer" if active_turn.as_deref() == Some(turn_id.as_str()) => {
+                    match write_backend.steer_via_app_server(&thread_id, &turn_id, &input) {
+                        Ok(backend) => {
+                            Response::success(json!({"mode": "steer", "backend": backend}))
+                        }
+                        Err(error) => write_backend_error(error),
+                    }
+                }
+                "steer" => Response::error(
+                    "question_turn_finished",
+                    "The question's turn is no longer active; choose a new turn explicitly",
+                ),
+                "new_turn" if active_turn.is_none() => {
+                    let client_id = format!("async-question-{item_id}");
+                    match write_backend.start_turn(&thread_id, &input, &client_id) {
+                        Ok(backend) => {
+                            Response::success(json!({"mode": "new_turn", "backend": backend}))
+                        }
+                        Err(error) => write_backend_error(error),
+                    }
+                }
+                "new_turn" => Response::error(
+                    "active_turn_changed",
+                    "Another turn is active; wait until it finishes",
+                ),
+                _ => Response::error("invalid_reply_mode", "Use steer or new_turn"),
+            }
+        }
         Request::AudioTranscribe { thread_id, audio } => {
             let decoded_bytes = BASE64_STANDARD.decode(&audio.data).ok();
             let expected_bytes = usize::try_from(audio.samples_per_channel)
@@ -9237,6 +9410,21 @@ impl Drop for SocketGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn async_question_reply_identity_is_read_from_user_item() {
+        let id = serde_json::json!(["request_user_input_async", "call-example", 0]).to_string();
+        let body =
+            serde_json::json!([{"questionItemId": id, "question": "Choose", "answer": "One"}]);
+        let item = serde_json::json!({
+            "type": "userMessage",
+            "content": [{"type": "text", "text": format!("<send_user_message_question_reply>\n{body}\n</send_user_message_question_reply>")}]
+        });
+        assert_eq!(super::async_question_reply_ids(&item), vec![id]);
+        assert!(
+            super::async_question_reply_ids(&serde_json::json!({"type": "agentMessage"}))
+                .is_empty()
+        );
+    }
     use super::*;
 
     fn fixture_store() -> SessionStore {

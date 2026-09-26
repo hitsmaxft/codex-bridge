@@ -1219,54 +1219,55 @@
         </p>
         <div class="release">
           <div class="release-date">
-            2026-09-23
-            <span class="zh">v0.3.3 正式版</span
-            ><span class="en">v0.3.3 release</span>
+            2026-09-26
+            <span class="zh">v0.3.4 正式版</span
+            ><span class="en">v0.3.4 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">Codex GUI 运行检查</span
-                ><span class="en">Codex GUI status</span>
+                <span class="zh">异步澄清浮窗</span
+                ><span class="en">Async clarification card</span>
               </h3>
               <p class="zh">
-                设置中可检查 Desktop 的 WebSocket 启动环境，并识别直接启动的 stdio app-server。
+                Codex 提问时可在浮窗回答，同时保持当前任务继续运行。
               </p>
               <p class="en">
-                Check Desktop's WebSocket launch environment and detect
-                directly owned stdio app-server processes in Settings.
+                Answer Codex questions in a floating card while the current task
+                keeps running.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">可靠的本机更新</span
-                ><span class="en">Reliable local updates</span>
+                <span class="zh">准确送回原 turn</span
+                ><span class="en">Reply to the originating turn</span>
               </h3>
               <p class="zh">
-                安装脚本使用 cargo install，沿用现有用户服务，并按配置自动启用 Whisper。
+                运行中用 Steer 回复；turn 已结束时明确开启新
+                turn，不会暗中排队。
               </p>
               <p class="en">
-                Install with cargo install, retain the existing user service,
-                and enable Whisper when configured.
+                Steer while the turn runs; explicitly start a new turn after it
+                ends, without silently queuing.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">独立的无项目聊天工作区</span
-                ><span class="en">Projectless chat workspaces</span>
+                <span class="zh">恢复待回答问题</span
+                ><span class="en">Recover pending questions</span>
               </h3>
               <p class="zh">
-                新聊天按日期创建独立目录，并预置 work 与 outputs 子目录。
+                重新打开会话时，从 App Server 的原生消息中恢复尚未回答的问题。
               </p>
               <p class="en">
-                New chats receive dated workspaces with dedicated work and
-                outputs directories.
+                Reopening a session restores unanswered questions from native
+                app-server items.
               </p>
             </article>
           </div>
         </div>
         <div class="release-history">
-          <a href="releases/v0.3.3.md">
+          <a href="releases/v0.3.4.md">
             <span
               ><span class="zh">查看完整发布说明</span
               ><span class="en">Read the complete release notes</span></span

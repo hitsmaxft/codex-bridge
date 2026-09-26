@@ -807,6 +807,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "thread_id": thread_id,
             "goal": if thread_id == PRIMARY_THREAD { state.goal.clone() } else { Value::Null },
         }),
+        "async_questions" => json!({"questions": []}),
         "thread_goal_set" => {
             if thread_id != PRIMARY_THREAD {
                 return error("goal_not_found", "the demo thread has no goal");

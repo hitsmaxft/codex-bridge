@@ -27,7 +27,7 @@ pub use write_backend::{
     StartedTurnReceipt, ThreadWriterState, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +182,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<ComposerAttachment>,
     },
+    AsyncQuestions {
+        thread_id: String,
+    },
+    AsyncQuestionReply {
+        thread_id: String,
+        item_id: String,
+        turn_id: String,
+        answers: Vec<String>,
+        mode: String,
+    },
     AudioTranscribe {
         thread_id: String,
         audio: RealtimeAudioChunk,
@@ -294,6 +304,8 @@ impl Request {
             Self::Tail => "tail",
             Self::Send { .. } => "send",
             Self::Steer { .. } => "steer",
+            Self::AsyncQuestions { .. } => "async_questions",
+            Self::AsyncQuestionReply { .. } => "async_question_reply",
             Self::AudioTranscribe { .. } => "audio_transcribe",
             Self::Scroll { .. } => "scroll",
             Self::Pending => "pending",

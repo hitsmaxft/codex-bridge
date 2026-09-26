@@ -12,6 +12,7 @@ import {
   timeText,
 } from "./api.js";
 import { goalToggleState } from "./goal-state.js";
+import { asyncQuestionReplyMode } from "./async-question-state.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { markdownNode } from "./markdown.js";
 import { memoryCitationModel } from "./memory-citations.js";
@@ -562,6 +563,138 @@ function renderThreadStatistics(statistics = state.threadStatistics) {
 }
 const GOAL_PANEL_COLLAPSED_KEY = "codex-bridge.goal-panel-collapsed.v1";
 let goalPanelCollapsed = window.localStorage.getItem(GOAL_PANEL_COLLAPSED_KEY) === "1";
+const asyncQuestionsByThread = new Map();
+const answeredAsyncQuestions = new Set();
+const ASYNC_QUESTION_COLLAPSED_KEY = "codex-bridge.async-question-collapsed.v1";
+let asyncQuestionCollapsed = window.localStorage.getItem(ASYNC_QUESTION_COLLAPSED_KEY) === "1";
+let asyncQuestionBusy = false;
+let renderedAsyncQuestionKey = null;
+
+function currentAsyncQuestion() {
+  return (asyncQuestionsByThread.get(state.current?.id) || []).find(
+    (entry) => !answeredAsyncQuestions.has(`${state.current.id}:${entry.item_id}`),
+  );
+}
+function renderAsyncQuestion() {
+  const question = currentAsyncQuestion();
+  const panel = $("asyncQuestionPanel"),
+    restore = $("asyncQuestionRestoreBtn");
+  panel.hidden = !question || asyncQuestionCollapsed;
+  restore.hidden = !question || !asyncQuestionCollapsed;
+  if (!question) {
+    renderedAsyncQuestionKey = null;
+    return;
+  }
+  const key = `${state.current.id}:${question.item_id}`;
+  if (renderedAsyncQuestionKey !== key) {
+    renderedAsyncQuestionKey = key;
+    const fields = $("asyncQuestionFields");
+    fields.replaceChildren();
+    for (const [index, item] of question.questions.entries()) {
+      const field = document.createElement("fieldset"),
+        legend = document.createElement("legend");
+      legend.textContent = item.title || "";
+      field.append(legend);
+      if (Array.isArray(item.options)) {
+        for (const [optionIndex, option] of item.options.entries()) {
+          const label = document.createElement("label"),
+            radio = document.createElement("input"),
+            span = document.createElement("span");
+          radio.type = "radio";
+          radio.name = `async-question-${index}`;
+          radio.value = option;
+          radio.checked = optionIndex === 0;
+          span.textContent = option;
+          label.append(radio, span);
+          field.append(label);
+        }
+        const other = document.createElement("label"),
+          radio = document.createElement("input"),
+          span = document.createElement("span");
+        radio.type = "radio";
+        radio.name = `async-question-${index}`;
+        radio.value = "__custom__";
+        span.textContent = tr("asyncQuestionOther");
+        other.append(radio, span);
+        field.append(other);
+      }
+      const custom = document.createElement("textarea");
+      custom.name = `async-answer-${index}`;
+      custom.setAttribute("aria-label", item.title || tr("asyncQuestionOther"));
+      if (Array.isArray(item.options))
+        custom.onfocus = () => {
+          field.querySelector('input[value="__custom__"]').checked = true;
+        };
+      field.append(custom);
+      fields.append(field);
+    }
+  }
+  const active = state.activeTurnId;
+  const mode = asyncQuestionReplyMode(question.turn_id, active);
+  $("asyncQuestionState").textContent = asyncQuestionBusy
+    ? tr("asyncQuestionBusy")
+    : !currentThreadWritable()
+      ? tr("asyncQuestionReadOnly")
+      : mode === "changed"
+        ? tr("asyncQuestionChanged")
+        : "";
+  const submit = $("asyncQuestionSubmitBtn");
+  submit.textContent = tr(mode === "steer" ? "asyncQuestionSteer" : "asyncQuestionNewTurn");
+  submit.disabled = asyncQuestionBusy || !currentThreadWritable() || mode === "changed";
+}
+async function refreshAsyncQuestions(threadId) {
+  const result = await command({ command: "async_questions", thread_id: threadId }, false);
+  if (state.current?.id !== threadId) return;
+  asyncQuestionsByThread.set(threadId, Array.isArray(result.questions) ? result.questions : []);
+  renderAsyncQuestion();
+}
+async function submitAsyncQuestion(event) {
+  event.preventDefault();
+  const question = currentAsyncQuestion();
+  if (!question || asyncQuestionBusy || !state.current) return;
+  const threadId = state.current.id;
+  requireCurrentThreadWriter();
+  const mode = asyncQuestionReplyMode(question.turn_id, state.activeTurnId);
+  if (mode === "changed") return;
+  const fields = [...$("asyncQuestionFields").querySelectorAll("fieldset")];
+  const answers = fields.map((field, index) => {
+    const choice = field.querySelector(`input[name="async-question-${index}"]:checked`);
+    return (
+      choice && choice.value !== "__custom__" ? choice.value : field.querySelector("textarea").value
+    ).trim();
+  });
+  if (answers.some((answer) => !answer)) {
+    fields
+      .find((field, index) => !answers[index])
+      ?.querySelector("textarea")
+      ?.focus();
+    return;
+  }
+  asyncQuestionBusy = true;
+  renderAsyncQuestion();
+  try {
+    await command(
+      {
+        command: "async_question_reply",
+        thread_id: threadId,
+        item_id: question.item_id,
+        turn_id: question.turn_id,
+        answers,
+        mode,
+      },
+      false,
+    );
+    answeredAsyncQuestions.add(`${threadId}:${question.item_id}`);
+    if (state.current?.id === threadId) renderAsyncQuestion();
+    scheduleEventRefresh(threadId, true);
+  } catch (error) {
+    await Promise.allSettled([refreshActivity(), refreshAsyncQuestions(threadId)]);
+    throw error;
+  } finally {
+    asyncQuestionBusy = false;
+    renderAsyncQuestion();
+  }
+}
 
 function formatGoalDuration(value) {
   const seconds = Math.max(0, Math.floor(Number(value) || 0));
@@ -662,6 +795,7 @@ async function toggleLanguage() {
   renderComposerReference();
   syncVoiceCapability();
   renderManagedServices();
+  renderAsyncQuestion();
   renderTasksButton();
   renderTaskOverviews();
   renderBrowserNotifications();
@@ -4726,6 +4860,7 @@ async function refreshActivity() {
   if (!state.activeTurnId && $("sendMode").value === "steer") setSendMode("send", true);
   else if (state.activeTurnId && state.modeAutomatic) setSendMode("steer", true);
   showActivity();
+  renderAsyncQuestion();
   return { activity, changed: previous !== null && previous !== activity.file_len };
 }
 async function pollActivity() {
@@ -4868,6 +5003,27 @@ function handleBridgeEvent(event) {
     params = message.params || {},
     threadId = params.threadId || null;
   if (!method) return;
+  if (
+    method === "item/completed" &&
+    threadId === state.current?.id &&
+    params.item?.type === "agentMessage" &&
+    params.item?.delivery === "async" &&
+    Array.isArray(params.item.questions) &&
+    params.item.questions.length
+  ) {
+    const questions = asyncQuestionsByThread.get(threadId) || [];
+    if (!questions.some((entry) => entry.item_id === params.item.id)) {
+      asyncQuestionsByThread.set(threadId, [
+        {
+          item_id: params.item.id,
+          turn_id: params.turnId || state.activeTurnId,
+          questions: params.item.questions,
+        },
+        ...questions,
+      ]);
+      renderAsyncQuestion();
+    }
+  }
   if (threadId && handleTemporaryAppServerEvent(method, params, threadId)) return;
   if (
     threadId === state.subagentConversation?.id &&
@@ -4893,6 +5049,7 @@ function handleBridgeEvent(event) {
       state.turnUsageBaseline = normalizeTokenUsage(state.threadStatistics);
       state.liveTurnUsage = null;
       showActivity();
+      renderAsyncQuestion();
     }
   } else if (method === "item/started" && threadId === state.current?.id) {
     const liveTool = appServerItemTool(params.item);
@@ -4907,6 +5064,7 @@ function handleBridgeEvent(event) {
       const followTail = shouldFollowMessageTail(state.followMessageTail, messageScrollMetrics());
       renderVisibleMessages();
       showActivity();
+      renderAsyncQuestion();
       if (followTail) requestAnimationFrame(scheduleMessageTailLock);
     }
   } else if (method === "item/completed" && threadId === state.current?.id) {
@@ -4951,6 +5109,7 @@ function handleBridgeEvent(event) {
       state.activeToolCallId = null;
       state.liveActivityOverlay = completedActivityOverlay();
       showActivity();
+      renderAsyncQuestion();
     }
   }
   if (method === "thread/queue/changed" && threadId === state.current?.id) {
@@ -4992,6 +5151,7 @@ function updateThreadLiveFromStatus(threadId, status) {
       state.liveActivityOverlay = completedActivityOverlay();
       if ($("sendMode").value === "steer") setSendMode("send", true);
       showActivity();
+      renderAsyncQuestion();
     }
   }
   renderProjects();
@@ -5199,6 +5359,7 @@ async function openThread(
       state.referenceDrafts.set(state.current.id, state.composerReference);
   }
   state.current = thread;
+  renderAsyncQuestion();
   if (changedThread) applyThreadWriterLock({ state: "checking", read_only: true, reason: null });
   syncTemporaryForCurrent();
   if (changedThread) resetThreadViewState(thread);
@@ -5250,6 +5411,9 @@ async function openThread(
         })),
       command({ command: "pending_messages", thread_id: thread.id }, false).catch(() => null),
       command({ command: "thread_goal_get", thread_id: thread.id }, false).catch(() => undefined),
+      !quiet || changedThread || reconnect
+        ? refreshAsyncQuestions(thread.id).catch(() => null)
+        : Promise.resolve(null),
     ]);
   let r;
   try {
@@ -5469,6 +5633,7 @@ function applyThreadWriterLock(lock) {
   }
   syncVoiceCapability();
   syncSubmitAction();
+  renderAsyncQuestion();
 }
 function setComposerSubmitting(active) {
   state.composerSubmitting = active;
@@ -5751,6 +5916,17 @@ $("createDialog").onclick = (event) => {
   if (event.target === $("createDialog")) closeCreateDialog();
 };
 $("goalHideBtn").onclick = () => setGoalPanelCollapsed(true);
+$("asyncQuestionHideBtn").onclick = () => {
+  asyncQuestionCollapsed = true;
+  window.localStorage.setItem(ASYNC_QUESTION_COLLAPSED_KEY, "1");
+  renderAsyncQuestion();
+};
+$("asyncQuestionRestoreBtn").onclick = () => {
+  asyncQuestionCollapsed = false;
+  window.localStorage.setItem(ASYNC_QUESTION_COLLAPSED_KEY, "0");
+  renderAsyncQuestion();
+};
+$("asyncQuestionForm").onsubmit = (event) => run(() => submitAsyncQuestion(event));
 $("goalRestoreBtn").onclick = () => setGoalPanelCollapsed(false);
 $("goalEditBtn").onclick = openGoalEditDialog;
 $("goalEditCancelBtn").onclick = closeGoalEditDialog;

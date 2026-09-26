@@ -20,6 +20,13 @@ import { createAuthenticationGate } from "../src/auth-gate.js";
 import { createEventSequenceTracker } from "../src/event-sequence.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { goalToggleState } from "../src/goal-state.js";
+import { asyncQuestionReplyMode } from "../src/async-question-state.js";
+
+test("async clarification answers steer only into their originating turn", () => {
+  assert.equal(asyncQuestionReplyMode("turn-a", "turn-a"), "steer");
+  assert.equal(asyncQuestionReplyMode("turn-a", "turn-b"), "changed");
+  assert.equal(asyncQuestionReplyMode("turn-a", null), "new_turn");
+});
 import { isLocalImagePath, localFilePath, localFileReference } from "../src/markdown.js";
 import { memoryCitationModel } from "../src/memory-citations.js";
 import {
