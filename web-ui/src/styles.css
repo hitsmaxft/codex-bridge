@@ -3747,10 +3747,14 @@ label.caption {
     transform: translate3d(var(--thread-swipe-offset, 0px), 0, 0);
     transition: transform 0.18s ease-out;
     touch-action: pan-y;
-    will-change: transform;
   }
-  .thread-row.swipe-dragging .thread-row-content {
+  .thread-row.swipe-dragging .thread-row-content,
+  .thread-row.swipe-immediate .thread-row-content {
     transition: none;
+  }
+  .thread-row.swipe-dragging .thread-row-content,
+  .thread-row.swipe-open .thread-row-content {
+    will-change: transform;
   }
   .thread-archive-action {
     position: absolute;
@@ -3767,6 +3771,15 @@ label.caption {
     color: #260907;
     font-size: 12px;
     font-weight: 700;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .thread-row.swipe-dragging .thread-archive-action,
+  .thread-row.swipe-open .thread-archive-action {
+    visibility: visible;
+  }
+  .thread-row.swipe-open:not(.swipe-dragging) .thread-archive-action {
+    pointer-events: auto;
   }
   html[data-theme="light"] .thread-archive-action {
     color: #fff;

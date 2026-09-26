@@ -865,6 +865,28 @@ test("mobile session rows reveal a direct archive action with a right swipe", as
   );
   assert.match(stylesheet, /translate3d\(var\(--thread-swipe-offset, 0px\), 0, 0\)/);
   assert.match(translations, /archiveSession: "归档"/);
+  const gesture = source.slice(
+    source.indexOf("function bindThreadArchiveSwipe"),
+    source.indexOf("function threadRow"),
+  );
+  const touchStart = gesture.slice(gesture.indexOf('"touchstart"'), gesture.indexOf('"touchmove"'));
+  assert.doesNotMatch(touchStart, /closeThreadArchiveSwipe\(/);
+  assert.match(
+    gesture,
+    /Math\.abs\(dy\) > 10[\s\S]*?closeThreadArchiveSwipe\(null, \{ immediate: true \}\)/,
+  );
+  assert.match(
+    source,
+    /\$\("projects"\)\.addEventListener\([\s\S]*?"scroll",[\s\S]*?closeThreadArchiveSwipe\(null, \{ immediate: true \}\)/,
+  );
+  assert.match(
+    stylesheet,
+    /\.thread-archive-action\s*\{[\s\S]*?visibility: hidden;[\s\S]*?pointer-events: none;/,
+  );
+  assert.match(
+    stylesheet,
+    /\.thread-row\.swipe-dragging \.thread-archive-action,[\s\S]*?\.thread-row\.swipe-open \.thread-archive-action\s*\{\s*visibility: visible;/,
+  );
 });
 
 test("composer keeps images as attachments and transcribes voice into editable text", async () => {

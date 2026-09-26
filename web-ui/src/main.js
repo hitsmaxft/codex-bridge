@@ -1409,8 +1409,14 @@ function closeTasksDialog() {
 }
 const THREAD_ARCHIVE_SWIPE_WIDTH = 76;
 let openThreadArchiveRow = null;
-function setThreadArchiveSwipe(row, open) {
+function setThreadArchiveSwipe(row, open, { immediate = false } = {}) {
   const action = row.querySelector(".thread-archive-action");
+  if (immediate) {
+    row.classList.add("swipe-immediate");
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => row.classList.remove("swipe-immediate")),
+    );
+  }
   row.classList.toggle("swipe-open", open);
   row.style.setProperty("--thread-swipe-offset", `${open ? THREAD_ARCHIVE_SWIPE_WIDTH : 0}px`);
   if (action) {
@@ -1420,9 +1426,9 @@ function setThreadArchiveSwipe(row, open) {
   if (open) openThreadArchiveRow = row;
   else if (openThreadArchiveRow === row) openThreadArchiveRow = null;
 }
-function closeThreadArchiveSwipe(except = null) {
+function closeThreadArchiveSwipe(except = null, { immediate = false } = {}) {
   if (!openThreadArchiveRow || openThreadArchiveRow === except) return;
-  setThreadArchiveSwipe(openThreadArchiveRow, false);
+  setThreadArchiveSwipe(openThreadArchiveRow, false, { immediate });
 }
 function bindThreadArchiveSwipe(row, content) {
   let gesture = null,
@@ -1433,7 +1439,6 @@ function bindThreadArchiveSwipe(row, content) {
       if (!matchMedia("(max-width:800px)").matches || event.touches.length !== 1) return;
       if (event.target.closest(".thread-archive-action")) return;
       event.stopPropagation();
-      closeThreadArchiveSwipe(row);
       const touch = event.touches[0],
         startOffset = row.classList.contains("swipe-open") ? THREAD_ARCHIVE_SWIPE_WIDTH : 0;
       gesture = {
@@ -1455,10 +1460,12 @@ function bindThreadArchiveSwipe(row, content) {
         dx = touch.clientX - gesture.x,
         dy = touch.clientY - gesture.y;
       if (!gesture.horizontal && Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx) * 1.2) {
+        closeThreadArchiveSwipe(null, { immediate: true });
         gesture = null;
         return;
       }
       if (!gesture.horizontal && Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+        closeThreadArchiveSwipe(row, { immediate: true });
         gesture.horizontal = true;
         row.classList.add("swipe-dragging");
       }
@@ -1476,7 +1483,7 @@ function bindThreadArchiveSwipe(row, content) {
     if (gesture.horizontal) {
       suppressOpenUntil = performance.now() + 500;
       setThreadArchiveSwipe(row, gesture.offset >= THREAD_ARCHIVE_SWIPE_WIDTH * 0.45);
-    }
+    } else closeThreadArchiveSwipe(row);
     gesture = null;
   };
   row.addEventListener("touchend", finish, { passive: true });
@@ -5880,6 +5887,9 @@ function approval(name) {
   return command({ command: name, id });
 }
 $("search").oninput = renderProjects;
+$("projects").addEventListener("scroll", () => closeThreadArchiveSwipe(null, { immediate: true }), {
+  passive: true,
+});
 $("archived").onchange = () => run(loadProjects);
 $("reloadBtn").onclick = () => run(loadProjects);
 $("tasksBtn").onclick = openTasksDialog;

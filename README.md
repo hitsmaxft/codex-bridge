@@ -29,13 +29,12 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.4 · 2026-09-26
+### v0.3.5 · 2026-09-26
 
-- **Async clarification:** Codex questions appear in a floating, nonblocking card. Answers steer
-  into the originating running turn. Once it ends, the card explicitly offers a new turn.
-- **Recovery:** pending questions are restored from native app-server items when a session opens.
+- **Mobile session list:** vertical scrolling keeps right-swipe archive buttons hidden until a
+  deliberate swipe reveals one. Scrolling closes an open archive action cleanly.
 
-See the [latest release notes](docs/releases/v0.3.4.md) or the
+See the [latest release notes](docs/releases/v0.3.5.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
