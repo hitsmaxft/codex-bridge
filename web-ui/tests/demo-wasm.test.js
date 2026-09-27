@@ -1863,7 +1863,7 @@ test("completed turns collapse by server turn id and preserve the full expansion
   );
   assert.match(
     stylesheet,
-    /\.turn-divider\s*\{[^}]*width:\s*66\.6667%;[^}]*height:\s*1px;[^}]*margin:\s*0 auto 18px;[^}]*background:\s*linear-gradient\(90deg, var\(--panel\), var\(--line\) 22%, var\(--line\) 78%, var\(--panel\)\);/s,
+    /\.turn-divider\s*\{[^}]*width:\s*66\.6667%;[^}]*height:\s*1px;[^}]*margin:\s*0 auto 10px;[^}]*background:\s*linear-gradient\(90deg, var\(--panel\), var\(--line\) 22%, var\(--line\) 78%, var\(--panel\)\);/s,
   );
   assert.match(stylesheet, /\.turn-divider\s*\{[^}]*grid-row:\s*3;/s);
   assert.match(source, /command: "turn_messages"/);

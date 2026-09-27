@@ -4121,6 +4121,10 @@ function messageNode(
   const copy = copyText ? messageCopyButton(copyText) : null,
     tools = toolGroupNode(m, activeToolCallId, threadId, liveTool, turnRunning);
   if (tools) {
+    box.classList.toggle(
+      "tool-only",
+      !ordinaryItems.some((item) => item.kind !== "text" || item.text?.trim()),
+    );
     const toolRow = document.createElement("div");
     toolRow.className = "message-tool-row";
     toolRow.appendChild(tools);

@@ -1517,7 +1517,7 @@ main.history-fullscreen .fullscreen-exit-icon {
   max-width: 100%;
   justify-self: start;
   min-height: 24px;
-  margin: 0 0 8px;
+  margin: 0 0 4px;
   padding: 2px;
   border: 0;
   background: transparent;
@@ -1611,7 +1611,7 @@ main.history-fullscreen .fullscreen-exit-icon {
   grid-row: 3;
   width: 66.6667%;
   height: 1px;
-  margin: 0 auto 18px;
+  margin: 0 auto 10px;
   border: 0;
   background: linear-gradient(90deg, var(--panel), var(--line) 22%, var(--line) 78%, var(--panel));
 }
@@ -1778,7 +1778,7 @@ main.history-fullscreen .fullscreen-exit-icon {
   display: none;
 }
 .message.compaction {
-  margin: 14px 0 18px;
+  margin: 8px 0 10px;
 }
 .message.compaction .message-head {
   display: none;
@@ -2246,6 +2246,13 @@ main.history-fullscreen .fullscreen-exit-icon {
   color: var(--muted);
   font-size: var(--message-disclosure-font-size);
 }
+.message.tool-only,
+.message.live-tool-activity {
+  margin-bottom: 10px;
+}
+.message.tool-only .tool-group {
+  margin-top: 0;
+}
 .message-tool-row {
   position: relative;
   display: flow-root;
@@ -2296,7 +2303,7 @@ main.history-fullscreen .fullscreen-exit-icon {
   animation: tool-summary-shimmer 1.65s linear infinite;
 }
 .live-tool-activity {
-  min-height: 30px;
+  min-height: 0;
 }
 .live-tool-summary {
   display: inline-flex;

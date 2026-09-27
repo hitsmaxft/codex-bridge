@@ -30,16 +30,12 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.6 · 2026-09-27
+### v0.3.7 · 2026-09-27
 
-- **Conversation reading:** turn controls, token usage, and scrolling behave consistently while
-  new activity arrives or details expand.
-- **Composer:** slash commands and skills are easier to select, and large pasted text becomes a
-  file attachment in the conversation.
-- **Computer use:** browse multiple screenshots from a message and see images beside their tool
-  calls and inside expanded results.
+- **Conversation spacing:** context compaction, tool activity, and turn controls sit closer to
+  the surrounding text without changing normal answer paragraph spacing.
 
-See the [latest release notes](docs/releases/v0.3.6.md) or the
+See the [latest release notes](docs/releases/v0.3.7.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
