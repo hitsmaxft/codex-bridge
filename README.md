@@ -22,6 +22,7 @@ still use the account and network configured by Codex itself.
 
 - A shared task list and persistent live connection for the Web UI and `codexctl`.
 - Structured messages, tool calls, diffs, status, models, and paginated history.
+- Composer slash commands and skill selection, with inline computer-use screenshots.
 - Remote Queue, Steer, withdrawal, interruption, pinning, renaming, and archiving.
 - Editable voice transcription through app-server, with an optional managed local whisper.cpp
   fallback for private Mac, Linux, homelab, and NAS deployments.
@@ -29,12 +30,16 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.5 · 2026-09-26
+### v0.3.6 · 2026-09-27
 
-- **Mobile session list:** vertical scrolling keeps right-swipe archive buttons hidden until a
-  deliberate swipe reveals one. Scrolling closes an open archive action cleanly.
+- **Conversation reading:** turn controls, token usage, and scrolling behave consistently while
+  new activity arrives or details expand.
+- **Composer:** slash commands and skills are easier to select, and large pasted text becomes a
+  file attachment in the conversation.
+- **Computer use:** browse multiple screenshots from a message and see images beside their tool
+  calls and inside expanded results.
 
-See the [latest release notes](docs/releases/v0.3.5.md) or the
+See the [latest release notes](docs/releases/v0.3.6.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
@@ -50,7 +55,9 @@ never contact Codex or leave the page.
 The private UI is responsive across mobile and desktop. It includes project and task navigation,
 rendered tool calls and diffs, task pinning, renaming, and archiving, model selection, Git change summaries,
 English and Chinese text, queue/steer message handoff, and opt-in browser notifications when a run
-finishes while the page is in the background. Notifications require site permission and an open Web UI
+finishes while the page is in the background. Large pasted text appears as a file attachment in the
+conversation. Tool images can be viewed at their call and browsed in the message gallery.
+Notifications require site permission and an open Web UI
 page; clicking one focuses the page and opens that session. Local file links can download regular
 files smaller than 16 MiB; the server resolves each link against that task's workspace and rejects
 paths or symlinks that escape it. Authenticated clients receive a random download ticket that

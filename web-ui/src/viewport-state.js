@@ -12,8 +12,16 @@ export function messageBottomDistance({ top, height, client }) {
   return Math.max(0, values[1] - values[0] - values[2]);
 }
 
-export function shouldFollowMessageTail(following, metrics, threshold = 100) {
-  return Boolean(following) || messageBottomDistance(metrics) < threshold;
+export function messageBottomScrollTop({ height, client }) {
+  return Math.max(0, height - client);
+}
+
+export function shouldFollowMessageTail(following) {
+  return Boolean(following);
+}
+
+export function shouldResumeMessageTail(startTop, metrics, threshold = 2) {
+  return metrics.top > startTop && messageBottomDistance(metrics) <= threshold;
 }
 
 export function documentOwnsMessageScroll({ mobile, fullscreen }) {

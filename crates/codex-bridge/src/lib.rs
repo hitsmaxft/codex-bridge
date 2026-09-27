@@ -27,7 +27,7 @@ pub use write_backend::{
     StartedTurnReceipt, ThreadWriterState, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 40;
+pub const PROTOCOL_VERSION: u32 = 42;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +100,12 @@ pub enum Request {
         status: Option<String>,
     },
     ComposerOptions,
+    SkillsList {
+        thread_id: String,
+    },
+    ThreadCompact {
+        thread_id: String,
+    },
     ThreadCreate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_path: Option<PathBuf>,
@@ -253,6 +259,10 @@ pub enum ComposerAttachment {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    PastedText {
+        id: String,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,6 +293,8 @@ impl Request {
             Self::ThreadGoalGet { .. } => "thread_goal_get",
             Self::ThreadGoalSet { .. } => "thread_goal_set",
             Self::ComposerOptions => "composer_options",
+            Self::SkillsList { .. } => "skills_list",
+            Self::ThreadCompact { .. } => "thread_compact",
             Self::ThreadCreate { .. } => "thread_create",
             Self::ThreadCreateStart { .. } => "thread_create_start",
             Self::ThreadCreateStatus { .. } => "thread_create_status",

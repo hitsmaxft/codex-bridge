@@ -17,6 +17,7 @@ struct PendingMessage {
     id: String,
     thread_id: String,
     text: String,
+    prompt: String,
     action: String,
     status: String,
     polls: u8,
@@ -118,6 +119,14 @@ impl DemoState {
             content.push(json!({"kind": "text", "text": text}));
         }
         for attachment in attachments {
+            if attachment.get("type").and_then(Value::as_str) == Some("pasted_text") {
+                let text = attachment
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                content.push(json!({"kind": "pasted_text", "text": text}));
+                continue;
+            }
             let url = attachment
                 .get("url")
                 .and_then(Value::as_str)
@@ -144,6 +153,9 @@ impl DemoState {
 
     fn scenario_for(text: &str, salt: u32) -> u8 {
         let lower = text.to_ascii_lowercase();
+        if lower.contains("screenshot") || lower.contains("截图") {
+            return 3;
+        }
         if lower.contains("search") || lower.contains("research") || lower.contains("查找") {
             return 1;
         }
@@ -167,6 +179,7 @@ impl DemoState {
 
     fn scenario_tool(scenario: u8) -> &'static str {
         match scenario {
+            3 => "mcp__cua_repl__js",
             1 => "web_search",
             2 => "apply_patch",
             _ => "exec_command",
@@ -179,7 +192,7 @@ impl DemoState {
         let scenario = Self::scenario_for(&pending.text, self.next_pending);
         self.append_user_message(
             pending.id,
-            pending.text.clone(),
+            pending.prompt.clone(),
             pending.attachments,
             "queue",
         );
@@ -200,7 +213,7 @@ impl DemoState {
         completed.status = "applied".to_owned();
         self.append_user_message(
             pending.id,
-            pending.text.clone(),
+            pending.prompt.clone(),
             pending.attachments,
             "steer",
         );
@@ -216,6 +229,10 @@ impl DemoState {
     fn append_progress(&mut self) {
         let scenario = self.active_scenario.unwrap_or_default();
         let (text, preview) = match scenario {
+            3 => (
+                "I’m taking a simulated computer-use screenshot.",
+                "Capture the demo browser",
+            ),
             1 => (
                 "I’m checking a few simulated sources and comparing the useful details.",
                 "Search the demo knowledge index",
@@ -272,9 +289,24 @@ impl DemoState {
         };
         tool["status"] = json!("completed");
         tool["detail"]["tool"]["status"] = json!("completed");
-        tool["detail"]["tool"]["output"] = json!({
-            "result": "Simulated locally by the in-browser WASM demo server."
-        });
+        if self.active_scenario == Some(3) {
+            tool["has_image"] = json!(true);
+            tool["detail"]["tool"]["output"] = json!({
+                "result": {"contentItems": [{
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAkCAIAAAC2bqvFAAAAT0lEQVR42u3YoQ0AIBAEQUpCUsLXR4GUgMBg6QBHCGGSdafGXsolni4BAPwO6GM+HQAAwHaO2q4HAAAAAAAAAAAAAAAAAHAD4JUAAAA43AKdQgTO9qSzVQAAAABJRU5ErkJggg=="
+                }, {
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAkCAIAAAC2bqvFAAAAQklEQVR4nO3PMQ0AMAgAMDzsRcGczNCkogcNHHxNaqCRv1ad+1aFgICAgICAgICAgICAgICAgICAgICAgICAgMBMA1QMr3k7iCm2AAAAAElFTkSuQmCC"
+                }]}
+            });
+        } else {
+            tool["detail"]["tool"]["output"] = json!({
+                "result": "Simulated locally by the in-browser WASM demo server."
+            });
+        }
         self.active_tool_message = None;
         self.file_len += 1;
     }
@@ -738,7 +770,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 34,
+            "protocol_version": 35,
             "capabilities": {
                 "audio_transcription": {
                     "enabled": true,
@@ -1003,6 +1035,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 id: merged_id.clone(),
                 thread_id: thread_id.to_owned(),
                 text: merged_text.clone(),
+                prompt: merged_text.clone(),
                 action: "queue".to_owned(),
                 status: "queued".to_owned(),
                 polls: 0,
@@ -1093,15 +1126,18 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 })
             } else {
                 state.next_pending += 1;
-                let summary = if text.is_empty() {
-                    "Demo image message".to_owned()
-                } else {
-                    text.to_owned()
-                };
+                let mut summary = text.to_owned();
+                for attachment in &attachments {
+                    summary.push_str(match attachment.get("type").and_then(Value::as_str) {
+                        Some("pasted_text") => "\n[Pasted text attachment]",
+                        _ => "\n[Image attachment]",
+                    });
+                }
                 state.pending.push(PendingMessage {
                     id: id.clone(),
                     thread_id: thread_id.to_owned(),
                     text: summary,
+                    prompt: text.to_owned(),
                     action: action.to_owned(),
                     status: format!("{action}ing"),
                     polls: 0,
@@ -1144,6 +1180,19 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "weekly_usage": {"remaining_percent": 63, "resets_at": 1_790_000_000_u64}
         }),
         "composer_options" => models(),
+        "skills_list" => json!({
+            "thread_id": thread_id,
+            "skills": [{
+                "name": "demo",
+                "description": "Explore the interactive demo",
+                "scope": "repo"
+            }]
+        }),
+        "thread_compact" => json!({
+            "action": "thread_compact",
+            "thread_id": thread_id,
+            "status": "started"
+        }),
         "audio_transcribe" => {
             let audio = request.get("audio").and_then(Value::as_object);
             if audio
@@ -1368,7 +1417,7 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 34);
+        assert_eq!(response["result"]["protocol_version"], 35);
     }
 
     #[test]
@@ -1598,6 +1647,7 @@ mod tests {
                 id: id.to_owned(),
                 thread_id: PRIMARY_THREAD.to_owned(),
                 text: text.to_owned(),
+                prompt: text.to_owned(),
                 action: "queue".to_owned(),
                 status: "queued".to_owned(),
                 polls: 0,

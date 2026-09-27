@@ -40,6 +40,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 
+mod pasted_text;
 #[cfg(feature = "whisper")]
 mod whisper;
 
@@ -1074,7 +1075,19 @@ fn queue_input_text(input: &Value) -> Option<String> {
         match item.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    parts.push(text.to_owned());
+                    if let Some(wrapper) = pasted_text::parse_wrapper(text) {
+                        if !wrapper.request.trim().is_empty() {
+                            parts.push(wrapper.request.trim().to_owned());
+                        }
+                        parts.extend(
+                            wrapper
+                                .paths
+                                .iter()
+                                .map(|_| "[Pasted text attachment]".to_owned()),
+                        );
+                    } else {
+                        parts.push(text.to_owned());
+                    }
                 }
             }
             Some("image" | "localImage") => parts.push("[Image attachment]".to_owned()),
@@ -1104,6 +1117,7 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
             ComposerAttachment::Image { url, .. } | ComposerAttachment::Audio { url, .. } => {
                 url.len()
             }
+            ComposerAttachment::PastedText { text, .. } => text.len(),
         })
     });
     if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
@@ -1117,6 +1131,9 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
         input.push(json!({"type":"text", "text":text, "text_elements":[]}));
     }
     for attachment in attachments {
+        if matches!(attachment, ComposerAttachment::PastedText { .. }) {
+            continue;
+        }
         if matches!(attachment, ComposerAttachment::Audio { .. }) {
             return Err(Response::error(
                 "invalid_attachment",
@@ -1145,6 +1162,7 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
                 supported_data_url(url, &["image/jpeg", "image/png", "image/webp", "image/gif"]),
             ),
             ComposerAttachment::Audio { .. } => unreachable!("audio rejected above"),
+            ComposerAttachment::PastedText { .. } => unreachable!("pasted text skipped above"),
         };
         if url.len() > MAX_ATTACHMENT_URL_BYTES || !valid_prefix {
             return Err(Response::error(
@@ -1157,6 +1175,58 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
     Ok(input)
 }
 
+fn prepared_composer_input(
+    codex_home: &Path,
+    text: &str,
+    attachments: &[ComposerAttachment],
+) -> Result<Vec<Value>, Response> {
+    composer_input(text, attachments)?;
+    let wrapped = pasted_text::materialize(codex_home, text, attachments)
+        .map_err(|error| Response::error("invalid_attachment", format!("{error:#}")))?;
+    composer_input(&wrapped, attachments)
+}
+
+fn composer_skill_inputs(text: &str, skills_list: &Value) -> Vec<Value> {
+    let mentions = text
+        .split_whitespace()
+        .filter_map(|word| {
+            word.trim_start_matches(['(', '[', '{'])
+                .strip_prefix('$')
+                .map(|name| name.trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '}']))
+        })
+        .filter(|name| !name.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    skills_list
+        .pointer("/data/0/skills")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|skill| skill.get("enabled").and_then(Value::as_bool) == Some(true))
+        .filter_map(|skill| {
+            let name = skill.get("name")?.as_str()?;
+            let path = skill.get("path")?.as_str()?;
+            (mentions.contains(name) && Path::new(path).is_absolute())
+                .then(|| json!({"type": "skill", "name": name, "path": path}))
+        })
+        .collect()
+}
+
+fn append_composer_skills(
+    write_backend: &CodexCliBackend,
+    cwd: &Path,
+    text: &str,
+    input: &mut Vec<Value>,
+) {
+    if !text.split_whitespace().any(|word| word.contains('$')) {
+        return;
+    }
+    if let Ok(skills_list) =
+        write_backend.app_server_rpc("skills/list", json!({"cwds": [cwd], "forceReload": false}))
+    {
+        input.extend(composer_skill_inputs(text, &skills_list));
+    }
+}
+
 fn pending_input_summary(text: &str, attachments: &[ComposerAttachment]) -> String {
     let mut parts = Vec::new();
     if !text.trim().is_empty() {
@@ -1166,6 +1236,7 @@ fn pending_input_summary(text: &str, attachments: &[ComposerAttachment]) -> Stri
         parts.push(match attachment {
             ComposerAttachment::Image { .. } => "[Image attachment]".to_owned(),
             ComposerAttachment::Audio { .. } => "[Audio attachment]".to_owned(),
+            ComposerAttachment::PastedText { .. } => "[Pasted text attachment]".to_owned(),
         });
     }
     parts.join("\n")
@@ -3911,6 +3982,39 @@ async fn web_file_preview(
         }) {
             Ok(preview) => Ok((thread.cwd, preview)),
             Err(FileDownloadFailure::OutsideWorkspace) => {
+                if let Some(message_index) = request.message_index {
+                    let authorized = store
+                        .read_message(&request.thread_id, message_index)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|message| {
+                            message.role == "user"
+                                && message.content.iter().any(|item| {
+                                    item.get("text")
+                                        .and_then(Value::as_str)
+                                        .and_then(pasted_text::parse_wrapper)
+                                        .is_some_and(|wrapper| {
+                                            wrapper.paths.contains(&request.path.as_str())
+                                        })
+                                })
+                        });
+                    if authorized {
+                        if let Some(path) =
+                            pasted_text::authorized_path(store.home(), &request.path)
+                        {
+                            let workspace = path
+                                .parent()
+                                .ok_or(FileDownloadFailure::FileNotFound)?
+                                .to_path_buf();
+                            let preview = read_workspace_preview_with(
+                                &workspace,
+                                path.to_string_lossy().as_ref(),
+                                |path| read_file_bytes(&write_backend, path),
+                            )?;
+                            return Ok((workspace, preview));
+                        }
+                    }
+                }
                 match read_tmp_image_preview_with(&request.path, |path| {
                     read_file_bytes(&write_backend, path)
                 }) {
@@ -6339,7 +6443,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     entry.status == "queued"
                         && entry.action == "queue"
                         && !entry.text.lines().any(|line| {
-                            matches!(line.trim(), "[Image attachment]" | "[Audio attachment]")
+                            matches!(
+                                line.trim(),
+                                "[Image attachment]"
+                                    | "[Audio attachment]"
+                                    | "[Pasted text attachment]"
+                            )
                         })
                 })
                 .collect::<Vec<_>>();
@@ -7117,6 +7226,63 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Err(error) => write_backend_error(error),
             }
         }
+        Request::SkillsList { thread_id } => {
+            let cwd = if thread_id.starts_with("draft:") {
+                session_store.home().to_path_buf()
+            } else {
+                match resolve_read_target(Some(thread_id.clone()), session_store, selected_thread) {
+                    Ok(resolved) => resolved.thread.cwd,
+                    Err(response) => return response,
+                }
+            };
+            match write_backend
+                .app_server_rpc("skills/list", json!({"cwds": [cwd], "forceReload": false}))
+            {
+                Ok(result) => {
+                    let skills = result
+                        .pointer("/data/0/skills")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|skill| skill.get("enabled").and_then(Value::as_bool) == Some(true))
+                        .filter_map(|skill| {
+                            let name = skill.get("name")?.as_str()?;
+                            Some(json!({
+                                "name": name,
+                                "description": skill.pointer("/interface/shortDescription")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| skill.get("shortDescription").and_then(Value::as_str))
+                                    .or_else(|| skill.get("description").and_then(Value::as_str)),
+                                "scope": skill.get("scope"),
+                            }))
+                        })
+                        .collect::<Vec<_>>();
+                    Response::success(json!({"thread_id": thread_id, "skills": skills}))
+                }
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::ThreadCompact { thread_id } => {
+            let resolved =
+                match resolve_write_target(Some(thread_id), session_store, selected_thread) {
+                    Ok(resolved) => resolved,
+                    Err(response) => return response,
+                };
+            if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
+                return response;
+            }
+            match write_backend.app_server_rpc(
+                "thread/compact/start",
+                json!({"threadId": resolved.thread.id}),
+            ) {
+                Ok(_) => Response::success(json!({
+                    "action": "thread_compact",
+                    "thread_id": resolved.thread.id,
+                    "status": "started",
+                })),
+                Err(error) => write_backend_error(error),
+            }
+        }
         Request::ThreadCreateStart {
             project_path,
             model,
@@ -7470,7 +7636,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "temporary thread and submission identifiers must be non-empty and bounded",
                 );
             }
-            let input = match composer_input(&text, &attachments) {
+            let input = match prepared_composer_input(session_store.home(), &text, &attachments) {
                 Ok(input) => input,
                 Err(response) => return response,
             };
@@ -7810,15 +7976,17 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             submission_id,
             attachments,
         } => {
-            let input = match composer_input(&text, &attachments) {
-                Ok(input) => input,
-                Err(response) => return response,
-            };
-            let pending_text = pending_input_summary(&text, &attachments);
             let resolved = match resolve_write_target(thread_id, session_store, selected_thread) {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
+            let mut input = match prepared_composer_input(session_store.home(), &text, &attachments)
+            {
+                Ok(input) => input,
+                Err(response) => return response,
+            };
+            let pending_text = pending_input_summary(&text, &attachments);
+            append_composer_skills(write_backend, &resolved.thread.cwd, &text, &mut input);
             let starts_if_idle = matches!(
                 write_backend.thread_writer_state(&resolved.thread.id),
                 ThreadWriterState::Owned | ThreadWriterState::Unknown
@@ -7926,15 +8094,17 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             submission_id,
             attachments,
         } => {
-            let input = match composer_input(&text, &attachments) {
-                Ok(input) => input,
-                Err(response) => return response,
-            };
-            let pending_text = pending_input_summary(&text, &attachments);
             let resolved = match resolve_write_target(thread_id, session_store, selected_thread) {
                 Ok(resolved) => resolved,
                 Err(response) => return response,
             };
+            let mut input = match prepared_composer_input(session_store.home(), &text, &attachments)
+            {
+                Ok(input) => input,
+                Err(response) => return response,
+            };
+            let pending_text = pending_input_summary(&text, &attachments);
+            append_composer_skills(write_backend, &resolved.thread.cwd, &text, &mut input);
             if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
                 return response;
             }
@@ -8689,6 +8859,18 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
                 ));
                 content_index = content_end;
                 continue;
+            } else if let Some(wrapper) = pasted_text::parse_wrapper(text) {
+                content.extend(wrapper.paths.into_iter().map(|path| {
+                    json!({
+                        "kind": "pasted_text",
+                        "path": path,
+                        "message_index": message_index,
+                    })
+                }));
+                has_visible_text = true;
+                if !wrapper.request.trim().is_empty() {
+                    content.push(json!({"kind": "text", "text": wrapper.request.trim()}));
+                }
             } else if let Some(request) = user_request_from_file_wrapper(text) {
                 let content_end = attachment_block_end(&message.content, content_index);
                 let label = if message.content[content_index..content_end]
@@ -10483,17 +10665,17 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .unwrap()
             .unwrap();
         assert!(status.borrow().running);
+        let mut pid = None;
         for _ in 0..50 {
-            if pid_file.exists() {
+            pid = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok());
+            if pid.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let pid = fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        let pid = pid.expect("managed process did not write its PID");
         shutdown_tx.send_replace(true);
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -10533,17 +10715,17 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .await
             .unwrap()
             .unwrap();
+        let mut pid = None;
         for _ in 0..50 {
-            if pid_file.exists() {
+            pid = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok());
+            if pid.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let pid = fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        let pid = pid.expect("managed app-server did not write its PID");
         assert_eq!(unsafe { libc::getpgid(pid) }, pid);
         assert_ne!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgrp() });
         shutdown_tx.send_replace(true);
@@ -10581,6 +10763,23 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         )
         .unwrap_err();
         assert_eq!(error.error.unwrap().code, "invalid_attachment");
+    }
+
+    #[test]
+    fn composer_skill_mentions_use_only_enabled_listed_paths() {
+        let listed = json!({"data": [{"skills": [
+            {"name": "demo", "path": "/skills/demo/SKILL.md", "enabled": true},
+            {"name": "disabled", "path": "/skills/disabled/SKILL.md", "enabled": false},
+            {"name": "relative", "path": "relative/SKILL.md", "enabled": true}
+        ]}]});
+        assert_eq!(
+            composer_skill_inputs("Use $demo, then $demo and $disabled $relative", &listed),
+            vec![json!({
+                "type": "skill",
+                "name": "demo",
+                "path": "/skills/demo/SKILL.md"
+            })]
+        );
     }
 
     #[test]
@@ -11244,7 +11443,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(WEB_APP_CSS.contains("touch-action:pan-y"));
         assert!(source.contains("background: var(--control-bg)"));
         assert!(source.contains("background: var(--code-bg)"));
-        assert_eq!(source.matches(".message.user {").count(), 1);
+        assert_eq!(source.matches("\n.message.user {").count(), 1);
         assert_eq!(source.matches(".composer-shell {").count(), 2);
         assert_eq!(source.matches("\n.outbox-item {").count(), 1);
         assert!(!source.contains("--mobile-code"));
@@ -11815,6 +12014,28 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact["content"][0]["content_end"], 4);
         assert_eq!(compact["content"][1]["text"], "输入框样式异常");
         assert!(!encoded.contains("large-payload"));
+    }
+
+    #[test]
+    fn pasted_text_wrapper_is_a_user_attachment_without_inline_contents() {
+        let message = ThreadMessage {
+            timestamp: None,
+            id: None,
+            turn_id: None,
+            role: "user".into(),
+            phase: None,
+            content: vec![json!({
+                "type": "input_text",
+                "text": "# Files mentioned by the user:\n\n## Pasted text.txt: /tmp/attachments/bridge-d28b8e6c-2ab3-4df6-8d3d-40cb925665d9/pasted-text.txt\n\n## My request:\nReview this"
+            })],
+            tools: Vec::new(),
+        };
+        let compact = compact_web_message(&message, 5);
+        assert_eq!(compact["category"], "user");
+        assert_eq!(compact["content"][0]["kind"], "pasted_text");
+        assert_eq!(compact["content"][0]["message_index"], 5);
+        assert_eq!(compact["content"][1]["text"], "Review this");
+        assert!(!compact.to_string().contains("# Files mentioned"));
     }
 
     #[test]

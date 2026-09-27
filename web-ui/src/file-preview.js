@@ -107,6 +107,7 @@ export function createFilePreviewController({
     sourceMode = false;
     title.textContent = preview.name;
     meta.textContent = `${preview.mime_type} · ${formatBytes(preview.size)}`;
+    downloadButton.hidden = !preview.download_url;
     root.hidden = false;
     document.body.classList.add("file-preview-open");
     renderCurrent();

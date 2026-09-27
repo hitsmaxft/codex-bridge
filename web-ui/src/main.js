@@ -13,7 +13,9 @@ import {
 } from "./api.js";
 import { goalToggleState } from "./goal-state.js";
 import { asyncQuestionReplyMode } from "./async-question-state.js";
+import { commandPickerTrigger } from "./command-picker.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
+import { MAX_PASTED_TEXT_BYTES, shouldAttachPastedText } from "./large-paste.js";
 import { markdownNode } from "./markdown.js";
 import { memoryCitationModel } from "./memory-citations.js";
 import { shouldCollapseAssistantOutput, toolFileList } from "./message-presentation.js";
@@ -34,6 +36,8 @@ import {
 import { persistExpandedProjects, storedExpandedProjects } from "./project-state.js";
 import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
+import { toolOutputImageUrls } from "./tool-image.js";
+import { orderedTurnChildren, turnUsageHost } from "./turn-stack.js";
 import {
   rememberSessionId,
   sessionHash,
@@ -59,9 +63,11 @@ import {
   latestActivityMessages,
   messageIdentity,
   messageBottomDistance,
+  messageBottomScrollTop,
   messagePersistsWhenTurnCollapsed,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
+  shouldResumeMessageTail,
   toolGroupIdentity,
 } from "./viewport-state.js";
 import {
@@ -802,7 +808,7 @@ async function toggleLanguage() {
   renderGoalPanel();
   showActivity();
   await loadStatus();
-  if (state.current) await openThread(state.current, { quiet: true });
+  if (state.current) await openThread(state.current, { quiet: true, preserveView: true });
 }
 async function openDefaultProjectThread() {
   if (!state.projects.length) return;
@@ -2461,6 +2467,15 @@ function renderComposerAttachments() {
       image.src = attachment.url;
       image.alt = attachment.name || tr("attachment");
       item.appendChild(image);
+    } else if (attachment.type === "pasted_text") {
+      const icon = document.createElement("span"),
+        label = document.createElement("span");
+      icon.className = "pasted-text-icon";
+      icon.textContent = "▤";
+      label.className = "pasted-text-label";
+      label.textContent = tr("pastedTextName");
+      item.append(icon, label);
+      item.title = tr("pastedTextSize", { count: attachment.text.length });
     } else {
       item.innerHTML =
         '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 9v6M9 6v12M13 4v16M17 7v10M21 10v4"/></svg>';
@@ -2652,6 +2667,7 @@ function memoryCitationNode(items) {
     list.appendChild(line);
   }
   details.append(summary, list);
+  preserveMessageDisclosureOnClick(details, summary);
   return details;
 }
 const imageViewer = {
@@ -3011,6 +3027,32 @@ function appendContextValue(details, value, label) {
 }
 function contentNode(item, threadId = state.current?.id) {
   if (item.kind === "text") return markdownNode(item.text, markdownOptions(threadId));
+  if (item.kind === "pasted_text") {
+    const button = document.createElement("button"),
+      icon = document.createElement("span");
+    button.type = "button";
+    button.className = "pasted-text-message";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "▤";
+    button.append(icon, tr("pastedTextName"));
+    button.onclick = () =>
+      run(async () => {
+        const preview =
+          typeof item.text === "string"
+            ? {
+                kind: "text",
+                name: tr("pastedTextName"),
+                mime_type: "text/plain; charset=utf-8",
+                size: new Blob([item.text]).size,
+                content: item.text,
+              }
+            : await requestFilePreview(threadId, item.path, {
+                message_index: item.message_index,
+              });
+        (await getFilePreview()).open(preview);
+      });
+    return button;
+  }
   if (item.kind === "context_compaction") {
     const notice = document.createElement("div"),
       icon = document.createElement("span"),
@@ -3049,6 +3091,7 @@ function contentNode(item, threadId = state.current?.id) {
   size.textContent = byteText(item.bytes || 0);
   summary.appendChild(size);
   details.appendChild(summary);
+  preserveMessageDisclosureOnClick(details, summary);
   details.ontoggle = () => {
     if (!details.open || details.dataset.loaded) return;
     details.dataset.loaded = "1";
@@ -3139,6 +3182,29 @@ function toolValueText(value) {
   }
   return JSON.stringify(value, null, 2);
 }
+function toolValueWithoutImages(value) {
+  if (typeof value === "string") {
+    if (/^data:image\/[^;]+;base64,/i.test(value)) return undefined;
+    try {
+      return toolValueWithoutImages(JSON.parse(value));
+    } catch {
+      return value;
+    }
+  }
+  if (Array.isArray(value)) {
+    const items = value.map(toolValueWithoutImages).filter((item) => item !== undefined);
+    return items.length ? items : undefined;
+  }
+  if (value && typeof value === "object") {
+    if (value.type === "image" && (value.data || value.image_url)) return undefined;
+    const entries = Object.entries(value)
+      .filter(([key]) => key !== "image_url")
+      .map(([key, nested]) => [key, toolValueWithoutImages(nested)])
+      .filter(([, nested]) => nested !== undefined);
+    return entries.length ? Object.fromEntries(entries) : undefined;
+  }
+  return value;
+}
 function appendToolValue(parent, value) {
   let parsed = value;
   if (typeof parsed === "string") {
@@ -3156,11 +3222,7 @@ function appendToolValue(parent, value) {
     if (!imageUrl && part?.type === "image" && typeof part.data === "string")
       imageUrl = `data:${part.mimeType || part.mime_type || "image/png"};base64,${part.data}`;
     if (imageUrl && /^(?:data:image\/|https?:\/\/)/i.test(imageUrl)) {
-      const img = document.createElement("img");
-      img.src = imageUrl;
-      img.alt = tr("toolResultImage");
-      img.loading = "lazy";
-      parent.appendChild(makeInspectableImage(img));
+      appendToolResultImage(parent, imageUrl);
       continue;
     }
     if (typeof part?.audio_url === "string") {
@@ -3176,47 +3238,170 @@ function appendToolValue(parent, value) {
         : typeof part?.output_text === "string"
           ? part.output_text
           : null;
-    const pre = document.createElement("pre");
-    pre.textContent = raw === null ? toolValueText(part) : raw;
-    parent.appendChild(pre);
+    const nestedImages = toolOutputImageUrls(part);
+    const text =
+      raw !== null
+        ? raw
+        : nestedImages.length
+          ? toolValueText(toolValueWithoutImages(part))
+          : toolValueText(part);
+    if (text !== undefined) {
+      const pre = document.createElement("pre");
+      pre.textContent = text;
+      parent.appendChild(pre);
+    }
+    for (const url of nestedImages) appendToolResultImage(parent, url);
   }
 }
+function appendToolResultImage(parent, url, name = tr("toolResultImage")) {
+  const img = document.createElement("img");
+  img.src = url;
+  img.alt = name;
+  img.loading = "lazy";
+  parent.appendChild(makeInspectableImage(img));
+}
 const toolImagePreviewCache = new Map();
-function toolImagePreviewNode(tool, threadId) {
-  if (tool.name !== "view_image" || typeof tool.image_path !== "string" || !threadId) return null;
-  const frame = document.createElement("figure"),
-    status = document.createElement("span"),
-    cacheKey = `${threadId}:${tool.image_path}`;
-  frame.className = "tool-image-preview";
-  status.className = "tool-image-preview-status";
-  status.textContent = tr("loading");
-  frame.appendChild(status);
+const toolImageGalleryState = new Map();
+function toolImagePreviews(tool, threadId) {
+  const fileImage = tool.name === "view_image" && typeof tool.image_path === "string";
+  if (!threadId || (!fileImage && !tool.has_image)) return Promise.resolve([]);
+  if (!fileImage && !Number.isInteger(tool.message_index)) return Promise.resolve([]);
+  const cacheKey = fileImage
+    ? `${threadId}:file:${tool.image_path}`
+    : `${threadId}:tool:${tool.message_index}:${tool.tool_index}:${tool.status}:${tool.bytes}`;
   let previewRequest = toolImagePreviewCache.get(cacheKey);
   if (!previewRequest) {
-    previewRequest = requestFilePreview(threadId, tool.image_path, {
-      message_index: tool.message_index,
-      tool_index: tool.tool_index,
-    }).catch((error) => {
+    previewRequest = (
+      fileImage
+        ? requestFilePreview(threadId, tool.image_path, {
+            message_index: tool.message_index,
+            tool_index: tool.tool_index,
+          }).then((preview) =>
+            preview.kind === "image" && preview.preview_url
+              ? [{ url: preview.preview_url, name: preview.name }]
+              : [],
+          )
+        : command(
+            {
+              command: "tool_content",
+              thread_id: threadId,
+              message_index: tool.message_index,
+              tool_index: tool.tool_index,
+            },
+            false,
+          ).then((detail) =>
+            toolOutputImageUrls(detail.tool?.output).map((url) => ({ url, name: null })),
+          )
+    ).catch((error) => {
       toolImagePreviewCache.delete(cacheKey);
       throw error;
     });
     toolImagePreviewCache.set(cacheKey, previewRequest);
+    if (toolImagePreviewCache.size > 12)
+      toolImagePreviewCache.delete(toolImagePreviewCache.keys().next().value);
   }
-  previewRequest
-    .then((preview) => {
-      if (!frame.isConnected || preview.kind !== "image" || !preview.preview_url) return;
-      const img = document.createElement("img");
-      img.src = preview.preview_url;
-      img.alt = preview.name || tool.image_path.split("/").at(-1) || tr("toolResultImage");
-      img.loading = "lazy";
-      frame.replaceChildren(makeInspectableImage(img));
+  return previewRequest.then((images) => {
+    if (!images.length) toolImagePreviewCache.delete(cacheKey);
+    return images;
+  });
+}
+function toolCallImagesNode(tool, threadId) {
+  const container = document.createElement("div"),
+    status = document.createElement("span");
+  container.className = "tool-call-images";
+  status.className = "tool-image-preview-status";
+  status.textContent = tr("loading");
+  container.appendChild(status);
+  toolImagePreviews(tool, threadId)
+    .then((images) => {
+      if (!container.isConnected) return;
+      if (!images.length) throw new Error(tr("waitingScreenshot"));
+      container.replaceChildren();
+      for (const image of images)
+        appendToolResultImage(container, image.url, image.name || tr("toolResultImage"));
     })
     .catch((error) => {
-      if (!frame.isConnected) return;
+      if (!container.isConnected) return;
+      status.textContent = error.message;
+      status.classList.toggle("error", tool.status !== "running");
+    });
+  return container;
+}
+function toolImageGalleryNode(tools, threadId, galleryKey) {
+  const gallery = document.createElement("div"),
+    frame = document.createElement("figure"),
+    status = document.createElement("span"),
+    choose = document.createElement("button"),
+    thumbnails = document.createElement("div");
+  gallery.className = "tool-image-preview-list";
+  frame.className = "tool-image-preview";
+  status.className = "tool-image-preview-status";
+  status.textContent = tr("loading");
+  frame.appendChild(status);
+  choose.type = "button";
+  choose.className = "tool-image-choose";
+  choose.hidden = true;
+  thumbnails.className = "tool-image-thumbnails";
+  thumbnails.hidden = true;
+  choose.onclick = () => {
+    thumbnails.hidden = !thumbnails.hidden;
+    choose.setAttribute("aria-expanded", String(!thumbnails.hidden));
+    const saved = toolImageGalleryState.get(galleryKey) || {};
+    toolImageGalleryState.set(galleryKey, { ...saved, open: !thumbnails.hidden });
+  };
+  gallery.append(frame, choose, thumbnails);
+  Promise.allSettled(tools.map((tool) => toolImagePreviews(tool, threadId)))
+    .then((results) => {
+      if (!gallery.isConnected) return;
+      const images = results.flatMap((result) =>
+        result.status === "fulfilled" ? result.value : [],
+      );
+      if (!images.length)
+        throw (
+          results.find((result) => result.status === "rejected")?.reason ||
+          new Error(tr("waitingScreenshot"))
+        );
+      const select = (index, remember = false) => {
+        frame.replaceChildren();
+        const image = images[index];
+        appendToolResultImage(frame, image.url, image.name || tr("toolResultImage"));
+        [...thumbnails.children].forEach((button, position) => {
+          button.setAttribute("aria-pressed", String(position === index));
+        });
+        if (remember) {
+          const saved = toolImageGalleryState.get(galleryKey) || {};
+          toolImageGalleryState.set(galleryKey, { ...saved, selected: index });
+        }
+      };
+      images.forEach((image, index) => {
+        const button = document.createElement("button"),
+          thumbnail = document.createElement("img");
+        button.type = "button";
+        button.setAttribute("aria-label", tr("toolImageNumber", { index: index + 1 }));
+        button.onclick = () => select(index, true);
+        thumbnail.src = image.url;
+        thumbnail.alt = "";
+        thumbnail.loading = "lazy";
+        button.appendChild(thumbnail);
+        thumbnails.appendChild(button);
+      });
+      const saved = toolImageGalleryState.get(galleryKey) || {};
+      select(Math.min(saved.selected ?? images.length - 1, images.length - 1));
+      if (images.length > 1) {
+        choose.textContent = tr("chooseToolImage", { count: images.length });
+        choose.hidden = false;
+        thumbnails.hidden = !saved.open;
+        choose.setAttribute("aria-expanded", String(Boolean(saved.open)));
+      }
+      if (toolImageGalleryState.size > 100)
+        toolImageGalleryState.delete(toolImageGalleryState.keys().next().value);
+    })
+    .catch((error) => {
+      if (!gallery.isConnected) return;
       status.textContent = error.message;
       status.classList.add("error");
     });
-  return frame;
+  return gallery;
 }
 function appendPatchDiff(parent, patch, label = "Diff") {
   const card = document.createElement("div"),
@@ -3359,9 +3544,13 @@ function toolGroupNode(
       run(() => openSubagentConversation(latest));
     };
   } else {
-    summary.onclick = () => {
-      if (group.open) state.expandedToolGroupIds.delete(groupKey);
-      else state.expandedToolGroupIds.add(groupKey);
+    summary.onclick = (event) => {
+      event.preventDefault();
+      preserveMessageElementPosition(summary, () => {
+        if (group.open) state.expandedToolGroupIds.delete(groupKey);
+        else state.expandedToolGroupIds.add(groupKey);
+        group.open = !group.open;
+      });
     };
   }
   if (hasImage) summary.appendChild(toolImageIndicator());
@@ -3373,6 +3562,7 @@ function toolGroupNode(
     detail.className = "tool-call";
     const sourceMessageIndex = tool.message_index ?? message.message_index,
       sourceToolIndex = tool.tool_index ?? toolPosition,
+      imageTool = { ...tool, message_index: sourceMessageIndex, tool_index: sourceToolIndex },
       disclosureKey = `${threadId || ""}:${sourceMessageIndex}:${sourceToolIndex}`;
     detail.dataset.toolKey = `${sourceMessageIndex}:${sourceToolIndex}`;
     detail.open = state.expandedToolCallIds.has(disclosureKey);
@@ -3400,9 +3590,13 @@ function toolGroupNode(
     if (tool.has_image) head.appendChild(toolImageIndicator());
     head.appendChild(status);
     detail.appendChild(head);
-    head.onclick = () => {
-      if (detail.open) state.expandedToolCallIds.delete(disclosureKey);
-      else state.expandedToolCallIds.add(disclosureKey);
+    head.onclick = (event) => {
+      event.preventDefault();
+      preserveMessageElementPosition(head, () => {
+        if (detail.open) state.expandedToolCallIds.delete(disclosureKey);
+        else state.expandedToolCallIds.add(disclosureKey);
+        detail.open = !detail.open;
+      });
     };
     detail.ontoggle = () => {
       if (!detail.open || detail.dataset.loaded) return;
@@ -3447,10 +3641,17 @@ function toolGroupNode(
             body.append(inputTitle, input, outputTitle);
           }
         }
-        appendToolValue(body, r.tool.output);
+        if (r.tool.output != null) appendToolValue(body, r.tool.output);
+        if (tool.name === "view_image" && !toolOutputImageUrls(r.tool.output).length) {
+          const images = await toolImagePreviews(imageTool, threadId);
+          for (const image of images)
+            appendToolResultImage(body, image.url, image.name || tr("toolResultImage"));
+        }
       });
     };
     list.appendChild(detail);
+    if (tool.has_image || (tool.name === "view_image" && tool.image_path))
+      list.appendChild(toolCallImagesNode(imageTool, threadId));
   }
   group.appendChild(list);
   return group;
@@ -3632,14 +3833,52 @@ function setMessageSyncPhase(phase = null) {
   renderMessageTailStatus(changed);
 }
 
-function preserveMessageElementPosition(element, change) {
+function captureMessageElementPosition(element) {
+  state.followMessageTail = false;
+  state.userScrolled = true;
+  messageScrollIntentVersion += 1;
+  messageUserInteracting = false;
+  clearTimeout(messageInteractionTimer);
+  cancelAnimationFrame(messageTailFrame);
+  cancelAnimationFrame(messageTailSettleFrame);
   const beforeTop = element?.getBoundingClientRect().top,
-    scrollTop = messageScrollMetrics().top;
+    intentVersion = messageScrollIntentVersion;
+  const apply = (focus) => {
+    if (
+      intentVersion !== messageScrollIntentVersion ||
+      !focus?.isConnected ||
+      focus.hidden ||
+      focus.getClientRects().length === 0
+    )
+      return;
+    setMessageScrollTop(
+      scrollTopForViewportAnchor(
+        messageScrollMetrics().top,
+        beforeTop,
+        focus.getBoundingClientRect().top,
+      ),
+    );
+  };
+  return (focus = element) => {
+    apply(focus);
+    requestAnimationFrame(() => {
+      apply(focus);
+      requestAnimationFrame(() => apply(focus));
+    });
+  };
+}
+function preserveMessageElementPosition(element, change) {
+  const restore = captureMessageElementPosition(element);
   change();
-  if (!element?.isConnected || element.hidden || element.getClientRects().length === 0) return;
-  setMessageScrollTop(
-    scrollTopForViewportAnchor(scrollTop, beforeTop, element.getBoundingClientRect().top),
-  );
+  restore();
+}
+function preserveMessageDisclosureOnClick(details, summary) {
+  summary.onclick = (event) => {
+    event.preventDefault();
+    preserveMessageElementPosition(summary, () => {
+      details.open = !details.open;
+    });
+  };
 }
 
 function collapseExpandedMessages() {
@@ -3695,16 +3934,27 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   if (!foldable) {
     for (const node of messageNodes) {
       node.hidden = false;
+      node.classList.remove("has-turn-usage");
+      node.style.removeProperty("--turn-stack-depth");
+      node.querySelector(":scope > .turn-fold-usage")?.remove();
       for (const token of node.querySelectorAll(".turn-token-usage")) token.hidden = false;
     }
     const liveUsage = usage?.live
-      ? section.querySelector(":scope > .turn-live-usage") || document.createElement("div")
+      ? section.querySelector(".turn-live-usage") || document.createElement("div")
       : null;
     if (liveUsage) {
       liveUsage.className = "turn-live-usage turn-meta-line";
       liveUsage.textContent = liveTurnTokenUsageText(usage);
     }
-    reconcileChildren(section, liveUsage ? [...messageNodes, liveUsage] : messageNodes);
+    reconcileChildren(section, messageNodes);
+    if (liveUsage) {
+      const toolRow = [...messageNodes]
+        .reverse()
+        .find((node) => node.querySelector(".message-tool-row"))
+        ?.querySelector(".message-tool-row");
+      if (toolRow) toolRow.querySelector(".tool-group")?.after(liveUsage);
+      else section.appendChild(liveUsage);
+    }
     return;
   }
   for (const node of messageNodes)
@@ -3716,7 +3966,9 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
     fold = foldBlock.querySelector(":scope > .turn-fold") || document.createElement("button"),
     divider = foldBlock.querySelector(":scope > .turn-divider") || document.createElement("hr"),
     tokenUsage =
-      foldBlock.querySelector(":scope > .turn-fold-usage") || document.createElement("span");
+      userNodes.map((node) => node.querySelector(":scope > .turn-fold-usage")).find(Boolean) ||
+      foldBlock.querySelector(":scope > .turn-fold-usage") ||
+      document.createElement("span");
   foldBlock.className = "turn-fold-block";
   fold.type = "button";
   fold.className = "turn-fold tool-group-summary";
@@ -3731,20 +3983,32 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   text.className = "turn-fold-text";
   label.className = "tool-summary-label";
   label.textContent = turnSummaryText(group);
+  const usageText = usage ? turnTokenUsageText(usage) : "";
   tokenUsage.className = "turn-fold-usage";
-  tokenUsage.textContent = usage ? turnTokenUsageText(usage) : "";
+  tokenUsage.textContent = usageText;
+  tokenUsage.title = usageText;
+  if (usage) tokenUsage.setAttribute("aria-label", usageText);
+  else tokenUsage.removeAttribute("aria-label");
   tokenUsage.hidden = !usage;
   text.append(label);
   fold.append(text);
   fold.onclick = () => {
     if (!expanded && hasDeferred && group.turnId) {
+      const restorePosition = captureMessageElementPosition(fold);
+      const visibleBefore = new Set(
+        messageNodes.filter((node) => !node.hidden).map((node) => node.dataset.messageIndex),
+      );
       fold.disabled = true;
       fold.classList.add("loading");
       run(async () => {
         try {
           await hydrateTurn(group.turnId);
           state.expandedTurnIds.add(expansionKey);
-          renderVisibleMessages();
+          renderVisibleMessages({ preserveView: false });
+          const revealed = [...section.querySelectorAll(":scope > .message")].find(
+            (node) => !node.hidden && !visibleBefore.has(node.dataset.messageIndex),
+          );
+          restorePosition(revealed || fold);
         } finally {
           if (fold.isConnected) {
             fold.disabled = false;
@@ -3754,26 +4018,42 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
       });
       return;
     }
-    preserveMessageElementPosition(finalNode, () => {
-      if (expanded) state.expandedTurnIds.delete(expansionKey);
-      else state.expandedTurnIds.add(expansionKey);
-      layoutTurnGroup(section, group, messageNodes, completed);
-    });
+    const restorePosition = captureMessageElementPosition(fold);
+    if (expanded) state.expandedTurnIds.delete(expansionKey);
+    else state.expandedTurnIds.add(expansionKey);
+    layoutTurnGroup(section, group, messageNodes, completed);
+    const revealed = expanded ? null : hiddenNodes.find((node) => node.isConnected && !node.hidden);
+    restorePosition(revealed || fold);
   };
   divider.className = "turn-divider";
-  foldBlock.replaceChildren(fold, divider, tokenUsage);
+  foldBlock.replaceChildren(fold, divider);
+  for (const node of userNodes) node.classList.remove("has-turn-usage");
+  const usageHost = turnUsageHost(userNodes, expanded);
+  if (usage && usageHost) {
+    usageHost.classList.add("has-turn-usage");
+    usageHost.append(tokenUsage);
+  } else {
+    foldBlock.prepend(tokenUsage);
+  }
   section.classList.toggle("collapsed", !expanded);
   section.classList.toggle("expanded", expanded);
   for (const node of messageNodes) node.hidden = !expanded && hiddenNodes.includes(node);
-  const leading = expanded
-    ? messageNodes.filter((node) => node !== finalNode)
-    : visibleLeadingNodes;
-  reconcileChildren(section, [
-    ...leading,
-    foldBlock,
-    finalNode,
-    ...hiddenNodes.filter((node) => !leading.includes(node)),
-  ]);
+  const stack =
+    !expanded && userNodes.length > 1
+      ? section.querySelector(":scope > .turn-prompt-stack") || document.createElement("div")
+      : null;
+  if (stack) {
+    stack.className = "turn-prompt-stack";
+    for (const [index, node] of userNodes.entries())
+      node.style.setProperty("--turn-stack-depth", String(userNodes.length - index));
+    reconcileChildren(stack, userNodes);
+  } else {
+    for (const node of userNodes) node.style.removeProperty("--turn-stack-depth");
+  }
+  reconcileChildren(
+    section,
+    orderedTurnChildren(messageNodes, userNodes, foldBlock, stack, expanded),
+  );
 }
 
 function messageNode(
@@ -3850,20 +4130,21 @@ function messageNode(
       toolRow.appendChild(copy);
     }
     body.appendChild(toolRow);
-    const imagePreviews = (m.tools || [])
-      .map((tool) =>
-        toolImagePreviewNode(
-          { ...tool, message_index: tool.message_index ?? m.message_index },
+    const imageTools = (m.tools || []).filter(
+      (tool) => tool.has_image || (tool.name === "view_image" && tool.image_path),
+    );
+    if (imageTools.length)
+      body.appendChild(
+        toolImageGalleryNode(
+          imageTools.map((tool) => ({
+            ...tool,
+            message_index: tool.message_index ?? m.message_index,
+            tool_index: tool.tool_index ?? (m.tools || []).indexOf(tool),
+          })),
           threadId,
+          `${toolGroupIdentity(threadId, m)}:images`,
         ),
-      )
-      .filter(Boolean);
-    if (imagePreviews.length) {
-      const previewList = document.createElement("div");
-      previewList.className = "tool-image-preview-list";
-      previewList.append(...imagePreviews);
-      body.appendChild(previewList);
-    }
+      );
   } else if (copy) body.appendChild(copy);
   for (const item of usageItems) body.appendChild(contentNode(item, threadId));
   if (memoryItems.length) body.appendChild(memoryCitationNode(memoryItems));
@@ -4149,7 +4430,11 @@ function pendingNode(entry) {
     popover.appendChild(remove);
     const hasAttachmentSummary = entry.text
       .split("\n")
-      .some((line) => ["[Image attachment]", "[Audio attachment]"].includes(line.trim()));
+      .some((line) =>
+        ["[Image attachment]", "[Audio attachment]", "[Pasted text attachment]"].includes(
+          line.trim(),
+        ),
+      );
     const nativeQueue = ["app_server_queue", "demo_wasm"].includes(entry.source);
     const mergeableQueueCount = state.pending.filter(
       (pending) =>
@@ -4159,7 +4444,11 @@ function pendingNode(entry) {
         ["app_server_queue", "demo_wasm"].includes(pending.source) &&
         !pending.text
           .split("\n")
-          .some((line) => ["[Image attachment]", "[Audio attachment]"].includes(line.trim())),
+          .some((line) =>
+            ["[Image attachment]", "[Audio attachment]", "[Pasted text attachment]"].includes(
+              line.trim(),
+            ),
+          ),
     ).length;
     if (
       entry.action === "queue" &&
@@ -4406,8 +4695,9 @@ function mergeHydratedTurnMessages(messages, threadId = state.current?.id) {
     );
   });
 }
-function renderVisibleMessages() {
+function renderVisibleMessages({ preserveView = true } = {}) {
   if (!state.current) return;
+  const view = preserveView ? captureMessageView() : null;
   reconcileMessageNodes($("messages"), {
     messages: state.visibleMessages,
     page: {
@@ -4417,6 +4707,8 @@ function renderVisibleMessages() {
       has_more: state.hasMore,
     },
   });
+  syncLongAssistantMessages();
+  if (view) restoreMessageView(view);
 }
 async function hydrateTurn(turnId, { render = false } = {}) {
   const threadId = state.current?.id;
@@ -4518,7 +4810,7 @@ function messageScrollMetrics() {
     const viewport = window.visualViewport;
     return {
       top: viewport?.pageTop ?? window.scrollY,
-      height: document.documentElement.scrollHeight,
+      height: root.getBoundingClientRect().bottom + window.scrollY,
       client: viewport?.height ?? window.innerHeight,
     };
   }
@@ -4532,17 +4824,25 @@ let messageTailFrame = 0,
   messageTailSettleFrame = 0,
   messageScrollIntentVersion = 0,
   messageUserInteracting = false,
+  messageInteractionStartTop = 0,
+  messageInteractionDirection = null,
   messageInteractionTimer = null;
 function settleMessageInteraction() {
   clearTimeout(messageInteractionTimer);
   messageInteractionTimer = setTimeout(() => {
     messageUserInteracting = false;
-    if (messageBottomDistance(messageScrollMetrics()) < 100) scrollMessagesToBottom("auto");
+    const metrics = messageScrollMetrics();
+    if (
+      messageInteractionDirection === "down" &&
+      shouldResumeMessageTail(messageInteractionStartTop, metrics)
+    )
+      state.followMessageTail = true;
+    if (state.followMessageTail) scheduleMessageTailLock();
   }, 180);
 }
 function applyMessageTailLock() {
   if (!state.followMessageTail || messageUserInteracting) return;
-  setMessageScrollTop(messageScrollMetrics().height, "auto");
+  setMessageScrollTop(messageBottomScrollTop(messageScrollMetrics()), "auto");
 }
 function scheduleMessageTailLock() {
   if (!state.followMessageTail || messageUserInteracting) return;
@@ -4560,7 +4860,7 @@ function scheduleMessageTailLock() {
 function scrollMessagesToBottom(behavior = "auto") {
   state.userScrolled = false;
   state.followMessageTail = true;
-  setMessageScrollTop(messageScrollMetrics().height, behavior);
+  setMessageScrollTop(messageBottomScrollTop(messageScrollMetrics()), behavior);
   scheduleMessageTailLock();
 }
 function messageViewportTop() {
@@ -4842,7 +5142,7 @@ async function refreshActivity() {
   state.activeTool = projection.activeTool;
   state.activeToolCallId = projection.activeToolCallId;
   if (previousPhase !== state.activityPhase || previousToolCallId !== state.activeToolCallId) {
-    const followTail = shouldFollowMessageTail(state.followMessageTail, messageScrollMetrics());
+    const followTail = shouldFollowMessageTail(state.followMessageTail);
     renderVisibleMessages();
     if (followTail) requestAnimationFrame(scheduleMessageTailLock);
   }
@@ -5068,7 +5368,7 @@ function handleBridgeEvent(event) {
       state.activeTool = liveTool.name;
       state.activeToolCallId = liveTool.id;
       state.liveActivityOverlay = activeActivityOverlay(state.activeTurnId, "tool", liveTool);
-      const followTail = shouldFollowMessageTail(state.followMessageTail, messageScrollMetrics());
+      const followTail = shouldFollowMessageTail(state.followMessageTail);
       renderVisibleMessages();
       showActivity();
       renderAsyncQuestion();
@@ -5089,7 +5389,7 @@ function handleBridgeEvent(event) {
     const usage = params.tokenUsage || {};
     state.modelContextWindow = Number(usage.modelContextWindow || 0) || state.modelContextWindow;
     applyThreadTokenUsage(usage.total, null, params.turnId || state.activeTurnId);
-    const followTail = shouldFollowMessageTail(state.followMessageTail, messageScrollMetrics());
+    const followTail = shouldFollowMessageTail(state.followMessageTail);
     renderThreadStatistics();
     renderVisibleMessages();
     if (followTail) requestAnimationFrame(() => scrollMessagesToBottom("auto"));
@@ -5251,37 +5551,52 @@ function captureMessageView() {
   const root = $("messages"),
     metrics = messageScrollMetrics(),
     viewportTop = messageViewportTop(),
+    viewportBottom = usesDocumentMessageScroll()
+      ? (window.visualViewport?.offsetTop ?? 0) +
+        (window.visualViewport?.height ?? window.innerHeight)
+      : root.getBoundingClientRect().bottom,
     anchor = [...root.querySelectorAll(".message[data-message-index]")].find(
       (message) =>
         !message.hidden &&
         message.getClientRects().length > 0 &&
-        message.getBoundingClientRect().bottom > viewportTop + 1,
+        message.getBoundingClientRect().bottom > viewportTop + 1 &&
+        message.getBoundingClientRect().top < viewportBottom - 1,
     ),
-    anchorTurnKey = anchor?.closest(".turn-group")?.dataset.turnKey || null;
+    anchorTurn = anchor?.closest(".turn-group") || null;
   return {
-    atBottom: shouldFollowMessageTail(state.followMessageTail, metrics),
+    atBottom: shouldFollowMessageTail(state.followMessageTail),
+    top: metrics.top,
     anchorMessageIndex: anchor?.dataset.messageIndex || null,
-    anchorTurnKey,
+    anchorTurnKey: anchorTurn?.dataset.turnKey || null,
     anchorOffset: anchor ? anchor.getBoundingClientRect().top - viewportTop : null,
     intentVersion: messageScrollIntentVersion,
-    openDetails: [...root.querySelectorAll(".message details[open]")].map((detail) => {
+    openDetails: [
+      ...root.querySelectorAll(".message .context-block[open], .message .memory-citations[open]"),
+    ].map((detail) => {
       const message = detail.closest(".message");
-      return `${message?.dataset.messageIndex || ""}:${[
-        ...message.querySelectorAll("details"),
+      const kind = detail.classList.contains("context-block") ? "context" : "memory";
+      return `${message?.dataset.messageIndex || ""}:${kind}:${[
+        ...message.querySelectorAll(
+          `.${detail.classList.contains("context-block") ? "context-block" : "memory-citations"}`,
+        ),
       ].indexOf(detail)}`;
     }),
   };
 }
 function restoreMessageView(view) {
   if (!view) return scrollMessagesToBottom();
+  // A scroll or disclosure change during an asynchronous refresh supersedes its snapshot.
+  if (view.intentVersion !== messageScrollIntentVersion) return;
   const openDetails = new Set(view.openDetails);
   for (const message of $("messages").querySelectorAll(".message")) {
-    [...message.querySelectorAll("details")].forEach((detail, index) => {
-      detail.open = openDetails.has(`${message.dataset.messageIndex || ""}:${index}`);
-    });
+    for (const [kind, selector] of [
+      ["context", ".context-block"],
+      ["memory", ".memory-citations"],
+    ])
+      [...message.querySelectorAll(selector)].forEach((detail, index) => {
+        detail.open = openDetails.has(`${message.dataset.messageIndex || ""}:${kind}:${index}`);
+      });
   }
-  // Never fight a touch or momentum scroll that began while the refresh request was in flight.
-  if (view.intentVersion !== messageScrollIntentVersion || messageUserInteracting) return;
   if (view.atBottom) {
     scrollMessagesToBottom("auto");
     return;
@@ -5298,9 +5613,29 @@ function restoreMessageView(view) {
     view.anchorOffset !== null
   ) {
     const delta = anchor.getBoundingClientRect().top - messageViewportTop() - view.anchorOffset;
-    if (Number.isFinite(delta)) setMessageScrollTop(messageScrollMetrics().top + delta);
-    else scrollMessagesToBottom("auto");
-  } else scrollMessagesToBottom("auto");
+    if (Number.isFinite(delta)) {
+      setMessageScrollTop(messageScrollMetrics().top + delta);
+      return;
+    }
+  }
+  const turn = view.anchorTurnKey
+    ? [...$("messages").querySelectorAll(":scope > .turn-group")].find(
+        (section) => section.dataset.turnKey === view.anchorTurnKey,
+      )
+    : null;
+  if (turn) {
+    const focus = turn.querySelector(":scope > .turn-fold-block > .turn-fold") || turn,
+      targetOffset = Math.max(
+        8,
+        Math.min(view.anchorOffset ?? 8, messageScrollMetrics().client / 2),
+      ),
+      delta = focus.getBoundingClientRect().top - messageViewportTop() - targetOffset;
+    if (Number.isFinite(delta)) {
+      setMessageScrollTop(messageScrollMetrics().top + delta);
+      return;
+    }
+  }
+  setMessageScrollTop(view.top);
 }
 function yieldToBrowser() {
   // A backgrounded or newly restored mobile tab may suspend animation frames
@@ -5310,6 +5645,7 @@ function yieldToBrowser() {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 function resetThreadViewState(thread) {
+  closeCommandPicker();
   state.threadGoal = null;
   renderGoalPanel();
   restoreComposerDraft($("messageText"), state.drafts.get(thread.id), true);
@@ -5396,6 +5732,7 @@ async function openThread(
       root.replaceChildren();
       state.visibleMessages = cached.messages;
       reconcileMessageNodes(root, cached, null);
+      syncLongAssistantMessages();
       applyMessagePageState(cached);
       scrollMessagesToBottom("auto");
     } else {
@@ -5455,11 +5792,9 @@ async function openThread(
     };
   state.visibleMessages = visibleResponse.messages;
   const activeTool = activeToolMessage(visibleResponse.messages);
-  if (messageView?.anchorTurnKey && !messageView.atBottom) {
-    state.expandedTurnIds.add(`${thread.id}:${messageView.anchorTurnKey}`);
-  }
   const renderStarted = performance.now();
   reconcileMessageNodes(root, visibleResponse, activeTool);
+  syncLongAssistantMessages();
   applyMessagePageState(r);
   if (olderMessages.length) {
     state.historyStart = olderMessages[0].message_index;
@@ -5493,7 +5828,7 @@ async function openThread(
 async function refreshThread() {
   if (!state.current) return notify(tr("chooseSessionError"), true);
   if (state.current.projectless_draft) return notify(tr("newChatReady"));
-  return openThread(state.current, { reconnect: true });
+  return openThread(state.current, { quiet: true, preserveView: true, reconnect: true });
 }
 function clearCurrentSessionMessageCaches(threadId) {
   const prefix = `${threadId}:`;
@@ -5549,7 +5884,7 @@ async function loadOlder() {
     !isValidMessagePage(r, { expectedEnd }) ||
     (state.historyTotal !== null && r.page.total < state.historyTotal)
   ) {
-    await openThread(state.current, { quiet: true });
+    await openThread(state.current, { quiet: true, preserveView: true });
     notify(tr("historyResynced"));
     return;
   }
@@ -5570,6 +5905,7 @@ async function loadOlder() {
     },
     activeTool,
   );
+  syncLongAssistantMessages();
   reportMessagesRendered(r, renderStarted);
   const newHeight = messageScrollMetrics().height;
   setMessageScrollTop(oldTop + (newHeight - oldHeight));
@@ -5650,6 +5986,7 @@ function setComposerSubmitting(active) {
   $("messageText").readOnly = !currentThreadQueueable();
   $("sendModeToggle").disabled = active || !currentThreadWritable();
   $("attachBtn").disabled = active || !currentThreadQueueable();
+  $("slashBtn").disabled = active || !currentThreadQueueable();
   $("imageInput").disabled = active || !currentThreadQueueable();
   syncVoiceCapability();
   syncSubmitAction();
@@ -5672,6 +6009,7 @@ function syncSubmitAction() {
   $("messageText").readOnly = !queueable;
   $("sendModeToggle").disabled = state.composerSubmitting || !writable;
   $("attachBtn").disabled = state.composerSubmitting || !queueable;
+  $("slashBtn").disabled = state.composerSubmitting || !queueable;
   $("imageInput").disabled = state.composerSubmitting || !queueable;
   stop.disabled = state.interrupting || !writable;
   submit.disabled = state.composerSubmitting || state.interrupting || !queueable;
@@ -5797,7 +6135,7 @@ async function write(name) {
   if (state.current.projectless_draft) {
     setComposerSubmitting(true);
     try {
-      await materializeProjectlessDraft(text);
+      await materializeProjectlessDraft(text || tr("pastedTextName"));
     } catch (error) {
       setComposerSubmitting(false);
       throw error;
@@ -5837,6 +6175,7 @@ async function write(name) {
       }
     }
     $("messageText").value = "";
+    closeCommandPicker();
     resizeComposerTextarea();
     saveDraft(threadId, "", true);
     const request = command({
@@ -6100,9 +6439,224 @@ $("modelPickerClose").onclick = () => ($("modelPicker").hidden = true);
 $("modelSelect").onchange = () => renderEffortOptions(state.composerEffort);
 $("effortSelect").onchange = renderModelDescription;
 $("modelApply").onclick = () => run(applyThreadSettings);
+let commandPickerMode = null;
+let commandPickerExplicit = false;
+let commandPickerSelected = 0;
+let commandPickerItems = [];
+let commandPickerSkills = [];
+let commandPickerSkillThread = null;
+let commandPickerLoad = 0;
+let commandPickerSkillsLoading = false;
+let commandPickerSkillsError = null;
+
+function closeCommandPicker() {
+  commandPickerMode = null;
+  commandPickerExplicit = false;
+  commandPickerItems = [];
+  commandPickerSkills = [];
+  commandPickerSkillThread = null;
+  commandPickerLoad += 1;
+  commandPickerSkillsLoading = false;
+  commandPickerSkillsError = null;
+  $("composerCommandPicker").hidden = true;
+  $("messageText").setAttribute("aria-expanded", "false");
+  $("messageText").removeAttribute("aria-activedescendant");
+  $("slashBtn").setAttribute("aria-expanded", "false");
+}
+
+function currentCommandPickerTrigger() {
+  const textarea = $("messageText");
+  return commandPickerTrigger(
+    textarea.value,
+    textarea.selectionStart ?? textarea.value.length,
+    commandPickerExplicit,
+  );
+}
+
+async function loadCommandPickerSkills() {
+  const thread = state.current;
+  if (!thread || commandPickerSkillThread === thread.id) return;
+  const load = ++commandPickerLoad;
+  commandPickerSkillThread = thread.id;
+  commandPickerSkills = [];
+  commandPickerSkillsLoading = true;
+  commandPickerSkillsError = null;
+  try {
+    const result = await command({ command: "skills_list", thread_id: thread.id }, false);
+    if (load !== commandPickerLoad || state.current?.id !== thread.id) return;
+    commandPickerSkills = Array.isArray(result.skills) ? result.skills : [];
+  } catch (error) {
+    if (load === commandPickerLoad) {
+      commandPickerSkillsError = error.message;
+    }
+  }
+  if (load !== commandPickerLoad) return;
+  commandPickerSkillsLoading = false;
+  if (commandPickerMode === "skills") renderCommandPicker();
+}
+
+function renderCommandPicker() {
+  const trigger = currentCommandPickerTrigger();
+  if (!trigger || !state.current || $("messageText").readOnly) {
+    closeCommandPicker();
+    return;
+  }
+  const picker = $("composerCommandPicker"),
+    options = $("composerCommandOptions"),
+    query = trigger.query.toLocaleLowerCase();
+  commandPickerMode = trigger.mode;
+  $("composerCommandPickerTitle").textContent = tr(
+    trigger.mode === "skills" ? "availableSkills" : "slashCommands",
+  );
+  if (trigger.mode === "skills") {
+    if (commandPickerSkillThread !== state.current.id) void loadCommandPickerSkills();
+    commandPickerItems = commandPickerSkills
+      .filter((skill) =>
+        `${skill.name} ${skill.description || ""}`.toLocaleLowerCase().includes(query),
+      )
+      .map((skill) => ({
+        kind: "skill",
+        id: skill.name,
+        title: `$${skill.name}`,
+        description: skill.description || "",
+        icon: "✦",
+      }));
+  } else {
+    commandPickerItems = [
+      {
+        kind: "command",
+        id: "compact",
+        title: "/compact",
+        description: tr("compactCommand"),
+        icon: "↘",
+      },
+      {
+        kind: "command",
+        id: "skills",
+        title: "/skills",
+        description: tr("skillsCommand"),
+        icon: "✦",
+      },
+    ].filter(
+      (item) =>
+        (item.id !== "compact" || (currentThreadWritable() && !state.current?.projectless_draft)) &&
+        item.title.slice(1).includes(query),
+    );
+  }
+  commandPickerSelected = Math.min(
+    commandPickerSelected,
+    Math.max(0, commandPickerItems.length - 1),
+  );
+  options.replaceChildren();
+  commandPickerItems.forEach((item, index) => {
+    const button = document.createElement("button"),
+      icon = document.createElement("span"),
+      copy = document.createElement("span"),
+      title = document.createElement("strong"),
+      description = document.createElement("small");
+    button.type = "button";
+    button.id = `composer-command-option-${index}`;
+    button.className = "composer-command-option";
+    button.classList.toggle("active", index === commandPickerSelected);
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(index === commandPickerSelected));
+    icon.className = "composer-command-icon";
+    icon.textContent = item.icon;
+    copy.className = "composer-command-copy";
+    title.textContent = item.title;
+    description.textContent = item.description;
+    copy.append(title, description);
+    button.append(icon, copy);
+    button.onclick = (event) => {
+      event.stopPropagation();
+      run(() => selectCommandPickerItem(item));
+    };
+    options.appendChild(button);
+  });
+  if (!commandPickerItems.length) {
+    const empty = document.createElement("div");
+    empty.className = "composer-command-picker-title";
+    empty.textContent =
+      commandPickerSkillsError ||
+      tr(
+        trigger.mode === "skills"
+          ? commandPickerSkillsLoading
+            ? "loadingSkills"
+            : "noSkills"
+          : "noCommands",
+      );
+    options.appendChild(empty);
+  }
+  picker.hidden = false;
+  $("messageText").setAttribute("aria-expanded", "true");
+  $("slashBtn").setAttribute("aria-expanded", "true");
+  if (commandPickerItems.length)
+    $("messageText").setAttribute(
+      "aria-activedescendant",
+      `composer-command-option-${commandPickerSelected}`,
+    );
+  else $("messageText").removeAttribute("aria-activedescendant");
+}
+
+async function selectCommandPickerItem(item) {
+  const textarea = $("messageText"),
+    value = textarea.value,
+    commandDraft = /^\/[^\s]*$/.test(value),
+    trigger = currentCommandPickerTrigger();
+  if (item.kind === "skill") {
+    const token = `$${item.id} `,
+      start =
+        trigger?.mode === "skills" && Number.isInteger(trigger.start)
+          ? trigger.start
+          : value.length + (value && !/\s$/.test(value) ? 1 : 0);
+    textarea.value =
+      trigger?.mode === "skills" && Number.isInteger(trigger.start)
+        ? `${value.slice(0, trigger.start)}${token}${value.slice(trigger.end)}`
+        : `${value}${value && !/\s$/.test(value) ? " " : ""}${token}`;
+    saveDraft(state.current?.id, textarea.value);
+    resizeComposerTextarea();
+    closeCommandPicker();
+    textarea.focus({ preventScroll: true });
+    textarea.setSelectionRange(start + token.length, start + token.length);
+    return;
+  }
+  if (item.id === "skills") {
+    textarea.value = "/skills ";
+    saveDraft(state.current?.id, textarea.value);
+    commandPickerExplicit = false;
+    renderCommandPicker();
+    textarea.focus({ preventScroll: true });
+    return;
+  }
+  if (item.id === "compact") {
+    const threadId = state.current?.id;
+    await command({ command: "thread_compact", thread_id: threadId });
+    if (state.current?.id === threadId && commandDraft) {
+      textarea.value = "";
+      saveDraft(threadId, "");
+    }
+    notify(tr("compactStarted"));
+  }
+  closeCommandPicker();
+  resizeComposerTextarea();
+}
+
+$("slashBtn").onclick = () => {
+  if (!$("composerCommandPicker").hidden) {
+    closeCommandPicker();
+    return;
+  }
+  commandPickerExplicit = true;
+  commandPickerSelected = 0;
+  renderCommandPicker();
+  $("messageText").focus({ preventScroll: true });
+};
 $("messageText").oninput = () => {
   saveDraft(state.current?.id, $("messageText").value);
   resizeComposerTextarea();
+  commandPickerExplicit = false;
+  commandPickerSelected = 0;
+  renderCommandPicker();
 };
 $("messageText").onpointerdown = () => (
   document.querySelector(".composer-shell").classList.add("focused", "input-focused"),
@@ -6142,6 +6696,17 @@ function keepComposerTextFocus(event) {
 document
   .querySelectorAll(".composer-shell")
   .forEach((composer) => composer.addEventListener("pointerdown", keepComposerTextFocus));
+$("messageText").addEventListener("paste", (event) => {
+  if (event.clipboardData?.files.length) return;
+  const text = event.clipboardData?.getData("text/plain");
+  if (!shouldAttachPastedText(text)) return;
+  event.preventDefault();
+  if (state.composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS)
+    return notify(tr("attachmentLimit"), true);
+  if (new Blob([text]).size > MAX_PASTED_TEXT_BYTES) return notify(tr("pastedTextTooLarge"), true);
+  state.composerAttachments.push({ type: "pasted_text", id: crypto.randomUUID(), text });
+  renderComposerAttachments();
+});
 document.querySelector(".composer-shell").addEventListener("focusout", () =>
   requestAnimationFrame(() => {
     const shell = document.querySelector(".composer-shell");
@@ -6150,6 +6715,32 @@ document.querySelector(".composer-shell").addEventListener("focusout", () =>
   }),
 );
 $("messageText").onkeydown = (e) => {
+  if (!e.isComposing && !$("composerCommandPicker").hidden) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      closeCommandPicker();
+      return;
+    }
+    if ((e.key === "ArrowDown" || e.key === "ArrowUp") && commandPickerItems.length) {
+      e.preventDefault();
+      commandPickerSelected =
+        (commandPickerSelected + (e.key === "ArrowDown" ? 1 : -1) + commandPickerItems.length) %
+        commandPickerItems.length;
+      renderCommandPicker();
+      return;
+    }
+    if (
+      (e.key === "Enter" || e.key === "Tab") &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      commandPickerItems.length
+    ) {
+      e.preventDefault();
+      run(() => selectCommandPickerItem(commandPickerItems[commandPickerSelected]));
+      return;
+    }
+  }
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
     e.preventDefault();
     $("submitBtn").click();
@@ -6171,6 +6762,13 @@ $("repairHintBtn").onclick = (event) => {
   $("repairHintBtn").setAttribute("aria-expanded", String(open));
 };
 document.addEventListener("click", (event) => {
+  if (
+    !$("composerCommandPicker").hidden &&
+    !$("composerCommandPicker").contains(event.target) &&
+    !$("slashBtn").contains(event.target) &&
+    event.target !== $("messageText")
+  )
+    closeCommandPicker();
   if (event.target.closest("#repairHintBtn, #repairHintBubble")) return;
   $("repairHintBubble").hidden = true;
   $("repairHintBtn").setAttribute("aria-expanded", "false");
@@ -6508,15 +7106,66 @@ $("outboxTray").addEventListener("click", (event) => {
   syncOutboxCompactLabel();
 });
 syncOutboxCompactLabel();
-const markUserMessageScroll = () => {
+const markUserMessageScroll = (direction) => {
+  if (direction === "down" && state.followMessageTail) return;
+  if (direction === "down" && messageBottomDistance(messageScrollMetrics()) <= 2) {
+    state.followMessageTail = true;
+    scheduleMessageTailLock();
+    return;
+  }
   messageScrollIntentVersion += 1;
   state.userScrolled = true;
   state.followMessageTail = false;
+  if (!messageUserInteracting) messageInteractionStartTop = messageScrollMetrics().top;
   messageUserInteracting = true;
+  messageInteractionDirection = direction;
   settleMessageInteraction();
 };
-$("messages").addEventListener("touchmove", markUserMessageScroll, { passive: true });
-$("messages").addEventListener("wheel", markUserMessageScroll, { passive: true });
+let messageTouchY = null;
+$("messages").addEventListener(
+  "touchstart",
+  (event) => {
+    messageTouchY = event.touches[0]?.clientY ?? null;
+  },
+  { passive: true },
+);
+$("messages").addEventListener(
+  "touchmove",
+  (event) => {
+    const nextY = event.touches[0]?.clientY;
+    if (!Number.isFinite(nextY) || messageTouchY === null) return;
+    const direction = nextY > messageTouchY ? "up" : "down";
+    messageTouchY = nextY;
+    markUserMessageScroll(direction);
+  },
+  { passive: true },
+);
+$("messages").addEventListener(
+  "wheel",
+  (event) => {
+    if (event.deltaY) markUserMessageScroll(event.deltaY < 0 ? "up" : "down");
+  },
+  { passive: true },
+);
+$("messages").addEventListener(
+  "pointerdown",
+  (event) => {
+    const root = $("messages");
+    if (event.target === root && event.clientX >= root.getBoundingClientRect().right - 20)
+      markUserMessageScroll("up");
+  },
+  { passive: true },
+);
+document.addEventListener("keydown", (event) => {
+  if (
+    event.target !== document.body &&
+    event.target !== document.documentElement &&
+    !$("messages").contains(event.target)
+  )
+    return;
+  if (["PageUp", "ArrowUp", "Home"].includes(event.key)) markUserMessageScroll("up");
+  if (["PageDown", "ArrowDown", "End"].includes(event.key)) markUserMessageScroll("down");
+});
 $("messages").addEventListener(
   "load",
   (event) => {
@@ -6538,14 +7187,18 @@ document.fonts?.ready.then(() => {
   scheduleMessageTailLock();
 });
 const handleMessageScroll = () => {
-  if (state.userScrolled) {
+  if (state.userScrolled && messageUserInteracting) {
     messageScrollIntentVersion += 1;
-    messageUserInteracting = true;
+    if (
+      messageInteractionDirection === "down" &&
+      shouldResumeMessageTail(messageInteractionStartTop, messageScrollMetrics())
+    )
+      state.followMessageTail = true;
     settleMessageInteraction();
-    state.followMessageTail = messageBottomDistance(messageScrollMetrics()) < 100;
   }
   if (
     state.userScrolled &&
+    messageUserInteracting &&
     messageScrollMetrics().top < 8 &&
     !state.loadingHistory &&
     state.hasMore

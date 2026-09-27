@@ -58,10 +58,15 @@ reader's interaction state.
 
 - When the reader follows the tail, appended content and asynchronous height changes keep the
   newest activity visible.
+- A deliberate move upward exits tail following immediately. Reaching the bottom again while
+  scrolling downward resumes it; being merely close to the bottom does not.
 - When the reader has scrolled away from the tail, preserve a visible message/turn anchor and its
   viewport offset. New data must not jump the reader to either end.
 - Layout changes caused by disclosure, image loading, lazy hydration, and snapshot fusion follow
   the same anchor rule as message insertion.
+- Disclosure follows the reader's next target: expansion brings newly revealed content into the
+  clicked area; collapse keeps its control visible. Details revealed below a summary keep that
+  summary in place. If the scroll boundary prevents an exact offset, keep the target visible.
 
 ## Required regressions
 

@@ -7,8 +7,8 @@
       content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
     />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=d129fb0d9402"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=e886e0d32780">
+    <script type="module" crossorigin src="/assets/app.js?v=2e7e85306e8a"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=2d25fe8740f5">
   </head>
   <body>
     <div class="app">
@@ -259,6 +259,10 @@
           </div>
           <div class="composer-reference" id="composerReference" hidden></div>
           <div class="composer-attachments" id="composerAttachments" hidden></div>
+          <div class="composer-command-picker" id="composerCommandPicker" hidden>
+            <div class="composer-command-picker-title" id="composerCommandPickerTitle"></div>
+            <div class="composer-command-options" id="composerCommandOptions" role="listbox"></div>
+          </div>
           <div class="composer-shell">
             <div
               class="send-modes"
@@ -274,6 +278,16 @@
                 aria-label="Switch to Queue"
               >
                 Steer
+              </button>
+              <button
+                id="slashBtn"
+                class="mode-button"
+                type="button"
+                data-i18n-aria-label="slashCommands"
+                aria-label="Commands"
+                aria-expanded="false"
+              >
+                /
               </button>
             </div>
             <div class="composer-actions">
@@ -312,6 +326,8 @@
               rows="1"
               data-i18n-placeholder="messagePlaceholder"
               placeholder="Type a message… · ⌘ Enter to send"
+              aria-controls="composerCommandOptions"
+              aria-expanded="false"
             ></textarea
             ><button
               id="stopBtn"

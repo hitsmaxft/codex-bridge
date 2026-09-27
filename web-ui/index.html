@@ -257,6 +257,10 @@
           </div>
           <div class="composer-reference" id="composerReference" hidden></div>
           <div class="composer-attachments" id="composerAttachments" hidden></div>
+          <div class="composer-command-picker" id="composerCommandPicker" hidden>
+            <div class="composer-command-picker-title" id="composerCommandPickerTitle"></div>
+            <div class="composer-command-options" id="composerCommandOptions" role="listbox"></div>
+          </div>
           <div class="composer-shell">
             <div
               class="send-modes"
@@ -272,6 +276,16 @@
                 aria-label="Switch to Queue"
               >
                 Steer
+              </button>
+              <button
+                id="slashBtn"
+                class="mode-button"
+                type="button"
+                data-i18n-aria-label="slashCommands"
+                aria-label="Commands"
+                aria-expanded="false"
+              >
+                /
               </button>
             </div>
             <div class="composer-actions">
@@ -310,6 +324,8 @@
               rows="1"
               data-i18n-placeholder="messagePlaceholder"
               placeholder="Type a message… · ⌘ Enter to send"
+              aria-controls="composerCommandOptions"
+              aria-expanded="false"
             ></textarea
             ><button
               id="stopBtn"

@@ -21,6 +21,91 @@ import { createEventSequenceTracker } from "../src/event-sequence.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { goalToggleState } from "../src/goal-state.js";
 import { asyncQuestionReplyMode } from "../src/async-question-state.js";
+import { commandPickerTrigger } from "../src/command-picker.js";
+import { LARGE_PASTE_CHARS, shouldAttachPastedText } from "../src/large-paste.js";
+import { orderedTurnChildren, turnUsageHost } from "../src/turn-stack.js";
+
+test("collapsed steer messages form one ordered prompt stack", () => {
+  const [prompt, commentary, steerOne, tool, steerTwo, final, fold, stack] = Array.from(
+    { length: 8 },
+    () => ({}),
+  );
+  const messages = [prompt, commentary, steerOne, tool, steerTwo, final];
+  const users = [prompt, steerOne, steerTwo];
+  assert.deepEqual(orderedTurnChildren(messages, users, fold, stack, false), [
+    stack,
+    fold,
+    commentary,
+    tool,
+    final,
+  ]);
+  assert.deepEqual(orderedTurnChildren(messages, users, fold, null, true), [
+    prompt,
+    fold,
+    commentary,
+    steerOne,
+    tool,
+    steerTwo,
+    final,
+  ]);
+  assert.equal(turnUsageHost(users, false), steerTwo);
+  assert.equal(turnUsageHost(users, true), prompt);
+});
+
+test("skill slash command opens skills for exact and partial queries", () => {
+  assert.deepEqual(commandPickerTrigger("/skills"), {
+    mode: "skills",
+    query: "",
+    start: 0,
+    end: 7,
+  });
+  assert.deepEqual(commandPickerTrigger("/skills de"), {
+    mode: "skills",
+    query: "de",
+    start: 0,
+    end: 10,
+  });
+  assert.equal(commandPickerTrigger("/ski").mode, "commands");
+  assert.equal(commandPickerTrigger("/model").mode, "commands");
+});
+
+test("large clipboard text becomes a pasted-text attachment", async () => {
+  assert.equal(shouldAttachPastedText("x".repeat(LARGE_PASTE_CHARS - 1)), false);
+  assert.equal(shouldAttachPastedText("x".repeat(LARGE_PASTE_CHARS)), true);
+  assert.equal(
+    pendingInputSummary("Review this", [{ type: "pasted_text" }]),
+    "Review this\n[Pasted text attachment]",
+  );
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /messageText"\)\.addEventListener\("paste"/);
+  assert.match(source, /state\.composerAttachments\.push\(\{ type: "pasted_text"/);
+});
+
+test("submitted pasted text appears only as an attachment in demo history", async () => {
+  const command = await demoClient();
+  const pasted = "x".repeat(LARGE_PASTE_CHARS);
+  result(
+    command({
+      command: "send",
+      thread_id: "demo-thread-web-ui",
+      text: "Review this",
+      attachments: [
+        { type: "pasted_text", id: "d28b8e6c-2ab3-4df6-8d3d-40cb925665d9", text: pasted },
+      ],
+    }),
+  );
+  for (let poll = 0; poll < 4; poll++) result(command({ command: "pending_messages" }));
+  const messages = result(
+    command({ command: "messages", thread_id: "demo-thread-web-ui", limit: 30 }),
+  ).messages;
+  const user = messages.findLast((message) => message.role === "user");
+  assert.deepEqual(
+    user.content.map((item) => item.kind),
+    ["text", "pasted_text"],
+  );
+  assert.equal(user.content[0].text, "Review this");
+  assert.equal(user.content[1].text, pasted);
+});
 
 test("async clarification answers steer only into their originating turn", () => {
   assert.equal(asyncQuestionReplyMode("turn-a", "turn-a"), "steer");
@@ -43,6 +128,7 @@ import {
   storedExpandedProjects,
 } from "../src/project-state.js";
 import { taskOverview } from "../src/task-overview.js";
+import { toolOutputImageUrl, toolOutputImageUrls } from "../src/tool-image.js";
 import {
   activeActivityOverlay,
   activityOverlayConfirmed,
@@ -66,9 +152,11 @@ import {
   latestActivityMessages,
   messageIdentity,
   messageBottomDistance,
+  messageBottomScrollTop,
   messagePersistsWhenTurnCollapsed,
   scrollTopForViewportAnchor,
   shouldFollowMessageTail,
+  shouldResumeMessageTail,
   toolGroupIdentity,
 } from "../src/viewport-state.js";
 
@@ -754,7 +842,7 @@ test("mobile composer stays out of the message grid and catches its own pointer 
   assert.doesNotMatch(mobile, /\.composer-shell[^\{]*\{[^}]*grid-template-areas:/s);
   assert.match(
     mobile,
-    /\.composer-shell\s*\{[^}]*grid-template-columns:\s*64px 72px minmax\(0, 1fr\) 64px;/s,
+    /\.composer-shell\s*\{[^}]*grid-template-columns:\s*106px 72px minmax\(0, 1fr\) 64px;/s,
   );
   assert.match(mobile, /\.composer-shell #submitBtn\s*\{[^}]*width:\s*64px;/s);
   assert.match(mobile, /\.composer\s*\{[^}]*pointer-events:\s*auto;/s);
@@ -1149,7 +1237,11 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
   assert.match(source, /message\.getClientRects\(\)\.length > 0/);
   assert.match(source, /viewport\?\.pageTop \?\? window\.scrollY/);
   assert.match(source, /viewport\?\.height \?\? window\.innerHeight/);
-  assert.match(source, /shouldFollowMessageTail\(state\.followMessageTail, metrics\)/);
+  assert.match(source, /shouldFollowMessageTail\(state\.followMessageTail\)/);
+  assert.doesNotMatch(
+    source,
+    /state\.expandedTurnIds\.add\(`\$\{thread\.id\}:\$\{messageView\.anchorTurnKey\}`\)/,
+  );
   const restoreView = source.slice(
     source.indexOf("function restoreMessageView"),
     source.indexOf("async function openThread"),
@@ -1158,6 +1250,7 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
   assert.match(restoreView, /view\.intentVersion !== messageScrollIntentVersion/);
   assert.match(restoreView, /if \(view\.atBottom\)[\s\S]*?scrollMessagesToBottom\("auto"\)/);
   assert.doesNotMatch(restoreView, /else setMessageScrollTop\(view\.top\)/);
+  assert.match(restoreView, /setMessageScrollTop\(view\.top\)/);
   const reconcile = source.slice(
     source.indexOf("function reconcileMessageNodes"),
     source.indexOf("function pendingNode"),
@@ -1260,12 +1353,45 @@ test("streaming tool disclosure survives snapshot host changes", async () => {
   assert.match(specification, /preserve a visible message\/turn anchor/);
 });
 
-test("mobile tail following survives layout growth until the user scrolls away", () => {
+test("tail following requires explicit reader intent and resumes only after reaching bottom", () => {
   assert.equal(messageBottomDistance({ top: 900, height: 1500, client: 600 }), 0);
   assert.equal(messageBottomDistance({ top: 650, height: 1500, client: 600 }), 250);
-  assert.equal(shouldFollowMessageTail(false, { top: 850, height: 1500, client: 600 }), true);
-  assert.equal(shouldFollowMessageTail(false, { top: 650, height: 1500, client: 600 }), false);
-  assert.equal(shouldFollowMessageTail(true, { top: 100, height: 1500, client: 600 }), true);
+  assert.equal(messageBottomScrollTop({ height: 1500, client: 600 }), 900);
+  assert.equal(messageBottomScrollTop({ height: 300, client: 600 }), 0);
+  assert.equal(shouldFollowMessageTail(false), false);
+  assert.equal(shouldFollowMessageTail(true), true);
+  assert.equal(shouldResumeMessageTail(900, { top: 899, height: 1500, client: 600 }), false);
+  assert.equal(shouldResumeMessageTail(850, { top: 900, height: 1500, client: 600 }), true);
+  assert.equal(shouldResumeMessageTail(850, { top: 890, height: 1500, client: 600 }), false);
+  assert.equal(shouldResumeMessageTail(850, { top: 897, height: 1500, client: 600 }), false);
+});
+
+test("mobile tail lock targets the message area, not the composer-expanded document", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const metrics = source.slice(
+    source.indexOf("function messageScrollMetrics"),
+    source.indexOf("function setMessageScrollTop"),
+  );
+  assert.match(metrics, /height: root\.getBoundingClientRect\(\)\.bottom \+ window\.scrollY/);
+  assert.doesNotMatch(metrics, /document\.documentElement\.scrollHeight/);
+  assert.match(source, /setMessageScrollTop\(messageBottomScrollTop\(messageScrollMetrics\(\)\)/);
+});
+
+test("user scroll intent supersedes tail lock before live content arrives", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const scrollHandler = source.slice(
+    source.indexOf("const handleMessageScroll ="),
+    source.indexOf('$("messages").onscroll = handleMessageScroll'),
+  );
+  assert.match(
+    scrollHandler,
+    /shouldResumeMessageTail\(messageInteractionStartTop, messageScrollMetrics\(\)\)/,
+  );
+  assert.match(
+    scrollHandler,
+    /state\.followMessageTail = true;[\s\S]*settleMessageInteraction\(\)/,
+  );
+  assert.doesNotMatch(source, /messageBottomDistance\(messageScrollMetrics\(\)\) < 100/);
 });
 
 test("the real scroll owner changes for mobile history fullscreen", () => {
@@ -1638,19 +1764,37 @@ test("completed turns collapse by server turn id and preserve the full expansion
   );
   assert.match(layout, /message\.turn_id/);
   assert.match(layout, /state\.expandedTurnIds/);
-  assert.match(layout, /preserveMessageElementPosition\(finalNode/);
-  assert.match(layout, /foldBlock\.replaceChildren\(fold, divider, tokenUsage\)/);
-  assert.match(layout, /\.\.\.leading,[\s\S]*foldBlock,[\s\S]*finalNode/);
+  assert.match(layout, /captureMessageElementPosition\(fold\)/);
+  assert.match(layout, /restorePosition\(revealed \|\| fold\)/);
+  assert.match(layout, /foldBlock\.replaceChildren\(fold, divider\)/);
+  assert.match(layout, /const usageHost = turnUsageHost\(userNodes, expanded\)/);
+  assert.match(layout, /usageHost\.append\(tokenUsage\)/);
+  assert.match(layout, /!expanded && userNodes\.length > 1/);
+  assert.match(layout, /reconcileChildren\(stack, userNodes\)/);
+  assert.match(
+    layout,
+    /orderedTurnChildren\(messageNodes, userNodes, foldBlock, stack, expanded\)/,
+  );
+  assert.match(
+    layout,
+    /node\.style\.setProperty\("--turn-stack-depth", String\(userNodes\.length - index\)\)/,
+  );
   assert.match(layout, /turnSummaryText\(group\)/);
   assert.match(layout, /usage = turnUsageItem\(group\)/);
   assert.match(layout, /turnTokenUsageText\(usage\)/);
+  assert.match(layout, /const usageText = usage \? turnTokenUsageText\(usage\) : ""/);
+  assert.match(layout, /tokenUsage\.textContent = usageText/);
+  assert.match(layout, /tokenUsage\.title = usageText/);
   assert.match(layout, /querySelectorAll\("\.turn-token-usage"\)/);
   assert.doesNotMatch(layout, /latestTool/);
   assert.doesNotMatch(layout, /toolIconClass/);
   const stylesheet = await readFile(stylesheetPath, "utf8");
-  assert.match(stylesheet, /\.turn-fold::before\s*\{/);
-  assert.doesNotMatch(stylesheet, /\.turn-fold::after\s*\{/);
-  assert.doesNotMatch(stylesheet, /\.turn-group\.expanded \.turn-fold::before\s*\{[^}]*margin-/s);
+  assert.match(stylesheet, /\.turn-fold::after\s*\{[^}]*transform:\s*rotate\(-45deg\)/s);
+  assert.match(
+    stylesheet,
+    /\.turn-group\.expanded \.turn-fold::after\s*\{[^}]*transform:\s*rotate\(45deg\)/s,
+  );
+  assert.doesNotMatch(stylesheet, /\.turn-fold::before\s*\{/);
   assert.match(stylesheet, /\.turn-fold\s*\{[^}]*width:\s*fit-content;[^}]*justify-self:\s*start/s);
   assert.match(
     stylesheet,
@@ -1658,30 +1802,96 @@ test("completed turns collapse by server turn id and preserve the full expansion
   );
   assert.match(
     stylesheet,
-    /\.turn-fold-block\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) max-content;/s,
+    /\.turn-fold-block\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/s,
   );
   assert.match(
     stylesheet,
-    /\.turn-fold-usage\s*\{[^}]*grid-column:\s*2;[^}]*max-width:\s*none;[^}]*overflow:\s*visible;[^}]*text-align:\s*right;[^}]*text-overflow:\s*clip/s,
+    /\.turn-fold-usage\s*\{[^}]*grid-row:\s*1;[^}]*justify-self:\s*end;[^}]*max-width:\s*100%;[^}]*overflow:\s*hidden;[^}]*text-align:\s*right;[^}]*text-overflow:\s*ellipsis/s,
   );
   assert.match(
     stylesheet,
-    /\.turn-fold:hover \+ \.turn-divider\s*\{[^}]*border-top-color:[^}]*box-shadow:/s,
+    /\.turn-fold\s*\{[^}]*grid-row:\s*2;[^}]*color:\s*color-mix\(in srgb, var\(--muted\) 82%, var\(--panel\)\);[^}]*font-size:\s*var\(--message-disclosure-font-size\);[^}]*font-weight:\s*400;/s,
   );
   assert.match(
     stylesheet,
-    /\.turn-group\.collapsed > \.turn-fold-block > \.turn-fold\s*\{[^}]*font-weight:\s*700;/s,
+    /\.turn-fold-usage\s*\{[^}]*border-radius:\s*0 0 18px 18px;[^}]*background:\s*var\(--queue-bg\);[^}]*color:\s*var\(--queue-text\);/s,
+  );
+  assert.match(stylesheet, /\.turn-fold-usage\[hidden\]\s*\{[^}]*display:\s*none;/s);
+  assert.match(
+    stylesheet,
+    /\.turn-prompt-stack > \.message\.user\.has-turn-usage,\s*\.turn-group:is\(\.collapsed, \.expanded\) > \.message\.user\.has-turn-usage\s*\{[^}]*padding:\s*0;[^}]*background:\s*var\(--queue-bg\);/s,
   );
   assert.match(
     stylesheet,
-    /\.turn-group\.collapsed > \.turn-fold-block > \.turn-divider\s*\{[^}]*border-top-width:\s*1px;[^}]*box-shadow:/s,
+    /\.message\.user\.has-turn-usage > \.message-body\s*\{[^}]*border-radius:\s*21px;[^}]*background:\s*var\(--user-bg\);/s,
   );
   assert.match(
     stylesheet,
-    /@media \(max-width: 800px\)[\s\S]*\.turn-fold-usage\s*\{[^}]*grid-row:\s*2;[^}]*justify-self:\s*start;[^}]*margin:\s*0 2px 6px 18px[\s\S]*\.turn-fold-block > \.turn-divider\s*\{[^}]*grid-row:\s*3/s,
+    /\.message\.user\.has-turn-usage > \.turn-fold-usage\s*\{[^}]*width:\s*100%;[^}]*margin:\s*-8px 0 0;[^}]*white-space:\s*normal;/s,
   );
+  assert.match(
+    stylesheet,
+    /\.turn-prompt-stack\s*\{[^}]*width:\s*max-content;[^}]*max-width:\s*82%;[^}]*margin:\s*0 0 8px auto;/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-prompt-stack > \.message\.user\s*\{[^}]*width:\s*100%;[^}]*box-shadow:\s*0 3px 8px/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-prompt-stack > \.message\.user\s*\{[^}]*z-index:\s*var\(--turn-stack-depth, 0\);/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-prompt-stack > \.message\.user \+ \.message\.user\s*\{[^}]*margin-top:\s*-8px;[^}]*border-radius:\s*0 0 21px 21px;/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-prompt-stack > \.message\.user \+ \.message\.user::before\s*\{[^}]*top:\s*-16px;[^}]*height:\s*24px;[^}]*background:\s*var\(--user-bg\);/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-prompt-stack > \.message\.user \+ \.message\.user\.has-turn-usage > \.message-body\s*\{[^}]*border-radius:\s*0 0 21px 21px;/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.message\.user\.has-turn-usage > \.message-body\s*\{[^}]*box-shadow:\s*0 3px 8px/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-group:is\(\.collapsed, \.expanded\) > article\[class~="user"\]\s*\{[^}]*z-index:\s*1;[^}]*margin-bottom:\s*8px;/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.turn-divider\s*\{[^}]*width:\s*66\.6667%;[^}]*height:\s*1px;[^}]*margin:\s*0 auto 18px;[^}]*background:\s*linear-gradient\(90deg, var\(--panel\), var\(--line\) 22%, var\(--line\) 78%, var\(--panel\)\);/s,
+  );
+  assert.match(stylesheet, /\.turn-divider\s*\{[^}]*grid-row:\s*3;/s);
   assert.match(source, /command: "turn_messages"/);
   assert.match(source, /await hydrateTurn\(group\.turnId\)/);
+});
+
+test("message disclosure labels share the running tool type scale", async () => {
+  const stylesheet = await readFile(stylesheetPath, "utf8");
+  for (const selector of [
+    ".turn-fold",
+    ".message-detail-toggle",
+    ".memory-citations summary",
+    ".context-block summary",
+    ".tool-group > summary",
+    ".tool-call > summary",
+  ]) {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    assert.match(
+      stylesheet,
+      new RegExp(`${escaped}\\s*\\{[^}]*font-size:\\s*var\\(--message-disclosure-font-size\\);`),
+    );
+    assert.match(
+      stylesheet,
+      new RegExp(
+        `${escaped}\\s*\\{[^}]*line-height:\\s*var\\(--message-disclosure-line-height\\);`,
+      ),
+    );
+  }
 });
 
 test("Tools can collapse every expanded message in the current session", async () => {
@@ -1763,7 +1973,7 @@ test("initial session loading does not wait for an animation frame", async () =>
   assert.doesNotMatch(yieldBody, /requestAnimationFrame/);
 });
 
-test("token usage joins the turn fold while memory stays on the final response", async () => {
+test("token usage stacks beneath the user prompt while memory stays on the final response", async () => {
   assert.deepEqual(
     memoryCitationModel([
       { source: "MEMORY.md:12-18", note: "first" },
@@ -1788,11 +1998,26 @@ test("token usage joins the turn fold while memory stays on the final response",
   assert.match(render, /for \(const item of usageItems\)[\s\S]*memoryCitationNode\(memoryItems\)/);
   assert.match(source, /node\.classList\.add\("turn-token-usage"\)/);
   assert.match(source, /text\.append\(label\)/);
-  assert.match(source, /foldBlock\.replaceChildren\(fold, divider, tokenUsage\)/);
+  assert.match(source, /foldBlock\.replaceChildren\(fold, divider\)/);
+  assert.match(source, /usageHost\.append\(tokenUsage\)/);
   assert.match(source, /activity\.turn_token_usage/);
   assert.match(source, /turn-live-usage/);
   assert.match(source, /liveTurnTokenUsageText\(usage\)/);
   assert.match(source, /hitRate: cacheHitPercent\(item\)\.toFixed\(0\)/);
+  const [stylesheet, translations] = await Promise.all([
+    readFile(stylesheetPath, "utf8"),
+    readFile(new URL("../src/i18n.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(
+    stylesheet,
+    /\.tool-group-summary\.running \.tool-summary-label,\s*\.turn-live-usage\s*\{[^}]*animation:\s*tool-summary-shimmer/s,
+  );
+  assert.match(
+    stylesheet,
+    /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.tool-group-summary\.running \.tool-summary-label,\s*\.turn-live-usage\s*\{[^}]*animation:\s*none/s,
+  );
+  assert.match(translations, /liveTurnTokenUsage: "\{total\} tokens · \{hitRate\}% cached"/);
+  assert.match(translations, /liveTurnTokenUsage: "\{total\} Token · 缓存 \{hitRate\}%"/);
 });
 
 test("message copy follows text before tools and completion metadata", async () => {
@@ -1806,7 +2031,7 @@ test("message copy follows text before tools and completion metadata", async () 
     render,
     /for \(const item of ordinaryItems\)[\s\S]*copy = copyText \? messageCopyButton\(copyText\) : null,[\s\S]*tools = toolGroupNode\(m,[\s\S]*toolRow\.appendChild\(tools\)[\s\S]*toolRow\.appendChild\(copy\)[\s\S]*usageItems/,
   );
-  const copyStyle = stylesheet.match(/\.message-copy\s*\{[^}]*\}/s)?.[0] || "";
+  const copyStyle = stylesheet.match(/(?:^|\n)\.message-copy\s*\{[^}]*\}/s)?.[0] || "";
   assert.match(copyStyle, /position:\s*absolute/);
   assert.match(copyStyle, /right:\s*0/);
   assert.match(stylesheet, /\.message\.user \.message-body\s*\{[^}]*padding:\s*0 28px 0 0/s);
@@ -1818,6 +2043,10 @@ test("message copy follows text before tools and completion metadata", async () 
   assert.match(
     stylesheet,
     /\.message\.user \.message-copy\s*\{[^}]*right:\s*-8px;[^}]*bottom:\s*0/s,
+  );
+  assert.match(
+    stylesheet,
+    /\.message\.user\.has-turn-usage > \.message-body > \.message-copy\s*\{[^}]*right:\s*8px;/s,
   );
 });
 
@@ -1885,6 +2114,64 @@ test("context compaction renders as a persistent special message", async () => {
   assert.match(source, /visibleLeadingNodes/);
   assert.match(stylesheet, /\.context-compaction-notice/);
   assert.match(translations, /contextCompactionComplete:\s*"上下文已压缩"/);
+});
+
+test("composer command picker receives skills and starts compaction in the demo", async () => {
+  const command = await demoClient();
+  const skills = result(command({ command: "skills_list", thread_id: "demo-thread-web-ui" }));
+  assert.equal(skills.skills[0].name, "demo");
+  const compact = result(command({ command: "thread_compact", thread_id: "demo-thread-web-ui" }));
+  assert.equal(compact.status, "started");
+});
+
+test("computer-use tool output exposes its latest inline screenshot", () => {
+  const first = "data:image/png;base64,YQ==";
+  const latest = "data:image/jpeg;base64,Yg==";
+  const output = {
+    result: {
+      contentItems: [
+        { type: "image", mimeType: "image/png", data: "YQ==" },
+        { output: JSON.stringify({ image_url: latest }) },
+      ],
+    },
+  };
+  assert.deepEqual(toolOutputImageUrls(output), [first, latest]);
+  assert.equal(toolOutputImageUrl(output), latest);
+  assert.equal(
+    toolOutputImageUrl({
+      content: [{ type: "image", mimeType: "image/png", data: "YQ==" }, { image_url: latest }],
+    }),
+    latest,
+  );
+  assert.equal(toolOutputImageUrl(JSON.stringify({ output: { image_url: first } })), first);
+  assert.equal(toolOutputImageUrl({ image_url: "https://example.com/tracker.png" }), null);
+});
+
+test("live demo exposes a computer-use screenshot while its turn is active", async () => {
+  const command = await demoClient(),
+    threadId = "demo-thread-web-ui";
+  result(command({ command: "send", thread_id: threadId, text: "Take a screenshot" }));
+  for (let poll = 0; poll < 4; poll++) result(command({ command: "pending_messages" }));
+  for (let poll = 0; poll < 18; poll++)
+    result(command({ command: "thread_activity", thread_id: threadId }));
+  const page = result(command({ command: "messages", thread_id: threadId, limit: 30 }));
+  const message = page.messages.findLast((entry) =>
+    entry.tools?.some((tool) => tool.name === "mcp__cua_repl__js" && tool.has_image),
+  );
+  assert.ok(message);
+  const detail = result(
+    command({
+      command: "tool_content",
+      thread_id: threadId,
+      message_index: message.message_index,
+      tool_index: 0,
+    }),
+  );
+  assert.equal(toolOutputImageUrls(detail.tool.output).length, 2);
+  assert.match(toolOutputImageUrl(detail.tool.output), /^data:image\/png;base64,/);
+  const source = await readFile(mainScriptPath, "utf8");
+  assert.match(source, /list\.appendChild\(toolCallImagesNode\(imageTool, threadId\)\)/);
+  assert.match(source, /toolImageGalleryNode\(/);
 });
 
 test("session writer ownership drives read-only UI and explicit release", async () => {
