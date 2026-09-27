@@ -17,6 +17,9 @@ const sceneScript = `<script>
 addEventListener("load", () => {
   const scene = new URLSearchParams(location.search).get("scene");
   if (!scene || scene === "overview") return;
+  const still = document.createElement("style");
+  still.textContent = "*,*::before,*::after{transition-duration:0s!important;animation-duration:0s!important}";
+  document.head.append(still);
   const timer = setInterval(() => {
     if (!document.querySelector(".turn-prompt-stack")) return;
     clearInterval(timer);
