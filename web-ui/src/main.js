@@ -3331,25 +3331,15 @@ function toolImageGalleryNode(tools, threadId, galleryKey) {
   const gallery = document.createElement("div"),
     frame = document.createElement("figure"),
     status = document.createElement("span"),
-    choose = document.createElement("button"),
     thumbnails = document.createElement("div");
   gallery.className = "tool-image-preview-list";
   frame.className = "tool-image-preview";
   status.className = "tool-image-preview-status";
   status.textContent = tr("loading");
   frame.appendChild(status);
-  choose.type = "button";
-  choose.className = "tool-image-choose";
-  choose.hidden = true;
   thumbnails.className = "tool-image-thumbnails";
   thumbnails.hidden = true;
-  choose.onclick = () => {
-    thumbnails.hidden = !thumbnails.hidden;
-    choose.setAttribute("aria-expanded", String(!thumbnails.hidden));
-    const saved = toolImageGalleryState.get(galleryKey) || {};
-    toolImageGalleryState.set(galleryKey, { ...saved, open: !thumbnails.hidden });
-  };
-  gallery.append(frame, choose, thumbnails);
+  gallery.append(frame, thumbnails);
   Promise.allSettled(tools.map((tool) => toolImagePreviews(tool, threadId)))
     .then((results) => {
       if (!gallery.isConnected) return;
@@ -3387,12 +3377,7 @@ function toolImageGalleryNode(tools, threadId, galleryKey) {
       });
       const saved = toolImageGalleryState.get(galleryKey) || {};
       select(Math.min(saved.selected ?? images.length - 1, images.length - 1));
-      if (images.length > 1) {
-        choose.textContent = tr("chooseToolImage", { count: images.length });
-        choose.hidden = false;
-        thumbnails.hidden = !saved.open;
-        choose.setAttribute("aria-expanded", String(Boolean(saved.open)));
-      }
+      thumbnails.hidden = images.length <= 1;
       if (toolImageGalleryState.size > 100)
         toolImageGalleryState.delete(toolImageGalleryState.keys().next().value);
     })
@@ -4045,7 +4030,7 @@ function layoutTurnGroup(section, group, messageNodes, completed) {
   if (stack) {
     stack.className = "turn-prompt-stack";
     for (const [index, node] of userNodes.entries())
-      node.style.setProperty("--turn-stack-depth", String(userNodes.length - index));
+      node.style.setProperty("--turn-stack-depth", String(index + 1));
     reconcileChildren(stack, userNodes);
   } else {
     for (const node of userNodes) node.style.removeProperty("--turn-stack-depth");

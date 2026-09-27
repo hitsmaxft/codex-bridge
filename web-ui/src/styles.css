@@ -1632,18 +1632,21 @@ main.history-fullscreen .fullscreen-exit-icon {
   margin: 0;
   box-shadow: 0 3px 8px color-mix(in srgb, #000 18%, transparent);
 }
-.turn-prompt-stack > .message.user + .message.user {
-  margin-top: -8px;
-  border-radius: 0 0 21px 21px;
+.turn-prompt-stack > .message.user:not(:last-child) {
+  border-radius: 21px 21px 0 0;
 }
-.turn-prompt-stack > .message.user + .message.user::before {
+.turn-prompt-stack > .message.user:not(:last-child)::after {
   position: absolute;
-  top: -16px;
+  top: calc(100% - 8px);
   right: 0;
   left: 0;
   height: 24px;
   background: var(--user-bg);
   content: "";
+}
+.turn-prompt-stack > .message.user + .message.user {
+  margin-top: -8px;
+  box-shadow: 0 -3px 8px color-mix(in srgb, #000 18%, transparent);
 }
 .turn-prompt-stack > .message.user.has-turn-usage,
 .turn-group:is(.collapsed, .expanded) > .message.user.has-turn-usage {
@@ -1654,9 +1657,6 @@ main.history-fullscreen .fullscreen-exit-icon {
 .turn-prompt-stack > .message.user.has-turn-usage {
   box-shadow: none;
 }
-.turn-prompt-stack > .message.user + .message.user.has-turn-usage {
-  border-radius: 0 0 18px 18px;
-}
 .message.user.has-turn-usage > .message-body {
   z-index: 1;
   padding: 10px 44px 10px 16px;
@@ -1665,7 +1665,9 @@ main.history-fullscreen .fullscreen-exit-icon {
   box-shadow: 0 3px 8px color-mix(in srgb, #000 18%, transparent);
 }
 .turn-prompt-stack > .message.user + .message.user.has-turn-usage > .message-body {
-  border-radius: 0 0 21px 21px;
+  box-shadow:
+    0 -3px 8px color-mix(in srgb, #000 18%, transparent),
+    0 3px 8px color-mix(in srgb, #000 18%, transparent);
 }
 .message.user.has-turn-usage > .turn-fold-usage {
   position: relative;
@@ -2596,15 +2598,6 @@ main.history-fullscreen .fullscreen-exit-icon {
   width: 100%;
   height: 100%;
   object-fit: contain;
-}
-.tool-image-choose {
-  justify-self: start;
-  padding: 4px 10px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--panel);
-  color: var(--muted);
-  cursor: pointer;
 }
 .tool-image-thumbnails {
   display: flex;

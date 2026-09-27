@@ -203,6 +203,14 @@
         gap: 10px;
         margin-top: 30px;
       }
+      .demo-gallery-link {
+        margin: 16px 0 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .demo-gallery-link a {
+        text-underline-offset: 3px;
+      }
       .button {
         display: inline-flex;
         align-items: center;
@@ -999,6 +1007,12 @@
               ><span class="en">View source</span> ↗</a
             >
           </div>
+          <p class="demo-gallery-link zh">
+            <a href="demo/gallery.html">查看 Demo 页面截图 →</a>
+          </p>
+          <p class="demo-gallery-link en">
+            <a href="demo/gallery.html">Browse demo views →</a>
+          </p>
         </div>
         <div class="product" aria-label="CLI and mobile Web UI preview">
           <div class="desktop">
@@ -1220,48 +1234,46 @@
         <div class="release">
           <div class="release-date">
             2026-09-27
-            <span class="zh">v0.3.7 正式版</span
-            ><span class="en">v0.3.7 release</span>
+            <span class="zh">v0.3.8 正式版</span
+            ><span class="en">v0.3.8 release</span>
           </div>
           <div class="release-list">
             <article class="release-item">
               <h3>
-                <span class="zh">更紧凑的辅助信息</span
-                ><span class="en">Tighter conversation spacing</span>
+                <span class="zh">图片缩略图</span
+                ><span class="en">Image thumbnails</span>
+              </h3>
+              <p class="zh">多张 computer use 截图可直接从预览下方切换。</p>
+              <p class="en">
+                Select computer-use screenshots directly below the preview.
+              </p>
+            </article>
+            <article class="release-item">
+              <h3>
+                <span class="zh">Steer 卡片</span
+                ><span class="en">Steer cards</span>
               </h3>
               <p class="zh">
-                上下文压缩、工具活动与折叠控件和正文之间的空白更自然。
+                折叠后的多条后续消息按时间顺序叠放，后发消息在上层。
               </p>
               <p class="en">
-                Context compaction, tool activity, and turn controls now sit
-                closer to the surrounding text.
-              </p>
-            </article>
-            <article class="release-item">
-              <h3>
-                <span class="zh">工具活动</span
-                ><span class="en">Tool activity</span>
-              </h3>
-              <p class="zh">仅含工具的消息去掉多余的顶部与底部间距。</p>
-              <p class="en">
-                Tool-only messages no longer carry extra space above and below
-                the activity label.
+                Collapsed follow-up messages stack with later cards in front.
               </p>
             </article>
             <article class="release-item">
               <h3>
-                <span class="zh">Turn 折叠</span
-                ><span class="en">Turn controls</span>
+                <span class="zh">Token 用量</span
+                ><span class="en">Token usage</span>
               </h3>
-              <p class="zh">折叠控件和分隔线更贴近相邻消息。</p>
+              <p class="zh">用量卡片与最后一条消息保持连续、等宽的衔接。</p>
               <p class="en">
-                Turn controls and their divider sit closer to nearby messages.
+                The token card joins the last message without a visible gap.
               </p>
             </article>
           </div>
         </div>
         <div class="release-history">
-          <a href="releases/v0.3.7.md">
+          <a href="releases/v0.3.8.md">
             <span
               ><span class="zh">查看完整发布说明</span
               ><span class="en">Read the complete release notes</span></span

@@ -30,12 +30,14 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.7 · 2026-09-27
+### v0.3.8 · 2026-09-27
 
-- **Conversation spacing:** context compaction, tool activity, and turn controls sit closer to
-  the surrounding text without changing normal answer paragraph spacing.
+- **Computer-use images:** multiple screenshots can be selected directly from thumbnails beneath
+  the preview.
+- **Steer cards:** collapsed follow-up messages stack with later cards in front, and token usage
+  joins the last card cleanly.
 
-See the [latest release notes](docs/releases/v0.3.7.md) or the
+See the [latest release notes](docs/releases/v0.3.8.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI

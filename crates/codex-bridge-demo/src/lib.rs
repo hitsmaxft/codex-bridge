@@ -591,6 +591,46 @@ fn seed_messages() -> Vec<Value> {
                 "file_count": null
             }],
         }),
+        json!({
+            "timestamp": "2026-09-07T06:32:01.000Z",
+            "id": "demo-user-stack-1",
+            "turn_id": "demo-turn-seed-3",
+            "role": "user",
+            "phase": null,
+            "category": "user",
+            "content": [{"kind": "text", "text": "Show computer-use screenshots in each tool result."}],
+            "tools": [],
+        }),
+        json!({
+            "timestamp": "2026-09-07T06:32:02.000Z",
+            "id": "demo-user-stack-2",
+            "turn_id": "demo-turn-seed-3",
+            "role": "user",
+            "phase": null,
+            "category": "user",
+            "content": [{"kind": "text", "text": "Let me choose among all screenshots below the preview."}],
+            "tools": [],
+        }),
+        json!({
+            "timestamp": "2026-09-07T06:32:03.000Z",
+            "id": "demo-user-stack-3",
+            "turn_id": "demo-turn-seed-3",
+            "role": "user",
+            "phase": null,
+            "category": "user",
+            "content": [{"kind": "text", "text": "Make the latest steer card cover the earlier cards."}],
+            "tools": [],
+        }),
+        json!({
+            "timestamp": "2026-09-07T06:32:04.000Z",
+            "id": "demo-assistant-stack-4",
+            "turn_id": "demo-turn-seed-3",
+            "role": "assistant",
+            "phase": "final_answer",
+            "category": "assistant",
+            "content": [{"kind": "text", "text": "The preview now shows every screenshot, and steer cards stack in message order."}, {"kind": "turn_usage", "total_tokens": 1632, "input_tokens": 1248, "cached_input_tokens": 312, "output_tokens": 384}],
+            "tools": [],
+        }),
     ]
 }
 
@@ -899,15 +939,15 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 "tool_source": "demo_wasm",
                 "repair_required": false,
                 "statistics": {
-                    "turns": 2,
-                    "completed_turns": 1,
+                    "turns": 3,
+                    "completed_turns": 3,
                     "cancelled_turns": 0,
-                    "tool_calls": 2,
-                    "total_duration_ms": 42000,
-                    "total_tokens": 12840,
-                    "input_tokens": 11200,
-                    "cached_input_tokens": 7300,
-                    "output_tokens": 1640
+                    "tool_calls": 3,
+                    "total_duration_ms": 45000,
+                    "total_tokens": 14472,
+                    "input_tokens": 12448,
+                    "cached_input_tokens": 7612,
+                    "output_tokens": 2024
                 },
                 "thread": state.thread(thread_id),
                 "messages": messages,
@@ -1462,13 +1502,14 @@ mod tests {
     #[test]
     fn messages_have_exact_page_indices() {
         let mut state = DemoState::new();
+        let total = state.messages.len();
         let response = dispatch(
             json!({"command": "messages", "thread_id": PRIMARY_THREAD, "limit": 2}),
             &mut state,
         );
-        assert_eq!(response["result"]["page"]["start"], 3);
-        assert_eq!(response["result"]["page"]["end"], 5);
-        assert_eq!(response["result"]["messages"][0]["message_index"], 3);
+        assert_eq!(response["result"]["page"]["start"], total - 2);
+        assert_eq!(response["result"]["page"]["end"], total);
+        assert_eq!(response["result"]["messages"][0]["message_index"], total - 2);
     }
 
     #[test]

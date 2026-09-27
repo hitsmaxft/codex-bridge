@@ -38,7 +38,7 @@ jobs:
         run: |
           rustup target add wasm32-unknown-unknown
           CARGO_INCREMENTAL=0 cargo test --locked -p codex-bridge-demo
-          cargo build --locked --release --target wasm32-unknown-unknown -p codex-bridge-demo
+          CARGO_INCREMENTAL=0 cargo build --locked --release --target wasm32-unknown-unknown -p codex-bridge-demo
           npm --prefix web-ui run test:demo-wasm
       - name: Build Pages site and interactive demo
         run: |
@@ -49,6 +49,19 @@ jobs:
             --base /codex-bridge/demo/ --outDir ../_site/demo
           test -s _site/demo/codex_bridge_demo.wasm
           grep -q "assets/app.js" _site/demo/index.html
+      - name: Generate UI demo images
+        run: |
+          node web-ui/scripts/generate-demo-images.mjs _site/demo
+          test -s _site/demo/images/overview.png
+          test -s _site/demo/images/steer-stack.png
+          test -s _site/demo/images/tools.png
+          test -s _site/demo/images/commands.png
+          test -s _site/demo/gallery.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-demo-images
+          path: _site/demo/images
+          if-no-files-found: error
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
