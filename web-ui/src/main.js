@@ -18,8 +18,16 @@ import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18
 import { MAX_PASTED_TEXT_BYTES, shouldAttachPastedText } from "./large-paste.js";
 import { markdownNode } from "./markdown.js";
 import { memoryCitationModel } from "./memory-citations.js";
-import { shouldCollapseAssistantOutput, toolFileList } from "./message-presentation.js";
-import { pendingInputSummary, reconcilePendingMessages } from "./pending-state.js";
+import {
+  shouldCollapseAssistantOutput,
+  shouldCollapseUserMessage,
+  toolFileList,
+} from "./message-presentation.js";
+import {
+  mergePendingSnapshot,
+  pendingInputSummary,
+  reconcilePendingMessages,
+} from "./pending-state.js";
 import {
   browserNotificationState,
   disableBrowserNotifications,
@@ -4075,15 +4083,16 @@ function messageNode(
     ),
     usageItems = content.filter((item) => item.kind === "turn_usage"),
     memoryItems = content.filter((item) => item.kind === "memory_citation");
-  const assistantOutput = m.role === "assistant" ? document.createElement("div") : body;
-  if (m.role === "assistant") {
-    assistantOutput.className = "assistant-output collapse-candidate";
-    body.appendChild(assistantOutput);
+  const collapsibleRole = m.role === "assistant" || m.role === "user",
+    messageOutput = collapsibleRole ? document.createElement("div") : body;
+  if (collapsibleRole) {
+    messageOutput.className = `${m.role}-output collapse-candidate`;
+    body.appendChild(messageOutput);
   }
-  for (const item of ordinaryItems) assistantOutput.appendChild(contentNode(item, threadId));
-  if (m.role === "assistant" && ordinaryItems.length) {
+  for (const item of ordinaryItems) messageOutput.appendChild(contentNode(item, threadId));
+  if (collapsibleRole && ordinaryItems.length) {
     const toggle = document.createElement("button"),
-      expansionKey = `${threadId || ""}:${m.message_index}`;
+      expansionKey = `${threadId || ""}:${m.role === "user" ? messageIdentity(m) : m.message_index}`;
     toggle.type = "button";
     toggle.className = "message-detail-toggle";
     toggle.hidden = true;
@@ -4093,7 +4102,7 @@ function messageNode(
       preserveMessageElementPosition(anchor, () => {
         if (expanded) state.expandedLongMessageIds.delete(expansionKey);
         else state.expandedLongMessageIds.add(expansionKey);
-        syncLongAssistantMessage(box);
+        syncLongMessage(box);
       });
     };
     body.appendChild(toggle);
@@ -4146,18 +4155,34 @@ function messageNode(
   return box;
 }
 
-function syncLongAssistantMessage(message) {
-  const output = message.querySelector(":scope > .message-body > .assistant-output"),
+function syncLongMessage(message) {
+  const output = message.querySelector(
+      ":scope > .message-body > .assistant-output, :scope > .message-body > .user-output",
+    ),
     toggle = message.querySelector(":scope > .message-body > .message-detail-toggle"),
     key = message.dataset.longMessageKey;
   if (!output || !toggle || !key) return;
-  const long = shouldCollapseAssistantOutput(output.scrollHeight, messageScrollMetrics().client),
+  const userMessage = output.classList.contains("user-output"),
+    long = userMessage
+      ? shouldCollapseUserMessage(
+          output.scrollHeight,
+          parseFloat(getComputedStyle(output).lineHeight),
+        )
+      : shouldCollapseAssistantOutput(output.scrollHeight, messageScrollMetrics().client),
     expanded = long && state.expandedLongMessageIds.has(key);
   output.classList.toggle("collapsible", long);
   output.classList.toggle("expanded", expanded);
   output.classList.remove("collapse-candidate");
   toggle.hidden = !long;
-  const label = tr(expanded ? "collapseMessageDetails" : "expandMessageDetails");
+  const label = tr(
+    userMessage
+      ? expanded
+        ? "collapseUserMessage"
+        : "expandUserMessage"
+      : expanded
+        ? "collapseMessageDetails"
+        : "expandMessageDetails",
+  );
   // This function is called from the message MutationObserver. Replacing the
   // text node unconditionally would trigger that observer again forever and
   // lock the browser main thread immediately after the first message page.
@@ -4165,9 +4190,9 @@ function syncLongAssistantMessage(message) {
   toggle.setAttribute("aria-expanded", String(expanded));
 }
 
-function syncLongAssistantMessages(root = $("messages")) {
+function syncLongMessages(root = $("messages")) {
   for (const message of root.querySelectorAll(".message[data-long-message-key]"))
-    syncLongAssistantMessage(message);
+    syncLongMessage(message);
 }
 
 function loadedToolDetails(root) {
@@ -4307,7 +4332,7 @@ function reconcileMessageNodes(root, response) {
     cursor.remove();
     cursor = next;
   }
-  requestAnimationFrame(() => syncLongAssistantMessages(root));
+  requestAnimationFrame(() => syncLongMessages(root));
 }
 
 function liveToolActivityNode(root = $("messages")) {
@@ -4384,7 +4409,9 @@ function pendingNode(entry) {
   body.className = "message-body";
   body.appendChild(markdownNode(entry.text, markdownOptions(entry.thread_id || state.current?.id)));
   const meta = document.createElement("div"),
-    busy = !["queued", "failed"].includes(entry.status);
+    withdrawable =
+      entry.status === "failed" ||
+      (entry.status === "queued" && ["app_server_queue", "demo_wasm"].includes(entry.source));
   meta.className = "outbox-meta";
   if (entry.handoff) {
     const status = document.createElement("div");
@@ -4399,6 +4426,22 @@ function pendingNode(entry) {
       popover = document.createElement("div");
     mode.className = "outbox-mode";
     mode.textContent = tr(entry.action === "steer" ? "followUp" : "queue");
+    meta.appendChild(mode);
+    if (!withdrawable) {
+      const status = document.createElement("span");
+      status.className = "outbox-status";
+      status.textContent = tr(
+        entry.status === "accepted"
+          ? "sentCannotWithdraw"
+          : entry.status === "queued"
+            ? "queuedRecovering"
+            : "submittingToServer",
+      );
+      status.title = status.textContent;
+      meta.appendChild(status);
+      box.append(meta, body);
+      return box;
+    }
     menu.className = "outbox-menu";
     summary.textContent = "•••";
     summary.title = tr("pendingMenu");
@@ -4408,8 +4451,7 @@ function pendingNode(entry) {
     remove.className = "outbox-delete";
     remove.type = "button";
     remove.textContent = tr("withdraw");
-    remove.disabled = busy;
-    remove.title = busy ? tr("deleteBusy") : tr("deleteRestore");
+    remove.title = tr("deleteRestore");
     remove.setAttribute("aria-label", remove.title);
     remove.onclick = (event) => {
       event.stopPropagation();
@@ -4475,7 +4517,7 @@ function pendingNode(entry) {
       popover.prepend(convert);
     }
     menu.append(summary, popover);
-    meta.append(mode, menu);
+    meta.appendChild(menu);
   }
   box.append(meta, body);
   return box;
@@ -4521,17 +4563,17 @@ function mergePendingResponse(
 ) {
   const remote = Array.isArray(messages) ? messages : [];
   if (!preserveLocal) return reconcilePendingMessages(remote, authoritativeMessages);
-  const ids = new Set(remote.map((entry) => entry.id));
   return reconcilePendingMessages(
-    [...remote, ...state.pending.filter((entry) => !ids.has(entry.id))],
+    mergePendingSnapshot(remote, state.pending, state.pendingInFlight),
     authoritativeMessages,
   );
 }
+let pendingSnapshotGeneration = 0;
 async function refreshPending({ preserveOptimistic = true } = {}) {
-  const r = await command(
-    { command: "pending_messages", thread_id: state.current?.id || null },
-    false,
-  );
+  const threadId = state.current?.id || null,
+    generation = ++pendingSnapshotGeneration;
+  const r = await command({ command: "pending_messages", thread_id: threadId }, false);
+  if (generation !== pendingSnapshotGeneration || threadId !== (state.current?.id || null)) return;
   state.pending = mergePendingResponse(r.messages, preserveOptimistic);
   renderPending();
 }
@@ -4556,6 +4598,14 @@ async function deletePending(entry, button) {
     $("messageText").focus();
     $("messageText").setSelectionRange(text.length, text.length);
     notify(r.queue_deleted ? tr("queueDeletedRestore") : tr("deletedRestore"));
+  } catch (error) {
+    // A queue item may have been consumed between opening the menu and the
+    // delete request. Refresh its status so the stale action does not remain.
+    if (state.current?.id === entry.thread_id) {
+      await refreshPending({ preserveOptimistic: false }).catch(() => {});
+      await openThread(state.current, { quiet: true, preserveView: true }).catch(() => {});
+    }
+    throw error;
   } finally {
     if (button.isConnected) button.disabled = false;
   }
@@ -4586,6 +4636,7 @@ async function convertPendingToSteer(entry, button) {
     source: "web_optimistic",
     after_message_index: state.lastMessageIndex ?? -1,
   });
+  state.pendingInFlight.add(submissionId);
   renderPending();
   try {
     await command(
@@ -4598,10 +4649,12 @@ async function convertPendingToSteer(entry, button) {
       },
       false,
     );
+    state.pendingInFlight.delete(submissionId);
     if (state.current?.id === entry.thread_id)
       await openThread(state.current, { quiet: true, preserveView: true });
     notify(tr("queueConverted"));
   } catch (error) {
+    state.pendingInFlight.delete(submissionId);
     state.pending = state.pending.filter((item) => item.id !== submissionId);
     try {
       await refreshPending({ preserveOptimistic: false });
@@ -4616,6 +4669,7 @@ async function convertPendingToSteer(entry, button) {
     }
     throw new Error(`${tr("convertFailedRestored")} ${error.message || error}`);
   } finally {
+    state.pendingInFlight.delete(submissionId);
     if (button.isConnected) button.disabled = false;
   }
 }
@@ -4696,7 +4750,7 @@ function renderVisibleMessages({ preserveView = true } = {}) {
       has_more: state.hasMore,
     },
   });
-  syncLongAssistantMessages();
+  syncLongMessages();
   if (view) restoreMessageView(view);
 }
 async function hydrateTurn(turnId, { render = false } = {}) {
@@ -5721,7 +5775,7 @@ async function openThread(
       root.replaceChildren();
       state.visibleMessages = cached.messages;
       reconcileMessageNodes(root, cached, null);
-      syncLongAssistantMessages();
+      syncLongMessages();
       applyMessagePageState(cached);
       scrollMessagesToBottom("auto");
     } else {
@@ -5731,6 +5785,7 @@ async function openThread(
   }
   await yieldToBrowser();
   if (token !== state.openToken) return;
+  const pendingGeneration = ++pendingSnapshotGeneration;
   const messagesRequest = fetchMessages(null, state.initialPageSize),
     auxiliaryRequest = Promise.all([
       refreshActivity().catch(() => null),
@@ -5783,7 +5838,7 @@ async function openThread(
   const activeTool = activeToolMessage(visibleResponse.messages);
   const renderStarted = performance.now();
   reconcileMessageNodes(root, visibleResponse, activeTool);
-  syncLongAssistantMessages();
+  syncLongMessages();
   applyMessagePageState(r);
   if (olderMessages.length) {
     state.historyStart = olderMessages[0].message_index;
@@ -5801,11 +5856,8 @@ async function openThread(
   void auxiliaryRequest.then(([, watchResult, pendingResult, goalResult]) => {
     if (token !== state.openToken || state.current?.id !== thread.id) return;
     applyThreadWriterLock(watchResult?.writer_lock);
-    state.pending = mergePendingResponse(
-      pendingResult?.messages || state.pending,
-      true,
-      r.messages,
-    );
+    if (pendingGeneration === pendingSnapshotGeneration && Array.isArray(pendingResult?.messages))
+      state.pending = mergePendingResponse(pendingResult.messages, true, r.messages);
     if (goalResult) state.threadGoal = goalResult.goal || null;
     renderPending();
     renderGoalPanel();
@@ -5894,7 +5946,7 @@ async function loadOlder() {
     },
     activeTool,
   );
-  syncLongAssistantMessages();
+  syncLongMessages();
   reportMessagesRendered(r, renderStarted);
   const newHeight = messageScrollMetrics().height;
   setMessageScrollTop(oldTop + (newHeight - oldHeight));
@@ -6145,6 +6197,7 @@ async function write(name) {
     source: "web_optimistic",
     after_message_index: state.lastMessageIndex ?? -1,
   });
+  state.pendingInFlight.add(submissionId);
   renderPending();
   setComposerSubmitting(true);
   try {
@@ -6179,11 +6232,13 @@ async function write(name) {
     );
     const outcome = await request;
     if (outcome.error) {
+      state.pendingInFlight.delete(submissionId);
       await refreshPending({ preserveOptimistic: false });
       throw outcome.error;
     }
     setComposerSubmitting(false);
     acknowledged = true;
+    state.pendingInFlight.delete(submissionId);
     state.composerAttachments = [];
     state.attachmentDrafts.delete(threadId);
     renderComposerAttachments();
@@ -6206,6 +6261,7 @@ async function write(name) {
     }
     throw error;
   } finally {
+    state.pendingInFlight.delete(submissionId);
     setComposerSubmitting(false);
   }
 }
@@ -7058,7 +7114,7 @@ window.addEventListener(
   "resize",
   () => {
     resizeComposerAfterViewportChange();
-    syncLongAssistantMessages();
+    syncLongMessages();
     scheduleMessageTailLock();
   },
   { passive: true },
@@ -7159,20 +7215,20 @@ $("messages").addEventListener(
   "load",
   (event) => {
     if (event.target instanceof HTMLImageElement) {
-      syncLongAssistantMessages();
+      syncLongMessages();
       scheduleMessageTailLock();
     }
   },
   true,
 );
 const messageLayoutMutationObserver = new MutationObserver(() => {
-  syncLongAssistantMessages();
+  syncLongMessages();
   scheduleMessageTailLock();
   updateTurnNavigation();
 });
 messageLayoutMutationObserver.observe($("messages"), { childList: true, subtree: true });
 document.fonts?.ready.then(() => {
-  syncLongAssistantMessages();
+  syncLongMessages();
   scheduleMessageTailLock();
 });
 const handleMessageScroll = () => {
@@ -7245,5 +7301,12 @@ run(async () => {
 setInterval(() => {
   if (!state.eventStreamConnected) pollActivity().catch(() => {});
 }, 1500);
+setInterval(() => {
+  if (
+    state.eventStreamConnected &&
+    state.pending.some((entry) => entry.thread_id === state.current?.id)
+  )
+    refreshPending().catch(() => {});
+}, 5000);
 setInterval(() => refreshTaskOverviews().catch(() => {}), 1500);
 setInterval(() => refreshComposerStatus().catch(() => {}), 60000);

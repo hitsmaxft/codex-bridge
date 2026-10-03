@@ -117,9 +117,14 @@ import { memoryCitationModel } from "../src/memory-citations.js";
 import {
   compactToolFilePath,
   shouldCollapseAssistantOutput,
+  shouldCollapseUserMessage,
   toolFileList,
 } from "../src/message-presentation.js";
-import { pendingInputSummary, reconcilePendingMessages } from "../src/pending-state.js";
+import {
+  mergePendingSnapshot,
+  pendingInputSummary,
+  reconcilePendingMessages,
+} from "../src/pending-state.js";
 import { SessionMessageCache } from "../src/message-cache.js";
 import { runtimeArchitectureModel } from "../src/runtime-architecture.js";
 import {
@@ -1748,6 +1753,16 @@ test("pending handoff matches multimodal user messages one-to-one", async () => 
   assert.match(acceptedFlow, /await openThread/);
 });
 
+test("authoritative pending refresh removes consumed steer without losing an in-flight send", () => {
+  const consumed = { id: "old-steer", source: "bridge", status: "accepted" },
+    inFlight = { id: "new-steer", source: "web_optimistic", status: "steering" },
+    local = [consumed, inFlight];
+  assert.deepEqual(mergePendingSnapshot([], local, new Set([inFlight.id])), [inFlight]);
+  assert.deepEqual(mergePendingSnapshot([], local, new Set()), []);
+  const confirmed = { id: inFlight.id, source: "bridge", status: "accepted" };
+  assert.deepEqual(mergePendingSnapshot([confirmed], local, new Set([inFlight.id])), [confirmed]);
+});
+
 test("completed turns collapse by server turn id and preserve the full expansion", async () => {
   assert.equal(scrollTopForViewportAnchor(900, 700, 200), 400);
   assert.equal(scrollTopForViewportAnchor(400, 200, 700), 900);
@@ -2066,8 +2081,13 @@ test("long assistant output collapses by viewport with controls at the message b
   assert.equal(shouldCollapseAssistantOutput(700, 600), true);
   assert.equal(shouldCollapseAssistantOutput(600, 600), false);
   assert.equal(shouldCollapseAssistantOutput(319, 200), false);
+  assert.equal(shouldCollapseUserMessage(226, 22.5), false);
+  assert.equal(shouldCollapseUserMessage(240, 22.5), true);
   assert.match(source, /shouldCollapseAssistantOutput\(output\.scrollHeight/);
+  assert.match(source, /shouldCollapseUserMessage\(\s*output\.scrollHeight/);
   assert.match(stylesheet, /max-height:\s*16em/);
+  assert.match(stylesheet, /\.user-output\.collapsible:not\(\.expanded\)/);
+  assert.match(stylesheet, /max-height:\s*15em/);
   assert.match(source, /body\.appendChild\(toggle\)/);
   assert.ok(
     source.indexOf("body.appendChild(toggle)") < source.indexOf("const copyText = content"),
@@ -2079,6 +2099,7 @@ test("long assistant output collapses by viewport with controls at the message b
   assert.match(stylesheet, /\.message-detail-toggle\s*\{[^}]*border-radius:\s*999px/s);
   assert.match(translations, /expandMessageDetails:\s*"展开详情"/);
   assert.match(translations, /collapseMessageDetails:\s*"收起"/);
+  assert.match(translations, /expandUserMessage:\s*"展开全文"/);
 });
 
 test("view image uses an image tool icon", async () => {
@@ -2213,13 +2234,32 @@ test("session writer ownership drives read-only UI and explicit release", async 
 });
 
 test("queued messages expose withdraw and convert-to-steer actions", async () => {
-  const source = await readFile(mainScriptPath, "utf8");
+  const [source, stylesheet, translations] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+    readFile(new URL("../src/i18n.js", import.meta.url), "utf8"),
+  ]);
   assert.match(source, /function convertPendingToSteer/);
   assert.match(source, /command: "pending_message_delete"/);
   assert.match(source, /command: "steer"/);
   assert.match(source, /className = "outbox-menu"/);
   assert.match(source, /existingById/);
   assert.match(source, /entry\.status !== "failed"/);
+  assert.match(source, /entry\.status === "failed" \|\|/);
+  assert.match(source, /\["app_server_queue", "demo_wasm"\]\.includes\(entry\.source\)/);
+  assert.match(source, /if \(!withdrawable\)/);
+  assert.match(source, /sentCannotWithdraw/);
+  assert.match(stylesheet, /\.outbox-delete\s*\{[^}]*color:\s*var\(--text\)/s);
+  assert.match(translations, /sentCannotWithdraw:\s*"已交接 · 无法撤回"/);
+  const withdrawFlow = source.slice(
+    source.indexOf("async function deletePending"),
+    source.indexOf("async function convertPendingToSteer"),
+  );
+  assert.match(withdrawFlow, /refreshPending\(\{ preserveOptimistic: false \}\)/);
+  assert.match(
+    source,
+    /state\.eventStreamConnected &&\s*state\.pending\.some\(\(entry\) => entry\.thread_id === state\.current\?\.id\)/,
+  );
   const convertFlow = source.slice(
     source.indexOf("async function convertPendingToSteer"),
     source.indexOf("function olderButton"),

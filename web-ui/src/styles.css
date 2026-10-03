@@ -1812,6 +1812,24 @@ main.history-fullscreen .fullscreen-exit-icon {
 .assistant-output {
   position: relative;
 }
+.user-output {
+  position: relative;
+}
+.user-output.collapse-candidate,
+.user-output.collapsible:not(.expanded) {
+  max-height: 15em;
+  overflow: hidden;
+}
+.user-output.collapsible:not(.expanded)::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 4.5em;
+  background: linear-gradient(transparent, var(--user-bg) 85%);
+  content: "";
+  pointer-events: none;
+}
 .assistant-output.collapse-candidate,
 .assistant-output.collapsible:not(.expanded) {
   max-height: 16em;
@@ -1866,6 +1884,9 @@ main.history-fullscreen .fullscreen-exit-icon {
 }
 .message-detail-toggle[hidden] {
   display: none;
+}
+.message.user .message-detail-toggle {
+  margin: 8px auto 0 0;
 }
 .turn-meta-line {
   min-width: 0;
@@ -2238,7 +2259,7 @@ main.history-fullscreen .fullscreen-exit-icon {
   font-size: 12px;
 }
 .outbox-delete {
-  color: var(--muted);
+  color: var(--text);
 }
 .outbox-delete:hover {
   color: var(--danger);

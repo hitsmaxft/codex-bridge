@@ -24,6 +24,9 @@ user = "codex"
 # tls_private_key_file = "~/.config/codex-bridge/tls/private-key.pem"
 no_auth = false
 public_origins = []
+# Additional directories whose files may be previewed and downloaded from any session.
+# Use absolute paths or ~/ paths; symlinks outside these directories remain blocked.
+# visible_directories = ["~/projects"]
 
 [services]
 # When enabled, codex-bridge starts or adopts and restarts `codex app-server`.

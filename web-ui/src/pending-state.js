@@ -54,6 +54,18 @@ export function pendingInputSummary(text, attachments) {
   return parts.join("\n");
 }
 
+export function mergePendingSnapshot(remote, local, inFlightIds) {
+  const entries = Array.isArray(remote) ? remote : [],
+    ids = new Set(entries.map((entry) => entry.id));
+  return [
+    ...entries,
+    ...local.filter(
+      (entry) =>
+        entry.source === "web_optimistic" && inFlightIds.has(entry.id) && !ids.has(entry.id),
+    ),
+  ];
+}
+
 export function reconcilePendingMessages(entries, authoritativeMessages) {
   const claimed = new Set(),
     messages = Array.isArray(authoritativeMessages) ? authoritativeMessages : [];

@@ -4,6 +4,17 @@ export function shouldCollapseAssistantOutput(contentHeight, viewportHeight) {
   return Number.isFinite(content) && content > viewport + 1;
 }
 
+export function shouldCollapseUserMessage(contentHeight, lineHeight, visibleLines = 10) {
+  const content = Number(contentHeight),
+    line = Number(lineHeight);
+  return (
+    Number.isFinite(content) &&
+    Number.isFinite(line) &&
+    line > 0 &&
+    content > line * visibleLines + 2
+  );
+}
+
 export function compactToolFilePath(path, cwd = "") {
   if (typeof path !== "string" || !path) return "";
   let relative = path.replaceAll("\\", "/");

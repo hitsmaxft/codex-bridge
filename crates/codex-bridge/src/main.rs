@@ -212,6 +212,7 @@ struct WebUiFileConfig {
     tls_private_key_file: Option<PathBuf>,
     no_auth: Option<bool>,
     public_origins: Option<Vec<String>>,
+    visible_directories: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -260,6 +261,7 @@ struct RuntimeArgs {
     web_ui_tls_private_key_file: Option<PathBuf>,
     web_ui_no_auth: bool,
     web_ui_public_origin: Vec<String>,
+    web_ui_visible_directories: Vec<PathBuf>,
     manage_app_server: bool,
     desktop_interposition: bool,
     ws_bridge_listen: SocketAddr,
@@ -446,6 +448,7 @@ struct WebState {
     secure: bool,
     auth: Option<Arc<WebAuth>>,
     public_origins: Arc<Vec<WebOrigin>>,
+    visible_directories: Arc<Vec<PathBuf>>,
     download_tickets: Arc<RwLock<HashMap<String, DownloadTicket>>>,
 }
 
@@ -860,7 +863,19 @@ impl PendingMessages {
                             .flatten()
                             .unwrap_or_else(|| (0, Vec::new()))
                     });
-                pending_message_landed(entry, &messages.1, messages.0, &mut landed).then(|| {
+                let landed_in_history =
+                    pending_message_landed(entry, &messages.1, messages.0, &mut landed);
+                let finished_turn = !landed_in_history
+                    && entry.action == "steer"
+                    && entry.status == "accepted"
+                    && entry.turn_id.as_deref().is_some_and(|turn_id| {
+                        session_store
+                            .read_turn_messages(&entry.thread_id, turn_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|messages| accepted_steer_turn_finished(entry, &messages))
+                    });
+                (landed_in_history || finished_turn).then(|| {
                     let mut completed = entry.clone();
                     completed.status = "applied".to_owned();
                     completed
@@ -900,11 +915,15 @@ impl PendingMessages {
                             && queued_entry.text == entry.text))
             }) {
                 entry.queued_submission_id = queued_entry.queued_submission_id.clone();
-                if entry.status != "accepted" {
-                    entry.status = "queued".to_owned();
-                }
+                entry.source = queued_entry.source.clone();
+                // The native queue is authoritative: a previous empty or stale
+                // list may have marked this entry accepted, but its presence
+                // here proves that it is still withdrawable.
+                entry.status = "queued".to_owned();
                 matched_queue_ids.insert(queued_entry.id.clone());
-            } else if entry.source == "app_server_queue" {
+            } else if entry.queued_submission_id.is_some()
+                && matches!(entry.source.as_str(), "app_server_queue" | "codex_queue")
+            {
                 // Leaving the native queue is not proof that the input landed in
                 // the rollout. Keep the transaction visible until the user item
                 // is observed; this closes the dequeue -> rollout gap.
@@ -1299,6 +1318,18 @@ fn pending_message_landed(
         })
 }
 
+fn accepted_steer_turn_finished(
+    entry: &PendingMessage,
+    messages: &[(usize, ThreadMessage)],
+) -> bool {
+    messages.iter().any(|(index, message)| {
+        *index as i64 > entry.after_message_index
+            && message.turn_id == entry.turn_id
+            && message.role == "assistant"
+            && message.phase.as_deref() == Some("final_answer")
+    })
+}
+
 fn thread_message_input_summary(message: &ThreadMessage) -> Option<String> {
     let parts = message
         .content
@@ -1382,6 +1413,28 @@ fn expand_home_path(path: PathBuf) -> PathBuf {
         .map(PathBuf::from)
         .map(|home| home.join(relative))
         .unwrap_or(path)
+}
+
+fn resolve_visible_directories(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    if paths.len() > 32 {
+        bail!("web_ui.visible_directories must contain at most 32 directories");
+    }
+    let mut directories = Vec::new();
+    for path in paths {
+        let path = expand_home_path(path);
+        if !path.is_absolute() {
+            bail!("web_ui.visible_directories entries must be absolute or start with ~/");
+        }
+        let canonical = fs::canonicalize(&path)
+            .with_context(|| format!("cannot access visible directory {}", path.display()))?;
+        if !canonical.is_dir() || canonical.parent().is_none() {
+            bail!("web_ui.visible_directories entry must be a directory below filesystem root");
+        }
+        if !directories.contains(&canonical) {
+            directories.push(canonical);
+        }
+    }
+    Ok(directories)
 }
 
 fn read_bridge_config(args: &Args) -> Result<(Option<PathBuf>, BridgeFileConfig)> {
@@ -1520,6 +1573,8 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
     } else {
         args.web_ui_public_origin
     };
+    let web_ui_visible_directories =
+        resolve_visible_directories(config.web_ui.visible_directories.unwrap_or_default())?;
     let manage_app_server = config.services.manage_app_server.unwrap_or(false);
     let desktop_interposition = config.services.desktop_interposition.unwrap_or(false);
     if desktop_interposition && !matches!(mode, RuntimeMode::Desktop) {
@@ -1640,6 +1695,7 @@ fn resolve_args(args: Args) -> Result<RuntimeArgs> {
             config.web_ui.no_auth.unwrap_or(false)
         },
         web_ui_public_origin,
+        web_ui_visible_directories,
         manage_app_server,
         desktop_interposition,
         ws_bridge_listen: config.services.ws_bridge_listen.unwrap_or_else(|| {
@@ -3162,6 +3218,7 @@ async fn main() -> Result<()> {
             secure: web_tls.is_some(),
             auth: web_auth.map(Arc::new),
             public_origins: Arc::new(web_public_origins),
+            visible_directories: Arc::new(args.web_ui_visible_directories.clone()),
             download_tickets: Arc::new(RwLock::new(HashMap::new())),
         };
         let scheme = if web_tls.is_some() { "https" } else { "http" };
@@ -3746,7 +3803,7 @@ async fn web_file_download(
         Ok(Err(FileDownloadFailure::OutsideWorkspace)) => {
             return (
                 StatusCode::FORBIDDEN,
-                "file is outside the session workspace",
+                "file is outside an allowed directory",
             )
                 .into_response();
         }
@@ -3828,7 +3885,7 @@ async fn web_file_preview_content(
         Ok(Err(FileDownloadFailure::OutsideWorkspace)) => {
             return (
                 StatusCode::FORBIDDEN,
-                "file is outside the session workspace",
+                "file is outside an allowed directory",
             )
                 .into_response()
         }
@@ -3899,13 +3956,22 @@ async fn web_file_ticket(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request").into_response(),
     };
     let store = Arc::clone(&state.bridge.session_store);
+    let visible_directories = Arc::clone(&state.visible_directories);
     let resolved = tokio::task::spawn_blocking(move || {
         let thread = store
             .find_thread(&request.thread_id)
             .map_err(|_| FileDownloadFailure::ThreadNotFound)?
             .ok_or(FileDownloadFailure::ThreadNotFound)?;
-        let (path, _, _) = resolve_workspace_download(&thread.cwd, &request.path)?;
-        Ok::<_, FileDownloadFailure>((thread.cwd, path))
+        match resolve_workspace_download(&thread.cwd, &request.path) {
+            Ok((path, _, _)) => Ok((thread.cwd, path)),
+            Err(FileDownloadFailure::OutsideWorkspace) => {
+                let root = configured_visible_root(&request.path, &visible_directories)
+                    .ok_or(FileDownloadFailure::OutsideWorkspace)?;
+                let (path, _, _) = resolve_workspace_download(root, &request.path)?;
+                Ok((root.to_path_buf(), path))
+            }
+            Err(error) => Err(error),
+        }
     })
     .await;
     let (workspace, path) = match resolved {
@@ -3913,7 +3979,7 @@ async fn web_file_ticket(
         Ok(Err(FileDownloadFailure::OutsideWorkspace)) => {
             return (
                 StatusCode::FORBIDDEN,
-                "file is outside the session workspace",
+                "file is outside an allowed directory",
             )
                 .into_response()
         }
@@ -3972,6 +4038,7 @@ async fn web_file_preview(
     };
     let store = Arc::clone(&state.bridge.session_store);
     let write_backend = Arc::clone(&state.bridge.write_backend);
+    let visible_directories = Arc::clone(&state.visible_directories);
     let resolved = tokio::task::spawn_blocking(move || {
         let thread = store
             .find_thread(&request.thread_id)
@@ -3982,6 +4049,12 @@ async fn web_file_preview(
         }) {
             Ok(preview) => Ok((thread.cwd, preview)),
             Err(FileDownloadFailure::OutsideWorkspace) => {
+                if let Some(root) = configured_visible_root(&request.path, &visible_directories) {
+                    let preview = read_workspace_preview_with(root, &request.path, |path| {
+                        read_file_bytes(&write_backend, path)
+                    })?;
+                    return Ok((root.to_path_buf(), preview));
+                }
                 if let Some(message_index) = request.message_index {
                     let authorized = store
                         .read_message(&request.thread_id, message_index)
@@ -4063,7 +4136,7 @@ async fn web_file_preview(
         Ok(Err(FileDownloadFailure::OutsideWorkspace)) => {
             return (
                 StatusCode::FORBIDDEN,
-                "file is outside the session workspace",
+                "file is outside an allowed directory",
             )
                 .into_response()
         }
@@ -4350,6 +4423,17 @@ fn resolve_workspace_download(
         })
         .collect::<String>();
     Ok((candidate, filename, metadata.len()))
+}
+
+fn configured_visible_root<'a>(requested: &str, roots: &'a [PathBuf]) -> Option<&'a Path> {
+    if !Path::new(requested).is_absolute() {
+        return None;
+    }
+    let canonical = fs::canonicalize(requested).ok()?;
+    roots
+        .iter()
+        .find(|root| canonical.starts_with(root))
+        .map(PathBuf::as_path)
 }
 
 fn download_roots(workspace: &Path) -> Vec<PathBuf> {
@@ -9850,6 +9934,52 @@ mod tests {
     }
 
     #[test]
+    fn configured_visible_directories_allow_only_canonical_files_inside_explicit_roots() {
+        let fixture = unique_test_dir("visible-directories");
+        let projects = fixture.join("projects");
+        let sibling = fixture.join("projects-private");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let visible = projects.join("README.md");
+        let hidden = sibling.join("secret.md");
+        fs::write(&visible, "visible").unwrap();
+        fs::write(&hidden, "hidden").unwrap();
+
+        let config: BridgeFileConfig = toml::from_str(&format!(
+            "[web_ui]\nvisible_directories = [{0:?}, {0:?}]\n",
+            projects.to_str().unwrap()
+        ))
+        .unwrap();
+        let roots =
+            resolve_visible_directories(config.web_ui.visible_directories.unwrap()).unwrap();
+        assert_eq!(roots.len(), 1);
+        let root = configured_visible_root(visible.to_str().unwrap(), &roots).unwrap();
+        assert_eq!(root, fs::canonicalize(&projects).unwrap());
+        assert_eq!(
+            read_workspace_preview(root, visible.to_str().unwrap())
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("visible")
+        );
+        assert!(configured_visible_root(hidden.to_str().unwrap(), &roots).is_none());
+        assert!(configured_visible_root("README.md", &roots).is_none());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&hidden, projects.join("linked-secret.md")).unwrap();
+            assert!(configured_visible_root(
+                projects.join("linked-secret.md").to_str().unwrap(),
+                &roots
+            )
+            .is_none());
+        }
+        assert!(resolve_visible_directories(vec![PathBuf::from("relative")]).is_err());
+        assert!(resolve_visible_directories(vec![PathBuf::from("/")]).is_err());
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn workspace_download_accepts_registered_worktrees_from_the_same_repository() {
         let root = unique_test_dir("workspace-download-worktree");
         let workspace = root.join("source");
@@ -11050,6 +11180,43 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn accepted_steer_closes_after_its_turn_finishes_even_if_text_changes() {
+        let pending = PendingMessages::default();
+        let (id, _) = pending
+            .begin("thread-1", "follow-up", "steer", 12, None)
+            .unwrap();
+        pending.accept(&id, Some("turn-1".to_owned()));
+        let entry = pending.get(&id).unwrap();
+        let final_message = ThreadMessage {
+            timestamp: None,
+            id: None,
+            turn_id: Some("turn-1".to_owned()),
+            role: "assistant".to_owned(),
+            phase: Some("final_answer".to_owned()),
+            content: vec![json!({"type": "text", "text": "Done"})],
+            tools: Vec::new(),
+        };
+        assert!(accepted_steer_turn_finished(
+            &entry,
+            &[(13, final_message.clone())]
+        ));
+        assert!(!accepted_steer_turn_finished(
+            &entry,
+            &[(12, final_message.clone())]
+        ));
+        assert!(!accepted_steer_turn_finished(
+            &entry,
+            &[(
+                13,
+                ThreadMessage {
+                    turn_id: Some("turn-2".to_owned()),
+                    ..final_message
+                }
+            )],
+        ));
+    }
+
+    #[test]
     fn stable_submission_id_is_idempotent_before_and_after_application() {
         let pending = PendingMessages::default();
         let (id, created) = pending
@@ -11112,6 +11279,47 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(dequeued.len(), 1);
         assert_eq!(dequeued[0].status, "accepted");
         assert_eq!(pending.entries.read().unwrap().len(), 1);
+
+        let reappeared = pending.reconcile(
+            &store,
+            vec![PendingMessage {
+                id: local_id,
+                thread_id: "thread-1".to_owned(),
+                text: "queued text".to_owned(),
+                action: "queue".to_owned(),
+                status: "queued".to_owned(),
+                source: "app_server_queue".to_owned(),
+                queued_submission_id: Some("server-queue-1".to_owned()),
+                turn_id: None,
+                after_message_index: -1,
+                error: None,
+            }],
+            Some("thread-1"),
+        );
+        assert_eq!(reappeared.len(), 1);
+        assert_eq!(reappeared[0].status, "queued");
+
+        let fallback = pending.reconcile(
+            &store,
+            vec![PendingMessage {
+                id: "server-queue-1".to_owned(),
+                thread_id: "thread-1".to_owned(),
+                text: "queued text".to_owned(),
+                action: "queue".to_owned(),
+                status: "queued".to_owned(),
+                source: "codex_queue".to_owned(),
+                queued_submission_id: Some("server-queue-1".to_owned()),
+                turn_id: None,
+                after_message_index: -1,
+                error: None,
+            }],
+            Some("thread-1"),
+        );
+        assert_eq!(fallback[0].source, "codex_queue");
+        assert_eq!(
+            pending.reconcile(&store, Vec::new(), Some("thread-1"))[0].status,
+            "accepted"
+        );
     }
 
     #[test]

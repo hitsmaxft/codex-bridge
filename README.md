@@ -26,18 +26,18 @@ still use the account and network configured by Codex itself.
 - Remote Queue, Steer, withdrawal, interruption, pinning, renaming, and archiving.
 - Editable voice transcription through app-server, with an optional managed local whisper.cpp
   fallback for private Mac, Linux, homelab, and NAS deployments.
-- Bounded caches and workspace-scoped downloads for long-running, always-on hosts.
+- Bounded caches and authenticated file preview and downloads for long-running hosts.
 
 ## Release highlights
 
-### v0.3.8 · 2026-09-27
+### v0.3.9 · 2026-10-04
 
-- **Computer-use images:** multiple screenshots can be selected directly from thumbnails beneath
-  the preview.
-- **Steer cards:** collapsed follow-up messages stack with later cards in front, and token usage
-  joins the last card cleanly.
+- **File preview:** add explicit visible directories through local configuration.
+- **Queue and Steer:** queued messages recover their withdrawable state after a stale refresh;
+  handed-off messages clearly show when withdrawal is unavailable.
+- **Reading:** long user messages collapse by default and can be expanded in place.
 
-See the [latest release notes](docs/releases/v0.3.8.md) or the
+See the [latest release notes](docs/releases/v0.3.9.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
@@ -57,8 +57,9 @@ finishes while the page is in the background. Large pasted text appears as a fil
 conversation. Tool images can be viewed at their call and browsed in the message gallery.
 Notifications require site permission and an open Web UI
 page; clicking one focuses the page and opens that session. Local file links can download regular
-files smaller than 16 MiB; the server resolves each link against that task's workspace and rejects
-paths or symlinks that escape it. Authenticated clients receive a random download ticket that
+files smaller than 16 MiB; the server resolves each link against that task's workspace or an
+explicitly configured visible directory and rejects paths or symlinks outside those roots.
+Authenticated clients receive a random download ticket that
 expires after five minutes and tolerates browser or proxy retries. Tickets live only in bridge
 process memory and become invalid after a restart, so downloads do not expose a long-lived
 anonymous file endpoint or depend on Basic Auth being forwarded by a navigation.

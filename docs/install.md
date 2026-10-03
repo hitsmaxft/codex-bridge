@@ -96,6 +96,7 @@ password_file = "~/.codex-bridge/web-ui-password"
 # tls_private_key_file = "~/.config/codex-bridge/tls/private-key.pem"
 no_auth = false
 public_origins = []
+# visible_directories = ["~/projects"]
 
 [services]
 manage_app_server = true
@@ -119,6 +120,10 @@ worktree sessions continue to use their selected roots.
 
 `web_ui.name` customizes both the browser title and the brand label in the top-left corner. It is
 display-only and does not change authentication, host validation, or the public URL.
+
+`web_ui.visible_directories` adds explicit roots for authenticated file preview and download links
+across sessions. Entries must be existing absolute directories or use `~/`; symlinks cannot escape
+the configured roots. Relative file references still resolve in the session workspace.
 
 Configuration precedence is:
 
