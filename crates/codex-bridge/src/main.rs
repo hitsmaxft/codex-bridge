@@ -6314,6 +6314,7 @@ fn app_server_list_all(
 fn fetch_app_server_project_index(
     write_backend: &CodexCliBackend,
     include_archived: bool,
+    codex_home: &Path,
 ) -> Result<ThreadProjectIndex, BackendFailure> {
     let projects = app_server_list_all(
         write_backend,
@@ -6349,17 +6350,28 @@ fn fetch_app_server_project_index(
             }),
         )?);
     }
-    Ok(ThreadProjectIndex::from_app_server_with_sections(
+    let mut index = ThreadProjectIndex::from_app_server_with_sections(
         &json!({"data": projects}),
         &json!({"data": sections}),
         &threads,
-    ))
+    );
+    let desktop_state_path = codex_home.join(".codex-global-state.json");
+    if fs::metadata(&desktop_state_path).is_ok_and(|metadata| metadata.len() <= 8 * 1024 * 1024) {
+        if let Some(state) = fs::read(&desktop_state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        {
+            index.apply_desktop_state(&state);
+        }
+    }
+    Ok(index)
 }
 
 fn app_server_project_index(
     write_backend: &CodexCliBackend,
     cache: &AppServerProjectCache,
     include_archived: bool,
+    codex_home: &Path,
 ) -> Option<ThreadProjectIndex> {
     if let Ok(cached) = cache.index.read() {
         if let Some(cached) = cached.as_ref().filter(|cached| {
@@ -6369,7 +6381,7 @@ fn app_server_project_index(
             return Some(cached.index.clone());
         }
     }
-    let index = fetch_app_server_project_index(write_backend, include_archived).ok()?;
+    let index = fetch_app_server_project_index(write_backend, include_archived, codex_home).ok()?;
     if let Ok(mut cached) = cache.index.write() {
         *cached = Some(CachedAppServerProjectIndex {
             refreshed_at: Instant::now(),
@@ -6712,8 +6724,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             }
         }
         Request::Projects { include_archived } => {
-            let project_index =
-                app_server_project_index(write_backend, app_server_projects, include_archived);
+            let project_index = app_server_project_index(
+                write_backend,
+                app_server_projects,
+                include_archived,
+                session_store.home(),
+            );
             match session_store.list_projects_with_index(include_archived, project_index.as_ref()) {
                 Ok(projects) => Response::success(json!({
                     "source": if project_index.is_some() {
@@ -6746,8 +6762,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             } else {
                 Vec::new()
             };
-            let project_index =
-                app_server_project_index(write_backend, app_server_projects, include_archived);
+            let project_index = app_server_project_index(
+                write_backend,
+                app_server_projects,
+                include_archived,
+                session_store.home(),
+            );
             match session_store.list_project_threads_with_index(
                 &project_path,
                 include_archived,
@@ -7921,8 +7941,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
         }
         Request::ThreadPins => match pinned_thread_ids(write_backend) {
             Ok(thread_ids) => {
-                let project_index =
-                    app_server_project_index(write_backend, app_server_projects, false);
+                let project_index = app_server_project_index(
+                    write_backend,
+                    app_server_projects,
+                    false,
+                    session_store.home(),
+                );
                 let mut threads = Vec::new();
                 for thread_id in &thread_ids {
                     if let Ok(Some(thread)) = session_store.find_thread(thread_id) {

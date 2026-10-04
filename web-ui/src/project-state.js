@@ -6,6 +6,21 @@ export function sidebarProjectOrder(projects) {
   );
 }
 
+export function sidebarProjectGroups(projects) {
+  const sections = new Set(
+    projects.filter((project) => project.kind === "section").map((p) => p.path),
+  );
+  return sidebarProjectOrder(projects)
+    .filter((project) => !project.section_path || !sections.has(project.section_path))
+    .map((project) => ({
+      project,
+      children:
+        project.kind === "section"
+          ? projects.filter((child) => child.section_path === project.path)
+          : [],
+    }));
+}
+
 export function storedExpandedProjects(storage) {
   try {
     const raw = storage.getItem(EXPANDED_PROJECTS_STORAGE_KEY);

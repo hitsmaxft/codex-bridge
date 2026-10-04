@@ -346,6 +346,8 @@ pub struct ProjectSummary {
     pub path: PathBuf,
     pub name: String,
     pub kind: ProjectKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_path: Option<PathBuf>,
     pub thread_count: usize,
     pub archived_count: usize,
     pub updated_at_ms: u64,
@@ -369,6 +371,7 @@ pub struct ThreadProjectIndex {
     thread_projects: HashMap<String, Option<String>>,
     sections: Vec<(String, String)>,
     thread_sections: HashMap<String, String>,
+    section_projects: HashMap<PathBuf, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -465,7 +468,108 @@ impl ThreadProjectIndex {
             thread_projects,
             sections,
             thread_sections,
+            section_projects: HashMap::new(),
         }
+    }
+
+    pub fn apply_desktop_state(&mut self, state: &Value) {
+        let Some(local_projects) = state.get("local-projects").and_then(Value::as_object) else {
+            return;
+        };
+        for (id, project) in local_projects {
+            let roots = project
+                .get("rootPaths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            if roots.is_empty() {
+                continue;
+            }
+            self.projects.insert(
+                id.clone(),
+                IndexedProject {
+                    name: project
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Project")
+                        .to_owned(),
+                    roots,
+                    updated_at_ms: project
+                        .get("updatedAt")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                },
+            );
+        }
+        if let Some(assignments) = state
+            .get("thread-project-assignments")
+            .and_then(Value::as_object)
+        {
+            for (thread_id, assignment) in assignments {
+                let Some(project_id) = assignment
+                    .get("projectKind")
+                    .and_then(Value::as_str)
+                    .filter(|kind| *kind == "local")
+                    .and_then(|_| assignment.get("projectId"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if self.projects.contains_key(project_id) {
+                    self.thread_projects
+                        .insert(thread_id.clone(), Some(project_id.to_owned()));
+                }
+            }
+        }
+        let Some(accounts) = state
+            .pointer("/electron-persisted-atom-state/sidebar-custom-sections-v3")
+            .and_then(Value::as_object)
+        else {
+            return;
+        };
+        for account in accounts.values() {
+            let Some(sections) = account.get("sections").and_then(Value::as_array) else {
+                continue;
+            };
+            for section in sections {
+                let Some(section_id) = section
+                    .pointer("/hostSectionIds/local")
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if !self.sections.iter().any(|(id, _)| id == section_id) {
+                    continue;
+                }
+                for key in section
+                    .get("itemKeys")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    if let Some(project_id) = key.strip_prefix("codex:project:") {
+                        if let Some(project) = self.projects.get(project_id) {
+                            for root in &project.roots {
+                                self.section_projects
+                                    .insert(root.clone(), section_id.to_owned());
+                            }
+                        }
+                    } else if let Some(thread_id) = key.strip_prefix("codex:thread:local:") {
+                        self.thread_sections
+                            .insert(thread_id.to_owned(), section_id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    fn section_path_for_project(&self, project_path: &Path) -> Option<PathBuf> {
+        let section_id = self.section_projects.get(project_path)?;
+        Some(PathBuf::from(format!("{SECTION_PATH_PREFIX}{section_id}")))
     }
 
     fn group_for_thread(&self, thread: &ThreadSummary) -> (PathBuf, String, ProjectKind) {
@@ -941,12 +1045,16 @@ impl SessionStore {
         let mut projects = HashMap::<PathBuf, ProjectSummary>::new();
         for thread in threads {
             let (path, name, kind) = self.group_for_thread(&thread, project_index);
+            let section_path = (kind == ProjectKind::Project)
+                .then(|| project_index.and_then(|index| index.section_path_for_project(&path)))
+                .flatten();
             let entry = projects
                 .entry(path.clone())
                 .or_insert_with(|| ProjectSummary {
                     name,
                     path,
                     kind,
+                    section_path,
                     thread_count: 0,
                     archived_count: 0,
                     updated_at_ms: 0,
@@ -964,6 +1072,7 @@ impl SessionStore {
                         name: name.clone(),
                         path,
                         kind: ProjectKind::Section,
+                        section_path: None,
                         thread_count: 0,
                         archived_count: 0,
                         updated_at_ms: 0,
@@ -977,11 +1086,13 @@ impl SessionStore {
                             name: project.name.clone(),
                             path: path.clone(),
                             kind: ProjectKind::Project,
+                            section_path: project_index.section_path_for_project(path),
                             thread_count: 0,
                             archived_count: 0,
                             updated_at_ms: project.updated_at_ms,
                         });
                     entry.updated_at_ms = entry.updated_at_ms.max(project.updated_at_ms);
+                    entry.section_path = project_index.section_path_for_project(path);
                 }
             }
             projects
@@ -990,6 +1101,7 @@ impl SessionStore {
                     name: "Chats".to_owned(),
                     path: PathBuf::from(CHATS_PROJECT_PATH),
                     kind: ProjectKind::Chats,
+                    section_path: None,
                     thread_count: 0,
                     archived_count: 0,
                     updated_at_ms: 0,
@@ -3679,6 +3791,55 @@ mod tests {
             .unwrap();
         assert_eq!(workspace_project.thread_count, 1);
         assert!(projects.iter().all(|project| project.name != "Pinned"));
+    }
+
+    #[test]
+    fn desktop_project_assignment_keeps_a_moved_thread_inside_a_section_project() {
+        let fixture = Fixture::new();
+        let old_workspace = fixture.path.join("old-workspace");
+        let project_root = fixture.path.join("velvet-design");
+        fs::create_dir_all(&old_workspace).unwrap();
+        fs::create_dir_all(&project_root).unwrap();
+        let record = format!(
+            r#"{{"timestamp":"2026-09-09T01:00:00Z","type":"session_meta","payload":{{"id":"moved-thread","cwd":{},"source":"vscode"}}}}"#,
+            serde_json::to_string(&old_workspace).unwrap()
+        );
+        fixture.write_rollout("rollout-moved.jsonl", &[&record]);
+        let mut index = ThreadProjectIndex::from_app_server_with_sections(
+            &json!({"data":[{"id":"server-project","name":"Velvet","roots":[{"path":project_root}]}]}),
+            &json!({"data":[{"id":"custom-section","name":"Keyboard design"}]}),
+            &[json!({"id":"moved-thread","projectId":null,"section":null})],
+        );
+        index.apply_desktop_state(&json!({
+            "local-projects": {
+                "local-project": {"name":"Velvet","rootPaths":[project_root],"updatedAt":1000}
+            },
+            "thread-project-assignments": {
+                "moved-thread": {"projectKind":"local","projectId":"local-project"}
+            },
+            "electron-persisted-atom-state": {
+                "sidebar-custom-sections-v3": {
+                    "account": {"sections":[{
+                        "name":"Keyboard design",
+                        "hostSectionIds":{"local":"custom-section"},
+                        "itemKeys":["codex:project:local-project"]
+                    }]}
+                }
+            }
+        }));
+        let store = SessionStore::new(fixture.path.clone());
+        let projects = store.list_projects_with_index(false, Some(&index)).unwrap();
+        let project = projects.iter().find(|p| p.path == project_root).unwrap();
+        assert_eq!(project.thread_count, 1);
+        assert_eq!(
+            project.section_path.as_deref(),
+            Some(Path::new("codex-bridge://section/custom-section"))
+        );
+        let (threads, available) = store
+            .list_project_threads_with_index(&project_root, false, 0, 10, &[], Some(&index))
+            .unwrap();
+        assert_eq!(available, 1);
+        assert_eq!(threads[0].id, "moved-thread");
     }
 
     #[test]

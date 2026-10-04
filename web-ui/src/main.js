@@ -43,7 +43,7 @@ import {
 } from "./composer-state.js";
 import {
   persistExpandedProjects,
-  sidebarProjectOrder,
+  sidebarProjectGroups,
   storedExpandedProjects,
 } from "./project-state.js";
 import { renderRuntimeArchitecture } from "./runtime-architecture.js";
@@ -1623,6 +1623,7 @@ async function revealSessionProject(thread) {
   if (state.pinnedIds.has(thread.id)) return renderProjects();
   const project = pinnedProject(thread);
   if (!project) return renderProjects();
+  if (project.section_path) setProjectExpanded(project.section_path, true);
   setProjectExpanded(project.path, true);
   if (!state.projectThreads.has(project.path)) await loadProjectThreads(project);
   else renderProjects();
@@ -1654,17 +1655,23 @@ function renderProjects() {
   closeThreadArchiveSwipe();
   root.textContent = "";
   const pinned = state.pinnedThreads.filter((thread) => threadMatches(thread, q));
-  const projects = sidebarProjectOrder(
-    state.projects.filter(
-      (p) =>
-        `${p.kind === "chats" ? tr("chats") : p.name} ${p.kind === "chats" ? "" : p.path}`
-          .toLowerCase()
-          .includes(q) ||
-        state.projectThreads
-          .get(p.path)
-          ?.threads.some((t) => !state.pinnedIds.has(t.id) && threadMatches(t, q)),
-    ),
+  const matchingProjects = state.projects.filter(
+    (p) =>
+      `${p.kind === "chats" ? tr("chats") : p.name} ${p.kind === "chats" ? "" : p.path}`
+        .toLowerCase()
+        .includes(q) ||
+      state.projectThreads
+        .get(p.path)
+        ?.threads.some((t) => !state.pinnedIds.has(t.id) && threadMatches(t, q)),
   );
+  const sectionParents = state.projects.filter(
+    (section) =>
+      section.kind === "section" &&
+      matchingProjects.some((project) => project.section_path === section.path),
+  );
+  const projects = [
+    ...new Map([...matchingProjects, ...sectionParents].map((p) => [p.path, p])).values(),
+  ];
   if (!projects.length && !pinned.length) {
     root.innerHTML = `<div class="empty" style="padding:12px">${tr("noMatchingProjects")}</div>`;
     return;
@@ -1683,9 +1690,14 @@ function renderProjects() {
     section.append(heading, list);
     root.appendChild(section);
   }
-  for (const p of projects) {
+  function projectNode(p, children = []) {
     const wrap = document.createElement("section");
-    wrap.className = p.kind === "section" ? "project custom-section" : "project";
+    wrap.className =
+      p.kind === "section"
+        ? "project custom-section"
+        : p.section_path
+          ? "project section-project"
+          : "project";
     const head = document.createElement("div");
     head.className = "project-head";
     const button = document.createElement("button");
@@ -1697,7 +1709,7 @@ function renderProjects() {
     const pinnedCount = state.pinnedThreads.filter(
       (thread) => pinnedProject(thread)?.path === p.path,
     ).length;
-    button.children[2].textContent = `${Math.max(0, p.thread_count - pinnedCount)}`;
+    button.children[2].textContent = `${Math.max(0, p.thread_count - pinnedCount) + children.length}`;
     button.onclick = () => run(() => toggleProject(p));
     head.appendChild(button);
     wrap.appendChild(head);
@@ -1705,9 +1717,9 @@ function renderProjects() {
     list.className = "project-threads";
     list.hidden = !state.expanded.has(p.path);
     const data = state.projectThreads.get(p.path);
-    if (!data) {
+    if (!data && p.thread_count > 0) {
       list.innerHTML = `<div class="empty" style="padding:8px">${tr("loadingSessions")}</div>`;
-    } else {
+    } else if (data) {
       const creation = state.threadCreationJobs.get(p.path);
       if (creation) {
         const placeholder = document.createElement("div");
@@ -1730,8 +1742,17 @@ function renderProjects() {
       }
     }
     wrap.appendChild(list);
-    root.appendChild(wrap);
+    if (children.length) {
+      const nested = document.createElement("div");
+      nested.className = "section-projects";
+      nested.hidden = !state.expanded.has(p.path);
+      for (const child of children) nested.appendChild(projectNode(child));
+      wrap.appendChild(nested);
+    }
+    return wrap;
   }
+  for (const { project, children } of sidebarProjectGroups(projects))
+    root.appendChild(projectNode(project, children));
 }
 function populateCreateProjectSelect() {
   const select = $("createProjectSelect"),

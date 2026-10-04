@@ -130,6 +130,7 @@ import { runtimeArchitectureModel } from "../src/runtime-architecture.js";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   persistExpandedProjects,
+  sidebarProjectGroups,
   sidebarProjectOrder,
   storedExpandedProjects,
 } from "../src/project-state.js";
@@ -145,6 +146,19 @@ test("custom sections stay below Pinned and before project folders", () => {
     ["section", "project", "chats"],
   );
   assert.equal(projects[0].kind, "project");
+});
+
+test("a project assigned to a section renders beneath that section once", () => {
+  const section = { path: "codex-bridge://section/design", kind: "section" };
+  const project = { path: "/workspace", kind: "project", section_path: section.path };
+  const groups = sidebarProjectGroups([project, section, { path: "/other", kind: "project" }]);
+  assert.deepEqual(
+    groups.map(({ project, children }) => [project.path, children.map((child) => child.path)]),
+    [
+      [section.path, [project.path]],
+      ["/other", []],
+    ],
+  );
 });
 import { taskOverview } from "../src/task-overview.js";
 import { toolOutputImageUrl, toolOutputImageUrls } from "../src/tool-image.js";

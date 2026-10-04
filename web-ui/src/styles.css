@@ -1042,6 +1042,12 @@ aside {
   font-size: 10px;
   letter-spacing: 0.04em;
 }
+.section-projects[hidden] {
+  display: none;
+}
+.section-project {
+  margin-left: 14px;
+}
 .project-head {
   display: block;
 }
