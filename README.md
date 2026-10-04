@@ -30,14 +30,12 @@ still use the account and network configured by Codex itself.
 
 ## Release highlights
 
-### v0.3.9 · 2026-10-04
+### v0.3.10 · 2026-10-04
 
-- **File preview:** add explicit visible directories through local configuration.
-- **Queue and Steer:** queued messages recover their withdrawable state after a stale refresh;
-  handed-off messages clearly show when withdrawal is unavailable.
-- **Reading:** long user messages collapse by default and can be expanded in place.
+- **Custom sections:** show custom sections beneath Pinned, including project folders and sessions.
+- **Project history:** keep moved conversations visible inside their assigned project folders.
 
-See the [latest release notes](docs/releases/v0.3.9.md) or the
+See the [latest release notes](docs/releases/v0.3.10.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
