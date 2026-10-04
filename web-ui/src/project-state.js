@@ -1,5 +1,11 @@
 export const EXPANDED_PROJECTS_STORAGE_KEY = "codex-bridge.expanded-projects.v1";
 
+export function sidebarProjectOrder(projects) {
+  return [...projects].sort(
+    (left, right) => Number(right.kind === "section") - Number(left.kind === "section"),
+  );
+}
+
 export function storedExpandedProjects(storage) {
   try {
     const raw = storage.getItem(EXPANDED_PROJECTS_STORAGE_KEY);

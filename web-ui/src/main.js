@@ -41,7 +41,11 @@ import {
   restoreComposerDraft,
   shouldOfferStop,
 } from "./composer-state.js";
-import { persistExpandedProjects, storedExpandedProjects } from "./project-state.js";
+import {
+  persistExpandedProjects,
+  sidebarProjectOrder,
+  storedExpandedProjects,
+} from "./project-state.js";
 import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
 import { toolOutputImageUrls } from "./tool-image.js";
@@ -820,7 +824,7 @@ async function toggleLanguage() {
 }
 async function openDefaultProjectThread() {
   if (!state.projects.length) return;
-  const project = state.projects[0];
+  const project = state.projects.find((item) => item.kind !== "section") || state.projects[0];
   if (!state.expandedPreferenceSaved) setProjectExpanded(project.path, true);
   const threads = await loadProjectThreads(project);
   if (threads.length) await openThread(threads[0], { replaceHash: true });
@@ -1650,14 +1654,16 @@ function renderProjects() {
   closeThreadArchiveSwipe();
   root.textContent = "";
   const pinned = state.pinnedThreads.filter((thread) => threadMatches(thread, q));
-  const projects = state.projects.filter(
-    (p) =>
-      `${p.kind === "chats" ? tr("chats") : p.name} ${p.kind === "chats" ? "" : p.path}`
-        .toLowerCase()
-        .includes(q) ||
-      state.projectThreads
-        .get(p.path)
-        ?.threads.some((t) => !state.pinnedIds.has(t.id) && threadMatches(t, q)),
+  const projects = sidebarProjectOrder(
+    state.projects.filter(
+      (p) =>
+        `${p.kind === "chats" ? tr("chats") : p.name} ${p.kind === "chats" ? "" : p.path}`
+          .toLowerCase()
+          .includes(q) ||
+        state.projectThreads
+          .get(p.path)
+          ?.threads.some((t) => !state.pinnedIds.has(t.id) && threadMatches(t, q)),
+    ),
   );
   if (!projects.length && !pinned.length) {
     root.innerHTML = `<div class="empty" style="padding:12px">${tr("noMatchingProjects")}</div>`;
@@ -1679,7 +1685,7 @@ function renderProjects() {
   }
   for (const p of projects) {
     const wrap = document.createElement("section");
-    wrap.className = "project";
+    wrap.className = p.kind === "section" ? "project custom-section" : "project";
     const head = document.createElement("div");
     head.className = "project-head";
     const button = document.createElement("button");
@@ -1729,7 +1735,7 @@ function renderProjects() {
 }
 function populateCreateProjectSelect() {
   const select = $("createProjectSelect"),
-    projects = state.projects.filter((project) => project.kind !== "chats"),
+    projects = state.projects.filter((project) => project.kind === "project"),
     chats = state.projects.find((project) => project.kind === "chats"),
     currentProject = state.current ? pinnedProject(state.current) : null;
   select.textContent = "";

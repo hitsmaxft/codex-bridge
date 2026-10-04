@@ -356,14 +356,19 @@ pub struct ProjectSummary {
 pub enum ProjectKind {
     Project,
     Chats,
+    Section,
 }
 
 pub const CHATS_PROJECT_PATH: &str = "codex-bridge://chats";
+const SECTION_PATH_PREFIX: &str = "codex-bridge://section/";
+const PINNED_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 
 #[derive(Debug, Clone, Default)]
 pub struct ThreadProjectIndex {
     projects: HashMap<String, IndexedProject>,
     thread_projects: HashMap<String, Option<String>>,
+    sections: Vec<(String, String)>,
+    thread_sections: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +380,14 @@ struct IndexedProject {
 
 impl ThreadProjectIndex {
     pub fn from_app_server(projects: &Value, threads: &[Value]) -> Self {
+        Self::from_app_server_with_sections(projects, &json!({"data": []}), threads)
+    }
+
+    pub fn from_app_server_with_sections(
+        projects: &Value,
+        sections: &Value,
+        threads: &[Value],
+    ) -> Self {
         let projects = projects
             .get("data")
             .and_then(Value::as_array)
@@ -425,13 +438,46 @@ impl ThreadProjectIndex {
                 Some((id, project_id))
             })
             .collect();
+        let sections = sections
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|section| {
+                let id = section.get("id")?.as_str()?;
+                let name = section.get("name")?.as_str()?;
+                (id != PINNED_SECTION_ID).then(|| (id.to_owned(), name.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        let thread_sections = threads
+            .iter()
+            .filter_map(|thread| {
+                let id = thread.get("id")?.as_str()?;
+                let section_id = thread.pointer("/section/id")?.as_str()?;
+                sections
+                    .iter()
+                    .any(|(known, _)| known == section_id)
+                    .then(|| (id.to_owned(), section_id.to_owned()))
+            })
+            .collect();
         Self {
             projects,
             thread_projects,
+            sections,
+            thread_sections,
         }
     }
 
     fn group_for_thread(&self, thread: &ThreadSummary) -> (PathBuf, String, ProjectKind) {
+        if let Some(section_id) = self.thread_sections.get(&thread.id) {
+            if let Some((_, name)) = self.sections.iter().find(|(id, _)| id == section_id) {
+                return (
+                    PathBuf::from(format!("{SECTION_PATH_PREFIX}{section_id}")),
+                    name.clone(),
+                    ProjectKind::Section,
+                );
+            }
+        }
         if let Some(project_id) = self.thread_projects.get(&thread.id) {
             if let Some(project) = project_id
                 .as_ref()
@@ -910,6 +956,19 @@ impl SessionStore {
             entry.updated_at_ms = entry.updated_at_ms.max(thread.updated_at_ms);
         }
         if let Some(project_index) = project_index {
+            for (id, name) in &project_index.sections {
+                let path = PathBuf::from(format!("{SECTION_PATH_PREFIX}{id}"));
+                projects
+                    .entry(path.clone())
+                    .or_insert_with(|| ProjectSummary {
+                        name: name.clone(),
+                        path,
+                        kind: ProjectKind::Section,
+                        thread_count: 0,
+                        archived_count: 0,
+                        updated_at_ms: 0,
+                    });
+            }
             for project in project_index.projects.values() {
                 for path in &project.roots {
                     let entry = projects
@@ -3574,6 +3633,52 @@ mod tests {
         assert_eq!(historical.name, "Historical");
         assert_eq!(historical.thread_count, 0);
         assert_eq!(historical.updated_at_ms, 1_788_760_000_000);
+    }
+
+    #[test]
+    fn custom_section_groups_its_threads_above_project_history() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        for id in ["section-thread", "project-thread"] {
+            let record = format!(
+                r#"{{"timestamp":"2026-09-09T01:00:00Z","type":"session_meta","payload":{{"id":{},"cwd":{},"source":"vscode"}}}}"#,
+                serde_json::to_string(id).unwrap(),
+                serde_json::to_string(&workspace).unwrap()
+            );
+            fixture.write_rollout(&format!("rollout-{id}.jsonl"), &[&record]);
+        }
+        let index = ThreadProjectIndex::from_app_server_with_sections(
+            &json!({"data":[{"id":"project-1","name":"Workspace","roots":[{"path":workspace}]}]}),
+            &json!({"data":[
+                {"id":PINNED_SECTION_ID,"name":"Pinned"},
+                {"id":"section-1","name":"Keyboard design"}
+            ]}),
+            &[
+                json!({"id":"section-thread","projectId":"project-1","section":{"id":"section-1","name":"Keyboard design"}}),
+                json!({"id":"project-thread","projectId":"project-1"}),
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let projects = store.list_projects_with_index(false, Some(&index)).unwrap();
+        let section = projects
+            .iter()
+            .find(|project| project.kind == ProjectKind::Section)
+            .unwrap();
+        assert_eq!(section.name, "Keyboard design");
+        assert_eq!(section.thread_count, 1);
+        assert_eq!(section.path, Path::new("codex-bridge://section/section-1"));
+        let (section_threads, available) = store
+            .list_project_threads_with_index(&section.path, false, 0, 10, &[], Some(&index))
+            .unwrap();
+        assert_eq!(available, 1);
+        assert_eq!(section_threads[0].id, "section-thread");
+        let workspace_project = projects
+            .iter()
+            .find(|project| project.path == workspace)
+            .unwrap();
+        assert_eq!(workspace_project.thread_count, 1);
+        assert!(projects.iter().all(|project| project.name != "Pinned"));
     }
 
     #[test]

@@ -1034,6 +1034,14 @@ aside {
 .project {
   margin: 3px 0 7px;
 }
+.custom-section {
+  border-bottom: 1px solid var(--line);
+}
+.custom-section .project-button {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
 .project-head {
   display: block;
 }

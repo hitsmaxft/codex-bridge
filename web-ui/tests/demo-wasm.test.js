@@ -130,8 +130,22 @@ import { runtimeArchitectureModel } from "../src/runtime-architecture.js";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   persistExpandedProjects,
+  sidebarProjectOrder,
   storedExpandedProjects,
 } from "../src/project-state.js";
+
+test("custom sections stay below Pinned and before project folders", () => {
+  const projects = [
+    { path: "/workspace", kind: "project" },
+    { path: "codex-bridge://section/design", kind: "section" },
+    { path: "codex-bridge://chats", kind: "chats" },
+  ];
+  assert.deepEqual(
+    sidebarProjectOrder(projects).map((project) => project.kind),
+    ["section", "project", "chats"],
+  );
+  assert.equal(projects[0].kind, "project");
+});
 import { taskOverview } from "../src/task-overview.js";
 import { toolOutputImageUrl, toolOutputImageUrls } from "../src/tool-image.js";
 import {

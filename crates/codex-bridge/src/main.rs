@@ -6324,6 +6324,8 @@ fn fetch_app_server_project_index(
             "sortDirection": "desc",
         }),
     )?;
+    let sections = app_server_list_all(write_backend, "threadSection/list", json!({"limit": 100}))
+        .unwrap_or_default();
     let source_kinds = json!(["cli", "vscode", "exec", "appServer", "unknown"]);
     let mut threads = app_server_list_all(
         write_backend,
@@ -6347,8 +6349,9 @@ fn fetch_app_server_project_index(
             }),
         )?);
     }
-    Ok(ThreadProjectIndex::from_app_server(
+    Ok(ThreadProjectIndex::from_app_server_with_sections(
         &json!({"data": projects}),
+        &json!({"data": sections}),
         &threads,
     ))
 }
