@@ -14,6 +14,7 @@ import {
 import { goalToggleState } from "./goal-state.js";
 import { asyncQuestionReplyMode } from "./async-question-state.js";
 import { commandPickerTrigger } from "./command-picker.js";
+import { appendLiveCommandText, commandOutputModel, isCommandTool } from "./command-output.js";
 import { applyLanguage, getLanguage, LANGUAGE_STORAGE_KEY, t as tr } from "./i18n.js";
 import { MAX_PASTED_TEXT_BYTES, shouldAttachPastedText } from "./large-paste.js";
 import { markdownNode } from "./markdown.js";
@@ -3499,6 +3500,80 @@ function appendCommandActions(parent, input) {
   parent.append(title, list);
   return true;
 }
+const liveCommandOutputs = new Map();
+
+function commandTerminalNode(model, live = false) {
+  const terminal = document.createElement("section"),
+    header = document.createElement("div"),
+    title = document.createElement("span"),
+    events = document.createElement("span"),
+    output = document.createElement("pre");
+  terminal.className = "command-terminal";
+  header.className = "command-terminal-header";
+  title.className = "command-terminal-title";
+  title.textContent = ">_  " + tr("terminalOutput");
+  events.className = "command-terminal-events";
+  const stateLabel =
+    model.event === "running"
+      ? tr("running")
+      : model.event === "failed"
+        ? tr("commandFailed")
+        : tr("commandFinished");
+  const exitLabel = model.exitCode === null ? "" : `${tr("exitCode")} ${model.exitCode}`;
+  events.textContent = [
+    stateLabel,
+    exitLabel,
+    model.durationMs === null ? "" : `${(model.durationMs / 1000).toFixed(2)}s`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  events.classList.toggle("error", model.exitCode !== null && model.exitCode !== 0);
+  header.append(title, events);
+  output.className = "command-terminal-output";
+  output.textContent = model.text || tr(live ? "waitingOutput" : "noCommandOutput");
+  terminal.append(header, output);
+  if (live) terminal.dataset.commandLiveId = state.liveAppServerTool?.id || "";
+  return terminal;
+}
+
+function appendCommandResult(parent, value, status) {
+  const model = commandOutputModel(value, status);
+  parent.appendChild(commandTerminalNode(model));
+  if (model.parsed !== null) {
+    const parsed = document.createElement("details"),
+      heading = document.createElement("summary"),
+      content = document.createElement("pre");
+    parsed.className = "command-parsed";
+    heading.textContent = tr("parsedContent");
+    content.textContent = JSON.stringify(model.parsed, null, 2);
+    parsed.append(heading, content);
+    parent.appendChild(parsed);
+  }
+  if (model.extra !== null) {
+    const heading = document.createElement("h5");
+    heading.textContent = tr("commandMetadata");
+    parent.appendChild(heading);
+    appendToolValue(parent, model.extra);
+  }
+}
+
+function liveCommandNode(tool) {
+  if (!tool?.id || !isCommandTool(tool.name)) return null;
+  const text = liveCommandOutputs.get(tool.id) || "";
+  return commandTerminalNode({ text, event: "running", exitCode: null, durationMs: null }, true);
+}
+
+function updateLiveCommandNodes(itemId) {
+  for (const node of document.querySelectorAll("[data-command-live-id]")) {
+    if (node.dataset.commandLiveId !== itemId) continue;
+    const output = node.querySelector(".command-terminal-output");
+    if (output) {
+      const nearBottom = output.scrollHeight - output.clientHeight - output.scrollTop < 24;
+      output.textContent = liveCommandOutputs.get(itemId) || tr("waitingOutput");
+      if (nearBottom) output.scrollTop = output.scrollHeight;
+    }
+  }
+}
 const renderedMessageState = new WeakMap();
 
 function toolGroupNode(
@@ -3664,7 +3739,8 @@ function toolGroupNode(
             body.append(inputTitle, input, outputTitle);
           }
         }
-        if (r.tool.output != null) appendToolValue(body, r.tool.output);
+        if (isCommandTool(tool.name)) appendCommandResult(body, r.tool.output, r.tool.status);
+        else if (r.tool.output != null) appendToolValue(body, r.tool.output);
         if (tool.name === "view_image" && !toolOutputImageUrls(r.tool.output).length) {
           const images = await toolImagePreviews(imageTool, threadId);
           for (const image of images)
@@ -3675,6 +3751,10 @@ function toolGroupNode(
     list.appendChild(detail);
     if (tool.has_image || (tool.name === "view_image" && tool.image_path))
       list.appendChild(toolCallImagesNode(imageTool, threadId));
+  }
+  if (runningTool && isCommandTool(runningTool.name)) {
+    const terminal = liveCommandNode(state.liveAppServerTool);
+    if (terminal) list.appendChild(terminal);
   }
   group.appendChild(list);
   return group;
@@ -4387,6 +4467,10 @@ function liveToolActivityNode(root = $("messages")) {
   summary.append(icon, label);
   row.appendChild(summary);
   body.appendChild(row);
+  if (state.liveAppServerTool?.id) {
+    const terminal = liveCommandNode(state.liveAppServerTool);
+    if (terminal) body.appendChild(terminal);
+  }
   while (node.firstChild) node.firstChild.remove();
   node.appendChild(body);
   return node;
@@ -5437,6 +5521,7 @@ function handleBridgeEvent(event) {
   } else if (method === "item/started" && threadId === state.current?.id) {
     const liveTool = appServerItemTool(params.item);
     if (liveTool) {
+      if (isCommandTool(liveTool.name) && liveTool.id) liveCommandOutputs.set(liveTool.id, "");
       state.liveAppServerTool = liveTool;
       state.authoritativeThreadActive.set(threadId, true);
       state.activeTurnId = params.turnId || state.activeTurnId;
@@ -5450,8 +5535,17 @@ function handleBridgeEvent(event) {
       renderAsyncQuestion();
       if (followTail) requestAnimationFrame(scheduleMessageTailLock);
     }
+  } else if (method === "item/commandExecution/outputDelta" && threadId === state.current?.id) {
+    if (typeof params.itemId === "string" && typeof params.delta === "string") {
+      liveCommandOutputs.set(
+        params.itemId,
+        appendLiveCommandText(liveCommandOutputs.get(params.itemId) || "", params.delta),
+      );
+      updateLiveCommandNodes(params.itemId);
+    }
   } else if (method === "item/completed" && threadId === state.current?.id) {
     const completedTool = appServerItemTool(params.item);
+    if (completedTool?.id) liveCommandOutputs.delete(completedTool.id);
     if (completedTool && state.liveAppServerTool?.id === completedTool.id) {
       state.liveAppServerTool = null;
       state.activityPhase = "model";
@@ -5508,7 +5602,7 @@ function handleBridgeEvent(event) {
   if (
     threadId === state.current?.id &&
     (method.startsWith("turn/") ||
-      method.startsWith("item/") ||
+      (method.startsWith("item/") && method !== "item/commandExecution/outputDelta") ||
       method === "thread/status/changed" ||
       method === "thread/reverted")
   ) {

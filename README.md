@@ -22,6 +22,7 @@ still use the account and network configured by Codex itself.
 
 - A shared task list and persistent live connection for the Web UI and `codexctl`.
 - Structured messages, tool calls, diffs, status, models, and paginated history.
+- Terminal-style command output with live progress, exit codes, and parsed JSON when available.
 - Composer slash commands and skill selection, with inline computer-use screenshots.
 - Remote Queue, Steer, withdrawal, interruption, pinning, custom sections, renaming, and archiving.
 - Editable voice transcription through app-server, with an optional managed local whisper.cpp

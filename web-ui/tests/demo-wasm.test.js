@@ -23,8 +23,42 @@ import { demoCommandWithInstance } from "../src/demo-client.js";
 import { goalToggleState } from "../src/goal-state.js";
 import { asyncQuestionReplyMode } from "../src/async-question-state.js";
 import { commandPickerTrigger } from "../src/command-picker.js";
+import { appendLiveCommandText, commandOutputModel, isCommandTool } from "../src/command-output.js";
 import { LARGE_PASTE_CHARS, shouldAttachPastedText } from "../src/large-paste.js";
 import { orderedTurnChildren, turnUsageHost } from "../src/turn-stack.js";
+
+test("command output keeps terminal text, exit status, and parsed JSON distinct", () => {
+  const native = commandOutputModel({
+    aggregatedOutput: '{"ok":true,"items":[1,2]}',
+    exitCode: 0,
+    durationMs: 1234,
+    result: "success",
+  });
+  assert.equal(native.text, '{"ok":true,"items":[1,2]}');
+  assert.equal(native.exitCode, 0);
+  assert.equal(native.durationMs, 1234);
+  assert.deepEqual(native.parsed, { ok: true, items: [1, 2] });
+  assert.deepEqual(native.extra, { result: "success" });
+  const wrapped = commandOutputModel([
+    {
+      type: "text",
+      text: "Chunk ID: abc\nWall time: 0.25 seconds\nProcess exited with code 7\nFinal output:\nfailed\n",
+    },
+  ]);
+  assert.equal(wrapped.text, "failed\n");
+  assert.equal(wrapped.exitCode, 7);
+  assert.equal(wrapped.durationMs, 250);
+  const objectResult = commandOutputModel([
+    { type: "text", text: '{"output":"done\\n","exit_code":0,"wall_time_seconds":0.05}' },
+  ]);
+  assert.equal(objectResult.text, "done\n");
+  assert.equal(objectResult.exitCode, 0);
+  assert.equal(objectResult.durationMs, 50);
+  assert.equal(commandOutputModel("exit code 7\n", "failed").text, "exit code 7\n");
+  assert.equal(isCommandTool("exec_command"), true);
+  assert.equal(isCommandTool("web_search"), false);
+  assert.equal(appendLiveCommandText("first", " second"), "first second");
+});
 
 test("collapsed steer messages form one ordered prompt stack", () => {
   const [prompt, commentary, steerOne, tool, steerTwo, final, fold, stack] = Array.from(

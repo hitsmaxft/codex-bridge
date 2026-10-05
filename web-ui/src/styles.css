@@ -2525,6 +2525,68 @@ main.history-fullscreen .fullscreen-exit-icon {
     Menlo,
     monospace;
 }
+.command-terminal {
+  min-width: 0;
+  margin: 5px 2px 8px;
+  overflow: hidden;
+  border: 1px solid #343b42;
+  border-radius: 8px;
+  background: #11171c;
+  color: #d9e2e8;
+}
+.command-terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+  padding: 5px 10px;
+  border-bottom: 1px solid #343b42;
+  color: #a8bac6;
+  font:
+    11px/1.4 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+.command-terminal-title {
+  white-space: nowrap;
+}
+.command-terminal-events {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.command-terminal-events.error {
+  color: #f3a3a3;
+}
+.tool-detail .command-terminal-output,
+.live-tool-activity .command-terminal-output,
+.tool-list > .command-terminal .command-terminal-output {
+  max-height: 52vh;
+  margin: 0;
+  padding: 10px;
+  border-radius: 0;
+  background: transparent;
+  color: #d9e2e8;
+  white-space: pre-wrap;
+  overflow: auto;
+  font:
+    12px/1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+.command-parsed {
+  margin: 6px 2px 9px;
+}
+.command-parsed > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+}
+.command-parsed > pre {
+  margin-top: 5px;
+}
 .command-actions {
   position: relative;
   display: grid;
