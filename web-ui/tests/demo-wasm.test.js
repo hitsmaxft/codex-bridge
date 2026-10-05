@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 import {
   completionMatchesActiveTurn,
@@ -2376,6 +2377,73 @@ test("selected text creates an annotated full-screen temporary conversation", as
   );
   assert.equal(turn.turn_id, "demo-temporary-turn");
   assert.match(turn.demo_reply, /in-memory temporary branch/);
+});
+
+test("failed Temp creation returns the main composer to a usable mode", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const writeSource = source.slice(
+    source.indexOf("async function write(name) {"),
+    source.indexOf("function approval(name) {"),
+  );
+  const message = { value: "Retry in the main conversation" };
+  const sendMode = { value: "temp" };
+  const modes = [];
+  const submitting = [];
+  const context = {
+    state: {
+      current: { id: "manta" },
+      activeTurnId: "active-turn",
+      composerAttachments: [],
+      composerReference: null,
+    },
+    $: (id) => ({ messageText: message, sendMode })[id],
+    voiceRecorder: null,
+    setComposerSubmitting: (value) => submitting.push(value),
+    createTemporaryThread: async () => {
+      throw new Error("fork failed");
+    },
+    setSendMode: (mode) => {
+      modes.push(mode);
+      sendMode.value = mode;
+    },
+  };
+  await assert.rejects(runInNewContext(`${writeSource}\nwrite("temp")`, context), /fork failed/);
+  assert.equal(message.value, "Retry in the main conversation");
+  assert.deepEqual(modes, ["steer"]);
+  assert.deepEqual(submitting, [true, false]);
+});
+
+test("failed Temp turn keeps its text available for an explicit retry", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const sendSource = source.slice(
+    source.indexOf("async function sendTemporaryMessage() {"),
+    source.indexOf("async function transcribeAudio(audio) {"),
+  );
+  const textarea = { value: "Inspect this selection" };
+  const temporary = {
+    id: "temporary-thread",
+    sourceThreadId: "manta",
+    selection: { text: "selected text" },
+    messages: [],
+    activeTurnId: null,
+  };
+  const context = {
+    state: { current: { id: "manta" }, temporaryThread: temporary },
+    $: () => textarea,
+    newSubmissionId: () => "temp-submission",
+    renderTemporaryMessages: () => {},
+    selectedContextPrompt: (_selection, text) => text,
+    command: async () => {
+      throw new Error("turn start failed");
+    },
+  };
+  await assert.rejects(
+    runInNewContext(`${sendSource}\nsendTemporaryMessage()`, context),
+    /turn start failed/,
+  );
+  assert.equal(textarea.value, "Inspect this selection");
+  assert.equal(temporary.activeTurnId, null);
+  assert.equal(temporary.messages.at(-1).running, false);
 });
 
 test("authentication gate serializes concurrent startup requests", async () => {

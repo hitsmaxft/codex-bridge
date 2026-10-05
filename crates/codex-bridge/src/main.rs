@@ -6311,6 +6311,28 @@ fn app_server_list_all(
     Ok(data)
 }
 
+fn temporary_fork_turn_id(thread: &Value, requested: &str) -> Result<String, &'static str> {
+    let Some(turns) = thread.pointer("/thread/turns").and_then(Value::as_array) else {
+        return Ok(requested.to_owned());
+    };
+    let Some(index) = turns
+        .iter()
+        .position(|turn| turn.get("id").and_then(Value::as_str) == Some(requested))
+    else {
+        return Ok(requested.to_owned());
+    };
+    if turns[index].get("status").and_then(Value::as_str) != Some("inProgress") {
+        return Ok(requested.to_owned());
+    }
+    turns[..index]
+        .iter()
+        .rev()
+        .find(|turn| turn.get("status").and_then(Value::as_str) == Some("completed"))
+        .and_then(|turn| turn.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .ok_or("finish the first turn before creating a temporary conversation")
+}
+
 fn fetch_app_server_project_index(
     write_backend: &CodexCliBackend,
     include_archived: bool,
@@ -7689,12 +7711,27 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             {
                 return response;
             }
+            let fork_turn_id = if let Some(last_turn_id) = last_turn_id {
+                let thread = match write_backend.app_server_rpc(
+                    "thread/read",
+                    json!({"threadId": thread_id, "includeTurns": true}),
+                ) {
+                    Ok(thread) => thread,
+                    Err(error) => return write_backend_error(error),
+                };
+                match temporary_fork_turn_id(&thread, &last_turn_id) {
+                    Ok(turn_id) => Some(turn_id),
+                    Err(message) => return Response::error("temporary_turn_not_ready", message),
+                }
+            } else {
+                None
+            };
             let mut params = json!({
                 "threadId": thread_id,
                 "ephemeral": true,
                 "excludeTurns": true,
             });
-            if let Some(last_turn_id) = last_turn_id {
+            if let Some(last_turn_id) = fork_turn_id {
                 params["lastTurnId"] = Value::String(last_turn_id);
             }
             match write_backend.app_server_rpc("thread/fork", params) {
@@ -9719,6 +9756,31 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn temporary_fork_uses_the_last_completed_turn_when_selection_is_in_progress() {
+        let thread = json!({"thread": {"turns": [
+            {"id": "turn-1", "status": "completed"},
+            {"id": "turn-2", "status": "completed"},
+            {"id": "turn-3", "status": "inProgress"}
+        ]}});
+        assert_eq!(
+            temporary_fork_turn_id(&thread, "turn-3"),
+            Ok("turn-2".into())
+        );
+        assert_eq!(
+            temporary_fork_turn_id(&thread, "turn-1"),
+            Ok("turn-1".into())
+        );
+        assert_eq!(
+            temporary_fork_turn_id(&thread, "missing"),
+            Ok("missing".into())
+        );
+        let first_turn = json!({"thread": {"turns": [
+            {"id": "turn-1", "status": "inProgress"}
+        ]}});
+        assert!(temporary_fork_turn_id(&first_turn, "turn-1").is_err());
+    }
 
     fn fixture_store() -> SessionStore {
         SessionStore::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex-home"))

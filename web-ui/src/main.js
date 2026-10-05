@@ -2379,7 +2379,7 @@ async function createTemporaryThread(selection, draft = "") {
       state.temporaryThreads.set(sourceThreadId, temporary);
     } else temporary.selection = { ...selection };
 
-    if (state.current?.id !== sourceThreadId) return;
+    if (state.current?.id !== sourceThreadId) return false;
     state.temporaryThread = temporary;
     $("temporaryPanelBtn").hidden = false;
     $("temporaryText").value = sourceDraft;
@@ -2391,6 +2391,7 @@ async function createTemporaryThread(selection, draft = "") {
     setTemporarySelection();
     renderTemporaryMessages();
     openTemporaryPanel();
+    return true;
   } finally {
     state.temporaryCreating = false;
     button.disabled = buttonWasDisabled;
@@ -2403,6 +2404,7 @@ async function sendTemporaryMessage() {
     textarea = $("temporaryText"),
     text = textarea.value.trim();
   if (!temporary || !text || temporary.activeTurnId) return;
+  if (temporary.sourceThreadId !== state.current?.id) throw new Error(tr("pendingWrongSession"));
   const submissionId = newSubmissionId();
   temporary.messages.push({ role: "user", text });
   temporary.messages.push({ role: "assistant", text: "", id: null, running: true });
@@ -2433,6 +2435,7 @@ async function sendTemporaryMessage() {
     temporary.activeTurnId = null;
     temporary.messages.at(-1).text = error.message;
     temporary.messages.at(-1).running = false;
+    textarea.value = text;
     renderTemporaryMessages();
     throw error;
   }
@@ -6190,11 +6193,16 @@ async function write(name) {
   if (!state.current) throw new Error(tr("chooseSessionError"));
   if (name === "temp") {
     if (attachments.length) throw new Error(tr("temporaryCreateFailed"));
+    const sourceThreadId = state.current.id;
     setComposerSubmitting(true);
     try {
-      await createTemporaryThread(state.temporarySelection, draft);
+      if (!(await createTemporaryThread(state.temporarySelection, draft))) return;
       await sendTemporaryMessage();
       setComposerReference();
+    } catch (error) {
+      if (state.current?.id === sourceThreadId && $("sendMode").value === "temp")
+        setSendMode(state.activeTurnId ? "steer" : "send", true);
+      throw error;
     } finally {
       setComposerSubmitting(false);
     }
