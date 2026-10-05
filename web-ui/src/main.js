@@ -4599,11 +4599,13 @@ function mergePendingResponse(
   );
 }
 let pendingSnapshotGeneration = 0;
+let pendingAppliedGeneration = 0;
 async function refreshPending({ preserveOptimistic = true } = {}) {
   const threadId = state.current?.id || null,
     generation = ++pendingSnapshotGeneration;
   const r = await command({ command: "pending_messages", thread_id: threadId }, false);
-  if (generation !== pendingSnapshotGeneration || threadId !== (state.current?.id || null)) return;
+  if (generation < pendingAppliedGeneration || threadId !== (state.current?.id || null)) return;
+  pendingAppliedGeneration = generation;
   state.pending = mergePendingResponse(r.messages, preserveOptimistic);
   renderPending();
 }
@@ -5816,23 +5818,41 @@ async function openThread(
   await yieldToBrowser();
   if (token !== state.openToken) return;
   const pendingGeneration = ++pendingSnapshotGeneration;
-  const messagesRequest = fetchMessages(null, state.initialPageSize),
-    auxiliaryRequest = Promise.all([
-      refreshActivity().catch(() => null),
-      command({ command: "thread_watch", thread_id: thread.id }, false)
-        .then((watch) => {
-          updateThreadLiveFromStatus(thread.id, watch.thread?.status);
-          return watch;
-        })
-        .catch((error) => ({
-          writer_lock: { state: "unavailable", read_only: true, reason: error.message },
-        })),
-      command({ command: "pending_messages", thread_id: thread.id }, false).catch(() => null),
-      command({ command: "thread_goal_get", thread_id: thread.id }, false).catch(() => undefined),
-      !quiet || changedThread || reconnect
-        ? refreshAsyncQuestions(thread.id).catch(() => null)
-        : Promise.resolve(null),
-    ]);
+  const sameThread = () => state.current?.id === thread.id;
+  const stillCurrent = () => token === state.openToken && state.current?.id === thread.id;
+  void refreshActivity().catch(() => {});
+  void command({ command: "thread_watch", thread_id: thread.id }, false)
+    .then((watch) => {
+      if (!sameThread()) return;
+      updateThreadLiveFromStatus(thread.id, watch.thread?.status);
+      applyThreadWriterLock(watch.writer_lock);
+    })
+    .catch((error) => {
+      if (sameThread())
+        applyThreadWriterLock({
+          state: "unavailable",
+          read_only: true,
+          reason: error.message,
+        });
+    });
+  void command({ command: "pending_messages", thread_id: thread.id }, false)
+    .then((pending) => {
+      if (!sameThread() || pendingGeneration < pendingAppliedGeneration) return;
+      if (!Array.isArray(pending.messages)) return;
+      pendingAppliedGeneration = pendingGeneration;
+      state.pending = mergePendingResponse(pending.messages, true);
+      renderPending();
+    })
+    .catch(() => {});
+  void command({ command: "thread_goal_get", thread_id: thread.id }, false)
+    .then((goal) => {
+      if (!stillCurrent()) return;
+      state.threadGoal = goal.goal || null;
+      renderGoalPanel();
+    })
+    .catch(() => {});
+  if (!quiet || changedThread || reconnect) void refreshAsyncQuestions(thread.id).catch(() => {});
+  const messagesRequest = fetchMessages(null, state.initialPageSize);
   let r;
   try {
     r = await messagesRequest;
@@ -5883,17 +5903,6 @@ async function openThread(
   setMessageSyncPhase(null);
   showActivity();
   if (!quiet) settleHorizontalPosition();
-  void auxiliaryRequest.then(([, watchResult, pendingResult, goalResult]) => {
-    if (token !== state.openToken || state.current?.id !== thread.id) return;
-    applyThreadWriterLock(watchResult?.writer_lock);
-    if (pendingGeneration === pendingSnapshotGeneration && Array.isArray(pendingResult?.messages))
-      state.pending = mergePendingResponse(pendingResult.messages, true, r.messages);
-    if (goalResult) state.threadGoal = goalResult.goal || null;
-    renderPending();
-    renderGoalPanel();
-    renderVisibleMessages();
-    showActivity();
-  });
   void refreshWorkspaceDiff(true).catch(() => {});
 }
 async function refreshThread() {
@@ -5991,11 +6000,7 @@ function currentThreadWritable() {
   );
 }
 function currentThreadQueueable() {
-  return Boolean(
-    state.current &&
-    (state.current.projectless_draft ||
-      ["owned", "external", "released"].includes(state.threadWriterLock?.state)),
-  );
+  return Boolean(state.current);
 }
 function requireCurrentThreadWriter() {
   if (!currentThreadWritable()) throw new Error(tr("sessionReadOnly"));

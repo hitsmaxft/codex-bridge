@@ -94,7 +94,7 @@ async function sendCommand(request) {
   }
   const timeoutMs = ["send", "steer", "temporary_turn_start"].includes(request.command)
       ? 30_000
-      : ["pending_messages", "thread_activity"].includes(request.command)
+      : ["pending_messages", "thread_activity", "thread_watch"].includes(request.command)
         ? 15_000
         : 0,
     controller = timeoutMs ? new AbortController() : null,

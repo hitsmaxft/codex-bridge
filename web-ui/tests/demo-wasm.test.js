@@ -1996,11 +1996,12 @@ test("session return renders the latest batch before any older history", async (
   assert.match(openFlow, /fetchMessages\(null, state\.initialPageSize\)/);
   assert.match(openFlow, /await yieldToBrowser\(\)/);
   assert.match(openFlow, /const messagesRequest = fetchMessages/);
-  assert.match(openFlow, /auxiliaryRequest = Promise\.all/);
+  assert.match(openFlow, /command\(\{ command: "thread_watch"/);
+  assert.match(openFlow, /command\(\{ command: "pending_messages"/);
   assert.match(openFlow, /r = await messagesRequest/);
-  assert.match(openFlow, /void auxiliaryRequest\.then/);
   assert.ok(
-    openFlow.indexOf("r = await messagesRequest") < openFlow.indexOf("void auxiliaryRequest.then"),
+    openFlow.indexOf('command({ command: "thread_watch"') <
+      openFlow.indexOf("r = await messagesRequest"),
   );
   assert.match(stateSource, /initialPageSize: 8,[\s\S]*pageSize: 30/);
   assert.match(source, /state\.messageSyncPhase === "loading"/);
@@ -2525,6 +2526,105 @@ test("a command timeout also covers a stalled response body", async () => {
     runInNewContext(`${sendSource}\nsendCommand({command: "steer"})`, context),
     /request timed out after 30000 ms/,
   );
+});
+
+test("a slow history page does not delay writer or queue state", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const openSource = source.slice(
+    source.indexOf("async function openThread("),
+    source.indexOf("async function refreshThread() {"),
+  );
+  const locks = [];
+  const state = {
+    openToken: 0,
+    current: null,
+    pending: [],
+    messageCache: new Map(),
+    initialPageSize: 30,
+  };
+  const context = {
+    state,
+    $: (id) => ({ textContent: "", id }),
+    renderAsyncQuestion: () => {},
+    applyThreadWriterLock: (lock) => locks.push(lock.state),
+    syncTemporaryForCurrent: () => {},
+    resetThreadViewState: () => {},
+    refreshComposerStatus: async () => {},
+    renderPending: () => {},
+    renderProjects: () => {},
+    renderRepairHint: () => {},
+    renderThreadStatistics: () => {},
+    tr: (key) => key,
+    setMessageSyncPhase: () => {},
+    yieldToBrowser: async () => {},
+    refreshActivity: async () => {},
+    refreshAsyncQuestions: async () => {},
+    fetchMessages: () => new Promise(() => {}),
+    command: async (request) => {
+      if (request.command === "thread_watch")
+        return { writer_lock: { state: "owned" }, thread: { status: { type: "active" } } };
+      if (request.command === "pending_messages")
+        return { messages: [{ id: "queued-1", thread_id: "manta", status: "queued" }] };
+      return { goal: null };
+    },
+    updateThreadLiveFromStatus: () => {},
+    mergePendingResponse: (messages) => messages,
+    renderGoalPanel: () => {},
+  };
+  runInNewContext(
+    `let pendingSnapshotGeneration = 0, pendingAppliedGeneration = 0;\n${openSource}\nopenThread({id: "manta", title: "Manta58", cwd: "/tmp"}, {quiet: true})`,
+    context,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(locks, ["checking", "owned"]);
+  assert.equal(state.pending[0].status, "queued");
+});
+
+test("Queue remains actionable while writer status is still loading", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const queueableSource = source.slice(
+    source.indexOf("function currentThreadQueueable() {"),
+    source.indexOf("function requireCurrentThreadWriter() {"),
+  );
+  const state = { current: { id: "manta" }, threadWriterLock: { state: "checking" } };
+  const context = { state };
+  assert.equal(runInNewContext(`${queueableSource}\ncurrentThreadQueueable()`, context), true);
+  state.threadWriterLock.state = "unavailable";
+  assert.equal(runInNewContext(`${queueableSource}\ncurrentThreadQueueable()`, context), true);
+  state.current = null;
+  assert.equal(runInNewContext(`${queueableSource}\ncurrentThreadQueueable()`, context), false);
+});
+
+test("pending snapshots apply promptly and never overwrite a newer applied result", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const refreshSource = source.slice(
+    source.indexOf("let pendingSnapshotGeneration = 0;"),
+    source.indexOf("async function deletePending(entry, button) {"),
+  );
+  const resolvers = [];
+  const state = { current: { id: "manta" }, pending: [] };
+  const context = {
+    state,
+    command: () => new Promise((resolve) => resolvers.push(resolve)),
+    mergePendingResponse: (messages) => messages,
+    renderPending: () => {},
+  };
+  const { refreshPending } = runInNewContext(`${refreshSource}\n({refreshPending})`, context);
+  const first = refreshPending();
+  const second = refreshPending();
+  resolvers[0]({ messages: [{ id: "older" }] });
+  await first;
+  assert.equal(state.pending[0].id, "older");
+  resolvers[1]({ messages: [{ id: "newer" }] });
+  await second;
+  assert.equal(state.pending[0].id, "newer");
+  const third = refreshPending();
+  const fourth = refreshPending();
+  resolvers[3]({ messages: [{ id: "latest" }] });
+  await fourth;
+  resolvers[2]({ messages: [{ id: "stale" }] });
+  await third;
+  assert.equal(state.pending[0].id, "latest");
 });
 
 test("authentication gate serializes concurrent startup requests", async () => {
