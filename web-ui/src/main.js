@@ -4538,7 +4538,6 @@ function pendingNode(entry) {
       const convert = document.createElement("button");
       convert.type = "button";
       convert.textContent = tr("convertToSteer");
-      convert.disabled = busy;
       convert.onclick = (event) => {
         event.stopPropagation();
         menu.open = false;

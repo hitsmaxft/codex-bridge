@@ -2302,6 +2302,59 @@ test("queued messages expose withdraw and convert-to-steer actions", async () =>
   assert.doesNotMatch(acceptedFlow, /preserveOptimistic: false/);
 });
 
+test("a queued card renders its Convert to Steer control without aborting session refresh", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const pendingSource = source.slice(
+    source.indexOf("function pendingNode(entry) {"),
+    source.indexOf("function renderPending() {"),
+  );
+  const created = [];
+  const document = {
+    createElement(tag) {
+      const node = {
+        tag,
+        children: [],
+        dataset: {},
+        append(...children) {
+          this.children.push(...children);
+        },
+        appendChild(child) {
+          this.children.push(child);
+        },
+        prepend(child) {
+          this.children.unshift(child);
+        },
+        setAttribute() {},
+      };
+      created.push(node);
+      return node;
+    },
+  };
+  const entry = {
+    id: "queued-1",
+    thread_id: "manta",
+    text: "queued prompt",
+    action: "queue",
+    status: "queued",
+    source: "app_server_queue",
+  };
+  const context = {
+    document,
+    state: { current: { id: "manta" }, pending: [entry] },
+    markdownNode: () => document.createElement("span"),
+    markdownOptions: () => ({}),
+    currentThreadWritable: () => true,
+    tr: (key) => key,
+    run: () => {},
+  };
+  runInNewContext(`${pendingSource}\npendingNode(${JSON.stringify(entry)})`, context);
+  const convert = created.find(
+    (node) => node.tag === "button" && node.textContent === "convertToSteer",
+  );
+  assert.ok(convert);
+  assert.notEqual(convert.disabled, true);
+});
+
 test("queued text messages expose an ordered merge action", async () => {
   const source = await readFile(mainScriptPath, "utf8");
   assert.match(source, /command: "pending_messages_merge"/);
