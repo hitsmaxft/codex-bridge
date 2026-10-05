@@ -5600,7 +5600,8 @@ function syncFocusedComposerViewport() {
 function syncComposerPlaceholder() {
   const textarea = $("messageText"),
     shell = document.querySelector(".composer-shell"),
-    queueOnly = currentThreadQueueable() && !currentThreadWritable(),
+    queueOnly =
+      $("sendMode").value === "send" && currentThreadQueueable() && !currentThreadWritable(),
     compact =
       usesDocumentMessageScroll() &&
       !textarea.value &&
@@ -6038,7 +6039,6 @@ function applyThreadWriterLock(lock) {
   );
   const readOnly = !currentThreadWritable();
   document.querySelector(".composer-shell").classList.toggle("read-only", readOnly);
-  if (readOnly && $("sendMode").value === "steer") setSendMode("send", true);
   for (const id of [
     "renameThreadBtn",
     "archiveThreadBtn",
@@ -6060,7 +6060,7 @@ function setComposerSubmitting(active) {
   shell.classList.toggle("submitting", active);
   $("messageText").disabled = active;
   $("messageText").readOnly = !currentThreadQueueable();
-  $("sendModeToggle").disabled = active || !currentThreadWritable();
+  $("sendModeToggle").disabled = active || !currentThreadQueueable();
   $("attachBtn").disabled = active || !currentThreadQueueable();
   $("slashBtn").disabled = active || !currentThreadQueueable();
   $("imageInput").disabled = active || !currentThreadQueueable();
@@ -6083,13 +6083,17 @@ function syncSubmitAction() {
   const writable = currentThreadWritable(),
     queueable = currentThreadQueueable();
   $("messageText").readOnly = !queueable;
-  $("sendModeToggle").disabled = state.composerSubmitting || !writable;
+  $("sendModeToggle").disabled = state.composerSubmitting || !queueable;
   $("attachBtn").disabled = state.composerSubmitting || !queueable;
   $("slashBtn").disabled = state.composerSubmitting || !queueable;
   $("imageInput").disabled = state.composerSubmitting || !queueable;
   stop.disabled = state.interrupting || !writable;
   submit.disabled = state.composerSubmitting || state.interrupting || !queueable;
-  submit.title = tr(queueable && !writable ? "queueWithoutLockAria" : "submitAria");
+  submit.title = tr(
+    queueable && !writable && $("sendMode").value === "send"
+      ? "queueWithoutLockAria"
+      : "submitAria",
+  );
   submit.setAttribute("aria-label", submit.title);
   syncComposerPlaceholder();
 }
@@ -6222,7 +6226,6 @@ async function write(name) {
       throw error;
     }
   }
-  if (name === "steer" && !currentThreadWritable()) name = "send";
   const threadId = state.current.id,
     submissionId = newSubmissionId();
   let action = name === "steer" ? "steer" : "queue";
@@ -6290,6 +6293,7 @@ async function write(name) {
     renderComposerAttachments();
     state.referenceDrafts.delete(threadId);
     if (state.current?.id === threadId) setComposerReference(null, false);
+    notify(name === "send" ? tr("messageQueued") : tr("guidanceSteered"));
     try {
       if (state.current?.id === threadId) await openThread(state.current, { quiet: true });
       else await refreshPending();
@@ -6297,7 +6301,6 @@ async function write(name) {
       notify(tr("acceptedRefreshFailed"), true);
       return;
     }
-    notify(name === "send" ? tr("messageQueued") : tr("guidanceSteered"));
   } catch (error) {
     if (!acknowledged) {
       if (!state.drafts.has(threadId)) saveDraft(threadId, draft, true);
@@ -6398,6 +6401,7 @@ function toggleSendModeAndKeepFocus() {
           ? "temp"
           : "steer";
   setSendMode(nextMode, false);
+  syncSubmitAction();
   $("messageText").focus({ preventScroll: true });
 }
 $("sendModeToggle").onclick = toggleSendModeAndKeepFocus;

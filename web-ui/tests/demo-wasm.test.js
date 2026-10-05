@@ -2256,7 +2256,10 @@ test("session writer ownership drives read-only UI and explicit release", async 
   assert.match(source, /readOnly = !currentThreadWritable\(\)/);
   assert.match(source, /function currentThreadQueueable\(\)/);
   assert.match(source, /submit\.disabled =[^;]*!queueable/);
-  assert.match(source, /if \(name === "steer" && !currentThreadWritable\(\)\) name = "send"/);
+  assert.doesNotMatch(
+    source,
+    /if \(name === "steer" && !currentThreadWritable\(\)\) name = "send"/,
+  );
   assert.match(source, /queueOnlyPlaceholder/);
   assert.match(stylesheet, /\.composer-shell\.read-only/);
   assert.match(translations, /sessionInUse:\s*"会话已被其他 app-server 使用 · 只读"/);
@@ -2498,6 +2501,107 @@ test("a lost Steer response reconciles server acceptance without trapping the co
   assert.equal(state.pendingInFlight.size, 0);
   assert.equal(message.value, "");
   assert.equal(submitting.at(-1), false);
+});
+
+test("a stale writer lock cannot silently turn an explicit Steer into Queue", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const writeSource = source.slice(
+    source.indexOf("async function write(name) {"),
+    source.indexOf("function approval(name) {"),
+  );
+  const message = { value: "Check the mounting slope" };
+  const state = {
+    current: { id: "manta" },
+    composerAttachments: [],
+    composerReference: null,
+    pending: [],
+    pendingInFlight: new Set(),
+    lastMessageIndex: 10,
+    drafts: new Map(),
+    attachmentDrafts: new Map(),
+    referenceDrafts: new Map(),
+  };
+  const calls = [];
+  const notifications = [];
+  let finishHistoryRefresh;
+  const context = {
+    state,
+    $: () => message,
+    voiceRecorder: null,
+    newSubmissionId: () => "steer-with-stale-lock",
+    currentThreadWritable: () => false,
+    pendingInputSummary: (text) => text,
+    renderPending: () => {},
+    setComposerSubmitting: () => {},
+    command: async (request) => {
+      calls.push(request.command);
+      return { status: "steered" };
+    },
+    closeCommandPicker: () => {},
+    resizeComposerTextarea: () => {},
+    saveDraft: (id, text) => state.drafts.set(id, text),
+    renderComposerAttachments: () => {},
+    setComposerReference: () => {},
+    openThread: () => new Promise((resolve) => (finishHistoryRefresh = resolve)),
+    notify: (message) => notifications.push(message),
+    tr: (key) => key,
+  };
+  const writing = runInNewContext(`${writeSource}\nwrite("steer")`, context);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ["steer"]);
+  assert.equal(state.pending[0].action, "steer");
+  assert.deepEqual(notifications, ["guidanceSteered"]);
+  finishHistoryRefresh();
+  await writing;
+});
+
+test("stale writer status keeps Steer selection and submit controls available", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const lockSource = source.slice(
+    source.indexOf("function applyThreadWriterLock(lock) {"),
+    source.indexOf("function setComposerSubmitting(active) {"),
+  );
+  const submitSource = source.slice(
+    source.indexOf("function syncSubmitAction() {"),
+    source.indexOf("async function interruptCurrentRun("),
+  );
+  const controls = new Map();
+  const element = (id) => {
+    if (!controls.has(id))
+      controls.set(id, {
+        value: id === "sendMode" ? "steer" : "",
+        dataset: {},
+        classList: { toggle: () => {} },
+        setAttribute: () => {},
+      });
+    return controls.get(id);
+  };
+  const state = {
+    current: { id: "manta" },
+    threadWriterLock: null,
+    activeTurnId: "active-turn",
+    composerSubmitting: false,
+    interrupting: false,
+  };
+  const context = {
+    state,
+    $: element,
+    document: { querySelector: () => element("shell") },
+    tr: (key) => key,
+    currentThreadWritable: () => state.threadWriterLock?.state === "owned",
+    currentThreadQueueable: () => true,
+    shouldOfferStop: () => true,
+    syncVoiceCapability: () => {},
+    syncComposerPlaceholder: () => {},
+    renderAsyncQuestion: () => {},
+  };
+  runInNewContext(
+    `${lockSource}\n${submitSource}\napplyThreadWriterLock({state: "checking", read_only: true})`,
+    context,
+  );
+  assert.equal(element("sendMode").value, "steer");
+  assert.equal(element("sendModeToggle").disabled, false);
+  assert.equal(element("submitBtn").disabled, false);
 });
 
 test("a command timeout also covers a stalled response body", async () => {
