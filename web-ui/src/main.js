@@ -4532,8 +4532,7 @@ function pendingNode(entry) {
       entry.action === "queue" &&
       entry.status === "queued" &&
       nativeQueue &&
-      !hasAttachmentSummary &&
-      currentThreadWritable()
+      !hasAttachmentSummary
     ) {
       const convert = document.createElement("button");
       convert.type = "button";
@@ -4643,64 +4642,67 @@ async function deletePending(entry, button) {
 }
 async function convertPendingToSteer(entry, button) {
   if (state.current?.id !== entry.thread_id) throw new Error(tr("pendingWrongSession"));
-  requireCurrentThreadWriter();
   button.disabled = true;
-  const activity = await refreshActivity();
-  if (!activity?.activity.active_turn_id) {
-    button.disabled = false;
-    throw new Error(tr("convertRequiresActive"));
-  }
-  const withdrawn = await command(
-    { command: "pending_message_delete", id: entry.id, thread_id: entry.thread_id },
-    false,
-  );
-  state.pending = state.pending.filter(
-    (item) => item.id !== entry.id || item.thread_id !== entry.thread_id,
-  );
-  const submissionId = newSubmissionId();
-  state.pending.push({
-    id: submissionId,
-    thread_id: entry.thread_id,
-    text: withdrawn.text,
-    action: "steer",
-    status: "steering",
-    source: "web_optimistic",
-    after_message_index: state.lastMessageIndex ?? -1,
-  });
-  state.pendingInFlight.add(submissionId);
-  renderPending();
+  let submissionId = null;
   try {
-    await command(
-      {
-        command: "steer",
-        thread_id: entry.thread_id,
-        text: withdrawn.text,
-        attachments: [],
-        submission_id: submissionId,
-      },
+    const watch = await command({ command: "thread_watch", thread_id: entry.thread_id }, false);
+    if (state.current?.id !== entry.thread_id) throw new Error(tr("pendingWrongSession"));
+    applyThreadWriterLock(watch.writer_lock);
+    requireCurrentThreadWriter();
+    const activity = await refreshActivity();
+    if (!activity?.activity.active_turn_id) throw new Error(tr("convertRequiresActive"));
+    const withdrawn = await command(
+      { command: "pending_message_delete", id: entry.id, thread_id: entry.thread_id },
       false,
     );
-    state.pendingInFlight.delete(submissionId);
-    if (state.current?.id === entry.thread_id)
-      await openThread(state.current, { quiet: true, preserveView: true });
-    notify(tr("queueConverted"));
-  } catch (error) {
-    state.pendingInFlight.delete(submissionId);
-    state.pending = state.pending.filter((item) => item.id !== submissionId);
+    state.pending = state.pending.filter(
+      (item) => item.id !== entry.id || item.thread_id !== entry.thread_id,
+    );
+    submissionId = newSubmissionId();
+    state.pending.push({
+      id: submissionId,
+      thread_id: entry.thread_id,
+      text: withdrawn.text,
+      action: "steer",
+      status: "steering",
+      source: "web_optimistic",
+      after_message_index: state.lastMessageIndex ?? -1,
+    });
+    state.pendingInFlight.add(submissionId);
+    renderPending();
     try {
-      await refreshPending({ preserveOptimistic: false });
-    } catch {
-      renderPending();
+      await command(
+        {
+          command: "steer",
+          thread_id: entry.thread_id,
+          text: withdrawn.text,
+          attachments: [],
+          submission_id: submissionId,
+        },
+        false,
+      );
+    } catch (error) {
+      state.pending = state.pending.filter((item) => item.id !== submissionId);
+      await refreshPending({ preserveOptimistic: false }).catch(() => renderPending());
+      if (state.current?.id === entry.thread_id) {
+        $("messageText").value = withdrawn.text;
+        saveDraft(entry.thread_id, withdrawn.text, true);
+        setSendMode("steer", false);
+        resizeComposerTextarea();
+      }
+      throw new Error(`${tr("convertFailedRestored")} ${error.message || error}`);
     }
-    if (state.current?.id === entry.thread_id) {
-      $("messageText").value = withdrawn.text;
-      saveDraft(entry.thread_id, withdrawn.text, true);
-      setSendMode("steer", false);
-      resizeComposerTextarea();
-    }
-    throw new Error(`${tr("convertFailedRestored")} ${error.message || error}`);
-  } finally {
     state.pendingInFlight.delete(submissionId);
+    notify(tr("queueConverted"));
+    try {
+      if (state.current?.id === entry.thread_id)
+        await openThread(state.current, { quiet: true, preserveView: true });
+      else await refreshPending();
+    } catch {
+      notify(tr("acceptedRefreshFailed"), true);
+    }
+  } finally {
+    if (submissionId) state.pendingInFlight.delete(submissionId);
     if (button.isConnected) button.disabled = false;
   }
 }

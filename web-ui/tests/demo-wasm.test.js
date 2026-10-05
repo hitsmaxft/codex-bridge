@@ -2343,7 +2343,7 @@ test("a queued card renders its Convert to Steer control without aborting sessio
     state: { current: { id: "manta" }, pending: [entry] },
     markdownNode: () => document.createElement("span"),
     markdownOptions: () => ({}),
-    currentThreadWritable: () => true,
+    currentThreadWritable: () => false,
     tr: (key) => key,
     run: () => {},
   };
@@ -2353,6 +2353,87 @@ test("a queued card renders its Convert to Steer control without aborting sessio
   );
   assert.ok(convert);
   assert.notEqual(convert.disabled, true);
+});
+
+test("Queue to Steer rechecks the server writer before withdrawing the queued message", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const convertSource = source.slice(
+    source.indexOf("async function convertPendingToSteer(entry, button) {"),
+    source.indexOf("async function mergePendingMessages(entry, button) {"),
+  );
+  const entry = {
+    id: "queued-1",
+    thread_id: "manta",
+    text: "queued prompt",
+    action: "queue",
+    status: "queued",
+  };
+  const state = {
+    current: { id: "manta" },
+    threadWriterLock: { state: "checking" },
+    pending: [entry],
+    pendingInFlight: new Set(),
+    lastMessageIndex: 8,
+  };
+  const button = { disabled: false, isConnected: true };
+  const calls = [];
+  const notices = [];
+  const context = {
+    state,
+    command: async (request) => {
+      calls.push(request.command);
+      if (request.command === "thread_watch") return { writer_lock: { state: "owned" } };
+      if (request.command === "pending_message_delete") return { text: entry.text };
+      if (request.command === "steer") return { status: "steered" };
+      throw new Error(`unexpected command: ${request.command}`);
+    },
+    applyThreadWriterLock: (lock) => (state.threadWriterLock = lock),
+    requireCurrentThreadWriter: () => {
+      if (state.threadWriterLock.state !== "owned") throw new Error("writer unavailable");
+    },
+    refreshActivity: async () => ({ activity: { active_turn_id: "active-turn" } }),
+    newSubmissionId: () => "converted-steer-1",
+    renderPending: () => {},
+    notify: (message) => notices.push(message),
+    openThread: async () => {},
+    tr: (key) => key,
+  };
+  await runInNewContext(
+    `${convertSource}\nconvertPendingToSteer(${JSON.stringify(entry)}, button)`,
+    {
+      ...context,
+      button,
+    },
+  );
+  assert.deepEqual(calls, ["thread_watch", "pending_message_delete", "steer"]);
+  assert.equal(
+    state.pending.some((item) => item.id === entry.id),
+    false,
+  );
+  assert.equal(state.pending[0].action, "steer");
+  assert.equal(button.disabled, false);
+  assert.deepEqual(notices, ["queueConverted"]);
+
+  state.threadWriterLock = { state: "checking" };
+  state.pending = [entry];
+  calls.length = 0;
+  const blocked = {
+    ...context,
+    command: async (request) => {
+      calls.push(request.command);
+      return { writer_lock: { state: "external" } };
+    },
+  };
+  await assert.rejects(
+    runInNewContext(`${convertSource}\nconvertPendingToSteer(${JSON.stringify(entry)}, button)`, {
+      ...blocked,
+      button,
+    }),
+    /writer unavailable/,
+  );
+  assert.deepEqual(calls, ["thread_watch"]);
+  assert.equal(button.disabled, false);
+  assert.equal(state.pending[0].id, entry.id);
 });
 
 test("queued text messages expose an ordered merge action", async () => {
