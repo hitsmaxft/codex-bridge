@@ -2446,6 +2446,87 @@ test("failed Temp turn keeps its text available for an explicit retry", async ()
   assert.equal(temporary.messages.at(-1).running, false);
 });
 
+test("a lost Steer response reconciles server acceptance without trapping the composer", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const writeSource = source.slice(
+    source.indexOf("async function write(name) {"),
+    source.indexOf("function approval(name) {"),
+  );
+  const message = { value: "Check the mounting slope" };
+  const state = {
+    current: { id: "manta" },
+    composerAttachments: [],
+    composerReference: null,
+    pending: [],
+    pendingInFlight: new Set(),
+    lastMessageIndex: 10,
+    drafts: new Map(),
+    attachmentDrafts: new Map(),
+    referenceDrafts: new Map(),
+  };
+  const submitting = [];
+  const calls = [];
+  const context = {
+    state,
+    $: () => message,
+    voiceRecorder: null,
+    newSubmissionId: () => "steer-attempt",
+    currentThreadWritable: () => true,
+    pendingInputSummary: (text) => text,
+    renderPending: () => {},
+    setComposerSubmitting: (value) => submitting.push(value),
+    command: async (request) => {
+      calls.push(request.command);
+      throw new Error("request timed out after 30000 ms");
+    },
+    closeCommandPicker: () => {},
+    resizeComposerTextarea: () => {},
+    saveDraft: (id, text) => state.drafts.set(id, text),
+    refreshPending: async () => {
+      state.pending = [{ ...state.pending[0], status: "accepted", source: "app_server_queue" }];
+    },
+    renderComposerAttachments: () => {},
+    setComposerReference: () => {},
+    openThread: async () => {},
+    notify: () => {},
+    tr: (key) => key,
+  };
+  await runInNewContext(`${writeSource}\nwrite("steer")`, context);
+  assert.deepEqual(calls, ["steer"]);
+  assert.equal(state.pending[0].status, "accepted");
+  assert.equal(state.pendingInFlight.size, 0);
+  assert.equal(message.value, "");
+  assert.equal(submitting.at(-1), false);
+});
+
+test("a command timeout also covers a stalled response body", async () => {
+  const source = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
+  const sendSource = source.slice(
+    source.indexOf("async function sendCommand(request) {"),
+    source.indexOf("export function recordPerformance"),
+  );
+  const context = {
+    authenticate: async () => {},
+    demoMode: false,
+    AbortController,
+    window: {
+      setTimeout: (callback) => setTimeout(callback, 0),
+      clearTimeout,
+    },
+    fetch: async (_url, options) => ({
+      status: 200,
+      json: () =>
+        new Promise((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(new Error("body aborted")));
+        }),
+    }),
+  };
+  await assert.rejects(
+    runInNewContext(`${sendSource}\nsendCommand({command: "steer"})`, context),
+    /request timed out after 30000 ms/,
+  );
+});
+
 test("authentication gate serializes concurrent startup requests", async () => {
   let probes = 0;
   let release;

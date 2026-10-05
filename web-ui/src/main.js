@@ -6236,40 +6236,46 @@ async function write(name) {
   renderPending();
   setComposerSubmitting(true);
   try {
-    if (name === "steer") {
-      const activity = await refreshActivity();
-      if (!activity?.activity.active_turn_id) {
-        name = "send";
-        action = "queue";
-        const optimistic = state.pending.find((entry) => entry.id === submissionId);
-        if (optimistic) {
-          optimistic.action = action;
-          optimistic.status = "queueing";
-          renderPending();
-        }
-        setSendMode("send", true);
-        notify(tr("noActiveTurnQueued"));
+    const queueInsteadOfSteer = () => {
+      name = "send";
+      action = "queue";
+      const optimistic = state.pending.find((entry) => entry.id === submissionId);
+      if (optimistic) {
+        optimistic.action = action;
+        optimistic.status = "queueing";
+        renderPending();
       }
-    }
+      setSendMode("send", true);
+      notify(tr("noActiveTurnQueued"));
+    };
+    const submit = () =>
+      command({
+        command: name,
+        thread_id: threadId,
+        text: requestText,
+        attachments,
+        submission_id: submissionId,
+      }).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
     $("messageText").value = "";
     closeCommandPicker();
     resizeComposerTextarea();
     saveDraft(threadId, "", true);
-    const request = command({
-      command: name,
-      thread_id: threadId,
-      text: requestText,
-      attachments,
-      submission_id: submissionId,
-    }).then(
-      (value) => ({ value }),
-      (error) => ({ error }),
-    );
-    const outcome = await request;
+    let outcome = await submit();
+    if (name === "steer" && outcome.error?.message?.startsWith("no_active_turn:")) {
+      queueInsteadOfSteer();
+      outcome = await submit();
+    }
     if (outcome.error) {
       state.pendingInFlight.delete(submissionId);
-      await refreshPending({ preserveOptimistic: false });
-      throw outcome.error;
+      const confirmed = await refreshPending({ preserveOptimistic: false })
+        .then(() =>
+          state.pending.some((entry) => entry.id === submissionId && entry.thread_id === threadId),
+        )
+        .catch(() => false);
+      if (!confirmed) throw outcome.error;
     }
     setComposerSubmitting(false);
     acknowledged = true;

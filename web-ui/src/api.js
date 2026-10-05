@@ -92,17 +92,32 @@ async function sendCommand(request) {
     const client = await demoClient;
     return client.demoCommand(request);
   }
-  const response = await fetch("/api/command", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
-  });
-  if (response.status === 401) {
-    const error = new Error("authentication expired; reload the page to sign in again");
-    authentication.block(error);
+  const timeoutMs = ["send", "steer", "temporary_turn_start"].includes(request.command)
+      ? 30_000
+      : ["pending_messages", "thread_activity"].includes(request.command)
+        ? 15_000
+        : 0,
+    controller = timeoutMs ? new AbortController() : null,
+    timer = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const response = await fetch("/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    if (response.status === 401) {
+      const error = new Error("authentication expired; reload the page to sign in again");
+      authentication.block(error);
+      throw error;
+    }
+    return await response.json();
+  } catch (error) {
+    if (controller?.signal.aborted) throw new Error(`request timed out after ${timeoutMs} ms`);
     throw error;
+  } finally {
+    if (timer !== null) window.clearTimeout(timer);
   }
-  return response.json();
 }
 
 export function recordPerformance(metric, durationMs, { count = 1, bytes = 0 } = {}) {
