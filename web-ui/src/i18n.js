@@ -211,6 +211,8 @@ const messages = {
     sessionReadOnly:
       "This session writer is not owned here; inputs may still be added to its queue",
     otherTools: "Other",
+    copySessionId: "Copy session ID",
+    sessionIdCopied: "Session ID copied",
     selectSessionHint: "Select a session to inspect its conversation.",
     gitStatus: "Git status…",
     usageUnavailableAria: "Weekly usage status unavailable",
@@ -745,6 +747,8 @@ const messages = {
     sessionLockStillUsed: "该会话仍由其他 app-server 使用",
     sessionReadOnly: "当前会话未由本端持有 writer，但仍可将输入加入 queue",
     otherTools: "其他",
+    copySessionId: "复制会话 ID",
+    sessionIdCopied: "已复制会话 ID",
     selectSessionHint: "选择一个会话以查看对话。",
     gitStatus: "Git 状态…",
     usageUnavailableAria: "周余量状态不可用",

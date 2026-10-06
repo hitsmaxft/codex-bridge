@@ -6133,6 +6133,7 @@ function applyThreadWriterLock(lock) {
         : "acquireSessionLock",
   );
   const readOnly = !currentThreadWritable();
+  $("copySessionIdBtn").disabled = !state.current?.id;
   document.querySelector(".composer-shell").classList.toggle("read-only", readOnly);
   for (const id of [
     "renameThreadBtn",
@@ -6432,6 +6433,12 @@ $("refreshBtn").onclick = () => run(refreshThread);
 $("historyFullscreenBtn").onclick = () => setHistoryFullscreen(!isHistoryFullscreen());
 $("collapseMessagesBtn").onclick = collapseExpandedMessages;
 $("sessionRefreshBtn").onclick = () => run(refreshCurrentSessionFromTools);
+$("copySessionIdBtn").onclick = () =>
+  run(async () => {
+    if (!state.current?.id) throw new Error(tr("chooseSessionError"));
+    await navigator.clipboard.writeText(state.current.id);
+    notify(tr("sessionIdCopied"));
+  });
 $("createSessionBtn").onclick = () => showCreateDialog();
 $("createProjectNextBtn").onclick = () => run(chooseCreateProject);
 $("createProjectBackBtn").onclick = backToCreateProject;

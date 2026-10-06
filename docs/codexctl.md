@@ -83,6 +83,10 @@ that is still being appended, and return the task's recorded working directory. 
 tries `git branch --show-current` in that directory; JSON uses `null` if the directory is gone, is
 not a Git repository, or is on a detached HEAD.
 
+`ls --json` and `current --json` include both `cwd` (the task's working directory) and
+`rollout_path` (the session JSONL file, when one exists). `codexctl` has no separate command to
+open the containing session directory.
+
 Override the read store for an isolated or offline inspection by starting the daemon with
 `--codex-home PATH`. This changes the daemon, not `codexctl` itself.
 
